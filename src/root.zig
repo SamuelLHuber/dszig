@@ -15,6 +15,11 @@ pub const Trace = predict.Trace;
 pub const Predict = predict.Predict;
 pub const ChainOfThought = predict.ChainOfThought;
 pub const Retrieve = predict.Retrieve;
+pub const optimize = @import("optimize.zig");
+pub const Example = optimize.Example;
+pub const BootstrapFewShot = optimize.BootstrapFewShot;
+pub const LabeledFewShot = optimize.LabeledFewShot;
+pub const state = @import("state.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
