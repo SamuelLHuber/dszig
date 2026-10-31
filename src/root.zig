@@ -7,6 +7,8 @@ pub const Signature = signature.Signature;
 pub const value = @import("value.zig");
 pub const adapter = @import("adapter.zig");
 pub const Adapter = adapter.Adapter;
+pub const lm = @import("lm.zig");
+pub const LM = lm.LM;
 
 test {
     @import("std").testing.refAllDecls(@This());
