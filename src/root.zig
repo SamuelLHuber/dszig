@@ -9,6 +9,12 @@ pub const adapter = @import("adapter.zig");
 pub const Adapter = adapter.Adapter;
 pub const lm = @import("lm.zig");
 pub const LM = lm.LM;
+pub const predict = @import("predict.zig");
+pub const Context = predict.Context;
+pub const Trace = predict.Trace;
+pub const Predict = predict.Predict;
+pub const ChainOfThought = predict.ChainOfThought;
+pub const Retrieve = predict.Retrieve;
 
 test {
     @import("std").testing.refAllDecls(@This());

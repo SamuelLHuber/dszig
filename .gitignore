@@ -1,0 +1,7 @@
+.zig-cache/
+zig-out/
+.devenv/
+.devenv.flake.nix
+.direnv/
+__pycache__/
+.venv/
