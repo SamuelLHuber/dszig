@@ -1,0 +1,166 @@
+[
+  {
+    "name": "cot_qa_chat",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Your input fields are:\n1. `context` (list[str]): may contain relevant facts\n2. `question` (str):\nYour output fields are:\n1. `reasoning` (str): \n2. `answer` (str): often between 1 and 5 words\nAll interactions will be structured in the following way, with the appropriate values filled in.\n\n[[ ## context ## ]]\n{context}\n\n[[ ## question ## ]]\n{question}\n\n[[ ## reasoning ## ]]\n{reasoning}\n\n[[ ## answer ## ]]\n{answer}\n\n[[ ## completed ## ]]\nIn adhering to this structure, your objective is: \n        Answer questions with short factoid answers."
+      },
+      {
+        "role": "user",
+        "content": "This is an example of the task, though some input or output fields are not supplied.\n\n[[ ## question ## ]]\nq2?"
+      },
+      {
+        "role": "assistant",
+        "content": "[[ ## reasoning ## ]]\nNot supplied for this particular example. \n\n[[ ## answer ## ]]\na2\n\n[[ ## completed ## ]]\n"
+      },
+      {
+        "role": "user",
+        "content": "[[ ## context ## ]]\n[\"a fact\"]\n\n[[ ## question ## ]]\nq1?"
+      },
+      {
+        "role": "assistant",
+        "content": "[[ ## reasoning ## ]]\nr1\n\n[[ ## answer ## ]]\na1\n\n[[ ## completed ## ]]\n"
+      },
+      {
+        "role": "user",
+        "content": "[[ ## context ## ]]\n[\"Paris is the capital of France.\", \"multi\\nline «x»\"]\n\n[[ ## question ## ]]\nWhat is the capital of France?\n\nRespond with the corresponding output fields, starting with the field `[[ ## reasoning ## ]]`, then `[[ ## answer ## ]]`, and then ending with the marker for `[[ ## completed ## ]]`."
+      }
+    ],
+    "completion": "[[ ## reasoning ## ]]\nParis is the capital.\n\n[[ ## answer ## ]]\nParis\n\n[[ ## completed ## ]]",
+    "outputs": {
+      "reasoning": "Paris is the capital.",
+      "answer": "Paris"
+    }
+  },
+  {
+    "name": "cot_qa_json",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Your input fields are:\n1. `context` (list[str]): may contain relevant facts\n2. `question` (str):\nYour output fields are:\n1. `reasoning` (str): \n2. `answer` (str): often between 1 and 5 words\nAll interactions will be structured in the following way, with the appropriate values filled in.\n\nInputs will have the following structure:\n\n[[ ## context ## ]]\n{context}\n\n[[ ## question ## ]]\n{question}\n\nOutputs will be a JSON object with the following fields.\n\n{\n  \"reasoning\": \"{reasoning}\",\n  \"answer\": \"{answer}\"\n}\nIn adhering to this structure, your objective is: \n        Answer questions with short factoid answers."
+      },
+      {
+        "role": "user",
+        "content": "This is an example of the task, though some input or output fields are not supplied.\n\n[[ ## question ## ]]\nq2?"
+      },
+      {
+        "role": "assistant",
+        "content": "{\n  \"reasoning\": \"Not supplied for this particular example. \",\n  \"answer\": \"a2\"\n}"
+      },
+      {
+        "role": "user",
+        "content": "[[ ## context ## ]]\n[\"a fact\"]\n\n[[ ## question ## ]]\nq1?"
+      },
+      {
+        "role": "assistant",
+        "content": "{\n  \"reasoning\": \"r1\",\n  \"answer\": \"a1\"\n}"
+      },
+      {
+        "role": "user",
+        "content": "[[ ## context ## ]]\n[\"Paris is the capital of France.\", \"multi\\nline «x»\"]\n\n[[ ## question ## ]]\nWhat is the capital of France?\n\nRespond with a JSON object in the following order of fields: `reasoning`, then `answer`."
+      }
+    ],
+    "completion": "```json\n{\"reasoning\": \"Because.\", \"answer\": \"Paris\"}\n```",
+    "outputs": {
+      "reasoning": "Because.",
+      "answer": "Paris"
+    }
+  },
+  {
+    "name": "typed_chat",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Your input fields are:\n1. `text` (str): \n2. `tags` (list[str]): free-form labels\nYour output fields are:\n1. `flag` (bool): \n2. `count` (int): \n3. `ratio` (float): between 0 and 1\n4. `label` (Literal['pos', 'neg']): \n5. `items` (list[str]):\nAll interactions will be structured in the following way, with the appropriate values filled in.\n\n[[ ## text ## ]]\n{text}\n\n[[ ## tags ## ]]\n{tags}\n\n[[ ## flag ## ]]\n{flag}        # note: the value you produce must be True or False\n\n[[ ## count ## ]]\n{count}        # note: the value you produce must be a single int value\n\n[[ ## ratio ## ]]\n{ratio}        # note: the value you produce must be a single float value\n\n[[ ## label ## ]]\n{label}        # note: the value you produce must exactly match (no extra characters) one of: pos; neg\n\n[[ ## items ## ]]\n{items}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"array\", \"items\": {\"type\": \"string\"}}\n\n[[ ## completed ## ]]\nIn adhering to this structure, your objective is: \n        Given the fields `text`, `tags`, produce the fields `flag`, `count`, `ratio`, `label`, `items`."
+      },
+      {
+        "role": "user",
+        "content": "This is an example of the task, though some input or output fields are not supplied.\n\n[[ ## text ## ]]\nbad"
+      },
+      {
+        "role": "assistant",
+        "content": "[[ ## flag ## ]]\nFalse\n\n[[ ## count ## ]]\nNot supplied for this particular example. \n\n[[ ## ratio ## ]]\nNot supplied for this particular example. \n\n[[ ## label ## ]]\nneg\n\n[[ ## items ## ]]\nNot supplied for this particular example.\n\n[[ ## completed ## ]]\n"
+      },
+      {
+        "role": "user",
+        "content": "[[ ## text ## ]]\ngood\n\n[[ ## tags ## ]]\n[\"x\"]"
+      },
+      {
+        "role": "assistant",
+        "content": "[[ ## flag ## ]]\nTrue\n\n[[ ## count ## ]]\n3\n\n[[ ## ratio ## ]]\n0.5\n\n[[ ## label ## ]]\npos\n\n[[ ## items ## ]]\n[\"a\", \"b\"]\n\n[[ ## completed ## ]]\n"
+      },
+      {
+        "role": "user",
+        "content": "[[ ## text ## ]]\ngreat movie\n\n[[ ## tags ## ]]\n[\"review\", \"film\"]\n\nRespond with the corresponding output fields, starting with the field `[[ ## flag ## ]]` (must be formatted as a valid Python bool), then `[[ ## count ## ]]` (must be formatted as a valid Python int), then `[[ ## ratio ## ]]` (must be formatted as a valid Python float), then `[[ ## label ## ]]` (must be formatted as a valid Python Literal['pos', 'neg']), then `[[ ## items ## ]]` (must be formatted as a valid Python list[str]), and then ending with the marker for `[[ ## completed ## ]]`."
+      }
+    ],
+    "completion": "[[ ## flag ## ]]\nTrue\n\n[[ ## count ## ]]\n42\n\n[[ ## ratio ## ]]\n0.25\n\n[[ ## label ## ]]\n'pos'\n\n[[ ## items ## ]]\n[\"one\", \"two\"]\n\n[[ ## completed ## ]]",
+    "outputs": {
+      "flag": true,
+      "count": 42,
+      "ratio": 0.25,
+      "label": "pos",
+      "items": [
+        "one",
+        "two"
+      ]
+    }
+  },
+  {
+    "name": "typed_json",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Your input fields are:\n1. `text` (str): \n2. `tags` (list[str]): free-form labels\nYour output fields are:\n1. `flag` (bool): \n2. `count` (int): \n3. `ratio` (float): between 0 and 1\n4. `label` (Literal['pos', 'neg']): \n5. `items` (list[str]):\nAll interactions will be structured in the following way, with the appropriate values filled in.\n\nInputs will have the following structure:\n\n[[ ## text ## ]]\n{text}\n\n[[ ## tags ## ]]\n{tags}\n\nOutputs will be a JSON object with the following fields.\n\n{\n  \"flag\": \"{flag}        # note: the value you produce must be True or False\",\n  \"count\": \"{count}        # note: the value you produce must be a single int value\",\n  \"ratio\": \"{ratio}        # note: the value you produce must be a single float value\",\n  \"label\": \"{label}        # note: the value you produce must exactly match (no extra characters) one of: pos; neg\",\n  \"items\": \"{items}        # note: the value you produce must adhere to the JSON schema: {\\\"type\\\": \\\"array\\\", \\\"items\\\": {\\\"type\\\": \\\"string\\\"}}\"\n}\nIn adhering to this structure, your objective is: \n        Given the fields `text`, `tags`, produce the fields `flag`, `count`, `ratio`, `label`, `items`."
+      },
+      {
+        "role": "user",
+        "content": "This is an example of the task, though some input or output fields are not supplied.\n\n[[ ## text ## ]]\nbad"
+      },
+      {
+        "role": "assistant",
+        "content": "{\n  \"flag\": false,\n  \"count\": \"Not supplied for this particular example. \",\n  \"ratio\": \"Not supplied for this particular example. \",\n  \"label\": \"neg\",\n  \"items\": \"Not supplied for this particular example. \"\n}"
+      },
+      {
+        "role": "user",
+        "content": "[[ ## text ## ]]\ngood\n\n[[ ## tags ## ]]\n[\"x\"]"
+      },
+      {
+        "role": "assistant",
+        "content": "{\n  \"flag\": true,\n  \"count\": 3,\n  \"ratio\": 0.5,\n  \"label\": \"pos\",\n  \"items\": [\n    \"a\",\n    \"b\"\n  ]\n}"
+      },
+      {
+        "role": "user",
+        "content": "[[ ## text ## ]]\ngreat movie\n\n[[ ## tags ## ]]\n[\"review\", \"film\"]\n\nRespond with a JSON object in the following order of fields: `flag` (must be formatted as a valid Python bool), then `count` (must be formatted as a valid Python int), then `ratio` (must be formatted as a valid Python float), then `label` (must be formatted as a valid Python Literal['pos', 'neg']), then `items` (must be formatted as a valid Python list[str])."
+      }
+    ],
+    "completion": "{\"flag\": true, \"count\": 7, \"ratio\": 1, \"label\": \"neg\", \"items\": [\"z\"]}",
+    "outputs": {
+      "flag": true,
+      "count": 7,
+      "ratio": 1.0,
+      "label": "neg",
+      "items": [
+        "z"
+      ]
+    }
+  },
+  {
+    "name": "indented_chat",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Your input fields are:\n1. `text` (str):\nYour output fields are:\n1. `label` (Literal['pos', 'neg']):\nAll interactions will be structured in the following way, with the appropriate values filled in.\n\n[[ ## text ## ]]\n{text}\n\n[[ ## label ## ]]\n{label}        # note: the value you produce must exactly match (no extra characters) one of: pos; neg\n\n[[ ## completed ## ]]\nIn adhering to this structure, your objective is: \n        Classify the text.\n            Keep nested indentation.\n        \n        Be brief."
+      },
+      {
+        "role": "user",
+        "content": "[[ ## text ## ]]\nmeh\n\nRespond with the corresponding output fields, starting with the field `[[ ## label ## ]]` (must be formatted as a valid Python Literal['pos', 'neg']), and then ending with the marker for `[[ ## completed ## ]]`."
+      }
+    ],
+    "completion": "[[ ## label ## ]]\nLiteral['neg']\n\n[[ ## completed ## ]]",
+    "outputs": {
+      "label": "neg"
+    }
+  }
+]

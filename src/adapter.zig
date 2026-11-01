@@ -151,7 +151,7 @@ fn translateFieldType(w: *Writer, f: Field, is_input: bool) Writer.Error!void {
             }
         },
         .str_list => try w.writeAll(
-            \\must adhere to the JSON schema: {"items": {"type": "string"}, "type": "array"}
+            \\must adhere to the JSON schema: {"type": "array", "items": {"type": "string"}}
         ),
     }
 }
