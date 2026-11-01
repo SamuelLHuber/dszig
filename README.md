@@ -97,6 +97,30 @@ real DSPy:
 1. DSPy 3.4.1 regenerates `tests/fixtures` with no changes.
 2. DSPy `load()`s the artifact written by `zig build bootstrap` and its
    `save()` produces the same bytes.
+3. DSPy replays both committed real-model transcripts in
+   [`tests/fixtures/live`](tests/fixtures/live) and reproduces every
+   request, output, Evaluate score and compiled artifact.
+
+### Real-model traces (gpt-4o-mini)
+
+Each transcript holds every request a runtime sent to the real OpenAI model,
+with the completion it got back. It covers the five adapter cases and the
+full RAG Evaluate → BootstrapFewShot → Evaluate pipeline, 17 calls in all.
+There are two transcripts, one per direction:
+
+- `dspy_gpt-4o-mini.json` was recorded by DSPy 3.4.1
+  (`tools/dspy_reference/live.py`). [`tests/live_replay.zig`](tests/live_replay.zig)
+  replays it through DSZig with `lm.ReplayLM`. Every DSZig request must
+  byte-match a recorded DSPy request, and every recorded call must be used.
+  The parsed outputs, both scores and the compiled artifact must then equal
+  DSPy's.
+- `dszig_gpt-4o-mini.json` was recorded by DSZig's own `std.http` OpenAI
+  client (`zig build live`, `lm.RecordingLM`). `check_live.py` replays it
+  through DSPy and applies the same checks in reverse.
+
+Replays need no key, so CI runs them. To re-record, run `dz-live` with
+`OPENAI_API_KEY` set. Real completions vary from run to run, so a
+re-recorded transcript differs, but the replay checks must still pass.
 
 ## Not implemented (v0.1)
 
@@ -118,8 +142,10 @@ real DSPy:
   `BaseModule.dump_state` passes it. The reference harness subclasses
   `Retrieve` to accept that argument. DSZig writes the state DSPy would have
   written.
-- The OpenAI client is tested on its request and response JSON. CI makes no
-  network calls to a model.
+- The OpenAI client sends `response_format: json_object` for JSONAdapter.
+  DSPy sends a structured-outputs JSON schema. The prompt messages are the
+  same; only this request option differs. CI makes no network calls; the
+  live path is exercised by `dz-live`.
 
 ## Development
 
@@ -129,6 +155,7 @@ dz-test          # zig build test
 dz-examples      # zig build examples
 dz-dspy          # cross-check against DSPy 3.4.1
 dz-check         # all of the above, Debug and ReleaseSafe (what devenv test runs)
+dz-live          # re-record real-model transcripts (needs OPENAI_API_KEY)
 devenv test
 ```
 

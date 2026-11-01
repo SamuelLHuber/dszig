@@ -103,6 +103,75 @@ pub const KeywordLM = struct {
     }
 };
 
+/// Replays a recorded transcript (e.g. real-model calls captured from DSPy).
+/// Each request must byte-match an unused recorded request (roles and
+/// contents); the first such call's completion is returned. A request with
+/// no recorded twin fails with `LMFailure`, so a replay that completes with
+/// `exhausted()` proves both runtimes sent identical prompts.
+pub const ReplayLM = struct {
+    calls: []const Call,
+    /// Parallel to `calls`; set once a call has been replayed.
+    used: []bool,
+    misses: usize = 0,
+    history: ?*History = null,
+
+    pub const Call = struct { messages: []const Message, completion: []const u8 };
+
+    pub fn lm(self: *ReplayLM) LM {
+        assert(self.calls.len == self.used.len);
+        return .{ .ptr = self, .vtable = &.{ .complete = complete } };
+    }
+
+    pub fn exhausted(self: *const ReplayLM) bool {
+        for (self.used) |u| if (!u) return false;
+        return self.misses == 0;
+    }
+
+    fn complete(ptr: *anyopaque, arena: Allocator, request: Request) Error![]const u8 {
+        const self: *ReplayLM = @ptrCast(@alignCast(ptr));
+        if (self.history) |h| try h.record(request);
+        for (self.calls, self.used) |call, *used| {
+            if (used.* or !sameMessages(call.messages, request.messages)) continue;
+            used.* = true;
+            return arena.dupe(u8, call.completion);
+        }
+        self.misses += 1;
+        return error.LMFailure;
+    }
+
+    fn sameMessages(a: []const Message, b: []const Message) bool {
+        if (a.len != b.len) return false;
+        for (a, b) |x, y| {
+            if (x.role != y.role or !std.mem.eql(u8, x.content, y.content)) return false;
+        }
+        return true;
+    }
+};
+
+/// Wraps another LM and keeps every request with its completion, e.g. to
+/// capture real-model traces for later `ReplayLM` runs.
+pub const RecordingLM = struct {
+    inner: LM,
+    /// Owns the recorded copies.
+    arena: Allocator,
+    calls: std.ArrayList(ReplayLM.Call) = .empty,
+
+    pub fn lm(self: *RecordingLM) LM {
+        return .{ .ptr = self, .vtable = &.{ .complete = complete } };
+    }
+
+    fn complete(ptr: *anyopaque, arena: Allocator, request: Request) Error![]const u8 {
+        const self: *RecordingLM = @ptrCast(@alignCast(ptr));
+        const completion = try self.inner.complete(arena, request);
+        const messages = try self.arena.alloc(Message, request.messages.len);
+        for (request.messages, messages) |src, *dst| {
+            dst.* = .{ .role = src.role, .content = try self.arena.dupe(u8, src.content) };
+        }
+        try self.calls.append(self.arena, .{ .messages = messages, .completion = try self.arena.dupe(u8, completion) });
+        return completion;
+    }
+};
+
 /// Transcript of LM requests, for golden comparisons and inspection.
 pub const History = struct {
     arena: Allocator,
@@ -226,4 +295,32 @@ test "keyword LM scopes and OpenAI wire format" {
         \\{"choices": [{"message": {"role": "assistant", "content": "hi"}}]}
     );
     try testing.expectEqualStrings("hi", content);
+}
+
+test "replay LM matches recorded requests exactly and reports misses" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = [_]Message{.{ .role = .user, .content = "a" }};
+    const b = [_]Message{.{ .role = .user, .content = "b" }};
+    var used = [_]bool{ false, false };
+    var replay: ReplayLM = .{
+        .calls = &.{ .{ .messages = &a, .completion = "A1" }, .{ .messages = &a, .completion = "A2" } },
+        .used = &used,
+    };
+    const replay_lm = replay.lm();
+    try testing.expectEqualStrings("A1", try replay_lm.complete(arena.allocator(), .{ .messages = &a }));
+    try testing.expect(!replay.exhausted());
+    try testing.expectError(error.LMFailure, replay_lm.complete(arena.allocator(), .{ .messages = &b }));
+    try testing.expectEqualStrings("A2", try replay_lm.complete(arena.allocator(), .{ .messages = &a }));
+    try testing.expectError(error.LMFailure, replay_lm.complete(arena.allocator(), .{ .messages = &a }));
+    try testing.expectEqual(@as(usize, 2), replay.misses);
+    try testing.expect(!replay.exhausted());
+
+    var inner_used = [_]bool{false};
+    var inner: ReplayLM = .{ .calls = &.{.{ .messages = &b, .completion = "B" }}, .used = &inner_used };
+    var recorder: RecordingLM = .{ .inner = inner.lm(), .arena = arena.allocator() };
+    try testing.expectEqualStrings("B", try recorder.lm().complete(arena.allocator(), .{ .messages = &b }));
+    try testing.expect(inner.exhausted());
+    try testing.expectEqual(@as(usize, 1), recorder.calls.items.len);
+    try testing.expectEqualStrings("b", recorder.calls.items[0].messages[0].content);
 }

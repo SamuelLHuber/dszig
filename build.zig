@@ -19,14 +19,24 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{.{ .name = "dszig", .module = dszig }},
     });
+    const live_suite = b.createModule(.{
+        .root_source_file = b.path("examples/live_suite.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "dszig", .module = dszig },
+            .{ .name = "rag_program", .module = rag_program },
+        },
+    });
     const imports: []const std.Build.Module.Import = &.{
         .{ .name = "dszig", .module = dszig },
         .{ .name = "rag_program", .module = rag_program },
+        .{ .name = "live_suite", .module = live_suite },
     };
 
     const test_step = b.step("test", "Run unit, DSPy golden, behaviour and compile-fail tests");
     test_step.dependOn(&run_unit_tests.step);
-    for ([_][]const u8{ "tests/golden.zig", "tests/behavior.zig" }) |path| {
+    for ([_][]const u8{ "tests/golden.zig", "tests/behavior.zig", "tests/live_replay.zig" }) |path| {
         const t = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path(path),
             .target = target,
@@ -51,6 +61,19 @@ pub fn build(b: *std.Build) void {
         b.step(name, b.fmt("Run examples/{s}.zig", .{name})).dependOn(&run.step);
         examples_step.dependOn(&b.addRunArtifact(exe).step);
     }
+
+    // Needs OPENAI_API_KEY and network, so it is not part of `examples`.
+    const live = b.addExecutable(.{ .name = "live", .root_module = b.createModule(.{
+        .root_source_file = b.path("examples/live.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = imports,
+    }) });
+    b.installArtifact(live);
+    const run_live = b.addRunArtifact(live);
+    run_live.addPassthruArgs();
+    b.step("live", "Run examples/live.zig against a real OpenAI-compatible model").dependOn(&run_live.step);
+    examples_step.dependOn(&live.step);
 }
 
 /// Each tests/compile_fail/<name>.zig must fail to compile with `message`.

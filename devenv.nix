@@ -51,6 +51,13 @@ in
     dz-test.exec = ''zig build test --summary all "$@"'';
     dz-examples.exec = ''zig build examples --summary all "$@"'';
     dz-dspy.exec = ''tools/dspy_reference/check.sh'';
+    # Re-record real-model transcripts (needs OPENAI_API_KEY; not run by CI).
+    dz-live.exec = ''
+      set -euo pipefail
+      (cd tools/dspy_reference && uv run --locked live.py)
+      zig build live -- tests/fixtures/live/dszig_gpt-4o-mini.json
+      tools/dspy_reference/check.sh
+    '';
     dz-check.exec = ''
       set -euo pipefail
       zig fmt --check .
@@ -69,7 +76,7 @@ in
     ''
     + ''
       echo "dszig: zig $(zig version), $(python3 --version), uv $(uv --version | cut -d' ' -f2)"
-      echo "  dz-test, dz-examples, dz-dspy (cross-check with DSPy 3.4.1), dz-check (what CI runs)"
+      echo "  dz-test, dz-examples, dz-dspy (cross-check with DSPy 3.4.1), dz-check (what CI runs), dz-live (re-record real gpt-4o-mini transcripts)"
     '';
 
   enterTest = ''
