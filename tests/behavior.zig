@@ -152,3 +152,43 @@ fn compileAndSave(gpa: Allocator) !void {
     const result = try optimizer.compile(rag.RAG, out.allocator(), gpa, ctx, .{}, null, trainset);
     _ = try dszig.state.saveAlloc(out.allocator(), &result.program);
 }
+
+test "random search scores every seed, ranks them and keeps the best" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    var learner: LearningLM = .{};
+    const ctx: dszig.Context = .{ .arena = out.allocator(), .lm = learner.lm(), .retriever = rag.corpus.retriever() };
+    const trainset = try rag.trainset(out.allocator());
+    const search: dszig.BootstrapFewShotWithRandomSearch = .{
+        .metric = rag.keywordMetric,
+        .max_bootstrapped_demos = 3,
+        .max_labeled_demos = 2,
+        .num_candidate_programs = 3,
+    };
+    const result = try search.compile(rag.RAG, out.allocator(), testing.allocator, ctx, .{}, null, trainset, null);
+    try testing.expectEqual(@as(usize, 6), result.candidates.len);
+    var seen: [6]bool = @splat(false);
+    for (result.candidates, 0..) |c, i| {
+        seen[@intCast(c.seed + 3)] = true;
+        if (i > 0) try testing.expect(result.candidates[i - 1].score >= c.score);
+    }
+    for (seen) |s| try testing.expect(s);
+    const best = try dszig.optimize.evaluate(rag.RAG, testing.allocator, ctx, &result.program, trainset, rag.keywordMetric, 10);
+    try testing.expectEqual(result.candidates[0].score, best.score);
+}
+
+test "random search stops at stop_at_score" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    var learner: LearningLM = .{};
+    const ctx: dszig.Context = .{ .arena = out.allocator(), .lm = learner.lm(), .retriever = rag.corpus.retriever() };
+    const trainset = try rag.trainset(out.allocator());
+    const search: dszig.BootstrapFewShotWithRandomSearch = .{
+        .metric = rag.keywordMetric,
+        .num_candidate_programs = 3,
+        .stop_at_score = 0.0,
+    };
+    const result = try search.compile(rag.RAG, out.allocator(), testing.allocator, ctx, .{}, null, trainset, null);
+    try testing.expectEqual(@as(usize, 1), result.candidates.len);
+    try testing.expectEqual(@as(i64, -3), result.candidates[0].seed);
+}

@@ -105,15 +105,21 @@ pub const Pipeline = struct {
     artifact: []const u8,
     /// Random-search candidates (`candidate_programs`); empty otherwise.
     candidates: []const dszig.optimize.BootstrapFewShotWithRandomSearch.Candidate = &.{},
+    /// MIPROv2 only: instruction candidates, `trial_logs` and the scores of
+    /// `candidate_programs`.
+    instructions: []const []const []const u8 = &.{},
+    trials: []const dszig.MIPROv2.TrialLog = &.{},
+    scores: []const f64 = &.{},
 };
 
-pub const pipeline_names = .{ "rag", "dates", "dates_search" };
+pub const pipeline_names = .{ "rag", "dates", "dates_search", "dates_mipro" };
 
 pub const Result = struct {
     cases: [case_count]Case,
     rag: Pipeline,
     dates: Pipeline,
     dates_search: Pipeline,
+    dates_mipro: Pipeline,
 };
 
 pub fn run(arena: Allocator, gpa: Allocator, lm: dszig.LM) !Result {
@@ -143,8 +149,19 @@ pub fn run(arena: Allocator, gpa: Allocator, lm: dszig.LM) !Result {
         .num_candidate_programs = 4,
     };
     result.dates_search = try pipeline(DateQA, arena, gpa, ctx, search, dates_train, dates_dev, exactMetric);
+    const mipro: dszig.MIPROv2 = .{
+        .metric = exactMetric,
+        .auto = null,
+        .num_candidates = 4,
+        .max_bootstrapped_demos = 2,
+        .max_labeled_demos = 2,
+    };
+    result.dates_mipro = try pipeline(DateQA, arena, gpa, ctx, mipro, dates_train, dates_dev, exactMetric);
     return result;
 }
+
+pub const mipro_trials = 12;
+pub const mipro_minibatch = 4;
 
 fn pipeline(
     comptime P: type,
@@ -157,6 +174,19 @@ fn pipeline(
     metric: dszig.optimize.Metric,
 ) !Pipeline {
     const baseline = try dszig.optimize.evaluate(P, gpa, ctx, &P{}, devset, metric, 10);
+    if (@TypeOf(optimizer) == dszig.MIPROv2) {
+        const options: dszig.MIPROv2.Options = .{ .valset = devset, .num_trials = mipro_trials, .minibatch_size = mipro_minibatch };
+        const compiled = try optimizer.compile(P, arena, gpa, ctx, null, .{}, null, trainset, options);
+        const optimized = try dszig.optimize.evaluate(P, gpa, ctx, &compiled.program, devset, metric, 10);
+        return .{
+            .baseline = baseline.score,
+            .optimized = optimized.score,
+            .artifact = try dszig.state.saveAlloc(arena, &compiled.program),
+            .instructions = compiled.instruction_candidates,
+            .trials = compiled.trials,
+            .scores = compiled.candidates,
+        };
+    }
     const search = @TypeOf(optimizer) == dszig.BootstrapFewShotWithRandomSearch;
     const compiled = if (search)
         try optimizer.compile(P, arena, gpa, ctx, .{}, null, trainset, null)
@@ -257,6 +287,30 @@ pub fn writeTranscript(arena: Allocator, runtime: []const u8, model: []const u8,
             try candidates.append(.{ .array = pair });
         }
         try obj.put(arena, "candidates", .{ .array = candidates });
+        var instructions: std.json.Array = .init(arena);
+        for (p.instructions) |list| {
+            var arr: std.json.Array = .init(arena);
+            for (list) |text| try arr.append(.{ .string = text });
+            try instructions.append(.{ .array = arr });
+        }
+        try obj.put(arena, "instructions", .{ .array = instructions });
+        var trials: std.json.Array = .init(arena);
+        for (p.trials) |t| {
+            var row: std.json.Array = .init(arena);
+            try row.append(.{ .integer = @intCast(t.number) });
+            if (t.params) |params| {
+                var arr: std.json.Array = .init(arena);
+                for (params) |i| try arr.append(.{ .integer = @intCast(i) });
+                try row.append(.{ .array = arr });
+            } else try row.append(.null);
+            try row.append(.{ .float = t.score });
+            try row.append(.{ .bool = t.full_eval });
+            try trials.append(.{ .array = row });
+        }
+        try obj.put(arena, "trials", .{ .array = trials });
+        var scores: std.json.Array = .init(arena);
+        for (p.scores) |x| try scores.append(.{ .float = x });
+        try obj.put(arena, "scores", .{ .array = scores });
         try root.put(arena, name, .{ .object = obj });
     }
     var aw: std.Io.Writer.Allocating = .init(arena);

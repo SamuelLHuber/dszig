@@ -82,16 +82,53 @@ def run_suite(lm):
         metric=exact_metric, max_bootstrapped_demos=2, max_labeled_demos=2, num_candidate_programs=4
     )
     out["dates_search"] = pipeline(DateQA, search, date_examples("train"), date_examples("dev"), exact_metric)
+    mipro = RecordedMIPROv2(
+        metric=exact_metric, auto=None, num_candidates=4, max_bootstrapped_demos=2, max_labeled_demos=2, num_threads=1
+    )
+    out["dates_mipro"] = pipeline(
+        DateQA, mipro, date_examples("train"), date_examples("dev"), exact_metric,
+        valset=date_examples("dev"), num_trials=MIPRO_TRIALS, minibatch_size=MIPRO_MINIBATCH, program_aware_proposer=False,
+    )
     return out
 
 
-def pipeline(make, optimizer, trainset, devset, metric):
+MIPRO_TRIALS = 12
+MIPRO_MINIBATCH = 4
+
+
+class RecordedMIPROv2(dspy.MIPROv2):
+    """Keeps the proposed instruction candidates for comparison."""
+
+    def _propose_instructions(self, *args, **kwargs):
+        self.instruction_candidates = super()._propose_instructions(*args, **kwargs)
+        return self.instruction_candidates
+
+
+def trial_rows(logs, n_predictors):
+    """`trial_logs` as [trial_num, chosen indices or None, score, full_eval]."""
+    rows = []
+    for num in sorted(logs):
+        log = logs[num]
+        keys = [k for i in range(n_predictors) for k in (f"{i}_predictor_instruction", f"{i}_predictor_demos") if k in log]
+        params = [log[k] for k in keys] or None
+        full = "mb_score" not in log
+        rows.append([num, params, log["full_eval_score"] if full else log["mb_score"], full])
+    return rows
+
+
+def pipeline(make, optimizer, trainset, devset, metric, **compile_kwargs):
     """Evaluate on devset, compile on trainset, evaluate again."""
     evaluate = dspy.Evaluate(devset=devset, metric=metric, display_progress=False, num_threads=1)
     result = {"baseline": evaluate(make()).score}
-    compiled = optimizer.compile(make(), trainset=trainset)
+    compiled = optimizer.compile(make(), trainset=trainset, **compile_kwargs)
     result["optimized"] = evaluate(compiled).score
-    result["candidates"] = [[c["seed"], c["score"]] for c in getattr(compiled, "candidate_programs", [])]
+    programs = getattr(compiled, "candidate_programs", [])
+    result["candidates"] = [[c["seed"], c["score"]] for c in programs if "seed" in c]
+    result["scores"] = [c["score"] for c in programs if "seed" not in c]
+    proposed = getattr(optimizer, "instruction_candidates", {})
+    result["instructions"] = [list(proposed[i]) for i in sorted(proposed)]
+    n_predictors = len(compiled.predictors())
+    result["trials"] = trial_rows(compiled.trial_logs, n_predictors) if hasattr(compiled, "trial_logs") else []
     with tempfile.TemporaryDirectory() as tmp:
         path = pathlib.Path(tmp) / "program.json"
         compiled.save(str(path))

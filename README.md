@@ -61,6 +61,8 @@ and [`examples/bootstrap.zig`](examples/bootstrap.zig)
 | Trace (`dspy.settings.trace`) | `dszig.Trace`, passed explicitly through `Context.trace`. Each step records the predictor, a deep copy of its inputs and its outputs. |
 | `Evaluate` | `optimize.evaluate`: `round(100 * sum / n, 2)`, with a `max_errors` limit |
 | `LabeledFewShot`, `BootstrapFewShot` | Same semantics: `max_bootstrapped_demos`, `max_labeled_demos`, `max_rounds` (with `rollout_id`/`temperature=1.0` on later rounds), `metric_threshold`, the example excluded from its own teacher demos, and `compiled` freezing. Sampling and shuffling use `pyrandom`, a port of CPython's MT19937 `random.Random(0)`, so the chosen demos match DSPy's. |
+| `BootstrapFewShotWithRandomSearch` | `optimize.BootstrapFewShotWithRandomSearch`: seeds -3 (no demos), -2 (`LabeledFewShot`), -1 (`BootstrapFewShot`), then `random.Random(seed)`-shuffled trainsets with `randint(1, max_bootstrapped_demos)` demos; first best score wins, `stop_at_score`, ranked `candidate_programs`. |
+| `MIPROv2` | `dszig.MIPROv2`: `auto` light/medium/heavy or explicit `num_candidates`/`num_trials`, the 80/20 train/val split, `create_n_fewshot_demo_sets`, the grounded proposer (dataset summary, task demos, random tips, `rollout_id`s, `init_temperature`), and Optuna 4.5.0's multivariate TPE (`dszig.tpe`, checked trial by trial against Optuna) over instruction × demo-set indices, with minibatches and periodic full evaluations. One `random.Random(seed)` stream is shared in DSPy's order. |
 | `module.save(path)` / `load` (JSON) | `state.save` / `saveAlloc` / `load`, which read and write the same file format byte for byte (`json.dumps(indent=2)` style, Python float formatting). |
 
 ## Proof of compatibility
@@ -104,15 +106,19 @@ real DSPy:
 ### Real-model traces (gpt-4o-mini)
 
 Each transcript holds every request a runtime sent to the real OpenAI model,
-with the completion it got back: 160 calls in all. It covers the five
-adapter cases and three Evaluate → compile → Evaluate pipelines. The random-search
-pipeline also compares the ranked `candidate_programs` (seed, score) list:
+with the completion it got back: 290 calls in all. It covers the five
+adapter cases and four Evaluate → compile → Evaluate pipelines. The random-search
+pipeline also compares the ranked `candidate_programs` (seed, score) list. The
+MIPROv2 pipeline also compares every proposed instruction candidate, every
+`trial_logs` entry (trial number, chosen instruction/demo indices, minibatch or
+full score) and the ranked full-evaluation scores:
 
 | Pipeline | Data | Baseline | Optimized |
 |---|---|---|---|
 | RAG (`Retrieve` + `ChainOfThought`) | 5 questions | 100.0% | 100.0% |
 | Dates (`ChainOfThought`, exact match) | 12 train / 12 held-out dev | 0.0% | 100.0% |
 | Dates, `BootstrapFewShotWithRandomSearch` (4 seeds + 3 baselines, scored on train) | 12 train / 12 held-out dev | 0.0% | 100.0% |
+| Dates, `MIPROv2` (4 candidates, 12 TPE trials on minibatches of 4, dev as valset, `program_aware_proposer=False`) | 12 train / 12 dev | 0.0% | 100.0% |
 
 The dates task ([`examples/dates.json`](examples/dates.json)) uses gold
 answers in ISO 8601 form (`1969-07-20`), and the instructions never say so.
@@ -139,7 +145,10 @@ re-recorded transcript differs, but the replay checks must still pass.
 
 ## Not implemented (v0.1)
 
-- MIPROv2, COPRO, GEPA, BootstrapFewShotWithRandomSearch, Ensemble
+- COPRO, GEPA, SIMBA, Ensemble
+- MIPROv2's program-aware proposer (DSPy describes the program from its
+  Python source; DSZig behaves as `program_aware_proposer=False`),
+  `teacher_settings`, `log_dir` and parallel evaluation threads
 - ReAct / tool calling, streaming, async/parallel execution, LM caching
 - Nested structs, Pydantic models, `dict`, `Optional`, images and other
   custom types as fields
@@ -158,6 +167,10 @@ re-recorded transcript differs, but the replay checks must still pass.
   `Retrieve` to accept that argument. DSZig writes the state DSPy would have
   written.
 - The OpenAI client sends `response_format: json_object` for JSONAdapter.
+- MIPROv2's `strip_prefix` treats only ASCII letters, digits, `_`, `'` and
+  `-` as word characters and only ASCII whitespace as `\s`; Python's `re`
+  also accepts Unicode ones, so a non-ASCII label before `:` in a proposed
+  instruction is kept by DSZig and stripped by DSPy.
   DSPy sends a structured-outputs JSON schema. The prompt messages are the
   same; only this request option differs. CI makes no network calls; the
   live path is exercised by `dz-live`.

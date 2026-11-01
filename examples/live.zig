@@ -40,6 +40,7 @@ pub fn main(init: std.process.Init) !void {
     try w.print("dates_search: baseline {d:.1}%  optimized {d:.1}%  candidates", .{ result.dates_search.baseline, result.dates_search.optimized });
     for (result.dates_search.candidates) |c| try w.print(" {d}:{d:.1}", .{ c.seed, c.score });
     try w.writeByte('\n');
+    try w.print("dates_mipro: baseline {d:.1}%  optimized {d:.1}%  {d} trials\n", .{ result.dates_mipro.baseline, result.dates_mipro.optimized, result.dates_mipro.trials.len });
     try w.print("{d} real calls to {s}; wrote {s}\n", .{ recorder.calls.items.len, model, out_path });
     try w.flush();
 }

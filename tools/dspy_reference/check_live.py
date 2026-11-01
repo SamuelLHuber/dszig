@@ -10,7 +10,7 @@ import sys
 
 import live_suite
 
-PIPELINES = ("rag", "dates", "dates_search")
+PIPELINES = ("rag", "dates", "dates_search", "dates_mipro")
 
 
 def main():
@@ -29,7 +29,7 @@ def main():
         if ("error" in want) != ("error" in got) or want.get("outputs") != got.get("outputs"):
             failures.append(f"case {want['name']}: recorded {want} != replayed {got}")
     for pipeline in PIPELINES:
-        for key in ("baseline", "optimized", "artifact", "candidates"):
+        for key in ("baseline", "optimized", "artifact", "candidates", "instructions", "trials", "scores"):
             if transcript[pipeline][key] != result[pipeline][key]:
                 failures.append(f"{pipeline} {key} differs")
     if failures:

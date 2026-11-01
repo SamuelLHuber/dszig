@@ -37,7 +37,7 @@ pub const tips = [_][]const u8{
     "",
     "Don't be afraid to be creative when creating the new instruction!",
     "Keep the instruction clear and concise.",
-    "Make sure the instruction is very informative and descriptive.",
+    "Make sure your instruction is very informative and descriptive.",
     "The instruction should include a high stakes scenario in which the LM must solve the task!",
     "Include a persona that is relevant to the task in the instruction (ie. \"You are a ...\")",
 };
@@ -313,7 +313,8 @@ pub const MIPROv2 = struct {
 
     /// One entry of DSPy's `trial_logs`: `params` holds the chosen indices
     /// (`{i}_predictor_instruction`, then `{i}_predictor_demos`, per
-    /// predictor) and is null for the default program's evaluation.
+    /// predictor) and, as in DSPy, is null for the default program's and
+    /// the periodic full evaluations.
     pub const TrialLog = struct {
         number: usize,
         params: ?[]const usize,
@@ -622,7 +623,7 @@ pub const MIPROv2 = struct {
                 const full_score = try self.score(P, out, gpa, ctx, &target.program, valset, valset.len, rng);
                 try full_scores.append(out, full_score);
                 try history.append(out, .{ .params = target.params, .value = full_score });
-                try logs.append(out, .{ .number = trial_num + 1, .params = target.params, .score = full_score, .full_eval = true });
+                try logs.append(out, .{ .number = trial_num + 1, .params = null, .score = full_score, .full_eval = true });
                 target.evaluated = true;
                 if (full_score > best_score) {
                     best_score = full_score;

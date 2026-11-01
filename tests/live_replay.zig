@@ -40,9 +40,12 @@ test "DSZig reproduces DSPy's real gpt-4o-mini run from its transcript" {
             try testing.expectEqualStrings(try compact(arena, outputs), try compact(arena, .{ .object = got.outputs.? }));
         }
     }
+    const mine_json = try suite.writeTranscript(arena, "dszig", "replay", calls, result);
+    const mine_root = try std.json.parseFromSliceLeaky(std.json.Value, arena, mine_json, .{});
     inline for (suite.pipeline_names) |name| {
         const want = transcript.object.get(name).?.object;
         const got = @field(result, name);
+        const mine = mine_root.object.get(name).?.object;
         try testing.expectEqual(want.get("baseline").?.float, got.baseline);
         try testing.expectEqual(want.get("optimized").?.float, got.optimized);
         try testing.expectEqualStrings(want.get("artifact").?.string, got.artifact);
@@ -51,6 +54,9 @@ test "DSZig reproduces DSPy's real gpt-4o-mini run from its transcript" {
         for (want_candidates, got.candidates) |pair, c| {
             try testing.expectEqual(pair.array.items[0].integer, c.seed);
             try testing.expectEqual(pair.array.items[1].float, c.score);
+        }
+        inline for (.{ "instructions", "trials", "scores" }) |key| {
+            try testing.expectEqualStrings(try compact(arena, want.get(key).?), try compact(arena, mine.get(key).?));
         }
     }
 }
