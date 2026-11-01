@@ -13,15 +13,65 @@ pub fn build(b: *std.Build) void {
     const unit_tests = b.addTest(.{ .root_module = dszig });
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
-    const golden = b.addTest(.{ .root_module = b.createModule(.{
-        .root_source_file = b.path("tests/golden.zig"),
+    const rag_program = b.createModule(.{
+        .root_source_file = b.path("examples/rag_program.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{.{ .name = "dszig", .module = dszig }},
-    }) });
-    const run_golden = b.addRunArtifact(golden);
+    });
+    const imports: []const std.Build.Module.Import = &.{
+        .{ .name = "dszig", .module = dszig },
+        .{ .name = "rag_program", .module = rag_program },
+    };
 
-    const test_step = b.step("test", "Run unit and DSPy golden tests");
+    const test_step = b.step("test", "Run unit, DSPy golden, behaviour and compile-fail tests");
     test_step.dependOn(&run_unit_tests.step);
-    test_step.dependOn(&run_golden.step);
+    for ([_][]const u8{ "tests/golden.zig", "tests/behavior.zig" }) |path| {
+        const t = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path(path),
+            .target = target,
+            .optimize = optimize,
+            .imports = imports,
+        }) });
+        test_step.dependOn(&b.addRunArtifact(t).step);
+    }
+    addCompileFailTests(b, test_step);
+
+    const examples_step = b.step("examples", "Build and run the examples");
+    for ([_][]const u8{ "rag", "bootstrap" }) |name| {
+        const exe = b.addExecutable(.{ .name = name, .root_module = b.createModule(.{
+            .root_source_file = b.path(b.fmt("examples/{s}.zig", .{name})),
+            .target = target,
+            .optimize = optimize,
+            .imports = imports,
+        }) });
+        b.installArtifact(exe);
+        const run = b.addRunArtifact(exe);
+        run.addPassthruArgs();
+        b.step(name, b.fmt("Run examples/{s}.zig", .{name})).dependOn(&run.step);
+        examples_step.dependOn(&b.addRunArtifact(exe).step);
+    }
+}
+
+/// Each tests/compile_fail/<name>.zig must fail to compile with `message`.
+fn addCompileFailTests(b: *std.Build, step: *std.Build.Step) void {
+    const cases = [_][2][]const u8{
+        .{ "duplicate_field", "is declared as both input and output" },
+        .{ "invalid_name", "must match \\\\w+" },
+        .{ "missing_output_decl", "must declare `pub const Output" },
+        .{ "no_outputs", "signature must declare at least one output field" },
+        .{ "non_exhaustive_enum", "enum must be exhaustive" },
+        .{ "reserved_completed", "is reserved by the chat protocol" },
+        .{ "unknown_description", "description for unknown field `answr`" },
+        .{ "unsupported_type", "has unsupported type" },
+    };
+    for (cases) |case| {
+        const run = b.addSystemCommand(&.{ b.graph.zig_exe, "test", "--dep", "dszig" });
+        run.addPrefixedFileArg("-Mroot=", b.path(b.fmt("tests/compile_fail/{s}.zig", .{case[0]})));
+        run.addPrefixedFileArg("-Mdszig=", b.path("src/root.zig"));
+        run.setName(b.fmt("compile-fail {s}", .{case[0]}));
+        run.expectExitCode(1);
+        run.addCheck(.{ .expect_stderr_match = case[1] });
+        step.dependOn(&run.step);
+    }
 }

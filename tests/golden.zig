@@ -9,7 +9,7 @@ const testing = std.testing;
 const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
 const Record = dszig.value.Record;
-const rag = @import("rag_program.zig");
+const rag = @import("rag_program");
 
 const format_cases = @embedFile("fixtures/format_cases.json");
 const bootstrap_rag = @embedFile("fixtures/bootstrap_rag.json");

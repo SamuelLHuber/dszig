@@ -1,4 +1,4 @@
-//! Zig mirror of tools/dspy_reference/reference.py (RAG program, corpus,
+//! Shared by the examples and golden tests. Zig mirror of tools/dspy_reference/reference.py (RAG program, corpus,
 //! trainset, keyword LM rules, metric).
 
 const std = @import("std");
