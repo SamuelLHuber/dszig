@@ -2,7 +2,8 @@
 # Cross-runtime gate against real DSPy 3.4.1 (uv.lock pins every package by
 # version and sha256):
 #   1. regenerating the golden fixtures with DSPy (and the Optuna 4.5.0 TPE
-#      trace MIPROv2 relies on) reproduces the committed ones;
+#      trace MIPROv2 relies on, and the multi-hop trace-pick pickle hashes)
+#      reproduces the committed ones;
 #   2. DSPy loads the DSZig-compiled program and re-saves it byte-for-byte;
 #   3. DSPy replays the committed real-model transcripts (its own and the one
 #      DSZig recorded with `zig build live`) and reproduces every request,
@@ -17,6 +18,7 @@ cd "$here"
 uv sync --locked --quiet
 uv run --locked gen_fixtures.py "$tmp/fixtures" 2>/dev/null
 uv run --locked gen_optuna.py "$tmp/fixtures"
+uv run --locked gen_pickle.py "$tmp/fixtures" >/dev/null
 diff -r --exclude=live "$root/tests/fixtures" "$tmp/fixtures"
 echo "ok: DSPy 3.4.1 regenerates tests/fixtures unchanged"
 

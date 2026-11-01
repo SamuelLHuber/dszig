@@ -105,6 +105,30 @@ pub const Random = struct {
         return x;
     }
 
+    /// `random.Random(s)` for a `str` seed of 1..64 UTF-8 bytes: CPython's
+    /// version-2 seeding uses `int.from_bytes(s + sha512(s).digest())`.
+    pub fn initStr(s: []const u8) Random {
+        assert(s.len > 0 and s.len <= 64);
+        var bytes: [128]u8 = undefined;
+        @memcpy(bytes[0..s.len], s);
+        std.crypto.hash.sha2.Sha512.hash(s, bytes[s.len..][0..64], .{});
+        const big = bytes[0 .. s.len + 64];
+        var key: [32]u32 = undefined;
+        var n: usize = 0;
+        var end = big.len;
+        while (end > 0) : (n += 1) {
+            const start = end -| 4;
+            var word: u32 = 0;
+            for (big[start..end]) |b| word = (word << 8) | b;
+            key[n] = word;
+            end = start;
+        }
+        while (n > 1 and key[n - 1] == 0) n -= 1;
+        var r: Random = .{ .mt = undefined, .index = state_len };
+        r.initByArray(key[0..n]);
+        return r;
+    }
+
     /// `numpy.random.RandomState(seed)`: NumPy's legacy seeding is plain
     /// `init_genrand`, unlike CPython's `init_by_array`. Optuna samplers use it.
     pub fn initNumpy(seed: u32) Random {

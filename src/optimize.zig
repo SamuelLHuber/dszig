@@ -8,6 +8,7 @@ const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 
 const predict = @import("predict.zig");
+const pickle = @import("pickle.zig");
 const pyrandom = @import("pyrandom.zig");
 const value = @import("value.zig");
 const Context = predict.Context;
@@ -273,8 +274,8 @@ pub const BootstrapFewShot = struct {
             if (!success) return false;
         }
 
-        const local = try arena.alloc(?Record, teacher_preds.len);
-        @memset(local, null);
+        const local = try arena.alloc(std.ArrayList(Record), teacher_preds.len);
+        for (local) |*l| l.* = .empty;
         for (trace.steps.items) |step| {
             const index = for (teacher_preds, 0..) |p, i| {
                 if (p.param.predict == step.predictor) break i;
@@ -285,12 +286,14 @@ pub const BootstrapFewShot = struct {
             while (it_in.next()) |e| try demo.put(arena, e.key_ptr.*, e.value_ptr.*);
             var it_out = step.outputs.iterator();
             while (it_out.next()) |e| try demo.put(arena, e.key_ptr.*, e.value_ptr.*);
-            // DSPy picks one of several same-predictor traces with a
-            // cloudpickle-derived seed; DSZig keeps the most recent one.
-            local[index] = demo;
+            try local[index].append(arena, demo);
         }
-        for (local, name2traces) |maybe, *traces| {
-            if (maybe) |demo| try traces.append(out, try value.cloneRecord(out, &demo));
+        // Of several same-predictor traces, DSPy keeps the one picked by a
+        // `random.Random` seeded with the pickle hash of all of them.
+        for (local, name2traces) |demos, *traces| {
+            if (demos.items.len == 0) continue;
+            const pick = if (demos.items.len == 1) 0 else try pickle.pickTrace(arena, demos.items);
+            try traces.append(out, try value.cloneRecord(out, &demos.items[pick]));
         }
         return true;
     }

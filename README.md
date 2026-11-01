@@ -157,10 +157,14 @@ re-recorded transcript differs, but the replay checks must still pass.
 ## Known divergences from DSPy 3.4.1
 
 - If one predictor runs several times while bootstrapping a single example
-  (multi-hop loops), DSPy keeps one of those traces at random, seeded by a
-  cloudpickle hash of the demos. DSZig keeps the most recent trace. Programs
-  that call each predictor once per example, which covers every program
-  tested here, give identical results.
+  (multi-hop loops), DSPy keeps one of those traces with
+  `random.Random(sha256(pickle.dumps(tuple(demos))))`. DSZig reproduces the
+  protocol-4 pickle bytes (`src/pickle.zig`, checked against 25 DSPy cases
+  in `tests/fixtures/pickle.json`, including multi-frame pickles over 64 KiB
+  and over 256 memo entries) and the str-seeded `random.Random`. Pickle
+  deduplicates by object identity, which DSZig models by value: if two hops
+  independently produce equal strings longer than one character, Python
+  pickles them twice and the pick can differ.
 - DSPy 3.4.1 cannot `save()` a program that contains a `dspy.Retrieve`:
   `Retrieve.dump_state()` does not accept the `json_mode` argument that
   `BaseModule.dump_state` passes it. The reference harness subclasses
