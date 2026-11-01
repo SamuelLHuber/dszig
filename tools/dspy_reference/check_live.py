@@ -10,6 +10,8 @@ import sys
 
 import live_suite
 
+PIPELINES = ("rag", "dates")
+
 
 def main():
     path = sys.argv[1]
@@ -26,17 +28,17 @@ def main():
         # Error types are runtime-specific names; only the outcome must agree.
         if ("error" in want) != ("error" in got) or want.get("outputs") != got.get("outputs"):
             failures.append(f"case {want['name']}: recorded {want} != replayed {got}")
-    for key in ("baseline", "optimized", "artifact"):
-        if transcript["rag"][key] != result["rag"][key]:
-            failures.append(f"rag {key} differs")
+    for pipeline in PIPELINES:
+        for key in ("baseline", "optimized", "artifact"):
+            if transcript[pipeline][key] != result[pipeline][key]:
+                failures.append(f"{pipeline} {key} differs")
     if failures:
         sys.stderr.write("\n".join(failures) + "\n")
         sys.exit(1)
-    rag = result["rag"]
-    print(
-        f"ok: DSPy 3.4.1 replayed {len(lm.calls)} {transcript['runtime']} calls ({transcript['model']}) identically; "
-        f"baseline {rag['baseline']}%, optimized {rag['optimized']}%, artifact {len(rag['artifact'])} bytes"
+    scores = "; ".join(
+        f"{p} {result[p]['baseline']}% -> {result[p]['optimized']}% ({len(result[p]['artifact'])}-byte artifact)" for p in PIPELINES
     )
+    print(f"ok: DSPy 3.4.1 replayed {len(lm.calls)} {transcript['runtime']} calls ({transcript['model']}) identically; {scores}")
 
 
 if __name__ == "__main__":

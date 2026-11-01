@@ -104,8 +104,21 @@ real DSPy:
 ### Real-model traces (gpt-4o-mini)
 
 Each transcript holds every request a runtime sent to the real OpenAI model,
-with the completion it got back. It covers the five adapter cases and the
-full RAG Evaluate → BootstrapFewShot → Evaluate pipeline, 17 calls in all.
+with the completion it got back: 45 calls in all. It covers the five
+adapter cases and two Evaluate → BootstrapFewShot → Evaluate pipelines:
+
+| Pipeline | Data | Baseline | Optimized |
+|---|---|---|---|
+| RAG (`Retrieve` + `ChainOfThought`) | 5 questions | 100.0% | 100.0% |
+| Dates (`ChainOfThought`, exact match) | 12 train / 12 held-out dev | 0.0% | 100.0% |
+
+The dates task ([`examples/dates.json`](examples/dates.json)) uses gold
+answers in ISO 8601 form (`1969-07-20`), and the instructions never say so.
+Zero-shot, gpt-4o-mini writes dates like "July 20, 1969" and gets every
+question wrong. After BootstrapFewShot (4 bootstrapped and 8 labeled demos)
+it answers all 12 held-out questions correctly. DSPy and DSZig each
+recorded these scores in their own live runs.
+
 There are two transcripts, one per direction:
 
 - `dspy_gpt-4o-mini.json` was recorded by DSPy 3.4.1

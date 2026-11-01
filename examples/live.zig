@@ -35,8 +35,8 @@ pub fn main(init: std.process.Init) !void {
     for (result.cases) |c| {
         try w.print("{s}: {s}\n", .{ c.name, if (c.err) |e| @errorName(e) else "ok" });
     }
-    try w.print("{d} real calls to {s}; baseline {d:.1}%  optimized {d:.1}%; wrote {s}\n", .{
-        recorder.calls.items.len, model, result.baseline, result.optimized, out_path,
-    });
+    try w.print("rag: baseline {d:.1}%  optimized {d:.1}%\n", .{ result.rag.baseline, result.rag.optimized });
+    try w.print("dates: baseline {d:.1}%  optimized {d:.1}%\n", .{ result.dates.baseline, result.dates.optimized });
+    try w.print("{d} real calls to {s}; wrote {s}\n", .{ recorder.calls.items.len, model, out_path });
     try w.flush();
 }

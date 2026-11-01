@@ -2,7 +2,7 @@
 check_live.py (replay a recorded transcript). Mirrors examples/live_suite.zig.
 
 A transcript is {"runtime", "model", "calls": [{"messages", "completion",
-...}], "cases": [...], "rag": {"baseline", "optimized", "artifact"}}."""
+...}], "cases": [...], "rag" and "dates": {"baseline", "optimized", "artifact"}}."""
 
 import json
 import pathlib
@@ -14,6 +14,31 @@ import dspy
 import reference as ref
 
 TEMPERATURE = 0.0
+DATES = json.loads((pathlib.Path(__file__).resolve().parents[2] / "examples" / "dates.json").read_text(encoding="utf-8"))
+
+
+class Dates(dspy.Signature):
+    """Answer the question with the date it asks for."""
+
+    question: str = dspy.InputField()
+    answer: str = dspy.OutputField()
+
+
+class DateQA(dspy.Module):
+    def __init__(self):
+        super().__init__()
+        self.generate = dspy.ChainOfThought(Dates)
+
+    def forward(self, question):
+        return self.generate(question=question)
+
+
+def exact_metric(example, pred, trace=None):
+    return pred.answer.strip() == example.answer
+
+
+def date_examples(split):
+    return [dspy.Example(question=q, answer=a).with_inputs("question") for q, a in DATES[split]]
 
 
 def cases():
@@ -37,8 +62,8 @@ def cases():
 
 
 def run_suite(lm):
-    """Run every case and the RAG BootstrapFewShot pipeline on `lm`."""
-    out = {"cases": [], "rag": {}}
+    """Run every case and both BootstrapFewShot pipelines on `lm`."""
+    out = {"cases": []}
     for name, make, adapter, demos, inputs in cases():
         dspy.configure(lm=lm, adapter=adapter)
         module = make()
@@ -49,16 +74,24 @@ def run_suite(lm):
         except Exception as e:  # noqa: BLE001 - parse failures are a result, compared across runtimes.
             out["cases"].append({"name": name, "error": type(e).__name__})
     dspy.configure(lm=lm, rm=ref.in_memory_rm(ref.CORPUS), adapter=dspy.ChatAdapter())
-    evaluate = dspy.Evaluate(devset=ref.trainset(), metric=ref.keyword_metric, display_progress=False, num_threads=1)
-    out["rag"]["baseline"] = evaluate(ref.RAG()).score
-    optimizer = dspy.BootstrapFewShot(metric=ref.keyword_metric, max_bootstrapped_demos=2, max_labeled_demos=3)
-    compiled = optimizer.compile(ref.RAG(), trainset=ref.trainset())
-    out["rag"]["optimized"] = evaluate(compiled).score
-    with tempfile.TemporaryDirectory() as tmp:
-        path = pathlib.Path(tmp) / "rag.json"
-        compiled.save(str(path))
-        out["rag"]["artifact"] = path.read_text(encoding="utf-8")
+    rag_optimizer = dspy.BootstrapFewShot(metric=ref.keyword_metric, max_bootstrapped_demos=2, max_labeled_demos=3)
+    out["rag"] = pipeline(ref.RAG, rag_optimizer, ref.trainset(), ref.trainset(), ref.keyword_metric)
+    dates_optimizer = dspy.BootstrapFewShot(metric=exact_metric, max_bootstrapped_demos=4, max_labeled_demos=8)
+    out["dates"] = pipeline(DateQA, dates_optimizer, date_examples("train"), date_examples("dev"), exact_metric)
     return out
+
+
+def pipeline(make, optimizer, trainset, devset, metric):
+    """Evaluate on devset, BootstrapFewShot on trainset, evaluate again."""
+    evaluate = dspy.Evaluate(devset=devset, metric=metric, display_progress=False, num_threads=1)
+    result = {"baseline": evaluate(make()).score}
+    compiled = optimizer.compile(make(), trainset=trainset)
+    result["optimized"] = evaluate(compiled).score
+    with tempfile.TemporaryDirectory() as tmp:
+        path = pathlib.Path(tmp) / "program.json"
+        compiled.save(str(path))
+        result["artifact"] = path.read_text(encoding="utf-8")
+    return result
 
 
 def completion_text(output):

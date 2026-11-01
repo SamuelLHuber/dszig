@@ -45,6 +45,49 @@ pub const typed_demos =
 ;
 pub const typed_input: Typed.Input = .{ .text = "great movie", .tags = &.{ "review", "film" } };
 
+/// Gold answers follow an ISO 8601 convention the instructions never state,
+/// so the zero-shot baseline is low and only demos can teach it.
+pub const Dates = dszig.Signature(struct {
+    pub const instructions = "Answer the question with the date it asks for.";
+    pub const Input = struct { question: []const u8 };
+    pub const Output = struct { answer: []const u8 };
+});
+
+pub const DateQA = struct {
+    generate: dszig.ChainOfThought(Dates) = .{},
+    compiled: bool = false,
+
+    pub const Input = struct { question: []const u8 };
+    pub const Output = dszig.ChainOfThought(Dates).Output;
+
+    pub fn forward(self: *const DateQA, ctx: dszig.Context, input: Input) dszig.predict.Error!Output {
+        return self.generate.forward(ctx, .{ .question = input.question });
+    }
+};
+
+const dates_json = @embedFile("dates.json");
+
+pub fn dateExamples(arena: Allocator, comptime split: enum { train, dev }) ![]const dszig.Example {
+    const Rows = struct { note: []const u8, train: []const [2][]const u8, dev: []const [2][]const u8 };
+    const rows = try std.json.parseFromSliceLeaky(Rows, arena, dates_json, .{});
+    const selected = @field(rows, @tagName(split));
+    const out = try arena.alloc(dszig.Example, selected.len);
+    for (selected, out) |row, *ex| {
+        var record: Record = .empty;
+        try record.put(arena, "question", .{ .string = row[0] });
+        try record.put(arena, "answer", .{ .string = row[1] });
+        ex.* = .{ .record = record, .input_keys = &.{"question"} };
+    }
+    return out;
+}
+
+/// `pred.answer.strip() == example.answer`.
+pub fn exactMetric(_: Allocator, example: *const dszig.Example, prediction: *const Record, _: ?*const dszig.Trace) f64 {
+    const want = example.record.get("answer").?.string;
+    const got = (prediction.get("answer") orelse return 0).string;
+    return if (std.mem.eql(u8, std.mem.trim(u8, got, " \t\r\n"), want)) 1 else 0;
+}
+
 pub const case_count = 5;
 
 pub const Case = struct {
@@ -54,12 +97,18 @@ pub const Case = struct {
     err: ?anyerror,
 };
 
-pub const Result = struct {
-    cases: [case_count]Case,
+/// Evaluate on the devset, BootstrapFewShot on the trainset, evaluate again.
+pub const Pipeline = struct {
     baseline: f64,
     optimized: f64,
-    /// Compiled RAG program in `program.save()` format.
+    /// Compiled program in `program.save()` format.
     artifact: []const u8,
+};
+
+pub const Result = struct {
+    cases: [case_count]Case,
+    rag: Pipeline,
+    dates: Pipeline,
 };
 
 pub fn run(arena: Allocator, gpa: Allocator, lm: dszig.LM) !Result {
@@ -75,13 +124,32 @@ pub fn run(arena: Allocator, gpa: Allocator, lm: dszig.LM) !Result {
 
     var ctx = base;
     ctx.retriever = rag.corpus.retriever();
-    const trainset = try rag.trainset(arena);
-    result.baseline = (try dszig.optimize.evaluate(rag.RAG, gpa, ctx, &rag.RAG{}, trainset, rag.keywordMetric, 10)).score;
-    const optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 2, .max_labeled_demos = 3 };
-    const compiled = try optimizer.compile(rag.RAG, arena, gpa, ctx, .{}, null, trainset);
-    result.optimized = (try dszig.optimize.evaluate(rag.RAG, gpa, ctx, &compiled.program, trainset, rag.keywordMetric, 10)).score;
-    result.artifact = try dszig.state.saveAlloc(arena, &compiled.program);
+    const rag_set = try rag.trainset(arena);
+    const rag_optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 2, .max_labeled_demos = 3 };
+    result.rag = try pipeline(rag.RAG, arena, gpa, ctx, rag_optimizer, rag_set, rag_set, rag.keywordMetric);
+    const dates_optimizer: dszig.BootstrapFewShot = .{ .metric = exactMetric, .max_bootstrapped_demos = 4, .max_labeled_demos = 8 };
+    result.dates = try pipeline(DateQA, arena, gpa, ctx, dates_optimizer, try dateExamples(arena, .train), try dateExamples(arena, .dev), exactMetric);
     return result;
+}
+
+fn pipeline(
+    comptime P: type,
+    arena: Allocator,
+    gpa: Allocator,
+    ctx: dszig.Context,
+    optimizer: dszig.BootstrapFewShot,
+    trainset: []const dszig.Example,
+    devset: []const dszig.Example,
+    metric: dszig.optimize.Metric,
+) !Pipeline {
+    const baseline = try dszig.optimize.evaluate(P, gpa, ctx, &P{}, devset, metric, 10);
+    const compiled = try optimizer.compile(P, arena, gpa, ctx, .{}, null, trainset);
+    const optimized = try dszig.optimize.evaluate(P, gpa, ctx, &compiled.program, devset, metric, 10);
+    return .{
+        .baseline = baseline.score,
+        .optimized = optimized.score,
+        .artifact = try dszig.state.saveAlloc(arena, &compiled.program),
+    };
 }
 
 fn runCase(
@@ -151,16 +219,19 @@ pub fn writeTranscript(arena: Allocator, runtime: []const u8, model: []const u8,
         if (c.err) |e| try obj.put(arena, "error", .{ .string = @errorName(e) });
         try cases.append(.{ .object = obj });
     }
-    var rag_obj: std.json.ObjectMap = .empty;
-    try rag_obj.put(arena, "baseline", .{ .float = result.baseline });
-    try rag_obj.put(arena, "optimized", .{ .float = result.optimized });
-    try rag_obj.put(arena, "artifact", .{ .string = result.artifact });
     var root: std.json.ObjectMap = .empty;
     try root.put(arena, "runtime", .{ .string = runtime });
     try root.put(arena, "model", .{ .string = model });
     try root.put(arena, "calls", .{ .array = call_values });
     try root.put(arena, "cases", .{ .array = cases });
-    try root.put(arena, "rag", .{ .object = rag_obj });
+    inline for (.{ "rag", "dates" }) |name| {
+        const p = @field(result, name);
+        var obj: std.json.ObjectMap = .empty;
+        try obj.put(arena, "baseline", .{ .float = p.baseline });
+        try obj.put(arena, "optimized", .{ .float = p.optimized });
+        try obj.put(arena, "artifact", .{ .string = p.artifact });
+        try root.put(arena, name, .{ .object = obj });
+    }
     var aw: std.Io.Writer.Allocating = .init(arena);
     dszig.pyjson.writeJson(&aw.writer, .{ .object = root }, .indent2) catch return error.OutOfMemory;
     try aw.writer.writeByte('\n');
