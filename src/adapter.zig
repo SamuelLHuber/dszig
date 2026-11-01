@@ -227,7 +227,7 @@ pub fn dedent(arena: Allocator, text: []const u8) Allocator.Error![]const u8 {
         if (!first) try out.append(arena, '\n');
         first = false;
         if (std.mem.indexOfNone(u8, line, " \t") == null) continue;
-        try out.appendSlice(arena, line[if (margin) |m| m.len else 0 ..]);
+        try out.appendSlice(arena, line[if (margin) |m| m.len else 0..]);
     }
     return out.items;
 }
