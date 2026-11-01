@@ -202,6 +202,10 @@ pub const OpenAI = struct {
     max_tokens: ?u32 = null,
     /// Upper bound on accepted response bodies.
     max_response_bytes: usize = 4 * 1024 * 1024,
+    /// Extra attempts after a transport error, HTTP 429 or 5xx (DSPy's
+    /// `num_retries`). Backoff doubles from `retry_base_ms`.
+    max_retries: u8 = 3,
+    retry_base_ms: u32 = 500,
 
     pub fn lm(self: *OpenAI) LM {
         return .{ .ptr = self, .vtable = &.{ .complete = complete } };
@@ -240,20 +244,33 @@ pub const OpenAI = struct {
         const url = try std.fmt.allocPrint(arena, "{s}/chat/completions", .{self.base_url});
         var auth_buf: ?[]const u8 = null;
         if (self.api_key) |key| auth_buf = try std.fmt.allocPrint(arena, "Bearer {s}", .{key});
-        var response: Writer.Allocating = .init(arena);
-        const result = self.client.fetch(.{
-            .location = .{ .url = url },
-            .method = .POST,
-            .payload = body,
-            .response_writer = &response.writer,
-            .headers = .{
-                .content_type = .{ .override = "application/json" },
-                .authorization = if (auth_buf) |a| .{ .override = a } else .default,
-            },
-        }) catch return error.LMFailure;
-        if (result.status != .ok) return error.LMFailure;
-        if (response.written().len > self.max_response_bytes) return error.LMFailure;
-        return parseResponse(arena, response.written());
+        var attempt: u8 = 0;
+        while (true) : (attempt += 1) {
+            var response: Writer.Allocating = .init(arena);
+            const status: ?std.http.Status = if (self.client.fetch(.{
+                .location = .{ .url = url },
+                .method = .POST,
+                .payload = body,
+                .response_writer = &response.writer,
+                .headers = .{
+                    .content_type = .{ .override = "application/json" },
+                    .authorization = if (auth_buf) |a| .{ .override = a } else .default,
+                },
+            })) |result| result.status else |_| null;
+            if (status == .ok) {
+                if (response.written().len > self.max_response_bytes) return error.LMFailure;
+                return parseResponse(arena, response.written());
+            }
+            if (!retryable(status) or attempt >= self.max_retries) return error.LMFailure;
+            const delay_ms = @as(i64, self.retry_base_ms) << @intCast(attempt);
+            std.Io.sleep(self.client.io, .fromMilliseconds(delay_ms), .awake) catch return error.LMFailure;
+        }
+    }
+
+    /// Transport failures (null), rate limits and server errors.
+    pub fn retryable(status: ?std.http.Status) bool {
+        const s = status orelse return true;
+        return s == .too_many_requests or @backingInt(s) >= 500;
     }
 
     /// Extract `choices[0].message.content`.
@@ -295,6 +312,11 @@ test "keyword LM scopes and OpenAI wire format" {
         \\{"choices": [{"message": {"role": "assistant", "content": "hi"}}]}
     );
     try testing.expectEqualStrings("hi", content);
+    try testing.expect(OpenAI.retryable(null));
+    try testing.expect(OpenAI.retryable(.too_many_requests));
+    try testing.expect(OpenAI.retryable(.service_unavailable));
+    try testing.expect(!OpenAI.retryable(.unauthorized));
+    try testing.expect(!OpenAI.retryable(.bad_request));
 }
 
 test "replay LM matches recorded requests exactly and reports misses" {
