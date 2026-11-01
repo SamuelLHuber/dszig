@@ -40,11 +40,17 @@ test "DSZig reproduces DSPy's real gpt-4o-mini run from its transcript" {
             try testing.expectEqualStrings(try compact(arena, outputs), try compact(arena, .{ .object = got.outputs.? }));
         }
     }
-    inline for (.{ "rag", "dates" }) |name| {
+    inline for (suite.pipeline_names) |name| {
         const want = transcript.object.get(name).?.object;
         const got = @field(result, name);
         try testing.expectEqual(want.get("baseline").?.float, got.baseline);
         try testing.expectEqual(want.get("optimized").?.float, got.optimized);
         try testing.expectEqualStrings(want.get("artifact").?.string, got.artifact);
+        const want_candidates = want.get("candidates").?.array.items;
+        try testing.expectEqual(want_candidates.len, got.candidates.len);
+        for (want_candidates, got.candidates) |pair, c| {
+            try testing.expectEqual(pair.array.items[0].integer, c.seed);
+            try testing.expectEqual(pair.array.items[1].float, c.score);
+        }
     }
 }

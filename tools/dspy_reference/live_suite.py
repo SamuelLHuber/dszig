@@ -62,7 +62,7 @@ def cases():
 
 
 def run_suite(lm):
-    """Run every case and both BootstrapFewShot pipelines on `lm`."""
+    """Run every case and every optimizer pipeline on `lm`."""
     out = {"cases": []}
     for name, make, adapter, demos, inputs in cases():
         dspy.configure(lm=lm, adapter=adapter)
@@ -78,15 +78,20 @@ def run_suite(lm):
     out["rag"] = pipeline(ref.RAG, rag_optimizer, ref.trainset(), ref.trainset(), ref.keyword_metric)
     dates_optimizer = dspy.BootstrapFewShot(metric=exact_metric, max_bootstrapped_demos=4, max_labeled_demos=8)
     out["dates"] = pipeline(DateQA, dates_optimizer, date_examples("train"), date_examples("dev"), exact_metric)
+    search = dspy.BootstrapFewShotWithRandomSearch(
+        metric=exact_metric, max_bootstrapped_demos=2, max_labeled_demos=2, num_candidate_programs=4
+    )
+    out["dates_search"] = pipeline(DateQA, search, date_examples("train"), date_examples("dev"), exact_metric)
     return out
 
 
 def pipeline(make, optimizer, trainset, devset, metric):
-    """Evaluate on devset, BootstrapFewShot on trainset, evaluate again."""
+    """Evaluate on devset, compile on trainset, evaluate again."""
     evaluate = dspy.Evaluate(devset=devset, metric=metric, display_progress=False, num_threads=1)
     result = {"baseline": evaluate(make()).score}
     compiled = optimizer.compile(make(), trainset=trainset)
     result["optimized"] = evaluate(compiled).score
+    result["candidates"] = [[c["seed"], c["score"]] for c in getattr(compiled, "candidate_programs", [])]
     with tempfile.TemporaryDirectory() as tmp:
         path = pathlib.Path(tmp) / "program.json"
         compiled.save(str(path))

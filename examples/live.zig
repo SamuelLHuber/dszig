@@ -37,6 +37,9 @@ pub fn main(init: std.process.Init) !void {
     }
     try w.print("rag: baseline {d:.1}%  optimized {d:.1}%\n", .{ result.rag.baseline, result.rag.optimized });
     try w.print("dates: baseline {d:.1}%  optimized {d:.1}%\n", .{ result.dates.baseline, result.dates.optimized });
+    try w.print("dates_search: baseline {d:.1}%  optimized {d:.1}%  candidates", .{ result.dates_search.baseline, result.dates_search.optimized });
+    for (result.dates_search.candidates) |c| try w.print(" {d}:{d:.1}", .{ c.seed, c.score });
+    try w.writeByte('\n');
     try w.print("{d} real calls to {s}; wrote {s}\n", .{ recorder.calls.items.len, model, out_path });
     try w.flush();
 }

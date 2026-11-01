@@ -19,6 +19,7 @@ pub const optimize = @import("optimize.zig");
 pub const Example = optimize.Example;
 pub const BootstrapFewShot = optimize.BootstrapFewShot;
 pub const LabeledFewShot = optimize.LabeledFewShot;
+pub const BootstrapFewShotWithRandomSearch = optimize.BootstrapFewShotWithRandomSearch;
 pub const state = @import("state.zig");
 
 test {

@@ -97,18 +97,23 @@ pub const Case = struct {
     err: ?anyerror,
 };
 
-/// Evaluate on the devset, BootstrapFewShot on the trainset, evaluate again.
+/// Evaluate on the devset, compile on the trainset, evaluate again.
 pub const Pipeline = struct {
     baseline: f64,
     optimized: f64,
     /// Compiled program in `program.save()` format.
     artifact: []const u8,
+    /// Random-search candidates (`candidate_programs`); empty otherwise.
+    candidates: []const dszig.optimize.BootstrapFewShotWithRandomSearch.Candidate = &.{},
 };
+
+pub const pipeline_names = .{ "rag", "dates", "dates_search" };
 
 pub const Result = struct {
     cases: [case_count]Case,
     rag: Pipeline,
     dates: Pipeline,
+    dates_search: Pipeline,
 };
 
 pub fn run(arena: Allocator, gpa: Allocator, lm: dszig.LM) !Result {
@@ -128,7 +133,16 @@ pub fn run(arena: Allocator, gpa: Allocator, lm: dszig.LM) !Result {
     const rag_optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 2, .max_labeled_demos = 3 };
     result.rag = try pipeline(rag.RAG, arena, gpa, ctx, rag_optimizer, rag_set, rag_set, rag.keywordMetric);
     const dates_optimizer: dszig.BootstrapFewShot = .{ .metric = exactMetric, .max_bootstrapped_demos = 4, .max_labeled_demos = 8 };
-    result.dates = try pipeline(DateQA, arena, gpa, ctx, dates_optimizer, try dateExamples(arena, .train), try dateExamples(arena, .dev), exactMetric);
+    const dates_train = try dateExamples(arena, .train);
+    const dates_dev = try dateExamples(arena, .dev);
+    result.dates = try pipeline(DateQA, arena, gpa, ctx, dates_optimizer, dates_train, dates_dev, exactMetric);
+    const search: dszig.BootstrapFewShotWithRandomSearch = .{
+        .metric = exactMetric,
+        .max_bootstrapped_demos = 2,
+        .max_labeled_demos = 2,
+        .num_candidate_programs = 4,
+    };
+    result.dates_search = try pipeline(DateQA, arena, gpa, ctx, search, dates_train, dates_dev, exactMetric);
     return result;
 }
 
@@ -137,18 +151,23 @@ fn pipeline(
     arena: Allocator,
     gpa: Allocator,
     ctx: dszig.Context,
-    optimizer: dszig.BootstrapFewShot,
+    optimizer: anytype,
     trainset: []const dszig.Example,
     devset: []const dszig.Example,
     metric: dszig.optimize.Metric,
 ) !Pipeline {
     const baseline = try dszig.optimize.evaluate(P, gpa, ctx, &P{}, devset, metric, 10);
-    const compiled = try optimizer.compile(P, arena, gpa, ctx, .{}, null, trainset);
+    const search = @TypeOf(optimizer) == dszig.BootstrapFewShotWithRandomSearch;
+    const compiled = if (search)
+        try optimizer.compile(P, arena, gpa, ctx, .{}, null, trainset, null)
+    else
+        try optimizer.compile(P, arena, gpa, ctx, .{}, null, trainset);
     const optimized = try dszig.optimize.evaluate(P, gpa, ctx, &compiled.program, devset, metric, 10);
     return .{
         .baseline = baseline.score,
         .optimized = optimized.score,
         .artifact = try dszig.state.saveAlloc(arena, &compiled.program),
+        .candidates = if (search) compiled.candidates else &.{},
     };
 }
 
@@ -224,12 +243,20 @@ pub fn writeTranscript(arena: Allocator, runtime: []const u8, model: []const u8,
     try root.put(arena, "model", .{ .string = model });
     try root.put(arena, "calls", .{ .array = call_values });
     try root.put(arena, "cases", .{ .array = cases });
-    inline for (.{ "rag", "dates" }) |name| {
+    inline for (pipeline_names) |name| {
         const p = @field(result, name);
         var obj: std.json.ObjectMap = .empty;
         try obj.put(arena, "baseline", .{ .float = p.baseline });
         try obj.put(arena, "optimized", .{ .float = p.optimized });
         try obj.put(arena, "artifact", .{ .string = p.artifact });
+        var candidates: std.json.Array = .init(arena);
+        for (p.candidates) |c| {
+            var pair: std.json.Array = .init(arena);
+            try pair.append(.{ .integer = c.seed });
+            try pair.append(.{ .float = c.score });
+            try candidates.append(.{ .array = pair });
+        }
+        try obj.put(arena, "candidates", .{ .array = candidates });
         try root.put(arena, name, .{ .object = obj });
     }
     var aw: std.Io.Writer.Allocating = .init(arena);

@@ -104,13 +104,15 @@ real DSPy:
 ### Real-model traces (gpt-4o-mini)
 
 Each transcript holds every request a runtime sent to the real OpenAI model,
-with the completion it got back: 45 calls in all. It covers the five
-adapter cases and two Evaluate → BootstrapFewShot → Evaluate pipelines:
+with the completion it got back: 160 calls in all. It covers the five
+adapter cases and three Evaluate → compile → Evaluate pipelines. The random-search
+pipeline also compares the ranked `candidate_programs` (seed, score) list:
 
 | Pipeline | Data | Baseline | Optimized |
 |---|---|---|---|
 | RAG (`Retrieve` + `ChainOfThought`) | 5 questions | 100.0% | 100.0% |
 | Dates (`ChainOfThought`, exact match) | 12 train / 12 held-out dev | 0.0% | 100.0% |
+| Dates, `BootstrapFewShotWithRandomSearch` (4 seeds + 3 baselines, scored on train) | 12 train / 12 held-out dev | 0.0% | 100.0% |
 
 The dates task ([`examples/dates.json`](examples/dates.json)) uses gold
 answers in ISO 8601 form (`1969-07-20`), and the instructions never say so.

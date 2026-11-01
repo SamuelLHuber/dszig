@@ -295,3 +295,119 @@ pub const BootstrapFewShot = struct {
         return true;
     }
 };
+
+/// `dspy.BootstrapFewShotWithRandomSearch`: evaluates seeds -3 (no demos),
+/// -2 (LabeledFewShot), -1 (BootstrapFewShot) and 0.. (shuffled trainset,
+/// `randint(1, max_bootstrapped_demos)` demos) on `valset` and keeps the
+/// first best-scoring candidate.
+pub const BootstrapFewShotWithRandomSearch = struct {
+    metric: Metric,
+    metric_threshold: ?f64 = null,
+    max_bootstrapped_demos: usize = 4,
+    max_labeled_demos: usize = 16,
+    max_rounds: usize = 1,
+    num_candidate_programs: usize = 16,
+    max_errors: usize = 10,
+    stop_at_score: ?f64 = null,
+
+    pub const Candidate = struct { seed: i64, score: f64 };
+
+    /// `candidates` is `best_program.candidate_programs` without the
+    /// programs: sorted by score, descending, stable.
+    pub fn Result(comptime P: type) type {
+        return struct { program: P, candidates: []Candidate };
+    }
+
+    /// `valset` defaults to `trainset`, as in DSPy. Result demos live in
+    /// `out`; every candidate is built in its own arena from `gpa`.
+    pub fn compile(
+        self: BootstrapFewShotWithRandomSearch,
+        comptime P: type,
+        out: Allocator,
+        gpa: Allocator,
+        ctx: Context,
+        student: P,
+        teacher: ?P,
+        trainset: []const Example,
+        valset: ?[]const Example,
+    ) !Result(P) {
+        assert(self.max_bootstrapped_demos > 0);
+        const val = valset orelse trainset;
+        const candidates = try out.alloc(Candidate, self.num_candidate_programs + 3);
+        var count: usize = 0;
+        var best: P = undefined;
+        var best_score: f64 = 0;
+        var best_arena: ?std.heap.ArenaAllocator = null;
+        defer if (best_arena) |*a| a.deinit();
+
+        var seed: i64 = -3;
+        while (seed < @as(i64, @intCast(self.num_candidate_programs))) : (seed += 1) {
+            var arena_state: std.heap.ArenaAllocator = .init(gpa);
+            var kept = false;
+            defer if (!kept) arena_state.deinit();
+            const program = try self.candidate(P, arena_state.allocator(), gpa, ctx, student, teacher, trainset, seed);
+            const result = try evaluate(P, gpa, ctx, &program, val, self.metric, self.max_errors);
+            if (count == 0 or result.score > best_score) {
+                best_score = result.score;
+                if (best_arena) |*a| a.deinit();
+                best_arena = arena_state;
+                kept = true;
+                best = program;
+            }
+            candidates[count] = .{ .seed = seed, .score = result.score };
+            count += 1;
+            if (self.stop_at_score) |stop| if (result.score >= stop) break;
+        }
+        assert(count > 0);
+
+        var program = best;
+        for (try predict.namedPredictors(out, &program)) |p| {
+            const demos = try out.alloc(Record, p.param.predict.demos.len);
+            for (demos, p.param.predict.demos) |*d, *src| d.* = try value.cloneRecord(out, src);
+            p.param.predict.demos = demos;
+        }
+        std.sort.insertion(Candidate, candidates[0..count], {}, scoreGreater);
+        return .{ .program = program, .candidates = candidates[0..count] };
+    }
+
+    fn scoreGreater(_: void, a: Candidate, b: Candidate) bool {
+        return a.score > b.score;
+    }
+
+    fn candidate(
+        self: BootstrapFewShotWithRandomSearch,
+        comptime P: type,
+        arena: Allocator,
+        gpa: Allocator,
+        ctx: Context,
+        student: P,
+        teacher: ?P,
+        trainset: []const Example,
+        seed: i64,
+    ) !P {
+        assert(seed >= -3);
+        if (seed == -3) {
+            var program = student;
+            try predict.resetDemos(arena, &program);
+            return program;
+        }
+        if (seed == -2) return (LabeledFewShot{ .k = self.max_labeled_demos }).compile(P, arena, student, trainset);
+        const shuffled = try arena.dupe(Example, trainset);
+        var size = self.max_bootstrapped_demos;
+        if (seed >= 0) {
+            var shuffle_rng = pyrandom.Random.init(@intCast(seed));
+            shuffle_rng.shuffle(Example, shuffled);
+            var size_rng = pyrandom.Random.init(@intCast(seed));
+            size = 1 + size_rng.randbelow(self.max_bootstrapped_demos);
+        }
+        const optimizer: BootstrapFewShot = .{
+            .metric = self.metric,
+            .metric_threshold = self.metric_threshold,
+            .max_bootstrapped_demos = size,
+            .max_labeled_demos = self.max_labeled_demos,
+            .max_rounds = self.max_rounds,
+            .max_errors = self.max_errors,
+        };
+        return (try optimizer.compile(P, arena, gpa, ctx, student, teacher, shuffled)).program;
+    }
+};
