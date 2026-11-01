@@ -21,9 +21,11 @@ pub const dependency_versions = [_][2][]const u8{
 pub const LoadError = error{ MissingState, InvalidState } || Allocator.Error;
 
 /// `module.dump_state()` plus the `metadata` key added by `save`.
+/// Read-only: `program` may be a const pointer.
 pub fn dumpState(arena: Allocator, program: anytype) Allocator.Error!Value {
     var root: Record = .empty;
-    for (try predict.namedParameters(arena, program)) |p| {
+    // The parameter walk yields mutable pointers; nothing here writes through them.
+    for (try predict.namedParameters(arena, @constCast(program))) |p| {
         try root.put(arena, p.name, switch (p.param) {
             .predict => |s| try dumpPredict(arena, s),
             .retrieve => |r| blk: {
