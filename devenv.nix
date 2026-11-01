@@ -45,6 +45,14 @@ in
   env = {
     UV_PYTHON = "${python}/bin/python3";
     UV_PYTHON_DOWNLOADS = "never";
+  }
+  # NumPy's manylinux wheel (pulled in by Optuna, which MIPROv2 uses) loads
+  # libstdc++ and libz from the system; Nix shells have no system copies.
+  // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+    LD_LIBRARY_PATH = lib.makeLibraryPath [
+      pkgs.stdenv.cc.cc.lib
+      pkgs.zlib
+    ];
   };
 
   scripts = {

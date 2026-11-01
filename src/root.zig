@@ -2,6 +2,7 @@
 
 pub const pyjson = @import("pyjson.zig");
 pub const pyrandom = @import("pyrandom.zig");
+pub const tpe = @import("tpe.zig");
 pub const signature = @import("signature.zig");
 pub const Signature = signature.Signature;
 pub const value = @import("value.zig");

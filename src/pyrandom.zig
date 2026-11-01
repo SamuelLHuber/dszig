@@ -105,6 +105,27 @@ pub const Random = struct {
         return x;
     }
 
+    /// `numpy.random.RandomState(seed)`: NumPy's legacy seeding is plain
+    /// `init_genrand`, unlike CPython's `init_by_array`. Optuna samplers use it.
+    pub fn initNumpy(seed: u32) Random {
+        var r: Random = .{ .mt = undefined, .index = state_len };
+        r.initGenrand(seed);
+        return r;
+    }
+
+    /// `random()` (CPython) and `random_sample()` (NumPy): 53-bit float in [0, 1).
+    pub fn random(r: *Random) f64 {
+        const a: f64 = @floatFromInt(r.nextU32() >> 5);
+        const b: f64 = @floatFromInt(r.nextU32() >> 6);
+        return (a * 67108864.0 + b) * (1.0 / 9007199254740992.0);
+    }
+
+    /// `randint(a, b)`: inclusive on both ends.
+    pub fn randint(r: *Random, a: usize, b: usize) usize {
+        assert(a <= b);
+        return a + r.randbelow(b - a + 1);
+    }
+
     /// `random.shuffle(items)`.
     pub fn shuffle(r: *Random, comptime T: type, items: []T) void {
         if (items.len < 2) return;
@@ -174,4 +195,16 @@ test "sample and shuffle stream matches CPython" {
     var l = [_]usize{ 0, 1, 2, 3, 4, 5, 6, 7 };
     r.shuffle(usize, &l);
     try testing.expectEqualSlices(usize, &.{ 5, 4, 3, 6, 0, 1, 7, 2 }, &l);
+}
+
+test "random, randint and NumPy seeding match CPython and NumPy" {
+    var r = Random.init(9);
+    try testing.expectEqual(@as(f64, 0x1.da1e99ce7dd62p-2), r.random());
+    try testing.expectEqual(@as(usize, 400840636), r.randint(0, 1_000_000_000));
+    try testing.expectEqual(@as(usize, 2), r.randint(1, 2));
+    try testing.expectEqual(@as(usize, 1), r.randbelow(6));
+    var n = Random.initNumpy(9);
+    try testing.expectEqual(@as(f64, 0x1.53f0b5d4d5140p-7), n.random());
+    try testing.expectEqual(@as(f64, 0x1.00f5b4dff1c07p-1), n.random());
+    try testing.expectEqual(@as(f64, 0x1.fbabfe80f72c0p-2), n.random());
 }

@@ -173,7 +173,7 @@ pub fn writeStr(w: *Writer, v: Value) Error!void {
     }
 }
 
-fn writeRepr(w: *Writer, v: Value, depth: u32) Error!void {
+pub fn writeRepr(w: *Writer, v: Value, depth: u32) Error!void {
     if (depth >= max_depth) return error.JsonTooDeep;
     switch (v) {
         .null => try w.writeAll("None"),
