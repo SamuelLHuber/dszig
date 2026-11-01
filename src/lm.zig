@@ -158,7 +158,10 @@ pub const OpenAI = struct {
             try body.put(arena, "response_format", .{ .object = format });
         }
         var aw: Writer.Allocating = .init(arena);
-        pyjson.writeJson(&aw.writer, .{ .object = body }, .compact) catch return error.OutOfMemory;
+        pyjson.writeJson(&aw.writer, .{ .object = body }, .compact) catch |err| return switch (err) {
+            error.WriteFailed => error.OutOfMemory,
+            error.JsonTooDeep => error.LMFailure,
+        };
         return aw.written();
     }
 

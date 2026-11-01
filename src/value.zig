@@ -90,7 +90,10 @@ pub fn parseJsonValue(arena: Allocator, field: Field, v: Value) ParseError!Value
     if (field.kind == .str) {
         if (v == .string) return v;
         var aw: Writer.Allocating = .init(arena);
-        pyjson.writeStr(&aw.writer, v) catch return error.OutOfMemory;
+        pyjson.writeStr(&aw.writer, v) catch |err| return switch (err) {
+            error.WriteFailed => error.OutOfMemory,
+            error.JsonTooDeep => error.ParseValue,
+        };
         return .{ .string = aw.written() };
     }
     if (v == .string) return parseText(arena, field, v.string);

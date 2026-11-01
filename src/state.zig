@@ -71,9 +71,13 @@ pub fn save(arena: Allocator, program: anytype, w: *Writer) (pyjson.Error || All
     try w.writeByte('\n');
 }
 
-pub fn saveAlloc(arena: Allocator, program: anytype) (pyjson.Error || Allocator.Error)![]const u8 {
+pub fn saveAlloc(arena: Allocator, program: anytype) error{ JsonTooDeep, OutOfMemory }![]const u8 {
     var aw: Writer.Allocating = .init(arena);
-    try save(arena, program, &aw.writer);
+    save(arena, program, &aw.writer) catch |err| return switch (err) {
+        // The allocating writer only fails when its allocator does.
+        error.WriteFailed => error.OutOfMemory,
+        else => |e| e,
+    };
     return aw.written();
 }
 
