@@ -13,6 +13,7 @@ const rag = @import("rag_program");
 
 const format_cases = @embedFile("fixtures/format_cases.json");
 const bootstrap_rag = @embedFile("fixtures/bootstrap_rag.json");
+const bootstrap_multihop = @embedFile("fixtures/bootstrap_multihop.json");
 
 const QA = rag.QA;
 
@@ -145,4 +146,21 @@ test "BootstrapFewShot RAG artifact is byte-identical to DSPy" {
     var loaded: rag.RAG = .{};
     try dszig.state.load(out.allocator(), &loaded, bootstrap_rag);
     try testing.expectEqualStrings(bootstrap_rag, try dszig.state.saveAlloc(out.allocator(), &loaded));
+}
+
+test "BootstrapFewShot multi-hop artifact picks DSPy's same-predictor traces" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    var keyword = rag.multihopLM();
+    const retriever = rag.corpus.retriever();
+    const ctx: dszig.Context = .{ .arena = out.allocator(), .lm = keyword.lm(), .retriever = retriever };
+    const trainset = try rag.trainset(out.allocator());
+    const optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 4, .max_labeled_demos = 1 };
+    const result = try optimizer.compile(rag.MultiHop, out.allocator(), testing.allocator, ctx, .{}, null, trainset);
+    try testing.expectEqual(@as(usize, 4), result.report.bootstrapped);
+    const saved = try dszig.state.saveAlloc(out.allocator(), &result.program);
+    try testing.expectEqualStrings(bootstrap_multihop, saved);
+    // DSPy kept the first hop's trace for some examples and the second for others.
+    try testing.expect(std.mem.indexOf(u8, saved, "Tokyo Japan capital") != null);
+    try testing.expect(std.mem.indexOf(u8, saved, "highest mountain Everest") != null);
 }

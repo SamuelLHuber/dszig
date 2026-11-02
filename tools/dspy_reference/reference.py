@@ -164,3 +164,49 @@ def compile_rag():
     lm = configure_rag()
     optimizer = dspy.BootstrapFewShot(metric=keyword_metric, max_bootstrapped_demos=2, max_labeled_demos=3)
     return optimizer.compile(RAG(), trainset=trainset()), lm
+
+
+class Hop(dspy.Signature):
+    """Write a search query that finds the missing facts."""
+
+    context: list[str] = dspy.InputField()
+    question: str = dspy.InputField()
+    query: str = dspy.OutputField()
+
+
+class MultiHop(dspy.Module):
+    """Runs `hop` twice per question, so BootstrapFewShot must pick one of
+    two same-predictor traces (seeded by the pickle hash of both)."""
+
+    def __init__(self):
+        super().__init__()
+        self.retrieve = Retrieve(k=1)
+        self.hop = dspy.Predict(Hop)
+        self.generate_answer = dspy.ChainOfThought(QA)
+
+    def forward(self, question):
+        context = []
+        query = question
+        for _ in range(2):
+            context = context + self.retrieve(query).passages
+            query = self.hop(context=context, question=question).query
+        context = context + self.retrieve(query).passages
+        return self.generate_answer(context=context, question=question)
+
+
+def hop_reply(query):
+    return f"[[ ## query ## ]]\n{query}\n\n[[ ## completed ## ]]"
+
+
+# The second hop sees the Tokyo passage the first hop's query retrieved.
+MULTIHOP_RULES = [
+    ('"Tokyo is the capital of Japan."]\n\n[[ ## question ## ]]', hop_reply("highest mountain Everest"), "last_user"),
+    ("`[[ ## query ## ]]`", hop_reply("Tokyo Japan capital"), "last_user"),
+] + RAG_RULES
+
+
+def compile_multihop():
+    lm = KeywordLM(MULTIHOP_RULES, RAG_DEFAULT)
+    dspy.configure(lm=lm, rm=in_memory_rm(CORPUS), adapter=dspy.ChatAdapter())
+    optimizer = dspy.BootstrapFewShot(metric=keyword_metric, max_bootstrapped_demos=4, max_labeled_demos=1)
+    return optimizer.compile(MultiHop(), trainset=trainset()), lm

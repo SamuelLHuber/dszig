@@ -164,7 +164,10 @@ re-recorded transcript differs, but the replay checks must still pass.
   and over 256 memo entries) and the str-seeded `random.Random`. Pickle
   deduplicates by object identity, which DSZig models by value: if two hops
   independently produce equal strings longer than one character, Python
-  pickles them twice and the pick can differ.
+  pickles them twice and the pick can differ. `tests/golden.zig` also
+  compiles a two-hop program (`MultiHop` in `examples/rag_program.zig`) where
+  DSPy keeps the first hop's trace for two examples and the second for two;
+  the DSZig artifact is byte-identical to DSPy's.
 - DSPy 3.4.1 cannot `save()` a program that contains a `dspy.Retrieve`:
   `Retrieve.dump_state()` does not accept the `json_mode` argument that
   `BaseModule.dump_state` passes it. The reference harness subclasses

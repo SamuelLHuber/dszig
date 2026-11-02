@@ -78,3 +78,46 @@ pub fn keywordMetric(arena: Allocator, example: *const dszig.Example, prediction
     const g = std.ascii.allocLowerString(arena, got) catch return 0;
     return if (std.mem.indexOf(u8, g, w) != null) 1 else 0;
 }
+
+pub const Hop = dszig.Signature(struct {
+    pub const instructions = "Write a search query that finds the missing facts.";
+    pub const Input = struct { context: []const []const u8, question: []const u8 };
+    pub const Output = struct { query: []const u8 };
+});
+
+/// Runs `hop` twice per question, so BootstrapFewShot must pick one of two
+/// same-predictor traces (seeded by the pickle hash of both).
+pub const MultiHop = struct {
+    retrieve: dszig.Retrieve = .{ .k = 1 },
+    hop: dszig.Predict(Hop) = .{},
+    generate_answer: dszig.ChainOfThought(QA) = .{},
+    compiled: bool = false,
+
+    pub const Input = struct { question: []const u8 };
+    pub const Output = dszig.ChainOfThought(QA).Output;
+
+    pub fn forward(self: *const MultiHop, ctx: dszig.Context, input: Input) dszig.predict.Error!Output {
+        var context: []const []const u8 = &.{};
+        var query = input.question;
+        for (0..2) |_| {
+            context = try std.mem.concat(ctx.arena, []const u8, &.{ context, try self.retrieve.forward(ctx, query) });
+            query = (try self.hop.forward(ctx, .{ .context = context, .question = input.question })).query;
+        }
+        context = try std.mem.concat(ctx.arena, []const u8, &.{ context, try self.retrieve.forward(ctx, query) });
+        return self.generate_answer.forward(ctx, .{ .context = context, .question = input.question });
+    }
+};
+
+fn hopReply(comptime query: []const u8) []const u8 {
+    return "[[ ## query ## ]]\n" ++ query ++ "\n\n[[ ## completed ## ]]";
+}
+
+/// The second hop sees the Tokyo passage the first hop's query retrieved.
+pub const multihop_rules = [_]dszig.lm.KeywordLM.Rule{
+    .{ .needle = "\"Tokyo is the capital of Japan.\"]\n\n[[ ## question ## ]]", .response = hopReply("highest mountain Everest") },
+    .{ .needle = "`[[ ## query ## ]]`", .response = hopReply("Tokyo Japan capital") },
+} ++ rules;
+
+pub fn multihopLM() dszig.lm.KeywordLM {
+    return .{ .rules = &multihop_rules, .default = chat("No idea.", "unknown") };
+}

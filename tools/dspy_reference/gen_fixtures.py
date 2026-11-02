@@ -68,6 +68,8 @@ def main():
     evaluate = dspy.Evaluate(devset=ref.trainset(), metric=ref.keyword_metric, display_progress=False)
     baseline = evaluate(ref.RAG()).score
     optimized = evaluate(compiled).score
+    multihop, _ = ref.compile_multihop()
+    multihop.save(str(OUT / "bootstrap_multihop.json"))
     write("bootstrap_rag_eval.json", json.dumps({"baseline": baseline, "optimized": optimized}, indent=2) + "\n")
 
 
