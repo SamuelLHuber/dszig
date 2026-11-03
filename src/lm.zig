@@ -17,6 +17,8 @@ pub const Options = struct {
     rollout_id: ?u32 = null,
     /// Ask the provider for a JSON object response (JSONAdapter).
     json_mode: bool = false,
+    /// Number of completions (OpenAI `n`).
+    n: u32 = 1,
 };
 
 pub const Request = struct {
@@ -31,13 +33,23 @@ pub const LM = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        /// Returns the completion text, allocated in `arena`.
-        complete: *const fn (ptr: *anyopaque, arena: Allocator, request: Request) Error![]const u8,
+        /// Returns `request.options.n` completion texts, allocated in `arena`.
+        complete: *const fn (ptr: *anyopaque, arena: Allocator, request: Request) Error![]const []const u8,
     };
 
     pub fn complete(lm: LM, arena: Allocator, request: Request) Error![]const u8 {
+        assert(request.options.n == 1);
+        return (try lm.completeMany(arena, request))[0];
+    }
+
+    /// All `request.options.n` completions; a provider that returns another
+    /// count fails with `LMFailure`.
+    pub fn completeMany(lm: LM, arena: Allocator, request: Request) Error![]const []const u8 {
         assert(request.messages.len > 0);
-        return lm.vtable.complete(lm.ptr, arena, request);
+        assert(request.options.n >= 1);
+        const completions = try lm.vtable.complete(lm.ptr, arena, request);
+        if (completions.len != request.options.n) return error.LMFailure;
+        return completions;
     }
 };
 
@@ -52,12 +64,16 @@ pub const ScriptedLM = struct {
         return .{ .ptr = self, .vtable = &.{ .complete = complete } };
     }
 
-    fn complete(ptr: *anyopaque, arena: Allocator, request: Request) Error![]const u8 {
+    /// The next `n` canned responses.
+    fn complete(ptr: *anyopaque, arena: Allocator, request: Request) Error![]const []const u8 {
         const self: *ScriptedLM = @ptrCast(@alignCast(ptr));
         if (self.history) |h| try h.record(request);
-        if (self.index >= self.responses.len) return error.ScriptExhausted;
-        defer self.index += 1;
-        return arena.dupe(u8, self.responses[self.index]);
+        const n = request.options.n;
+        if (self.responses.len - self.index < n) return error.ScriptExhausted;
+        const out = try arena.alloc([]const u8, n);
+        for (out, self.responses[self.index..][0..n]) |*o, r| o.* = try arena.dupe(u8, r);
+        self.index += n;
+        return out;
     }
 };
 
@@ -96,10 +112,14 @@ pub const KeywordLM = struct {
         return self.default;
     }
 
-    fn complete(ptr: *anyopaque, arena: Allocator, request: Request) Error![]const u8 {
+    /// `n` copies of the matching rule's response.
+    fn complete(ptr: *anyopaque, arena: Allocator, request: Request) Error![]const []const u8 {
         const self: *KeywordLM = @ptrCast(@alignCast(ptr));
         if (self.history) |h| try h.record(request);
-        return arena.dupe(u8, self.respond(request.messages));
+        const out = try arena.alloc([]const u8, request.options.n);
+        const response = try arena.dupe(u8, self.respond(request.messages));
+        for (out) |*o| o.* = response;
+        return out;
     }
 };
 
@@ -115,7 +135,18 @@ pub const ReplayLM = struct {
     misses: usize = 0,
     history: ?*History = null,
 
-    pub const Call = struct { messages: []const Message, completion: []const u8 };
+    pub const Call = struct {
+        messages: []const Message,
+        completion: []const u8,
+        /// Every completion of an `n > 1` call (`completion` is the first);
+        /// empty for single-completion calls.
+        completions: []const []const u8 = &.{},
+
+        pub fn all(call: *const Call) []const []const u8 {
+            if (call.completions.len > 0) return call.completions;
+            return (&call.completion)[0..1];
+        }
+    };
 
     pub fn lm(self: *ReplayLM) LM {
         assert(self.calls.len == self.used.len);
@@ -127,13 +158,16 @@ pub const ReplayLM = struct {
         return self.misses == 0;
     }
 
-    fn complete(ptr: *anyopaque, arena: Allocator, request: Request) Error![]const u8 {
+    fn complete(ptr: *anyopaque, arena: Allocator, request: Request) Error![]const []const u8 {
         const self: *ReplayLM = @ptrCast(@alignCast(ptr));
         if (self.history) |h| try h.record(request);
-        for (self.calls, self.used) |call, *used| {
+        for (self.calls, self.used) |*call, *used| {
             if (used.* or !sameMessages(call.messages, request.messages)) continue;
             used.* = true;
-            return arena.dupe(u8, call.completion);
+            const recorded = call.all();
+            const out = try arena.alloc([]const u8, recorded.len);
+            for (out, recorded) |*o, r| o.* = try arena.dupe(u8, r);
+            return out;
         }
         self.misses += 1;
         return error.LMFailure;
@@ -160,15 +194,21 @@ pub const RecordingLM = struct {
         return .{ .ptr = self, .vtable = &.{ .complete = complete } };
     }
 
-    fn complete(ptr: *anyopaque, arena: Allocator, request: Request) Error![]const u8 {
+    fn complete(ptr: *anyopaque, arena: Allocator, request: Request) Error![]const []const u8 {
         const self: *RecordingLM = @ptrCast(@alignCast(ptr));
-        const completion = try self.inner.complete(arena, request);
+        const completions = try self.inner.completeMany(arena, request);
         const messages = try self.arena.alloc(Message, request.messages.len);
         for (request.messages, messages) |src, *dst| {
             dst.* = .{ .role = src.role, .content = try self.arena.dupe(u8, src.content) };
         }
-        try self.calls.append(self.arena, .{ .messages = messages, .completion = try self.arena.dupe(u8, completion) });
-        return completion;
+        const kept = try self.arena.alloc([]const u8, completions.len);
+        for (kept, completions) |*k, c| k.* = try self.arena.dupe(u8, c);
+        try self.calls.append(self.arena, .{
+            .messages = messages,
+            .completion = kept[0],
+            .completions = if (kept.len > 1) kept else &.{},
+        });
+        return completions;
     }
 };
 
@@ -225,6 +265,7 @@ pub const OpenAI = struct {
         try body.put(arena, "messages", .{ .array = messages });
         if (request.options.temperature) |t| try body.put(arena, "temperature", .{ .float = t });
         if (self.max_tokens) |n| try body.put(arena, "max_tokens", .{ .integer = n });
+        if (request.options.n > 1) try body.put(arena, "n", .{ .integer = request.options.n });
         if (request.options.json_mode) {
             var format: std.json.ObjectMap = .empty;
             try format.put(arena, "type", .{ .string = "json_object" });
@@ -238,7 +279,7 @@ pub const OpenAI = struct {
         return aw.written();
     }
 
-    fn complete(ptr: *anyopaque, arena: Allocator, request: Request) Error![]const u8 {
+    fn complete(ptr: *anyopaque, arena: Allocator, request: Request) Error![]const []const u8 {
         const self: *OpenAI = @ptrCast(@alignCast(ptr));
         const body = try self.requestBody(arena, request);
         const url = try std.fmt.allocPrint(arena, "{s}/chat/completions", .{self.base_url});
@@ -273,19 +314,22 @@ pub const OpenAI = struct {
         return s == .too_many_requests or @backingInt(s) >= 500;
     }
 
-    /// Extract `choices[0].message.content`.
-    pub fn parseResponse(arena: Allocator, body: []const u8) Error![]const u8 {
+    /// Extract every `choices[i].message.content`, in order.
+    pub fn parseResponse(arena: Allocator, body: []const u8) Error![]const []const u8 {
         const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch return error.LMFailure;
         if (parsed != .object) return error.LMFailure;
         const choices = parsed.object.get("choices") orelse return error.LMFailure;
         if (choices != .array or choices.array.items.len == 0) return error.LMFailure;
-        const first = choices.array.items[0];
-        if (first != .object) return error.LMFailure;
-        const message = first.object.get("message") orelse return error.LMFailure;
-        if (message != .object) return error.LMFailure;
-        const content = message.object.get("content") orelse return error.LMFailure;
-        if (content != .string) return error.LMFailure;
-        return content.string;
+        const out = try arena.alloc([]const u8, choices.array.items.len);
+        for (choices.array.items, out) |choice, *o| {
+            if (choice != .object) return error.LMFailure;
+            const message = choice.object.get("message") orelse return error.LMFailure;
+            if (message != .object) return error.LMFailure;
+            const content = message.object.get("content") orelse return error.LMFailure;
+            if (content != .string) return error.LMFailure;
+            o.* = content.string;
+        }
+        return out;
     }
 };
 
@@ -311,7 +355,14 @@ test "keyword LM scopes and OpenAI wire format" {
     const content = try OpenAI.parseResponse(arena.allocator(),
         \\{"choices": [{"message": {"role": "assistant", "content": "hi"}}]}
     );
-    try testing.expectEqualStrings("hi", content);
+    try testing.expectEqual(@as(usize, 1), content.len);
+    try testing.expectEqualStrings("hi", content[0]);
+    const many = try OpenAI.parseResponse(arena.allocator(),
+        \\{"choices": [{"message": {"content": "a"}}, {"message": {"content": "b"}}]}
+    );
+    try testing.expectEqualStrings("b", many[1]);
+    const body_n = try client.requestBody(arena.allocator(), .{ .messages = &msgs, .options = .{ .n = 3 } });
+    try testing.expect(std.mem.endsWith(u8, body_n, "\"n\": 3}"));
     try testing.expect(OpenAI.retryable(null));
     try testing.expect(OpenAI.retryable(.too_many_requests));
     try testing.expect(OpenAI.retryable(.service_unavailable));

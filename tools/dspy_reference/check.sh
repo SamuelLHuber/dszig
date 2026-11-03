@@ -21,6 +21,9 @@ uv run --locked gen_optuna.py "$tmp/fixtures"
 uv run --locked gen_pickle.py "$tmp/fixtures" >/dev/null
 diff -r --exclude=live "$root/tests/fixtures" "$tmp/fixtures"
 echo "ok: DSPy 3.4.1 regenerates tests/fixtures unchanged"
+uv run --locked gen_program_code.py "$tmp/program_code"
+diff "$root/examples/dates_program_code.txt" "$tmp/program_code/dates_program_code.txt"
+echo "ok: DSPy 3.4.1 regenerates examples/dates_program_code.txt unchanged"
 
 (cd "$root" && zig build bootstrap -- "$tmp/dszig_rag.json" >/dev/null)
 uv run --locked check_artifact.py "$tmp/dszig_rag.json"

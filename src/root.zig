@@ -24,6 +24,8 @@ pub const LabeledFewShot = optimize.LabeledFewShot;
 pub const BootstrapFewShotWithRandomSearch = optimize.BootstrapFewShotWithRandomSearch;
 pub const mipro = @import("mipro.zig");
 pub const MIPROv2 = mipro.MIPROv2;
+pub const copro = @import("copro.zig");
+pub const COPRO = copro.COPRO;
 pub const state = @import("state.zig");
 
 test {

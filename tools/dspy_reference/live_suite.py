@@ -89,13 +89,25 @@ def run_suite(lm):
         DateQA, mipro, date_examples("train"), date_examples("dev"), exact_metric,
         valset=date_examples("dev"), num_trials=MIPRO_TRIALS, minibatch_size=MIPRO_MINIBATCH, program_aware_proposer=False,
     )
+    aware = RecordedMIPROv2(
+        metric=exact_metric, auto=None, num_candidates=2, max_bootstrapped_demos=2, max_labeled_demos=2, num_threads=1
+    )
+    out["dates_mipro_aware"] = pipeline(
+        DateQA, aware, date_examples("train"), date_examples("dev"), exact_metric,
+        valset=date_examples("dev"), num_trials=MIPRO_AWARE_TRIALS, minibatch_size=MIPRO_MINIBATCH,
+    )
+    copro = dspy.COPRO(metric=exact_metric, breadth=COPRO_BREADTH, depth=COPRO_DEPTH)
+    out["dates_copro"] = pipeline(
+        DateQA, copro, date_examples("train"), date_examples("dev"), exact_metric,
+        eval_kwargs={"num_threads": 1, "display_progress": False},
+    )
     return out
-
 
 MIPRO_TRIALS = 12
 MIPRO_MINIBATCH = 4
-
-
+MIPRO_AWARE_TRIALS = 4
+COPRO_BREADTH = 3
+COPRO_DEPTH = 2
 class RecordedMIPROv2(dspy.MIPROv2):
     """Keeps the proposed instruction candidates for comparison."""
 
@@ -154,6 +166,7 @@ class RecordingLM(dspy.LM):
         self.calls.append({
             "messages": [dict(m) for m in entry["messages"]],
             "completion": completion_text(entry["outputs"][0]),
+            **({"completions": [completion_text(o) for o in entry["outputs"]]} if len(entry["outputs"]) > 1 else {}),
             "temperature": kwargs.get("temperature"),
             "rollout_id": kwargs.get("rollout_id"),
             "response_format": json.dumps(kwargs["response_format"], default=str) if "response_format" in kwargs else None,
@@ -176,9 +189,16 @@ class ReplayLM(dspy.BaseLM):
         for i, call in enumerate(self.calls):
             if not self.used[i] and call["messages"] == want:
                 self.used[i] = True
-                message = SimpleNamespace(content=call["completion"], tool_calls=None, reasoning_content=None)
-                choice = SimpleNamespace(message=message, finish_reason="stop", index=0)
-                return SimpleNamespace(choices=[choice], usage={}, model=self.model)
+                texts = call.get("completions", [call["completion"]])
+                choices = [
+                    SimpleNamespace(
+                        message=SimpleNamespace(content=text, tool_calls=None, reasoning_content=None),
+                        finish_reason="stop",
+                        index=i,
+                    )
+                    for i, text in enumerate(texts)
+                ]
+                return SimpleNamespace(choices=choices, usage={}, model=self.model)
         self.misses.append(want)
         raise RuntimeError("replay: request has no recorded twin")
 

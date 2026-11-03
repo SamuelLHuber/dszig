@@ -5,9 +5,11 @@
 //! evaluations. One CPython `random.Random(seed)` stream is shared by every
 //! step, in DSPy's order, so the same LM answers give the same program.
 //!
-//! Not supported: the program-aware proposer (it reads the Python source of
-//! the program), i.e. DSZig behaves like `program_aware_proposer=False`;
-//! `teacher_settings`, `track_stats` program copies and `log_dir`.
+//! The program-aware proposer needs the program's code, which DSPy reads with
+//! `inspect.getsource`; DSZig takes it as `Options.program_code` and runs
+//! without it, like `program_aware_proposer=False`, when none is given.
+//! Not supported: `teacher_settings`, `track_stats` program copies and
+//! `log_dir`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -87,6 +89,75 @@ const basic_instruction_desc = "Basic instruction.";
 const tip_desc = "A suggestion for how to go about generating the new instruction.";
 const proposed_instruction_desc = "Propose an instruction that will be used to prompt a Language Model to perform this task.";
 const InstructionOutput = struct { proposed_instruction: []const u8 };
+const program_code_desc = "Language model program designed to solve a particular task.";
+const program_description_desc = "Summary of the task the program is designed to solve, and how it goes about solving it.";
+const module_desc = "The module to create an instruction for.";
+const module_description_desc = "Description of the module to create an instruction for.";
+const pseudocode_desc = "Pseudocode for a language model program designed to solve a particular task.";
+const program_example_desc = "An example of the program in use.";
+const describe_preamble = "Below is some pseudo-code for a pipeline that solves tasks with calls to language models. ";
+
+pub const DescribeProgram = signature.Signature(struct {
+    pub const instructions = describe_preamble ++ "Please describe what type of task this program appears to be designed to solve, and how it appears to work.";
+    pub const Input = struct { program_code: []const u8, program_example: []const u8 };
+    pub const Output = struct { program_description: []const u8 };
+    pub const descriptions = .{
+        .program_code = pseudocode_desc,
+        .program_example = program_example_desc,
+        .program_description = "Describe what task the program is designed to solve, and how it goes about solving this task.",
+    };
+});
+
+pub const DescribeModule = signature.Signature(struct {
+    pub const instructions = describe_preamble ++ "Please describe the purpose of one of the specified module in this pipeline.";
+    pub const Input = struct {
+        program_code: []const u8,
+        program_example: []const u8,
+        program_description: []const u8,
+        module: []const u8,
+    };
+    pub const Output = struct { module_description: []const u8 };
+    pub const descriptions = .{
+        .program_code = pseudocode_desc,
+        .program_example = program_example_desc,
+        .program_description = program_description_desc,
+        .module = "The module in the program that we want to describe.",
+        .module_description = "Description of the module's role in the broader program.",
+    };
+});
+
+/// The program-aware inputs of `generate_instruction_class(program_aware=True)`.
+const ProgramInfo = struct {
+    program_code: []const u8,
+    program_description: []const u8 = "Not available",
+    module: []const u8 = "Not provided",
+    module_description: []const u8 = "Not provided",
+};
+
+const AwareWithSummaryAndTip = signature.Signature(struct {
+    pub const instructions = generate_instruction;
+    pub const Input = struct { dataset_description: []const u8, program_code: []const u8, program_description: []const u8, module: []const u8, module_description: []const u8, task_demos: []const u8, basic_instruction: []const u8, tip: []const u8 };
+    pub const Output = InstructionOutput;
+    pub const descriptions = .{ .program_code = program_code_desc, .program_description = program_description_desc, .module = module_desc, .module_description = module_description_desc, .dataset_description = dataset_description_desc, .task_demos = task_demos_desc, .basic_instruction = basic_instruction_desc, .tip = tip_desc, .proposed_instruction = proposed_instruction_desc };
+});
+const AwareWithSummary = signature.Signature(struct {
+    pub const instructions = generate_instruction;
+    pub const Input = struct { dataset_description: []const u8, program_code: []const u8, program_description: []const u8, module: []const u8, module_description: []const u8, task_demos: []const u8, basic_instruction: []const u8 };
+    pub const Output = InstructionOutput;
+    pub const descriptions = .{ .program_code = program_code_desc, .program_description = program_description_desc, .module = module_desc, .module_description = module_description_desc, .dataset_description = dataset_description_desc, .task_demos = task_demos_desc, .basic_instruction = basic_instruction_desc, .proposed_instruction = proposed_instruction_desc };
+});
+const AwareWithTip = signature.Signature(struct {
+    pub const instructions = generate_instruction;
+    pub const Input = struct { program_code: []const u8, program_description: []const u8, module: []const u8, module_description: []const u8, task_demos: []const u8, basic_instruction: []const u8, tip: []const u8 };
+    pub const Output = InstructionOutput;
+    pub const descriptions = .{ .program_code = program_code_desc, .program_description = program_description_desc, .module = module_desc, .module_description = module_description_desc, .task_demos = task_demos_desc, .basic_instruction = basic_instruction_desc, .tip = tip_desc, .proposed_instruction = proposed_instruction_desc };
+});
+const Aware = signature.Signature(struct {
+    pub const instructions = generate_instruction;
+    pub const Input = struct { program_code: []const u8, program_description: []const u8, module: []const u8, module_description: []const u8, task_demos: []const u8, basic_instruction: []const u8 };
+    pub const Output = InstructionOutput;
+    pub const descriptions = .{ .program_code = program_code_desc, .program_description = program_description_desc, .module = module_desc, .module_description = module_description_desc, .task_demos = task_demos_desc, .basic_instruction = basic_instruction_desc, .proposed_instruction = proposed_instruction_desc };
+});
 
 /// `generate_instruction_class(...)` with `program_aware=False` and no
 /// instruction history (MIPROv2's configuration), with and without the
@@ -309,6 +380,10 @@ pub const MIPROv2 = struct {
         view_data_batch_size: usize = 10,
         tip_aware_proposer: bool = true,
         fewshot_aware_proposer: bool = true,
+        program_aware_proposer: bool = true,
+        /// What DSPy's `get_dspy_source_code(program)` returns for the
+        /// program; the program-aware proposer runs only when it is set.
+        program_code: ?[]const u8 = null,
     };
 
     /// One entry of DSPy's `trial_logs`: `params` holds the chosen indices
@@ -498,7 +573,11 @@ pub const MIPROv2 = struct {
                     try taskDemos(ctx.arena, state, demo_sets[pred_i], set_i, bootstrapped_fewshot_examples_in_context)
                 else
                     no_task_demos;
-                const proposed = try generate(ctx, summary, tip, demos_text, state.instructions);
+                const info: ?ProgramInfo = if (options.program_aware_proposer)
+                    if (options.program_code) |code| try describe(ctx, code, demos_text, state) else null
+                else
+                    null;
+                const proposed = try generate(ctx, summary, tip, demos_text, state.instructions, info);
                 item.* = try out.dupe(u8, stripPrefix(stripPrefix(proposed)));
             }
             items[0] = state.instructions;
@@ -507,7 +586,90 @@ pub const MIPROv2 = struct {
         return result;
     }
 
-    fn generate(ctx: Context, summary: ?[]const u8, tip: []const u8, task_demos: []const u8, basic: []const u8) predict.Error![]const u8 {
+    /// `GenerateModuleInstruction.forward`'s program summary. A failed LM
+    /// call keeps the defaults for what is not yet known, as DSPy does.
+    fn describe(ctx: Context, code: []const u8, task_demos: []const u8, state: *const predict.PredictState) Allocator.Error!ProgramInfo {
+        var info: ProgramInfo = .{ .program_code = code };
+        const described = (predict.Predict(DescribeProgram){}).forward(ctx, .{
+            .program_code = code,
+            .program_example = task_demos,
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return info,
+        };
+        info.program_description = stripPrefix(described.program_description);
+        var aw: Writer.Allocating = .init(ctx.arena);
+        const w = &aw.writer;
+        w.writeAll("Predict(") catch return error.OutOfMemory;
+        for (state.fields, 0..) |f, i| {
+            if (i == state.input_count) w.writeAll(") -> ") catch return error.OutOfMemory;
+            if (i != 0 and i != state.input_count) w.writeAll(", ") catch return error.OutOfMemory;
+            w.writeAll(f.name) catch return error.OutOfMemory;
+        }
+        info.module = aw.written();
+        const module = (predict.Predict(DescribeModule){}).forward(ctx, .{
+            .program_code = code,
+            .program_example = task_demos,
+            .program_description = info.program_description,
+            .module = info.module,
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return info,
+        };
+        info.module_description = module.module_description;
+        return info;
+    }
+
+    fn generate(
+        ctx: Context,
+        summary: ?[]const u8,
+        tip: []const u8,
+        task_demos: []const u8,
+        basic: []const u8,
+        program: ?ProgramInfo,
+    ) predict.Error![]const u8 {
+        const p = program orelse return generatePlain(ctx, summary, tip, task_demos, basic);
+        if (summary) |s| {
+            if (tip.len > 0) return (try (predict.Predict(AwareWithSummaryAndTip){}).forward(ctx, .{
+                .dataset_description = s,
+                .program_code = p.program_code,
+                .program_description = p.program_description,
+                .module = p.module,
+                .module_description = p.module_description,
+                .task_demos = task_demos,
+                .basic_instruction = basic,
+                .tip = tip,
+            })).proposed_instruction;
+            return (try (predict.Predict(AwareWithSummary){}).forward(ctx, .{
+                .dataset_description = s,
+                .program_code = p.program_code,
+                .program_description = p.program_description,
+                .module = p.module,
+                .module_description = p.module_description,
+                .task_demos = task_demos,
+                .basic_instruction = basic,
+            })).proposed_instruction;
+        }
+        if (tip.len > 0) return (try (predict.Predict(AwareWithTip){}).forward(ctx, .{
+            .program_code = p.program_code,
+            .program_description = p.program_description,
+            .module = p.module,
+            .module_description = p.module_description,
+            .task_demos = task_demos,
+            .basic_instruction = basic,
+            .tip = tip,
+        })).proposed_instruction;
+        return (try (predict.Predict(Aware){}).forward(ctx, .{
+            .program_code = p.program_code,
+            .program_description = p.program_description,
+            .module = p.module,
+            .module_description = p.module_description,
+            .task_demos = task_demos,
+            .basic_instruction = basic,
+        })).proposed_instruction;
+    }
+
+    fn generatePlain(ctx: Context, summary: ?[]const u8, tip: []const u8, task_demos: []const u8, basic: []const u8) predict.Error![]const u8 {
         if (summary) |s| {
             if (tip.len > 0) return (try (predict.Predict(GenerateInstructionWithSummaryAndTip){}).forward(ctx, .{
                 .dataset_description = s,

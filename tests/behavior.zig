@@ -16,7 +16,13 @@ const LearningLM = struct {
         return .{ .ptr = self, .vtable = &.{ .complete = complete } };
     }
 
-    fn complete(_: *anyopaque, arena: Allocator, request: dszig.lm.Request) dszig.lm.Error![]const u8 {
+    fn complete(_: *anyopaque, arena: Allocator, request: dszig.lm.Request) dszig.lm.Error![]const []const u8 {
+        const out = try arena.alloc([]const u8, 1);
+        out[0] = try reply(arena, request);
+        return out;
+    }
+
+    fn reply(arena: Allocator, request: dszig.lm.Request) dszig.lm.Error![]const u8 {
         const messages = request.messages;
         var demos: usize = 0;
         for (messages) |m| if (m.role == .assistant) {

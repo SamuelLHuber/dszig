@@ -10,7 +10,7 @@ import sys
 
 import live_suite
 
-PIPELINES = ("rag", "dates", "dates_search", "dates_mipro")
+PIPELINES = ("rag", "dates", "dates_search", "dates_mipro", "dates_mipro_aware", "dates_copro")
 
 
 def main():

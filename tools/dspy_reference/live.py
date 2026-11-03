@@ -20,7 +20,7 @@ def main():
     transcript = {"runtime": "dspy 3.4.1", "model": model, "calls": lm.calls, **result}
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(transcript, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    scores = "; ".join(f"{p} {result[p]['baseline']}% -> {result[p]['optimized']}%" for p in ("rag", "dates", "dates_search", "dates_mipro"))
+    scores = "; ".join(f"{p} {result[p]['baseline']}% -> {result[p]['optimized']}%" for p in ("rag", "dates", "dates_search", "dates_mipro", "dates_mipro_aware", "dates_copro"))
     print(f"wrote {out}: {len(lm.calls)} real calls; {scores}", file=sys.stderr)
 
 

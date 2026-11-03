@@ -111,7 +111,37 @@ pub const PredictState = struct {
         if (ctx.trace) |t| try t.record(state, inputs, &outputs);
         return outputs;
     }
+
+    /// `Predict(..., n=n)`: one LM call for `n` completions, all parsed with
+    /// the same adapter (DSPy falls back to JSON for the whole call). Like
+    /// DSPy, a temperature that is unset or at most 0.15 becomes 0.7.
+    pub fn callMany(state: *const PredictState, ctx_in: Context, inputs: *const Record, n: u32) Error![]const Record {
+        assert(n >= 1);
+        var ctx = ctx_in;
+        ctx.lm_options.n = n;
+        if (n > 1 and (ctx.lm_options.temperature orelse 0) <= 0.15) ctx.lm_options.temperature = 0.7;
+        const view_ = try state.view(ctx.arena);
+        const outputs = runAdapterMany(ctx, ctx.adapter, view_, state.demos, inputs) catch |err| switch (err) {
+            error.AdapterParse => if (ctx.adapter == .chat and ctx.json_fallback)
+                try runAdapterMany(ctx, .json, view_, state.demos, inputs)
+            else
+                return err,
+            else => return err,
+        };
+        if (ctx.trace) |t| try t.record(state, inputs, &outputs[0]);
+        return outputs;
+    }
 };
+
+fn runAdapterMany(ctx: Context, adapter: Adapter, view_: adapter_mod.View, demos: []const Record, inputs: *const Record) Error![]const Record {
+    const messages = try adapter.format(ctx.arena, view_, demos, inputs);
+    var options = ctx.lm_options;
+    options.json_mode = adapter == .json;
+    const completions = try ctx.lm.completeMany(ctx.arena, .{ .messages = messages, .options = options });
+    const outputs = try ctx.arena.alloc(Record, completions.len);
+    for (completions, outputs) |c, *o| o.* = try adapter.parse(ctx.arena, view_, c);
+    return outputs;
+}
 
 fn runAdapter(ctx: Context, adapter: Adapter, view_: adapter_mod.View, demos: []const Record, inputs: *const Record) Error!Record {
     const messages = try adapter.format(ctx.arena, view_, demos, inputs);

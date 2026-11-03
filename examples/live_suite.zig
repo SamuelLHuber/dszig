@@ -112,7 +112,7 @@ pub const Pipeline = struct {
     scores: []const f64 = &.{},
 };
 
-pub const pipeline_names = .{ "rag", "dates", "dates_search", "dates_mipro" };
+pub const pipeline_names = .{ "rag", "dates", "dates_search", "dates_mipro", "dates_mipro_aware", "dates_copro" };
 
 pub const Result = struct {
     cases: [case_count]Case,
@@ -120,6 +120,8 @@ pub const Result = struct {
     dates: Pipeline,
     dates_search: Pipeline,
     dates_mipro: Pipeline,
+    dates_mipro_aware: Pipeline,
+    dates_copro: Pipeline,
 };
 
 pub fn run(arena: Allocator, gpa: Allocator, lm: dszig.LM) !Result {
@@ -157,11 +159,22 @@ pub fn run(arena: Allocator, gpa: Allocator, lm: dszig.LM) !Result {
         .max_labeled_demos = 2,
     };
     result.dates_mipro = try pipeline(DateQA, arena, gpa, ctx, mipro, dates_train, dates_dev, exactMetric);
+    var aware = mipro;
+    aware.num_candidates = 2;
+    result.dates_mipro_aware = try pipeline(DateQA, arena, gpa, ctx, aware, dates_train, dates_dev, exactMetric);
+    const copro: dszig.COPRO = .{ .metric = exactMetric, .breadth = copro_breadth, .depth = copro_depth };
+    result.dates_copro = try pipeline(DateQA, arena, gpa, ctx, copro, dates_train, dates_dev, exactMetric);
     return result;
 }
 
 pub const mipro_trials = 12;
 pub const mipro_minibatch = 4;
+pub const mipro_aware_trials = 4;
+pub const copro_breadth = 3;
+pub const copro_depth = 2;
+/// DSPy's `get_dspy_source_code(DateQA())`, which the program-aware proposer
+/// reads; tools/dspy_reference/gen_program_code.py regenerates it.
+pub const dates_program_code = @embedFile("dates_program_code.txt");
 
 fn pipeline(
     comptime P: type,
@@ -175,7 +188,14 @@ fn pipeline(
 ) !Pipeline {
     const baseline = try dszig.optimize.evaluate(P, gpa, ctx, &P{}, devset, metric, 10);
     if (@TypeOf(optimizer) == dszig.MIPROv2) {
-        const options: dszig.MIPROv2.Options = .{ .valset = devset, .num_trials = mipro_trials, .minibatch_size = mipro_minibatch };
+        const aware = optimizer.num_candidates == 2;
+        const options: dszig.MIPROv2.Options = .{
+            .valset = devset,
+            .num_trials = if (aware) mipro_aware_trials else mipro_trials,
+            .minibatch_size = mipro_minibatch,
+            .program_aware_proposer = aware,
+            .program_code = dates_program_code,
+        };
         const compiled = try optimizer.compile(P, arena, gpa, ctx, null, .{}, null, trainset, options);
         const optimized = try dszig.optimize.evaluate(P, gpa, ctx, &compiled.program, devset, metric, 10);
         return .{
@@ -185,6 +205,18 @@ fn pipeline(
             .instructions = compiled.instruction_candidates,
             .trials = compiled.trials,
             .scores = compiled.candidates,
+        };
+    }
+    if (@TypeOf(optimizer) == dszig.COPRO) {
+        const compiled = try optimizer.compile(P, arena, gpa, ctx, null, .{}, trainset);
+        const optimized = try dszig.optimize.evaluate(P, gpa, ctx, &compiled.program, devset, metric, 10);
+        const scores = try arena.alloc(f64, compiled.candidates.len);
+        for (scores, compiled.candidates) |*s, c| s.* = c.score;
+        return .{
+            .baseline = baseline.score,
+            .optimized = optimized.score,
+            .artifact = try dszig.state.saveAlloc(arena, &compiled.program),
+            .scores = scores,
         };
     }
     const search = @TypeOf(optimizer) == dszig.BootstrapFewShotWithRandomSearch;
@@ -239,7 +271,17 @@ pub fn parseCalls(arena: Allocator, transcript: Value) ![]const Call {
             .role = std.meta.stringToEnum(dszig.adapter.Role, m.object.get("role").?.string) orelse return error.BadTranscript,
             .content = m.object.get("content").?.string,
         };
-        call.* = .{ .messages = messages, .completion = item.object.get("completion").?.string };
+        var completions: []const []const u8 = &.{};
+        if (item.object.get("completions")) |all| {
+            const list = try arena.alloc([]const u8, all.array.items.len);
+            for (all.array.items, list) |c, *dst| dst.* = c.string;
+            completions = list;
+        }
+        call.* = .{
+            .messages = messages,
+            .completion = item.object.get("completion").?.string,
+            .completions = completions,
+        };
     }
     return calls;
 }
@@ -258,6 +300,11 @@ pub fn writeTranscript(arena: Allocator, runtime: []const u8, model: []const u8,
         var obj: std.json.ObjectMap = .empty;
         try obj.put(arena, "messages", .{ .array = messages });
         try obj.put(arena, "completion", .{ .string = call.completion });
+        if (call.completions.len > 0) {
+            var all: std.json.Array = .init(arena);
+            for (call.completions) |c| try all.append(.{ .string = c });
+            try obj.put(arena, "completions", .{ .array = all });
+        }
         try call_values.append(.{ .object = obj });
     }
     var cases: std.json.Array = .init(arena);
