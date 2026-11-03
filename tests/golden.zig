@@ -14,7 +14,8 @@ const rag = @import("rag_program");
 const format_cases = @embedFile("fixtures/format_cases.json");
 const bootstrap_rag = @embedFile("fixtures/bootstrap_rag.json");
 const bootstrap_multihop = @embedFile("fixtures/bootstrap_multihop.json");
-
+const react_cases = @embedFile("fixtures/react.json");
+const ensemble_cases = @embedFile("fixtures/ensemble.json");
 const QA = rag.QA;
 
 const Typed = dszig.Signature(struct {
@@ -163,4 +164,140 @@ test "BootstrapFewShot multi-hop artifact picks DSPy's same-predictor traces" {
     // DSPy kept the first hop's trace for some examples and the second for others.
     try testing.expect(std.mem.indexOf(u8, saved, "Tokyo Japan capital") != null);
     try testing.expect(std.mem.indexOf(u8, saved, "highest mountain Everest") != null);
+}
+
+fn reactSearch(ctx: dszig.Context, _: *const Record) dszig.react.ToolError!Value {
+    var list: std.json.Array = .init(ctx.arena);
+    try list.append(.{ .string = "Apollo 11 landed on the Moon in 1969." });
+    try list.append(.{ .string = "multi\nline «x»" });
+    return .{ .array = list };
+}
+
+fn reactAdd(_: dszig.Context, args: *const Record) dszig.react.ToolError!Value {
+    const a = args.get("a") orelse return error.InvalidArguments;
+    const b: i64 = if (args.get("b")) |b| b.integer else 2;
+    return .{ .integer = a.integer + b };
+}
+
+const search_tool: dszig.Tool = .{
+    .name = "search",
+    .desc = "Search the corpus.\n    Returns passages.",
+    .args = &.{.{ .name = "query", .schema_type = "string" }},
+    .func = reactSearch,
+};
+
+const add_tool: dszig.Tool = .{
+    .name = "add",
+    .args = &.{ .{ .name = "a", .schema_type = "integer" }, .{ .name = "b", .schema_type = "integer", .default = "2" } },
+    .func = reactAdd,
+};
+
+const AgentQA = dszig.Signature(struct {
+    pub const Input = struct { question: []const u8 };
+    pub const Output = struct { answer: []const u8 };
+});
+
+fn checkReact(comptime Agent: type, name: []const u8) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const all = try std.json.parseFromSliceLeaky(Value, arena, react_cases, .{});
+    const case = for (all.array.items) |c| {
+        if (std.mem.eql(u8, c.object.get("name").?.string, name)) break c.object;
+    } else return error.MissingCase;
+    const calls = case.get("calls").?.array.items;
+    const completions = try arena.alloc([]const u8, calls.len);
+    for (calls, completions) |c, *out| out.* = c.object.get("completion").?.string;
+    var history: dszig.lm.History = .{ .arena = arena };
+    var scripted: dszig.lm.ScriptedLM = .{ .responses = completions, .history = &history };
+    const ctx: dszig.Context = .{ .arena = arena, .lm = scripted.lm() };
+    const agent: Agent = .{ .max_iters = @intCast(case.get("max_iters").?.integer) };
+    var inputs: Record = .empty;
+    try inputs.put(arena, "question", .{ .string = "When did Apollo 11 land?" });
+    const prediction = try agent.run(ctx, &inputs);
+    try testing.expectEqual(calls.len, history.requests.items.len);
+    for (calls, history.requests.items) |c, request| {
+        const want = c.object.get("messages").?.array.items;
+        try testing.expectEqual(want.len, request.messages.len);
+        for (want, request.messages) |w, got| {
+            try testing.expectEqualStrings(w.object.get("role").?.string, got.role.name());
+            try testing.expectEqualStrings(w.object.get("content").?.string, got.content);
+        }
+    }
+    try testing.expectEqualStrings(try compact(arena, case.get("trajectory").?), try compact(arena, .{ .object = prediction.trajectory }));
+    try testing.expectEqualStrings(try compact(arena, case.get("outputs").?), try compact(arena, .{ .object = prediction.outputs }));
+}
+
+test "ReAct prompts, trajectory and outputs match DSPy" {
+    try checkReact(dszig.ReAct(AgentQA, &.{ search_tool, add_tool }), "react_tools");
+    try checkReact(dszig.ReAct(AgentQA, &.{search_tool}), "react_max_iters");
+}
+
+test "ReAct turns bad tool arguments into an execution-error observation" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var scripted: dszig.lm.ScriptedLM = .{ .responses = &.{
+        "[[ ## next_thought ## ]]\nx\n\n[[ ## next_tool_name ## ]]\nadd\n\n[[ ## next_tool_args ## ]]\n{\"c\": 1}\n\n[[ ## completed ## ]]",
+        "[[ ## next_thought ## ]]\ny\n\n[[ ## next_tool_name ## ]]\nadd\n\n[[ ## next_tool_args ## ]]\n{\"a\": \"one\"}\n\n[[ ## completed ## ]]",
+        "[[ ## reasoning ## ]]\nr\n\n[[ ## answer ## ]]\nnone\n\n[[ ## completed ## ]]",
+    } };
+    const ctx: dszig.Context = .{ .arena = arena, .lm = scripted.lm() };
+    const agent: dszig.ReAct(AgentQA, &.{add_tool}) = .{ .max_iters = 2 };
+    var inputs: Record = .empty;
+    try inputs.put(arena, "question", .{ .string = "?" });
+    const prediction = try agent.run(ctx, &inputs);
+    try testing.expectEqualStrings("Execution error in add: InvalidArguments", prediction.trajectory.get("observation_0").?.string);
+    try testing.expectEqualStrings("Execution error in add: InvalidArguments", prediction.trajectory.get("observation_1").?.string);
+    try testing.expectEqualStrings("none", prediction.outputs.get("answer").?.string);
+}
+
+test "normalize_text and dspy.majority match DSPy" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const data = try std.json.parseFromSliceLeaky(Value, arena, ensemble_cases, .{});
+    for (data.object.get("normalize").?.array.items) |pair| {
+        const got = try dszig.ensemble.normalizeText(arena, pair.array.items[0].string);
+        try testing.expectEqualStrings(pair.array.items[1].string, got);
+    }
+    for (data.object.get("majority").?.array.items) |case| {
+        const values = case.object.get("values").?.array.items;
+        const records = try arena.alloc(Record, values.len);
+        for (values, records) |v, *r| {
+            r.* = .empty;
+            try r.put(arena, "reasoning", .{ .string = "r" });
+            try r.put(arena, "answer", v);
+        }
+        const winner = try dszig.ensemble.majority(arena, records, "answer");
+        try testing.expectEqualStrings(case.object.get("answer").?.string, values[winner].string);
+    }
+}
+
+const Echo = struct {
+    answer: []const u8,
+    compiled: bool = false,
+
+    pub const Input = struct { question: []const u8 };
+    pub const Output = struct { answer: []const u8 };
+
+    pub fn forward(self: *const Echo, _: dszig.Context, _: Input) dszig.predict.Error!Output {
+        return .{ .answer = self.answer };
+    }
+};
+
+test "Ensemble reduces with majority and samples like random.sample" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var scripted: dszig.lm.ScriptedLM = .{ .responses = &.{} };
+    const ctx: dszig.Context = .{ .arena = arena, .lm = scripted.lm() };
+    const all: dszig.Ensemble(Echo, 4) = .{ .programs = .{ .{ .answer = "Paris" }, .{ .answer = "Berlin" }, .{ .answer = "berlin!" }, .{ .answer = "Rome" } } };
+    try testing.expectEqualStrings("Berlin", (try all.forward(ctx, .{ .question = "?" })).answer);
+    // random.seed(0); random.sample(range(4), 2) == [3, 1] in CPython.
+    var rng: dszig.pyrandom.Random = .init(0);
+    const sampled: dszig.Ensemble(Echo, 4) = .{ .programs = all.programs, .size = 2, .rng = &rng };
+    const outputs = try sampled.forwardAll(ctx, .{ .question = "?" });
+    try testing.expectEqualStrings("Rome", outputs[0].answer);
+    try testing.expectEqualStrings("Berlin", outputs[1].answer);
 }

@@ -189,6 +189,35 @@ pub fn Predict(comptime Sig: type) type {
     };
 }
 
+/// A predictor over a comptime field list, for modules that build their own
+/// signatures (`ReAct`).
+pub fn PredictFields(comptime fields: []const Field, comptime input_count: usize, comptime instructions: []const u8) type {
+    comptime assert(input_count < fields.len);
+    return struct {
+        pub const is_dszig_predict = true;
+
+        const default_descs = blk: {
+            var d: [fields.len][]const u8 = undefined;
+            for (fields, 0..) |f, i| d[i] = f.desc;
+            break :blk d;
+        };
+        const default_prefixes = blk: {
+            var p: [fields.len][]const u8 = undefined;
+            for (fields, 0..) |f, i| p[i] = f.prefix;
+            break :blk p;
+        };
+
+        state: PredictState = .{
+            .fields = fields,
+            .input_count = input_count,
+            .instructions = instructions,
+            .descs = &default_descs,
+            .prefixes = &default_prefixes,
+        },
+        compiled: bool = false,
+    };
+}
+
 /// `dspy.ChainOfThought(Signature)`: prepends a `reasoning: str` output.
 pub fn ChainOfThought(comptime Sig: type) type {
     return struct {

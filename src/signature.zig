@@ -32,6 +32,8 @@ pub const Kind = enum {
     float,
     /// exhaustive enum <-> `Literal['a', 'b']`
     literal,
+    /// `std.json.ObjectMap` <-> `dict[str, Any]`
+    json_object,
 };
 
 pub const Field = struct {
@@ -165,6 +167,7 @@ pub fn kindOf(comptime T: type, comptime name: []const u8) Kind {
     if (T == []const u8) return .str;
     if (T == []const []const u8) return .str_list;
     if (T == bool) return .boolean;
+    if (T == std.json.ObjectMap) return .json_object;
     switch (@typeInfo(T)) {
         .int => return .int,
         .float => |f| {
@@ -181,7 +184,7 @@ pub fn kindOf(comptime T: type, comptime name: []const u8) Kind {
             return .literal;
         },
         else => @compileError("dszig: field `" ++ name ++ "` has unsupported type " ++ @typeName(T) ++
-            "; supported: []const u8, []const []const u8, bool, integers, f32/f64, exhaustive enums"),
+            "; supported: []const u8, []const []const u8, bool, integers, f32/f64, exhaustive enums, std.json.ObjectMap"),
     }
 }
 
@@ -192,6 +195,7 @@ fn typeName(comptime T: type, comptime kind: Kind) []const u8 {
         .boolean => "bool",
         .int => "int",
         .float => "float",
+        .json_object => "dict[str, Any]",
         .literal => blk: {
             var s: []const u8 = "Literal[";
             for (std.meta.fieldNames(T), 0..) |tag, i| {

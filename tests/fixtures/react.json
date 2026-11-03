@@ -1,0 +1,133 @@
+[
+  {
+    "name": "react_tools",
+    "max_iters": 5,
+    "calls": [
+      {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Your input fields are:\n1. `question` (str): \n2. `trajectory` (str):\nYour output fields are:\n1. `next_thought` (str): \n2. `next_tool_name` (Literal['search', 'add', 'finish']): \n3. `next_tool_args` (dict[str, Any]):\nAll interactions will be structured in the following way, with the appropriate values filled in.\n\n[[ ## question ## ]]\n{question}\n\n[[ ## trajectory ## ]]\n{trajectory}\n\n[[ ## next_thought ## ]]\n{next_thought}\n\n[[ ## next_tool_name ## ]]\n{next_tool_name}        # note: the value you produce must exactly match (no extra characters) one of: search; add; finish\n\n[[ ## next_tool_args ## ]]\n{next_tool_args}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"additionalProperties\": true}\n\n[[ ## completed ## ]]\nIn adhering to this structure, your objective is: \n        Given the fields `question`, produce the fields `answer`.\n        \n        You are an Agent. In each episode, you will be given the fields `question` as input. And you can see your past trajectory so far.\n        Your goal is to use one or more of the supplied tools to collect any necessary information for producing `answer`.\n        \n        To do this, you will interleave next_thought, next_tool_name, and next_tool_args in each turn, and also when finishing the task.\n        After each tool call, you receive a resulting observation, which gets appended to your trajectory.\n        \n        When writing next_thought, you may reason about the current situation and plan for future steps.\n        When selecting the next_tool_name and its next_tool_args, the tool must be one of:\n        \n        (1) search, whose description is <desc>Search the corpus.      Returns passages.</desc>. It takes arguments {'query': {'type': 'string'}}.\n        (2) add. It takes arguments {'a': {'type': 'integer'}, 'b': {'type': 'integer', 'default': 2}}.\n        (3) finish, whose description is <desc>Marks the task as complete. That is, signals that all information for producing the outputs, i.e. `answer`, are now available to be extracted.</desc>. It takes arguments {}.\n        When providing `next_tool_args`, the value inside the field must be in JSON format"
+          },
+          {
+            "role": "user",
+            "content": "[[ ## question ## ]]\nWhen did Apollo 11 land?\n\n[[ ## trajectory ## ]]\n\n\nRespond with the corresponding output fields, starting with the field `[[ ## next_thought ## ]]`, then `[[ ## next_tool_name ## ]]` (must be formatted as a valid Python Literal['search', 'add', 'finish']), then `[[ ## next_tool_args ## ]]` (must be formatted as a valid Python dict[str, Any]), and then ending with the marker for `[[ ## completed ## ]]`."
+          }
+        ],
+        "completion": "[[ ## next_thought ## ]]\nSearch first\n\n[[ ## next_tool_name ## ]]\nsearch\n\n[[ ## next_tool_args ## ]]\n{\"query\": \"moon landing\"}"
+      },
+      {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Your input fields are:\n1. `question` (str): \n2. `trajectory` (str):\nYour output fields are:\n1. `next_thought` (str): \n2. `next_tool_name` (Literal['search', 'add', 'finish']): \n3. `next_tool_args` (dict[str, Any]):\nAll interactions will be structured in the following way, with the appropriate values filled in.\n\n[[ ## question ## ]]\n{question}\n\n[[ ## trajectory ## ]]\n{trajectory}\n\n[[ ## next_thought ## ]]\n{next_thought}\n\n[[ ## next_tool_name ## ]]\n{next_tool_name}        # note: the value you produce must exactly match (no extra characters) one of: search; add; finish\n\n[[ ## next_tool_args ## ]]\n{next_tool_args}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"additionalProperties\": true}\n\n[[ ## completed ## ]]\nIn adhering to this structure, your objective is: \n        Given the fields `question`, produce the fields `answer`.\n        \n        You are an Agent. In each episode, you will be given the fields `question` as input. And you can see your past trajectory so far.\n        Your goal is to use one or more of the supplied tools to collect any necessary information for producing `answer`.\n        \n        To do this, you will interleave next_thought, next_tool_name, and next_tool_args in each turn, and also when finishing the task.\n        After each tool call, you receive a resulting observation, which gets appended to your trajectory.\n        \n        When writing next_thought, you may reason about the current situation and plan for future steps.\n        When selecting the next_tool_name and its next_tool_args, the tool must be one of:\n        \n        (1) search, whose description is <desc>Search the corpus.      Returns passages.</desc>. It takes arguments {'query': {'type': 'string'}}.\n        (2) add. It takes arguments {'a': {'type': 'integer'}, 'b': {'type': 'integer', 'default': 2}}.\n        (3) finish, whose description is <desc>Marks the task as complete. That is, signals that all information for producing the outputs, i.e. `answer`, are now available to be extracted.</desc>. It takes arguments {}.\n        When providing `next_tool_args`, the value inside the field must be in JSON format"
+          },
+          {
+            "role": "user",
+            "content": "[[ ## question ## ]]\nWhen did Apollo 11 land?\n\n[[ ## trajectory ## ]]\n[[ ## thought_0 ## ]]\nSearch first\n\n[[ ## tool_name_0 ## ]]\nsearch\n\n[[ ## tool_args_0 ## ]]\n{\"query\": \"moon landing\"}\n\n[[ ## observation_0 ## ]]\n[1] «Apollo 11 landed on the Moon in 1969.»\n[2] «««\n    multi\n    line «x»\n»»»\n\nRespond with the corresponding output fields, starting with the field `[[ ## next_thought ## ]]`, then `[[ ## next_tool_name ## ]]` (must be formatted as a valid Python Literal['search', 'add', 'finish']), then `[[ ## next_tool_args ## ]]` (must be formatted as a valid Python dict[str, Any]), and then ending with the marker for `[[ ## completed ## ]]`."
+          }
+        ],
+        "completion": "[[ ## next_thought ## ]]\nAdd one\n\n[[ ## next_tool_name ## ]]\nadd\n\n[[ ## next_tool_args ## ]]\n{\"a\": 1969, \"b\": 1}"
+      },
+      {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Your input fields are:\n1. `question` (str): \n2. `trajectory` (str):\nYour output fields are:\n1. `next_thought` (str): \n2. `next_tool_name` (Literal['search', 'add', 'finish']): \n3. `next_tool_args` (dict[str, Any]):\nAll interactions will be structured in the following way, with the appropriate values filled in.\n\n[[ ## question ## ]]\n{question}\n\n[[ ## trajectory ## ]]\n{trajectory}\n\n[[ ## next_thought ## ]]\n{next_thought}\n\n[[ ## next_tool_name ## ]]\n{next_tool_name}        # note: the value you produce must exactly match (no extra characters) one of: search; add; finish\n\n[[ ## next_tool_args ## ]]\n{next_tool_args}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"additionalProperties\": true}\n\n[[ ## completed ## ]]\nIn adhering to this structure, your objective is: \n        Given the fields `question`, produce the fields `answer`.\n        \n        You are an Agent. In each episode, you will be given the fields `question` as input. And you can see your past trajectory so far.\n        Your goal is to use one or more of the supplied tools to collect any necessary information for producing `answer`.\n        \n        To do this, you will interleave next_thought, next_tool_name, and next_tool_args in each turn, and also when finishing the task.\n        After each tool call, you receive a resulting observation, which gets appended to your trajectory.\n        \n        When writing next_thought, you may reason about the current situation and plan for future steps.\n        When selecting the next_tool_name and its next_tool_args, the tool must be one of:\n        \n        (1) search, whose description is <desc>Search the corpus.      Returns passages.</desc>. It takes arguments {'query': {'type': 'string'}}.\n        (2) add. It takes arguments {'a': {'type': 'integer'}, 'b': {'type': 'integer', 'default': 2}}.\n        (3) finish, whose description is <desc>Marks the task as complete. That is, signals that all information for producing the outputs, i.e. `answer`, are now available to be extracted.</desc>. It takes arguments {}.\n        When providing `next_tool_args`, the value inside the field must be in JSON format"
+          },
+          {
+            "role": "user",
+            "content": "[[ ## question ## ]]\nWhen did Apollo 11 land?\n\n[[ ## trajectory ## ]]\n[[ ## thought_0 ## ]]\nSearch first\n\n[[ ## tool_name_0 ## ]]\nsearch\n\n[[ ## tool_args_0 ## ]]\n{\"query\": \"moon landing\"}\n\n[[ ## observation_0 ## ]]\n[1] «Apollo 11 landed on the Moon in 1969.»\n[2] «««\n    multi\n    line «x»\n»»»\n\n[[ ## thought_1 ## ]]\nAdd one\n\n[[ ## tool_name_1 ## ]]\nadd\n\n[[ ## tool_args_1 ## ]]\n{\"a\": 1969, \"b\": 1}\n\n[[ ## observation_1 ## ]]\n1970\n\nRespond with the corresponding output fields, starting with the field `[[ ## next_thought ## ]]`, then `[[ ## next_tool_name ## ]]` (must be formatted as a valid Python Literal['search', 'add', 'finish']), then `[[ ## next_tool_args ## ]]` (must be formatted as a valid Python dict[str, Any]), and then ending with the marker for `[[ ## completed ## ]]`."
+          }
+        ],
+        "completion": "[[ ## next_thought ## ]]\nDone\n\n[[ ## next_tool_name ## ]]\nfinish\n\n[[ ## next_tool_args ## ]]\n{}"
+      },
+      {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Your input fields are:\n1. `question` (str): \n2. `trajectory` (str):\nYour output fields are:\n1. `reasoning` (str): \n2. `answer` (str):\nAll interactions will be structured in the following way, with the appropriate values filled in.\n\n[[ ## question ## ]]\n{question}\n\n[[ ## trajectory ## ]]\n{trajectory}\n\n[[ ## reasoning ## ]]\n{reasoning}\n\n[[ ## answer ## ]]\n{answer}\n\n[[ ## completed ## ]]\nIn adhering to this structure, your objective is: \n        Given the fields `question`, produce the fields `answer`."
+          },
+          {
+            "role": "user",
+            "content": "[[ ## question ## ]]\nWhen did Apollo 11 land?\n\n[[ ## trajectory ## ]]\n[[ ## thought_0 ## ]]\nSearch first\n\n[[ ## tool_name_0 ## ]]\nsearch\n\n[[ ## tool_args_0 ## ]]\n{\"query\": \"moon landing\"}\n\n[[ ## observation_0 ## ]]\n[1] «Apollo 11 landed on the Moon in 1969.»\n[2] «««\n    multi\n    line «x»\n»»»\n\n[[ ## thought_1 ## ]]\nAdd one\n\n[[ ## tool_name_1 ## ]]\nadd\n\n[[ ## tool_args_1 ## ]]\n{\"a\": 1969, \"b\": 1}\n\n[[ ## observation_1 ## ]]\n1970\n\n[[ ## thought_2 ## ]]\nDone\n\n[[ ## tool_name_2 ## ]]\nfinish\n\n[[ ## tool_args_2 ## ]]\n{}\n\n[[ ## observation_2 ## ]]\nCompleted.\n\nRespond with the corresponding output fields, starting with the field `[[ ## reasoning ## ]]`, then `[[ ## answer ## ]]`, and then ending with the marker for `[[ ## completed ## ]]`."
+          }
+        ],
+        "completion": "[[ ## reasoning ## ]]\nFound 1969\n\n[[ ## answer ## ]]\n1969"
+      }
+    ],
+    "trajectory": {
+      "thought_0": "Search first",
+      "tool_name_0": "search",
+      "tool_args_0": {
+        "query": "moon landing"
+      },
+      "observation_0": [
+        "Apollo 11 landed on the Moon in 1969.",
+        "multi\nline «x»"
+      ],
+      "thought_1": "Add one",
+      "tool_name_1": "add",
+      "tool_args_1": {
+        "a": 1969,
+        "b": 1
+      },
+      "observation_1": 1970,
+      "thought_2": "Done",
+      "tool_name_2": "finish",
+      "tool_args_2": {},
+      "observation_2": "Completed."
+    },
+    "outputs": {
+      "reasoning": "Found 1969",
+      "answer": "1969"
+    }
+  },
+  {
+    "name": "react_max_iters",
+    "max_iters": 1,
+    "calls": [
+      {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Your input fields are:\n1. `question` (str): \n2. `trajectory` (str):\nYour output fields are:\n1. `next_thought` (str): \n2. `next_tool_name` (Literal['search', 'finish']): \n3. `next_tool_args` (dict[str, Any]):\nAll interactions will be structured in the following way, with the appropriate values filled in.\n\n[[ ## question ## ]]\n{question}\n\n[[ ## trajectory ## ]]\n{trajectory}\n\n[[ ## next_thought ## ]]\n{next_thought}\n\n[[ ## next_tool_name ## ]]\n{next_tool_name}        # note: the value you produce must exactly match (no extra characters) one of: search; finish\n\n[[ ## next_tool_args ## ]]\n{next_tool_args}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"additionalProperties\": true}\n\n[[ ## completed ## ]]\nIn adhering to this structure, your objective is: \n        Given the fields `question`, produce the fields `answer`.\n        \n        You are an Agent. In each episode, you will be given the fields `question` as input. And you can see your past trajectory so far.\n        Your goal is to use one or more of the supplied tools to collect any necessary information for producing `answer`.\n        \n        To do this, you will interleave next_thought, next_tool_name, and next_tool_args in each turn, and also when finishing the task.\n        After each tool call, you receive a resulting observation, which gets appended to your trajectory.\n        \n        When writing next_thought, you may reason about the current situation and plan for future steps.\n        When selecting the next_tool_name and its next_tool_args, the tool must be one of:\n        \n        (1) search, whose description is <desc>Search the corpus.      Returns passages.</desc>. It takes arguments {'query': {'type': 'string'}}.\n        (2) finish, whose description is <desc>Marks the task as complete. That is, signals that all information for producing the outputs, i.e. `answer`, are now available to be extracted.</desc>. It takes arguments {}.\n        When providing `next_tool_args`, the value inside the field must be in JSON format"
+          },
+          {
+            "role": "user",
+            "content": "[[ ## question ## ]]\nWhen did Apollo 11 land?\n\n[[ ## trajectory ## ]]\n\n\nRespond with the corresponding output fields, starting with the field `[[ ## next_thought ## ]]`, then `[[ ## next_tool_name ## ]]` (must be formatted as a valid Python Literal['search', 'finish']), then `[[ ## next_tool_args ## ]]` (must be formatted as a valid Python dict[str, Any]), and then ending with the marker for `[[ ## completed ## ]]`."
+          }
+        ],
+        "completion": "[[ ## next_thought ## ]]\nSearch\n\n[[ ## next_tool_name ## ]]\nsearch\n\n[[ ## next_tool_args ## ]]\n{\"query\": \"moon\"}"
+      },
+      {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Your input fields are:\n1. `question` (str): \n2. `trajectory` (str):\nYour output fields are:\n1. `reasoning` (str): \n2. `answer` (str):\nAll interactions will be structured in the following way, with the appropriate values filled in.\n\n[[ ## question ## ]]\n{question}\n\n[[ ## trajectory ## ]]\n{trajectory}\n\n[[ ## reasoning ## ]]\n{reasoning}\n\n[[ ## answer ## ]]\n{answer}\n\n[[ ## completed ## ]]\nIn adhering to this structure, your objective is: \n        Given the fields `question`, produce the fields `answer`."
+          },
+          {
+            "role": "user",
+            "content": "[[ ## question ## ]]\nWhen did Apollo 11 land?\n\n[[ ## trajectory ## ]]\n[[ ## thought_0 ## ]]\nSearch\n\n[[ ## tool_name_0 ## ]]\nsearch\n\n[[ ## tool_args_0 ## ]]\n{\"query\": \"moon\"}\n\n[[ ## observation_0 ## ]]\n[1] «Apollo 11 landed on the Moon in 1969.»\n[2] «««\n    multi\n    line «x»\n»»»\n\nRespond with the corresponding output fields, starting with the field `[[ ## reasoning ## ]]`, then `[[ ## answer ## ]]`, and then ending with the marker for `[[ ## completed ## ]]`."
+          }
+        ],
+        "completion": "[[ ## reasoning ## ]]\nOut of steps\n\n[[ ## answer ## ]]\n1969"
+      }
+    ],
+    "trajectory": {
+      "thought_0": "Search",
+      "tool_name_0": "search",
+      "tool_args_0": {
+        "query": "moon"
+      },
+      "observation_0": [
+        "Apollo 11 landed on the Moon in 1969.",
+        "multi\nline «x»"
+      ]
+    },
+    "outputs": {
+      "reasoning": "Out of steps",
+      "answer": "1969"
+    }
+  }
+]

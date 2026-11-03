@@ -26,6 +26,11 @@ pub const mipro = @import("mipro.zig");
 pub const MIPROv2 = mipro.MIPROv2;
 pub const copro = @import("copro.zig");
 pub const COPRO = copro.COPRO;
+pub const react = @import("react.zig");
+pub const ReAct = react.ReAct;
+pub const Tool = react.Tool;
+pub const ensemble = @import("ensemble.zig");
+pub const Ensemble = ensemble.Ensemble;
 pub const state = @import("state.zig");
 
 test {

@@ -1,0 +1,94 @@
+{
+  "normalize": [
+    [
+      "The,  Eiffel  Tower!",
+      "eiffel tower"
+    ],
+    [
+      "an apple a day",
+      "apple day"
+    ],
+    [
+      "A",
+      ""
+    ],
+    [
+      "",
+      ""
+    ],
+    [
+      "!!!",
+      ""
+    ],
+    [
+      "Tab\tand\nnewline\u000bvt",
+      "tab and newline vt"
+    ],
+    [
+      "the_the the-the",
+      "thethe thethe"
+    ],
+    [
+      "x-ray's (an) anthem theater",
+      "xrays anthem theater"
+    ],
+    [
+      "  The  ",
+      ""
+    ],
+    [
+      "ANd THE An",
+      "and"
+    ]
+  ],
+  "majority": [
+    {
+      "values": [
+        "Paris",
+        "paris.",
+        "Berlin"
+      ],
+      "answer": "Paris"
+    },
+    {
+      "values": [
+        "a1",
+        "b1",
+        "B1!",
+        "A1."
+      ],
+      "answer": "a1"
+    },
+    {
+      "values": [
+        "",
+        "!!",
+        "x"
+      ],
+      "answer": "x"
+    },
+    {
+      "values": [
+        "",
+        "!!"
+      ],
+      "answer": ""
+    },
+    {
+      "values": [
+        "The cat",
+        "cat",
+        "a dog",
+        "dog",
+        "Dog!"
+      ],
+      "answer": "a dog"
+    },
+    {
+      "values": [
+        "only"
+      ],
+      "answer": "only"
+    }
+  ]
+}

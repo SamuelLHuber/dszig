@@ -153,6 +153,9 @@ fn translateFieldType(w: *Writer, f: Field, is_input: bool) Writer.Error!void {
         .str_list => try w.writeAll(
             \\must adhere to the JSON schema: {"type": "array", "items": {"type": "string"}}
         ),
+        .json_object => try w.writeAll(
+            \\must adhere to the JSON schema: {"type": "object", "additionalProperties": true}
+        ),
     }
 }
 
@@ -294,6 +297,12 @@ fn hasAny(fields: []const Field, demo: *const Record) bool {
 }
 
 /// `format_user_message_content` (shared by both adapters).
+/// `ChatAdapter.format_user_message_content(signature, inputs)` over input
+/// fields only (how `ReAct` renders its trajectory).
+pub fn formatInputs(arena: Allocator, fields: []const Field, inputs: *const Record) Error![]const u8 {
+    return userMessage(.chat, arena, .{ .instructions = "", .inputs = fields, .outputs = &.{} }, inputs, "", false);
+}
+
 fn userMessage(adapter: Adapter, arena: Allocator, view: View, inputs: *const Record, prefix: []const u8, main_request: bool) Error![]const u8 {
     var aw: Writer.Allocating = .init(arena);
     const w = &aw.writer;
