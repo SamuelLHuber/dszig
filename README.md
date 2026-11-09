@@ -63,6 +63,13 @@ and [`examples/bootstrap.zig`](examples/bootstrap.zig)
 | `LabeledFewShot`, `BootstrapFewShot` | Same semantics: `max_bootstrapped_demos`, `max_labeled_demos`, `max_rounds` (with `rollout_id`/`temperature=1.0` on later rounds), `metric_threshold`, the example excluded from its own teacher demos, and `compiled` freezing. Sampling and shuffling use `pyrandom`, a port of CPython's MT19937 `random.Random(0)`, so the chosen demos match DSPy's. |
 | `BootstrapFewShotWithRandomSearch` | `optimize.BootstrapFewShotWithRandomSearch`: seeds -3 (no demos), -2 (`LabeledFewShot`), -1 (`BootstrapFewShot`), then `random.Random(seed)`-shuffled trainsets with `randint(1, max_bootstrapped_demos)` demos; first best score wins, `stop_at_score`, ranked `candidate_programs`. |
 | `MIPROv2` | `dszig.MIPROv2`: `auto` light/medium/heavy or explicit `num_candidates`/`num_trials`, the 80/20 train/val split, `create_n_fewshot_demo_sets`, the grounded proposer (dataset summary, task demos, random tips, `rollout_id`s, `init_temperature`), and Optuna 4.5.0's multivariate TPE (`dszig.tpe`, checked trial by trial against Optuna) over instruction × demo-set indices, with minibatches and periodic full evaluations. One `random.Random(seed)` stream is shared in DSPy's order. |
+| MIPROv2 program-aware proposer | `MIPROv2.Options.program_code` (DSPy's `get_dspy_source_code(program)`): `DescribeProgram` and `DescribeModule` feed the instruction proposer, as in DSPy. |
+| `COPRO` | `dszig.COPRO`: `breadth`/`depth`/`init_temperature`, `n`-completion proposals (`LM.completeMany`), instruction and output-prefix candidates, de-duplicated and score-sorted `candidate_programs`. |
+| `ReAct`, `dspy.Tool` | `dszig.ReAct(Sig, tools)` with comptime `dszig.Tool`s: same instructions, `Literal` tool names, `dict[str, Any]` arguments, trajectory formatting, `finish` tool and `extract` ChainOfThought (`react`, `extract.predict`). |
+| `Ensemble`, `dspy.majority` | `dszig.Ensemble(P, n)` (optional `size` sampled with `random.sample`) and `ensemble.majority` with `normalize_text`. |
+| `SIMBA` | `dszig.SIMBA`: trajectory sampling per rollout, buckets, `append_a_demo` / `append_a_rule` (`OfferFeedback`), demo dropping with NumPy `default_rng` (`dszig.nprandom`), final validation and `candidate_programs`. |
+| `dspy.cache` | `dszig.CachedLM`: in-memory LRU response cache keyed by messages and options (incl. `rollout_id`), `dump`/`load` as JSON. |
+| Pydantic/typed fields | Structs (models), `list[T]`, `Optional[T]`, `dict[str, Any]`, `dict[str, str]`, with DSPy's JSON schemas, `Union[str, NoneType]`-style names and lax validation. |
 | `module.save(path)` / `load` (JSON) | `state.save` / `saveAlloc` / `load`, which read and write the same file format byte for byte (`json.dumps(indent=2)` style, Python float formatting). |
 
 ## Proof of compatibility
@@ -143,16 +150,29 @@ Replays need no key, so CI runs them. To re-record, run `dz-live` with
 `OPENAI_API_KEY` set. Real completions vary from run to run, so a
 re-recorded transcript differs, but the replay checks must still pass.
 
-## Not implemented (v0.1)
+## Not implemented
 
-- COPRO, GEPA, SIMBA, Ensemble
-- MIPROv2's program-aware proposer (DSPy describes the program from its
-  Python source; DSZig behaves as `program_aware_proposer=False`),
-  `teacher_settings`, `log_dir` and parallel evaluation threads
-- ReAct / tool calling, streaming, async/parallel execution, LM caching
-- Nested structs, Pydantic models, `dict`, `Optional`, images and other
-  custom types as fields
-- Saving LM state (`"lm": null` is written, and loading ignores it)
+- GEPA: DSPy delegates to the external `gepa` 0.1.4 engine (~24k lines of
+  Python: Pareto frontier, reflective mutation, merge); not ported.
+- MIPROv2 / SIMBA `teacher_settings`, `track_stats`, `log_dir`, parallel
+  threads (DSZig runs evaluations sequentially, like `num_threads=1`).
+- ReAct: trajectory truncation on context-window errors, async tools,
+  Pydantic-typed tool arguments; a failing tool's observation is
+  `Execution error in <tool>: <ErrorName>` (DSPy embeds a Python traceback).
+- `dict[str, T]` fields other than `dict[str, Any]` (`std.json.ObjectMap`)
+  and `dict[str, str]` (`signature.StrDict`); unions other than
+  `Optional[T]`; images and other custom DSPy types. DSPy repairs malformed
+  JSON answers with `json_repair`; DSZig parses strict JSON plus `None`,
+  `True` and `False`.
+- `normalize_text` (used by `dspy.majority`) is exact for ASCII only: no
+  Unicode NFD normalization or Unicode lowercasing.
+- `CachedLM` keeps DSPy's semantics (keys include `rollout_id`, failures
+  are not cached) but not its `diskcache` files or key hashing; persist with
+  `dump`/`load`.
+- SIMBA uses Zig's `@exp` for NumPy's `np.exp` in its softmax; a last-bit
+  difference could change a sampled program.
+- Streaming, async execution, saving LM state (`"lm": null` is written,
+  and loading ignores it).
 
 ## Known divergences from DSPy 3.4.1
 
