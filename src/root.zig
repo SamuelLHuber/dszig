@@ -34,6 +34,8 @@ pub const ensemble = @import("ensemble.zig");
 pub const Ensemble = ensemble.Ensemble;
 pub const simba = @import("simba.zig");
 pub const SIMBA = simba.SIMBA;
+pub const cache = @import("cache.zig");
+pub const CachedLM = cache.CachedLM;
 pub const state = @import("state.zig");
 
 test {
