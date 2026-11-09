@@ -22,6 +22,7 @@ uv run --locked gen_pickle.py "$tmp/fixtures" >/dev/null
 uv run --locked gen_react.py "$tmp/fixtures" 2>/dev/null
 uv run --locked gen_ensemble.py "$tmp/fixtures" 2>/dev/null
 uv run --locked gen_simba.py "$tmp/fixtures" 2>/dev/null
+uv run --locked gen_gepa.py "$tmp/fixtures" 2>/dev/null
 uv run --locked gen_nested.py "$tmp/fixtures" 2>/dev/null
 diff -r --exclude=live "$root/tests/fixtures" "$tmp/fixtures"
 echo "ok: DSPy 3.4.1 regenerates tests/fixtures unchanged"

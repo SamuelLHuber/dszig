@@ -68,6 +68,7 @@ and [`examples/bootstrap.zig`](examples/bootstrap.zig)
 | `ReAct`, `dspy.Tool` | `dszig.ReAct(Sig, tools)` with comptime `dszig.Tool`s: same instructions, `Literal` tool names, `dict[str, Any]` arguments, trajectory formatting, `finish` tool and `extract` ChainOfThought (`react`, `extract.predict`). |
 | `Ensemble`, `dspy.majority` | `dszig.Ensemble(P, n)` (optional `size` sampled with `random.sample`) and `ensemble.majority` with `normalize_text`. |
 | `SIMBA` | `dszig.SIMBA`: trajectory sampling per rollout, buckets, `append_a_demo` / `append_a_rule` (`OfferFeedback`), demo dropping with NumPy `default_rng` (`dszig.nprandom`), final validation and `candidate_programs`. |
+| `GEPA` | `dszig.GEPA` (gepa 0.1.4 paths DSPy uses): Pareto-front parent selection, epoch-shuffled minibatches, reflective mutation via `ProposeInstruction` (JSONAdapter) with metric feedback, strict-improvement acceptance, full valset evaluation, merge of Pareto programs with a common ancestor, `auto` / `max_full_evals` / `max_metric_calls` budgets, `track_stats` results. |
 | `dspy.cache` | `dszig.CachedLM`: in-memory LRU response cache keyed by messages and options (incl. `rollout_id`), `dump`/`load` as JSON. |
 | Pydantic/typed fields | Structs (models), `list[T]`, `Optional[T]`, `dict[str, Any]`, `dict[str, str]`, with DSPy's JSON schemas, `Union[str, NoneType]`-style names and lax validation. |
 | `module.save(path)` / `load` (JSON) | `state.save` / `saveAlloc` / `load`, which read and write the same file format byte for byte (`json.dumps(indent=2)` style, Python float formatting). |
@@ -152,8 +153,11 @@ re-recorded transcript differs, but the replay checks must still pass.
 
 ## Not implemented
 
-- GEPA: DSPy delegates to the external `gepa` 0.1.4 engine (~24k lines of
-  Python: Pareto frontier, reflective mutation, merge); not ported.
+- GEPA: custom instruction/code proposers, `dspy.Flex`, frontier types other
+  than `"instance"`, `"epsilon_greedy"` / `"top_k_pareto"` selection,
+  `add_format_failure_as_feedback`, `log_dir`, wandb/MLflow. Merge iterates
+  predictor names in program order where gepa uses a `set` (string-hash
+  order); they differ only when one merge breaks two or more score ties.
 - MIPROv2 / SIMBA `teacher_settings`, `track_stats`, `log_dir`, parallel
   threads (DSZig runs evaluations sequentially, like `num_threads=1`).
 - ReAct: trajectory truncation on context-window errors, async tools,

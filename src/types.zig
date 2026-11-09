@@ -39,6 +39,7 @@ pub fn pyName(comptime T: type) []const u8 {
     comptime {
         if (T == []const u8) return "str";
         if (T == bool) return "bool";
+        if (T == std.json.ObjectMap) return "dict[str, Any]";
         return switch (@typeInfo(T)) {
             .int => "int",
             .float => "float",
@@ -105,6 +106,7 @@ fn entriesOf(comptime T: type) []const Entry {
     comptime {
         if (T == []const u8) return &.{.{ .key = "type", .val = quote("string") }};
         if (T == bool) return &.{.{ .key = "type", .val = quote("boolean") }};
+        if (T == std.json.ObjectMap) return &.{ .{ .key = "type", .val = quote("object") }, .{ .key = "additionalProperties", .val = "true" } };
         return switch (@typeInfo(T)) {
             .int => &.{.{ .key = "type", .val = quote("integer") }},
             .float => &.{.{ .key = "type", .val = quote("number") }},
@@ -158,6 +160,7 @@ fn modelEntries(comptime S: type) []const Entry {
 fn collectDefs(comptime T: type, comptime seen: []const type) []const type {
     comptime {
         var out = seen;
+        if (T == std.json.ObjectMap) return out;
         switch (@typeInfo(T)) {
             .optional => |o| out = collectDefs(o.child, out),
             .pointer => |p| if (T != []const u8) {
@@ -198,6 +201,7 @@ pub fn schema(comptime T: type) []const u8 {
 /// Pydantic lax-mode `TypeAdapter(T).validate_python(v)`, as a JSON value.
 pub fn validate(comptime T: type, arena: Allocator, v: Value) Error!Value {
     if (T == []const u8) return if (v == .string) v else error.ParseValue;
+    if (T == std.json.ObjectMap) return if (v == .object) v else error.ParseValue;
     if (T == bool) return switch (v) {
         .bool => v,
         .integer => |i| if (i == 0 or i == 1) Value{ .bool = i == 1 } else error.ParseValue,

@@ -17,6 +17,8 @@ const bootstrap_multihop = @embedFile("fixtures/bootstrap_multihop.json");
 const react_cases = @embedFile("fixtures/react.json");
 const ensemble_cases = @embedFile("fixtures/ensemble.json");
 const simba_case = @embedFile("fixtures/simba.json");
+const gepa_case = @embedFile("fixtures/gepa.json");
+const gepa_merge_case = @embedFile("fixtures/gepa_merge.json");
 const nested_case = @embedFile("fixtures/nested.json");
 const live_suite = @import("live_suite");
 const QA = rag.QA;
@@ -442,4 +444,156 @@ test "nested Pydantic-style fields format, parse and validate like DSPy" {
     try testing.expect(typed.person.nickname == null and typed.age == null);
     try testing.expectEqualStrings("None", typed.maybe.?);
     try testing.expectEqual(@as(usize, 0), typed.pairs[1].len);
+}
+
+/// tools/dspy_reference/gen_gepa.py's MockLM: task answers are right when the
+/// instruction carries the advice; reflection proposes a fixed sequence.
+const GepaMock = struct {
+    arena: Allocator,
+    golds: std.StringHashMapUnmanaged([]const u8) = .empty,
+    calls: std.ArrayList(SimbaMock.Call) = .empty,
+    reflections: usize = 0,
+
+    const advice = "Answer with an ISO date.";
+    const keep_advice = "Keep the question.";
+    const proposals = [_][]const u8{ "Be brief.", "Think about the calendar. " ++ advice, "Answer politely.", advice ++ " Never guess." };
+
+    fn lm(self: *GepaMock) dszig.LM {
+        return .{ .ptr = self, .vtable = &.{ .complete = complete } };
+    }
+
+    fn complete(ptr: *anyopaque, arena: Allocator, request: dszig.lm.Request) dszig.lm.Error![]const []const u8 {
+        const self: *GepaMock = @ptrCast(@alignCast(ptr));
+        var list: std.json.Array = .init(arena);
+        for (request.messages) |m| {
+            var o: Record = .empty;
+            try o.put(arena, "role", .{ .string = m.role.name() });
+            try o.put(arena, "content", .{ .string = m.content });
+            try list.append(.{ .object = o });
+        }
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        dszig.pyjson.writeJson(&aw.writer, .{ .array = list }, .compact) catch return error.OutOfMemory;
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(aw.written(), &hash, .{});
+        try self.calls.append(self.arena, .{
+            .rollout = request.options.rollout_id,
+            .temperature = request.options.temperature,
+            .digest = std.fmt.bytesToHex(hash, .lower),
+        });
+        const system = request.messages[0].content;
+        const user = request.messages[request.messages.len - 1].content;
+        const out = try arena.alloc([]const u8, 1);
+        const reflection = std.mem.indexOf(u8, system, "examples_with_feedback") != null;
+        if (reflection and std.mem.indexOf(u8, user, "Restate the question.") != null) {
+            out[0] = "{\"new_instruction\": \"Restate the question. " ++ keep_advice ++ "\"}";
+            return out;
+        }
+        if (reflection) {
+            out[0] = try std.fmt.allocPrint(arena, "{{\"new_instruction\": \"  {s}\\n\"}}", .{proposals[self.reflections % proposals.len]});
+            self.reflections += 1;
+            return out;
+        }
+        const marker = "[[ ## question ## ]]\n";
+        const start = (std.mem.indexOf(u8, user, marker) orelse return error.LMFailure) + marker.len;
+        const end = std.mem.indexOfPos(u8, user, start, "\n\n") orelse user.len;
+        const q = user[start..end];
+        if (std.mem.indexOf(u8, system, "`restated`") != null) {
+            const keep = if (std.mem.indexOf(u8, system, keep_advice) != null) q.len % 5 != 0 else q.len % 2 == 1;
+            out[0] = try std.fmt.allocPrint(arena, "[[ ## restated ## ]]\n{s}{s}\n\n[[ ## completed ## ]]", .{ q, if (keep) "" else " Please." });
+            return out;
+        }
+        const gold = self.golds.get(q);
+        const good = (std.mem.indexOf(u8, system, advice) != null or q.len % 3 == 0) and gold != null;
+        const answer = if (good) gold.? else "unknown";
+        out[0] = try std.fmt.allocPrint(arena, "[[ ## reasoning ## ]]\nr\n\n[[ ## answer ## ]]\n{s}\n\n[[ ## completed ## ]]", .{answer});
+        return out;
+    }
+};
+
+fn gepaMetric(
+    arena: Allocator,
+    example: *const dszig.Example,
+    prediction: *const Record,
+    trace: ?*const dszig.Trace,
+    pred_name: ?[]const u8,
+    _: ?*const dszig.Trace.Step,
+) dszig.gepa.Feedback {
+    const score = live_suite.exactMetric(arena, example, prediction, trace);
+    if (pred_name == null or score != 0) return .{ .score = score };
+    const gold = example.record.get("answer").?.string;
+    return .{ .score = score, .feedback = std.fmt.allocPrint(arena, "Expected {s}.", .{gold}) catch "" };
+}
+
+const Restate = dszig.Signature(struct {
+    pub const instructions = "Restate the question.";
+    pub const Input = struct { question: []const u8 };
+    pub const Output = struct { restated: []const u8 };
+});
+
+/// gen_gepa.py's `TwoStep`: two predictors, so GEPA's merge runs.
+const TwoStep = struct {
+    restate: dszig.Predict(Restate) = .{},
+    generate: dszig.ChainOfThought(live_suite.Dates) = .{},
+    compiled: bool = false,
+
+    pub const Input = struct { question: []const u8 };
+    pub const Output = dszig.ChainOfThought(live_suite.Dates).Output;
+
+    pub fn forward(self: *const TwoStep, ctx: dszig.Context, input: Input) dszig.predict.Error!Output {
+        const r = try self.restate.forward(ctx, .{ .question = input.question });
+        return self.generate.forward(ctx, .{ .question = r.restated });
+    }
+};
+
+test "GEPA candidates, scores and every request match DSPy" {
+    try checkGepa(live_suite.DateQA, gepa_case, 150);
+}
+
+test "GEPA merge on a two-predictor program matches DSPy" {
+    try checkGepa(TwoStep, gepa_merge_case, 400);
+}
+
+fn checkGepa(comptime P: type, case: []const u8, budget: usize) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var mock: GepaMock = .{ .arena = arena };
+    const train = try live_suite.dateExamples(arena, .train);
+    const dev = try live_suite.dateExamples(arena, .dev);
+    for ([_][]const dszig.Example{ train, dev }) |set| {
+        for (set) |ex| try mock.golds.put(arena, ex.record.get("question").?.string, ex.record.get("answer").?.string);
+    }
+    const ctx: dszig.Context = .{ .arena = arena, .lm = mock.lm(), .lm_options = .{ .temperature = 0.0 } };
+    const gepa: dszig.GEPA = .{ .metric = gepaMetric, .max_metric_calls = budget };
+    const result = try gepa.compile(P, arena, ctx, .{}, train, .{ .valset = dev });
+
+    const want = try std.json.parseFromSliceLeaky(Value, arena, case, .{});
+    const calls = want.object.get("calls").?.array.items;
+    try testing.expectEqual(calls.len, mock.calls.items.len);
+    for (calls, mock.calls.items) |w, got| {
+        const items = w.array.items;
+        try testing.expect(items[0] == .null and got.rollout == null);
+        try testing.expectEqual(items[1].float, got.temperature.?);
+        try testing.expectEqualStrings(items[2].string, &got.digest);
+    }
+    const candidates = want.object.get("candidates").?.array.items;
+    try testing.expectEqual(candidates.len, result.candidates.len);
+    for (candidates, result.candidates) |w, got| {
+        for (w.array.items, got) |a, b| try testing.expectEqualStrings(a.string, b);
+    }
+    for (want.object.get("parents").?.array.items, result.parents) |w, got| {
+        for (w.array.items, got) |a, b| {
+            if (a == .null) try testing.expect(b == null) else try testing.expectEqual(@as(usize, @intCast(a.integer)), b.?);
+        }
+    }
+    for (want.object.get("val_aggregate_scores").?.array.items, result.val_aggregate_scores) |w, got| {
+        try testing.expectEqual(w.float, got);
+    }
+    for (want.object.get("discovery_eval_counts").?.array.items, result.discovery_eval_counts) |w, got| {
+        try testing.expectEqual(@as(usize, @intCast(w.integer)), got);
+    }
+    try testing.expectEqual(@as(usize, @intCast(want.object.get("best_idx").?.integer)), result.best_idx);
+    try testing.expectEqual(@as(usize, @intCast(want.object.get("total_metric_calls").?.integer)), result.total_metric_calls);
+    try testing.expectEqual(@as(usize, @intCast(want.object.get("num_full_val_evals").?.integer)), result.num_full_val_evals);
+    try testing.expectEqualStrings(want.object.get("artifact").?.string, try dszig.state.saveAlloc(arena, &result.program));
 }
