@@ -16,6 +16,7 @@
 //! first LM call is a `@compileError` here.
 
 const std = @import("std");
+const nested = @import("types.zig");
 const assert = std.debug.assert;
 
 /// Field value kinds supported in v0.1, with their DSPy annotation.
@@ -36,6 +37,9 @@ pub const Kind = enum {
     json_object,
     /// `StrDict` <-> `dict[str, str]`
     str_dict,
+    /// Structs (Pydantic models), other slices (`list[T]`) and optionals,
+    /// typed by a Pydantic JSON schema (see types.zig).
+    json,
 };
 
 /// A `dict[str, str]` field value: every value is a `.string`.
@@ -52,6 +56,11 @@ pub const Field = struct {
     prefix: []const u8,
     /// Allowed values for `.literal`, in declaration order.
     literals: []const []const u8 = &.{},
+    /// `.json`: the Pydantic JSON schema, its validator, and whether the
+    /// type is `Optional[str]` (whose text DSPy keeps unparsed).
+    schema: []const u8 = "",
+    validate: ?*const fn (std.mem.Allocator, std.json.Value) nested.Error!std.json.Value = null,
+    optional_str: bool = false,
 };
 
 pub const Description = struct { name: []const u8, text: []const u8 };
@@ -145,6 +154,9 @@ fn fieldsOf(comptime T: type, comptime role: []const u8, comptime descriptions: 
                 .desc = descriptionFor(name, descriptions) orelse "${" ++ name ++ "}",
                 .prefix = inferPrefix(name) ++ ":",
                 .literals = if (kind == .literal) std.meta.fieldNames(FT) else &.{},
+                .schema = if (kind == .json) nested.schema(FT) else "",
+                .validate = if (kind == .json) nested.Validator(FT) else null,
+                .optional_str = nested.isOptionalStr(FT),
             };
         }
         return out;
@@ -174,6 +186,7 @@ pub fn kindOf(comptime T: type, comptime name: []const u8) Kind {
     if (T == bool) return .boolean;
     if (T == std.json.ObjectMap) return .json_object;
     if (T == StrDict) return .str_dict;
+    if (nested.isNested(T)) return .json;
     switch (@typeInfo(T)) {
         .int => return .int,
         .float => |f| {
@@ -203,6 +216,7 @@ fn typeName(comptime T: type, comptime kind: Kind) []const u8 {
         .float => "float",
         .json_object => "dict[str, Any]",
         .str_dict => "dict[str, str]",
+        .json => nested.pyName(T),
         .literal => blk: {
             var s: []const u8 = "Literal[";
             for (std.meta.fieldNames(T), 0..) |tag, i| {

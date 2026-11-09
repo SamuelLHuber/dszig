@@ -17,6 +17,7 @@ const bootstrap_multihop = @embedFile("fixtures/bootstrap_multihop.json");
 const react_cases = @embedFile("fixtures/react.json");
 const ensemble_cases = @embedFile("fixtures/ensemble.json");
 const simba_case = @embedFile("fixtures/simba.json");
+const nested_case = @embedFile("fixtures/nested.json");
 const live_suite = @import("live_suite");
 const QA = rag.QA;
 
@@ -388,4 +389,57 @@ test "SIMBA program, scores and every request match DSPy" {
         if (w == .null) try testing.expect(got == null) else try testing.expectEqual(w.float, got.?);
     }
     try testing.expectEqualStrings(want.object.get("artifact").?.string, try dszig.state.saveAlloc(arena, &result.program));
+}
+
+const Address = struct { city: []const u8, zip_code: i64 };
+
+const Person = struct {
+    name: []const u8,
+    age: i64,
+    tags: []const []const u8,
+    address: Address,
+    role: enum { admin, user },
+    score: f64,
+    nickname: ?[]const u8 = null,
+};
+
+const Extract = dszig.Signature(struct {
+    pub const instructions = "Extract people.";
+    pub const Input = struct { people: []const Person, note: ?[]const u8 };
+    pub const Output = struct {
+        person: Person,
+        ids: []const i64,
+        pairs: []const []const i64,
+        maybe: ?[]const u8,
+        age: ?i64,
+    };
+});
+
+test "nested Pydantic-style fields format, parse and validate like DSPy" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const want = try std.json.parseFromSliceLeaky(Value, arena, nested_case, .{});
+    const predictor: dszig.Predict(Extract) = .{};
+    const view = try predictor.state.view(arena);
+    const ada: Person = .{ .name = "Ada", .age = 36, .tags = &.{"math"}, .address = .{ .city = "London", .zip_code = 1 }, .role = .admin, .score = 0.5 };
+    const inputs = try dszig.value.toRecord(arena, Extract.Input, .{ .people = &.{ada}, .note = null });
+    for (want.object.get("cases").?.array.items) |case| {
+        const adapter: dszig.Adapter = if (std.mem.eql(u8, case.object.get("adapter").?.string, "chat")) .chat else .json;
+        const messages = try adapter.format(arena, view, &.{}, &inputs);
+        const want_messages = case.object.get("messages").?.array.items;
+        try testing.expectEqual(want_messages.len, messages.len);
+        for (want_messages, messages) |w, got| {
+            try testing.expectEqualStrings(w.object.get("role").?.string, got.role.name());
+            try testing.expectEqualStrings(w.object.get("content").?.string, got.content);
+        }
+    }
+    const parsed = try dszig.Adapter.chat.parse(arena, view, want.object.get("completion").?.string);
+    try testing.expectEqualStrings(try compact(arena, want.object.get("outputs").?), try compact(arena, .{ .object = parsed }));
+    const typed = try dszig.value.fromRecord(arena, Extract.Output, &parsed);
+    try testing.expectEqualStrings("Bo", typed.person.name);
+    try testing.expectEqual(@as(i64, 9), typed.person.address.zip_code);
+    try testing.expect(typed.person.nickname == null and typed.age == null);
+    try testing.expectEqualStrings("None", typed.maybe.?);
+    try testing.expectEqual(@as(usize, 0), typed.pairs[1].len);
 }

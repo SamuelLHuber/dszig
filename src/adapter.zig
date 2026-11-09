@@ -166,6 +166,7 @@ fn translateFieldType(w: *Writer, f: Field, is_input: bool) Writer.Error!void {
         .str_dict => try w.writeAll(
             \\must adhere to the JSON schema: {"type": "object", "additionalProperties": {"type": "string"}}
         ),
+        .json => try w.print("must adhere to the JSON schema: {s}", .{f.schema}),
     }
 }
 

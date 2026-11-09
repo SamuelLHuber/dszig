@@ -84,6 +84,7 @@ pub fn parseText(arena: Allocator, field: Field, text: []const u8) ParseError!Va
         .str_list => parseStrListText(arena, text),
         .json_object => parseObjectText(arena, text),
         .str_dict => strDict(try parseObjectText(arena, text)),
+        .json => parseNestedText(arena, field, text),
     };
 }
 
@@ -126,11 +127,32 @@ pub fn parseJsonValue(arena: Allocator, field: Field, v: Value) ParseError!Value
         },
         .json_object => if (v == .object) v else error.ParseValue,
         .str_dict => strDict(v),
+        .json => field.validate.?(arena, v),
     };
 }
 
 /// `dict[str, Any]` from text: a JSON object (DSPy also repairs malformed
 /// JSON with `json_repair`, which DSZig does not).
+/// `parse_value(text, annotation)` for a nested type: `Optional[str]` keeps
+/// the text; otherwise JSON (DSPy also repairs malformed JSON), then a Python
+/// literal, then the text itself, validated against the type.
+fn parseNestedText(arena: Allocator, field: Field, text: []const u8) ParseError!Value {
+    if (field.optional_str) return .{ .string = text };
+    const t = pyStrip(text);
+    const candidate: Value = std.json.parseFromSliceLeaky(Value, arena, t, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => if (std.mem.eql(u8, t, "None"))
+            Value.null
+        else if (std.mem.eql(u8, t, "True"))
+            Value{ .bool = true }
+        else if (std.mem.eql(u8, t, "False"))
+            Value{ .bool = false }
+        else
+            Value{ .string = text },
+    };
+    return field.validate.?(arena, candidate);
+}
+
 fn strDict(v: Value) ParseError!Value {
     if (v != .object) return error.ParseValue;
     for (v.object.values()) |item| if (item != .string) return error.ParseValue;
@@ -334,6 +356,14 @@ pub fn toValue(arena: Allocator, comptime T: type, v: T) Allocator.Error!Value {
         .int => .{ .integer = @intCast(v) },
         .float => .{ .float = @floatCast(v) },
         .@"enum" => .{ .string = @tagName(v) },
+        .optional => |o| if (v) |x| try toValue(arena, o.child, x) else .null,
+        .pointer => |p| blk: {
+            var array: std.json.Array = .init(arena);
+            try array.ensureTotalCapacity(v.len);
+            for (v) |item| array.appendAssumeCapacity(try toValue(arena, p.child, item));
+            break :blk .{ .array = array };
+        },
+        .@"struct" => .{ .object = try toRecord(arena, T, v) },
         else => @compileError("dszig: unsupported field type " ++ @typeName(T)),
     };
 }
@@ -379,6 +409,25 @@ pub fn fromValue(arena: Allocator, comptime T: type, v: Value) ConvertError!T {
         .@"enum" => {
             if (v != .string) return error.TypeMismatch;
             return std.meta.stringToEnum(T, v.string) orelse error.TypeMismatch;
+        },
+        .optional => |o| return if (v == .null) null else try fromValue(arena, o.child, v),
+        .pointer => |p| {
+            if (v != .array) return error.TypeMismatch;
+            const out = try arena.alloc(p.child, v.array.items.len);
+            for (v.array.items, out) |item, *o| o.* = try fromValue(arena, p.child, item);
+            return out;
+        },
+        .@"struct" => |s| {
+            if (v != .object) return error.TypeMismatch;
+            var out: T = undefined;
+            inline for (s.field_names, s.field_types, 0..) |name, FT, i| {
+                if (v.object.get(name)) |fv| {
+                    @field(out, name) = try fromValue(arena, FT, fv);
+                } else if (comptime s.field_attrs[i].default_value_ptr != null) {
+                    @field(out, name) = @as(*const FT, @ptrCast(@alignCast(s.field_attrs[i].default_value_ptr.?))).*;
+                } else return error.MissingField;
+            }
+            return out;
         },
         else => @compileError("dszig: unsupported field type " ++ @typeName(T)),
     }
