@@ -2,6 +2,7 @@
 
 pub const pyjson = @import("pyjson.zig");
 pub const pyrandom = @import("pyrandom.zig");
+pub const nprandom = @import("nprandom.zig");
 pub const tpe = @import("tpe.zig");
 pub const pickle = @import("pickle.zig");
 pub const signature = @import("signature.zig");
@@ -31,6 +32,8 @@ pub const ReAct = react.ReAct;
 pub const Tool = react.Tool;
 pub const ensemble = @import("ensemble.zig");
 pub const Ensemble = ensemble.Ensemble;
+pub const simba = @import("simba.zig");
+pub const SIMBA = simba.SIMBA;
 pub const state = @import("state.zig");
 
 test {

@@ -119,6 +119,13 @@ fn mapWriteError(err: pyjson.Error) Error {
     };
 }
 
+/// `get_field_description_string(fields)`.
+pub fn fieldDescriptionString(arena: Allocator, fields: []const Field) Error![]const u8 {
+    var aw: Writer.Allocating = .init(arena);
+    try writeStripped(arena, &aw.writer, fieldDescriptions, fields);
+    return aw.written();
+}
+
 /// `get_field_description_string`.
 fn fieldDescriptions(w: *Writer, fields: []const Field) pyjson.Error!void {
     for (fields, 0..) |f, i| {
@@ -155,6 +162,9 @@ fn translateFieldType(w: *Writer, f: Field, is_input: bool) Writer.Error!void {
         ),
         .json_object => try w.writeAll(
             \\must adhere to the JSON schema: {"type": "object", "additionalProperties": true}
+        ),
+        .str_dict => try w.writeAll(
+            \\must adhere to the JSON schema: {"type": "object", "additionalProperties": {"type": "string"}}
         ),
     }
 }

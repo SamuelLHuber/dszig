@@ -96,18 +96,46 @@ def run_suite(lm):
         DateQA, aware, date_examples("train"), date_examples("dev"), exact_metric,
         valset=date_examples("dev"), num_trials=MIPRO_AWARE_TRIALS, minibatch_size=MIPRO_MINIBATCH,
     )
+    out["rag_react"] = pipeline(
+        rag_agent, dspy.BootstrapFewShot(metric=ref.keyword_metric, max_bootstrapped_demos=2, max_labeled_demos=0),
+        ref.trainset(), ref.trainset(), ref.keyword_metric,
+    )
     copro = dspy.COPRO(metric=exact_metric, breadth=COPRO_BREADTH, depth=COPRO_DEPTH)
     out["dates_copro"] = pipeline(
         DateQA, copro, date_examples("train"), date_examples("dev"), exact_metric,
         eval_kwargs={"num_threads": 1, "display_progress": False},
     )
+    simba = dspy.SIMBA(
+        metric=float_metric, bsize=SIMBA_BSIZE, num_candidates=SIMBA_CANDIDATES, max_steps=SIMBA_STEPS,
+        max_demos=SIMBA_DEMOS, num_threads=1,
+    )
+    out["dates_simba"] = pipeline(DateQA, simba, date_examples("train"), date_examples("dev"), float_metric)
     return out
-
 MIPRO_TRIALS = 12
 MIPRO_MINIBATCH = 4
 MIPRO_AWARE_TRIALS = 4
 COPRO_BREADTH = 3
 COPRO_DEPTH = 2
+SIMBA_BSIZE = 4
+SIMBA_CANDIDATES = 2
+SIMBA_STEPS = 2
+SIMBA_DEMOS = 2
+
+
+def float_metric(example, pred, trace=None):
+    return float(exact_metric(example, pred))
+
+
+def corpus_search(query: str) -> list[str]:
+    """Search the corpus for passages relevant to the query."""
+    return [p.long_text for p in ref.in_memory_rm(ref.CORPUS)(query, k=2)]
+
+
+def rag_agent():
+    return dspy.ReAct("question -> answer", tools=[corpus_search], max_iters=REACT_MAX_ITERS)
+
+
+REACT_MAX_ITERS = 4
 class RecordedMIPROv2(dspy.MIPROv2):
     """Keeps the proposed instruction candidates for comparison."""
 
@@ -140,7 +168,9 @@ def pipeline(make, optimizer, trainset, devset, metric, **compile_kwargs):
     proposed = getattr(optimizer, "instruction_candidates", {})
     result["instructions"] = [list(proposed[i]) for i in sorted(proposed)]
     n_predictors = len(compiled.predictors())
-    result["trials"] = trial_rows(compiled.trial_logs, n_predictors) if hasattr(compiled, "trial_logs") else []
+    result["trials"] = trial_rows(compiled.trial_logs, n_predictors) if isinstance(optimizer, dspy.MIPROv2) else []
+    logs = compiled.trial_logs if isinstance(optimizer, dspy.SIMBA) else {}
+    result["train_scores"] = [logs[k].get("train_score") for k in sorted(logs)]
     with tempfile.TemporaryDirectory() as tmp:
         path = pathlib.Path(tmp) / "program.json"
         compiled.save(str(path))

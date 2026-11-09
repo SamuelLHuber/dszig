@@ -1,0 +1,7 @@
+class DateQA(dspy.Module):
+    def __init__(self):
+        super().__init__()
+        self.generate = dspy.ChainOfThought(Dates)
+
+    def forward(self, question):
+        return self.generate(question=question)

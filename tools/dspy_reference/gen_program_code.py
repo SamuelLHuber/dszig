@@ -1,9 +1,11 @@
 """Write DSPy 3.4.1's `get_dspy_source_code(DateQA())`, the program code the
-MIPROv2 program-aware proposer sends; DSZig embeds it in examples/live_suite.zig.
+MIPROv2 program-aware proposer sends, and `inspect.getsource(DateQA)`, which
+SIMBA's rule writer sends; DSZig embeds both in examples/live_suite.zig.
 
     uv run --locked gen_program_code.py [out_dir]"""
 
 import contextlib
+import inspect
 import io
 import pathlib
 import sys
@@ -21,7 +23,6 @@ def main():
     with contextlib.redirect_stdout(io.StringIO()):
         code = get_dspy_source_code(live_suite.DateQA())
     (out / "dates_program_code.txt").write_text(code, encoding="utf-8")
-
-
+    (out / "dates_class_source.txt").write_text(inspect.getsource(live_suite.DateQA), encoding="utf-8")
 if __name__ == "__main__":
     main()

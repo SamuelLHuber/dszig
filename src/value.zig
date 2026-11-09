@@ -83,6 +83,7 @@ pub fn parseText(arena: Allocator, field: Field, text: []const u8) ParseError!Va
         .float => parseFloatText(text),
         .str_list => parseStrListText(arena, text),
         .json_object => parseObjectText(arena, text),
+        .str_dict => strDict(try parseObjectText(arena, text)),
     };
 }
 
@@ -124,11 +125,18 @@ pub fn parseJsonValue(arena: Allocator, field: Field, v: Value) ParseError!Value
             else => error.ParseValue,
         },
         .json_object => if (v == .object) v else error.ParseValue,
+        .str_dict => strDict(v),
     };
 }
 
 /// `dict[str, Any]` from text: a JSON object (DSPy also repairs malformed
 /// JSON with `json_repair`, which DSZig does not).
+fn strDict(v: Value) ParseError!Value {
+    if (v != .object) return error.ParseValue;
+    for (v.object.values()) |item| if (item != .string) return error.ParseValue;
+    return v;
+}
+
 fn parseObjectText(arena: Allocator, text: []const u8) ParseError!Value {
     const v = std.json.parseFromSliceLeaky(Value, arena, pyStrip(text), .{}) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
@@ -321,6 +329,7 @@ pub fn toValue(arena: Allocator, comptime T: type, v: T) Allocator.Error!Value {
     }
     if (T == bool) return .{ .bool = v };
     if (T == std.json.ObjectMap) return .{ .object = v };
+    if (T == signature.StrDict) return .{ .object = v.map };
     return switch (@typeInfo(T)) {
         .int => .{ .integer = @intCast(v) },
         .float => .{ .float = @floatCast(v) },
@@ -353,6 +362,10 @@ pub fn fromValue(arena: Allocator, comptime T: type, v: Value) ConvertError!T {
     }
     if (T == bool) return if (v == .bool) v.bool else error.TypeMismatch;
     if (T == std.json.ObjectMap) return if (v == .object) v.object else error.TypeMismatch;
+    if (T == signature.StrDict) {
+        _ = strDict(v) catch return error.TypeMismatch;
+        return .{ .map = v.object };
+    }
     switch (@typeInfo(T)) {
         .int => {
             if (v != .integer) return error.TypeMismatch;

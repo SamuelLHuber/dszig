@@ -55,7 +55,7 @@ test "DSZig reproduces DSPy's real gpt-4o-mini run from its transcript" {
             try testing.expectEqual(pair.array.items[0].integer, c.seed);
             try testing.expectEqual(pair.array.items[1].float, c.score);
         }
-        inline for (.{ "instructions", "trials", "scores" }) |key| {
+        inline for (.{ "instructions", "trials", "scores", "train_scores" }) |key| {
             try testing.expectEqualStrings(try compact(arena, want.get(key).?), try compact(arena, mine.get(key).?));
         }
     }

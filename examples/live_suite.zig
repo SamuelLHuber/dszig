@@ -110,9 +110,11 @@ pub const Pipeline = struct {
     instructions: []const []const []const u8 = &.{},
     trials: []const dszig.MIPROv2.TrialLog = &.{},
     scores: []const f64 = &.{},
+    /// SIMBA only: `trial_logs[i].get("train_score")`.
+    train_scores: []const ?f64 = &.{},
 };
 
-pub const pipeline_names = .{ "rag", "dates", "dates_search", "dates_mipro", "dates_mipro_aware", "dates_copro" };
+pub const pipeline_names = .{ "rag", "dates", "dates_search", "dates_mipro", "dates_mipro_aware", "rag_react", "dates_copro", "dates_simba" };
 
 pub const Result = struct {
     cases: [case_count]Case,
@@ -121,7 +123,9 @@ pub const Result = struct {
     dates_search: Pipeline,
     dates_mipro: Pipeline,
     dates_mipro_aware: Pipeline,
+    rag_react: Pipeline,
     dates_copro: Pipeline,
+    dates_simba: Pipeline,
 };
 
 pub fn run(arena: Allocator, gpa: Allocator, lm: dszig.LM) !Result {
@@ -162,8 +166,18 @@ pub fn run(arena: Allocator, gpa: Allocator, lm: dszig.LM) !Result {
     var aware = mipro;
     aware.num_candidates = 2;
     result.dates_mipro_aware = try pipeline(DateQA, arena, gpa, ctx, aware, dates_train, dates_dev, exactMetric);
+    const react_optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 2, .max_labeled_demos = 0 };
+    result.rag_react = try pipeline(RagAgent, arena, gpa, ctx, react_optimizer, rag_set, rag_set, rag.keywordMetric);
     const copro: dszig.COPRO = .{ .metric = exactMetric, .breadth = copro_breadth, .depth = copro_depth };
     result.dates_copro = try pipeline(DateQA, arena, gpa, ctx, copro, dates_train, dates_dev, exactMetric);
+    const simba: dszig.SIMBA = .{
+        .metric = exactMetric,
+        .bsize = simba_bsize,
+        .num_candidates = simba_candidates,
+        .max_steps = simba_steps,
+        .max_demos = simba_demos,
+    };
+    result.dates_simba = try pipeline(DateQA, arena, gpa, ctx, simba, dates_train, dates_dev, exactMetric);
     return result;
 }
 
@@ -175,7 +189,35 @@ pub const copro_depth = 2;
 /// DSPy's `get_dspy_source_code(DateQA())`, which the program-aware proposer
 /// reads; tools/dspy_reference/gen_program_code.py regenerates it.
 pub const dates_program_code = @embedFile("dates_program_code.txt");
+/// `inspect.getsource(DateQA)`, which SIMBA's rule writer reads.
+pub const dates_class_source = @embedFile("dates_class_source.txt");
+pub const simba_bsize = 4;
+pub const simba_candidates = 2;
+pub const simba_steps = 2;
+pub const simba_demos = 2;
+pub const react_max_iters = 4;
 
+pub const AgentQA = dszig.Signature(struct {
+    pub const Input = struct { question: []const u8 };
+    pub const Output = struct { answer: []const u8 };
+});
+
+fn corpusSearch(ctx: dszig.Context, args: *const Record) dszig.react.ToolError!Value {
+    const query = args.get("query") orelse return error.InvalidArguments;
+    const retriever = ctx.retriever orelse return error.ToolFailed;
+    const passages = try retriever.search(ctx.arena, query.string, 2);
+    var list: std.json.Array = .init(ctx.arena);
+    for (passages) |p| try list.append(.{ .string = p });
+    return .{ .array = list };
+}
+
+/// `dspy.ReAct("question -> answer", tools=[corpus_search], max_iters=4)`.
+pub const RagAgent = dszig.react.ReActIters(AgentQA, &.{.{
+    .name = "corpus_search",
+    .desc = "Search the corpus for passages relevant to the query.",
+    .args = &.{.{ .name = "query", .schema_type = "string" }},
+    .func = corpusSearch,
+}}, react_max_iters);
 fn pipeline(
     comptime P: type,
     arena: Allocator,
@@ -205,6 +247,17 @@ fn pipeline(
             .instructions = compiled.instruction_candidates,
             .trials = compiled.trials,
             .scores = compiled.candidates,
+        };
+    }
+    if (@TypeOf(optimizer) == dszig.SIMBA) {
+        const compiled = try optimizer.compile(P, arena, ctx, .{}, trainset, .{ .program_code = dates_class_source });
+        const optimized = try dszig.optimize.evaluate(P, gpa, ctx, &compiled.program, devset, metric, 10);
+        return .{
+            .baseline = baseline.score,
+            .optimized = optimized.score,
+            .artifact = try dszig.state.saveAlloc(arena, &compiled.program),
+            .scores = compiled.scores,
+            .train_scores = compiled.train_scores,
         };
     }
     if (@TypeOf(optimizer) == dszig.COPRO) {
@@ -358,6 +411,9 @@ pub fn writeTranscript(arena: Allocator, runtime: []const u8, model: []const u8,
         var scores: std.json.Array = .init(arena);
         for (p.scores) |x| try scores.append(.{ .float = x });
         try obj.put(arena, "scores", .{ .array = scores });
+        var train_scores: std.json.Array = .init(arena);
+        for (p.train_scores) |x| try train_scores.append(if (x) |f| .{ .float = f } else .null);
+        try obj.put(arena, "train_scores", .{ .array = train_scores });
         try root.put(arena, name, .{ .object = obj });
     }
     var aw: std.Io.Writer.Allocating = .init(arena);

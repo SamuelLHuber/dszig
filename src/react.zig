@@ -128,6 +128,11 @@ fn finishResult(_: Context, _: *const Record) ToolError!Value {
 }
 
 pub fn ReAct(comptime Sig: type, comptime user_tools: []const Tool) type {
+    return ReActIters(Sig, user_tools, 20);
+}
+
+/// `ReAct` whose `max_iters` defaults to `default_max_iters`.
+pub fn ReActIters(comptime Sig: type, comptime user_tools: []const Tool, comptime default_max_iters: usize) type {
     comptime assert(signature.isSignature(Sig));
     const n_in = Sig.input_fields_list.len;
     const output_names = backticked(Sig.fields[n_in..]);
@@ -187,7 +192,7 @@ pub fn ReAct(comptime Sig: type, comptime user_tools: []const Tool) type {
 
         react: predict.PredictFields(react_fields, n_in + 1, instructions) = .{},
         extract: Extract = .{},
-        max_iters: usize = 20,
+        max_iters: usize = default_max_iters,
         compiled: bool = false,
 
         /// `dspy.ChainOfThought(fallback_signature)`; its predictor is

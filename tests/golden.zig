@@ -16,6 +16,8 @@ const bootstrap_rag = @embedFile("fixtures/bootstrap_rag.json");
 const bootstrap_multihop = @embedFile("fixtures/bootstrap_multihop.json");
 const react_cases = @embedFile("fixtures/react.json");
 const ensemble_cases = @embedFile("fixtures/ensemble.json");
+const simba_case = @embedFile("fixtures/simba.json");
+const live_suite = @import("live_suite");
 const QA = rag.QA;
 
 const Typed = dszig.Signature(struct {
@@ -300,4 +302,90 @@ test "Ensemble reduces with majority and samples like random.sample" {
     const outputs = try sampled.forwardAll(ctx, .{ .question = "?" });
     try testing.expectEqualStrings("Rome", outputs[0].answer);
     try testing.expectEqualStrings("Berlin", outputs[1].answer);
+}
+
+/// tools/dspy_reference/gen_simba.py's MockLM: answers depend on the rollout
+/// id, the demos and SIMBA's advice; every request is logged by digest.
+const SimbaMock = struct {
+    arena: Allocator,
+    golds: std.StringHashMapUnmanaged([]const u8) = .empty,
+    calls: std.ArrayList(Call) = .empty,
+
+    const advice = "Answer with an ISO date.";
+    const feedback = "[[ ## discussion ## ]]\nThe worse run guessed.\n\n[[ ## module_advice ## ]]\n{\"generate.predict\": \"" ++
+        advice ++ "\"}\n\n[[ ## completed ## ]]";
+    const Call = struct { rollout: ?u32, temperature: ?f64, digest: [64]u8 };
+
+    fn lm(self: *SimbaMock) dszig.LM {
+        return .{ .ptr = self, .vtable = &.{ .complete = complete } };
+    }
+
+    fn complete(ptr: *anyopaque, arena: Allocator, request: dszig.lm.Request) dszig.lm.Error![]const []const u8 {
+        const self: *SimbaMock = @ptrCast(@alignCast(ptr));
+        var list: std.json.Array = .init(arena);
+        for (request.messages) |m| {
+            var o: Record = .empty;
+            try o.put(arena, "role", .{ .string = m.role.name() });
+            try o.put(arena, "content", .{ .string = m.content });
+            try list.append(.{ .object = o });
+        }
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        dszig.pyjson.writeJson(&aw.writer, .{ .array = list }, .compact) catch return error.OutOfMemory;
+        var hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(aw.written(), &hash, .{});
+        try self.calls.append(self.arena, .{
+            .rollout = request.options.rollout_id,
+            .temperature = request.options.temperature,
+            .digest = std.fmt.bytesToHex(hash, .lower),
+        });
+        const system = request.messages[0].content;
+        const user = request.messages[request.messages.len - 1].content;
+        const out = try arena.alloc([]const u8, 1);
+        if (std.mem.indexOf(u8, system, "module_advice") != null) {
+            out[0] = feedback;
+            return out;
+        }
+        const marker = "[[ ## question ## ]]\n";
+        const start = (std.mem.indexOf(u8, user, marker) orelse return error.LMFailure) + marker.len;
+        const end = std.mem.indexOfPos(u8, user, start, "\n\n") orelse user.len;
+        const q = user[start..end];
+        var good = std.mem.indexOf(u8, system, advice) != null or (request.messages.len > 2 and q.len % 3 == 0);
+        if (request.options.rollout_id) |r| good = good or (q.len + r) % 2 == 0;
+        const answer = if (good) self.golds.get(q) orelse return error.LMFailure else "unknown";
+        out[0] = try std.fmt.allocPrint(arena, "[[ ## reasoning ## ]]\nr\n\n[[ ## answer ## ]]\n{s}\n\n[[ ## completed ## ]]", .{answer});
+        return out;
+    }
+};
+
+test "SIMBA program, scores and every request match DSPy" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var mock: SimbaMock = .{ .arena = arena };
+    const train = try live_suite.dateExamples(arena, .train);
+    const dev = try live_suite.dateExamples(arena, .dev);
+    for ([_][]const dszig.Example{ train, dev }) |set| {
+        for (set) |ex| try mock.golds.put(arena, ex.record.get("question").?.string, ex.record.get("answer").?.string);
+    }
+    const ctx: dszig.Context = .{ .arena = arena, .lm = mock.lm(), .lm_options = .{ .temperature = 0.0 } };
+    const simba: dszig.SIMBA = .{ .metric = live_suite.exactMetric, .bsize = 4, .num_candidates = 3, .max_steps = 3, .max_demos = 2 };
+    const result = try simba.compile(live_suite.DateQA, arena, ctx, .{}, train, .{ .program_code = live_suite.dates_class_source });
+
+    const want = try std.json.parseFromSliceLeaky(Value, arena, simba_case, .{});
+    const calls = want.object.get("calls").?.array.items;
+    try testing.expectEqual(calls.len, mock.calls.items.len);
+    for (calls, mock.calls.items) |w, got| {
+        const items = w.array.items;
+        if (items[0] == .null) try testing.expect(got.rollout == null) else try testing.expectEqual(items[0].integer, @as(i64, got.rollout.?));
+        try testing.expectEqual(items[1].float, got.temperature.?);
+        try testing.expectEqualStrings(items[2].string, &got.digest);
+    }
+    const scores = want.object.get("scores").?.array.items;
+    try testing.expectEqual(scores.len, result.scores.len);
+    for (scores, result.scores) |w, got| try testing.expectEqual(w.float, got);
+    const train_scores = want.object.get("train_scores").?.array.items;
+    for (train_scores, result.train_scores[0..train_scores.len]) |w, got| {
+        if (w == .null) try testing.expect(got == null) else try testing.expectEqual(w.float, got.?);
+    }
+    try testing.expectEqualStrings(want.object.get("artifact").?.string, try dszig.state.saveAlloc(arena, &result.program));
 }

@@ -86,7 +86,7 @@ pub fn evaluate(
     return .{ .score = @round(ratio * 100.0) / 100.0, .sum = sum, .total = devset.len, .errors = errors };
 }
 
-fn runProgram(comptime P: type, ctx: Context, program: *const P, example: *const Example) !Record {
+pub fn runProgram(comptime P: type, ctx: Context, program: *const P, example: *const Example) !Record {
     const inputs = try example.inputs(ctx.arena);
     const input = try value.fromRecord(ctx.arena, P.Input, &inputs);
     const output = try program.forward(ctx, input);
