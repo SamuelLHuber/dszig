@@ -39,6 +39,7 @@ pub const gepa = @import("gepa.zig");
 pub const cache = @import("cache.zig");
 pub const CachedLM = cache.CachedLM;
 pub const state = @import("state.zig");
+pub const unicode = @import("unicode.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

@@ -3,8 +3,6 @@
 //! `Ensemble(P, n)` runs every program (or, with `size`, a `random.sample`
 //! of them drawn from `rng`, which stands in for Python's global `random`)
 //! and reduces the outputs with `majority` on the last output field.
-//! `normalize_text` is exact for ASCII text; DSZig does not apply Unicode
-//! NFD normalization or Unicode lowercasing to non-ASCII bytes.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -13,63 +11,59 @@ const Allocator = std.mem.Allocator;
 const predict = @import("predict.zig");
 const pyjson = @import("pyjson.zig");
 const pyrandom = @import("pyrandom.zig");
+const unicode = @import("unicode.zig");
 const value = @import("value.zig");
 
 const Context = predict.Context;
 const Record = value.Record;
 const Value = std.json.Value;
 
-/// `dspy.evaluate.normalize_text`: lowercase, drop ASCII punctuation, drop
-/// the words a/an/the, collapse whitespace.
+/// `dspy.evaluate.normalize_text`: NFD, `str.lower`, drop
+/// `string.punctuation`, replace the words a/an/the (re's Unicode `\b`)
+/// with a space, then `" ".join(s.split())`.
 pub fn normalizeText(arena: Allocator, s: []const u8) Allocator.Error![]const u8 {
-    var kept: std.ArrayList(u8) = .empty;
-    try kept.ensureTotalCapacity(arena, s.len);
-    for (s) |c| {
-        if (c < 0x80 and std.ascii.isPrint(c) and !std.ascii.isAlphanumeric(c) and c != ' ') continue;
-        kept.appendAssumeCapacity(std.ascii.toLower(c));
+    const lowered = try unicode.lower(arena, try unicode.nfd(arena, try unicode.decode(arena, s)));
+    var kept: std.ArrayList(u21) = .empty;
+    try kept.ensureTotalCapacity(arena, lowered.len);
+    for (lowered) |cp| {
+        if (cp < 0x80 and std.ascii.isPrint(@intCast(cp)) and !std.ascii.isAlphanumeric(@intCast(cp)) and cp != ' ') continue;
+        kept.appendAssumeCapacity(cp);
     }
-    var out: std.ArrayList(u8) = .empty;
-    try out.ensureTotalCapacity(arena, kept.items.len);
-    var i: usize = 0;
     const text = kept.items;
+    var out: std.ArrayList(u21) = .empty;
+    try out.ensureTotalCapacity(arena, text.len);
+    var i: usize = 0;
     while (i < text.len) {
-        // Split into whitespace-separated words, then drop article word runs.
-        while (i < text.len and isSpace(text[i])) i += 1;
+        // Articles never span whitespace, so drop them word by word.
+        while (i < text.len and unicode.isSpace(text[i])) i += 1;
         const start = i;
-        while (i < text.len and !isSpace(text[i])) i += 1;
+        while (i < text.len and !unicode.isSpace(text[i])) i += 1;
         if (start == i) break;
-        const word = try dropArticles(arena, text[start..i]);
-        var it = std.mem.tokenizeAny(u8, word, " ");
-        while (it.next()) |part| {
-            if (out.items.len > 0) out.appendAssumeCapacity(' ');
-            out.appendSliceAssumeCapacity(part);
+        var j = start;
+        var pending_space = out.items.len > 0;
+        while (j < i) {
+            const run_start = j;
+            const word_run = unicode.isWord(text[j]);
+            while (j < i and unicode.isWord(text[j]) == word_run) j += 1;
+            const run = text[run_start..j];
+            if (word_run and isArticle(run)) {
+                pending_space = out.items.len > 0;
+                continue;
+            }
+            if (pending_space) out.appendAssumeCapacity(' ');
+            pending_space = false;
+            out.appendSliceAssumeCapacity(run);
         }
     }
-    return out.items;
+    return unicode.encode(arena, out.items);
 }
 
-fn isSpace(c: u8) bool {
-    return c == ' ' or (c >= '\t' and c <= '\r') or (c >= 0x1c and c <= 0x1f);
-}
-
-fn isWord(c: u8) bool {
-    return std.ascii.isAlphanumeric(c) or c == '_' or c >= 0x80;
-}
-
-/// `re.sub(r"\b(a|an|the)\b", " ", word)` within one whitespace-free word.
-fn dropArticles(arena: Allocator, word: []const u8) Allocator.Error![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    try out.ensureTotalCapacity(arena, word.len);
-    var i: usize = 0;
-    while (i < word.len) {
-        const start = i;
-        const word_run = isWord(word[i]);
-        while (i < word.len and isWord(word[i]) == word_run) i += 1;
-        const run = word[start..i];
-        const article = word_run and (std.mem.eql(u8, run, "a") or std.mem.eql(u8, run, "an") or std.mem.eql(u8, run, "the"));
-        if (article) out.appendAssumeCapacity(' ') else out.appendSliceAssumeCapacity(run);
+fn isArticle(run: []const u21) bool {
+    const articles = [_][]const u21{ &.{'a'}, &.{ 'a', 'n' }, &.{ 't', 'h', 'e' } };
+    for (articles) |a| {
+        if (std.mem.eql(u21, run, a)) return true;
     }
-    return out.items;
+    return false;
 }
 
 /// `dspy.majority(completions, field=field)`: the index of the first

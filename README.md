@@ -168,8 +168,6 @@ re-recorded transcript differs, but the replay checks must still pass.
   `Optional[T]`; images and other custom DSPy types. DSPy repairs malformed
   JSON answers with `json_repair`; DSZig parses strict JSON plus `None`,
   `True` and `False`.
-- `normalize_text` (used by `dspy.majority`) is exact for ASCII only: no
-  Unicode NFD normalization or Unicode lowercasing.
 - `CachedLM` keeps DSPy's semantics (keys include `rollout_id`, failures
   are not cached) but not its `diskcache` files or key hashing; persist with
   `dump`/`load`.
