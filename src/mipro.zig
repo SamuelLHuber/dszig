@@ -22,6 +22,7 @@ const pyjson = @import("pyjson.zig");
 const pyrandom = @import("pyrandom.zig");
 const signature = @import("signature.zig");
 const tpe = @import("tpe.zig");
+const unicode = @import("unicode.zig");
 const value = @import("value.zig");
 
 const Context = predict.Context;
@@ -189,33 +190,50 @@ const GenerateInstruction = signature.Signature(struct {
 
 /// `dspy.propose.utils.strip_prefix`: drops a leading `Label:` of at most five
 /// words (`^[\*\s]*(([\w'\-]+\s+){0,4}[\w'\-]+):\s*`), then surrounding `"`.
-/// `\w` and `\s` are matched over ASCII only.
 pub fn stripPrefix(text: []const u8) []const u8 {
     var i: usize = 0;
-    while (i < text.len and (text[i] == '*' or isSpace(text[i]))) i += 1;
+    while (i < text.len and (text[i] == '*' or isSpace(text, i))) i += cpLen(text, i);
     var words: usize = 0;
     const rest = while (true) {
         const start = i;
-        while (i < text.len and isWord(text[i])) i += 1;
+        while (i < text.len and isWord(text, i)) i += cpLen(text, i);
         if (i == start) break text;
         words += 1;
         if (i < text.len and text[i] == ':') {
             i += 1;
-            while (i < text.len and isSpace(text[i])) i += 1;
+            while (i < text.len and isSpace(text, i)) i += cpLen(text, i);
             break text[i..];
         }
-        if (words == 5 or i == text.len or !isSpace(text[i])) break text;
-        while (i < text.len and isSpace(text[i])) i += 1;
+        if (words == 5 or i == text.len or !isSpace(text, i)) break text;
+        while (i < text.len and isSpace(text, i)) i += cpLen(text, i);
     };
     return std.mem.trim(u8, rest, "\"");
 }
 
-fn isWord(c: u8) bool {
-    return std.ascii.isAlphanumeric(c) or c == '_' or c == '\'' or c == '-';
+/// Byte length of the UTF-8 sequence at `i` (1 for an invalid byte).
+fn cpLen(text: []const u8, i: usize) usize {
+    const n = std.unicode.utf8ByteSequenceLength(text[i]) catch return 1;
+    if (i + n > text.len) return 1;
+    _ = std.unicode.utf8Decode(text[i..][0..n]) catch return 1;
+    return n;
 }
 
-fn isSpace(c: u8) bool {
-    return std.mem.indexOfScalar(u8, value.py_whitespace, c) != null;
+fn codepoint(text: []const u8, i: usize) ?u21 {
+    const n = cpLen(text, i);
+    if (n == 1 and text[i] >= 0x80) return null;
+    return std.unicode.utf8Decode(text[i..][0..n]) catch null;
+}
+
+/// `[\w'\-]` with re's Unicode `\w`.
+fn isWord(text: []const u8, i: usize) bool {
+    const cp = codepoint(text, i) orelse return false;
+    return cp == '\'' or cp == '-' or unicode.isWord(cp);
+}
+
+/// re's Unicode `\s`.
+fn isSpace(text: []const u8, i: usize) bool {
+    const cp = codepoint(text, i) orelse return false;
+    return unicode.isSpace(cp);
 }
 
 /// `order_input_keys_in_string(repr(examples))` for a list of `dspy.Example`.
@@ -839,6 +857,9 @@ test "stripPrefix matches dspy.propose.utils.strip_prefix" {
     try testing.expectEqualStrings("Answer with ISO dates.", stripPrefix("Proposed Instruction: Answer with ISO dates."));
     try testing.expectEqualStrings("**New Instruction**: \"Do it", stripPrefix("**New Instruction**: \"Do it\""));
     try testing.expectEqualStrings("hi\" there", stripPrefix("  *Instruction:   \"hi\" there\""));
+    try testing.expectEqualStrings("Hazlo", stripPrefix("Instrucción propuesta: Hazlo"));
+    try testing.expectEqualStrings("go", stripPrefix("*\u{3000}Ⅻ\u{a0}Schritt: go"));
+    try testing.expectEqualStrings("a—b: c", stripPrefix("a—b: c"));
     try testing.expectEqualStrings("one two three four five six: x", stripPrefix("one two three four five six: x"));
     try testing.expectEqualStrings("x", stripPrefix("one two three four five: x"));
     try testing.expectEqualStrings("No label here.", stripPrefix("No label here."));

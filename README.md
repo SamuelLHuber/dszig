@@ -196,10 +196,6 @@ re-recorded transcript differs, but the replay checks must still pass.
   `Retrieve` to accept that argument. DSZig writes the state DSPy would have
   written.
 - The OpenAI client sends `response_format: json_object` for JSONAdapter.
-- MIPROv2's `strip_prefix` treats only ASCII letters, digits, `_`, `'` and
-  `-` as word characters and only ASCII whitespace as `\s`; Python's `re`
-  also accepts Unicode ones, so a non-ASCII label before `:` in a proposed
-  instruction is kept by DSZig and stripped by DSPy.
   DSPy sends a structured-outputs JSON schema. The prompt messages are the
   same; only this request option differs. CI makes no network calls; the
   live path is exercised by `dz-live`.
