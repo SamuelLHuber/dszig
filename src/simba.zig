@@ -7,7 +7,10 @@
 //! same LM answers give the same program.
 //!
 //! The program's class source (`inspect.getsource`) is `Options.program_code`.
-//! Not supported: `teacher_settings`, parallel threads, metrics returning a
+//! With `teacher_settings`, the first trajectory sampler runs under the
+//! teacher (its LM keeps its temperature), as `prepare_models_for_resampling`
+//! does; DSZig does not mutate the teacher LM's `rollout_id` afterwards.
+//! Not supported: parallel threads, metrics returning a
 //! `dspy.Prediction` with feedback. `np.exp` is Zig's `@exp`.
 
 const std = @import("std");
@@ -90,6 +93,7 @@ pub const SIMBA = struct {
     demo_input_field_maxlen: usize = 100_000,
     temperature_for_sampling: f64 = 0.2,
     temperature_for_candidates: f64 = 0.2,
+    teacher_settings: ?optimize.TeacherSettings = null,
 
     pub const Options = struct {
         seed: u32 = 0,
@@ -238,7 +242,11 @@ pub const SIMBA = struct {
             for (0..self.num_candidates) |model| {
                 var c = base;
                 c.lm_options.rollout_id = start_rollout + @as(u32, @intCast(model));
-                c.lm_options.temperature = 1.0;
+                if (model == 0 and self.teacher_settings != null) {
+                    self.teacher_settings.?.apply(&c);
+                } else {
+                    c.lm_options.temperature = 1.0;
+                }
                 for (batch, 0..) |ex_i, j| {
                     const chosen = try st.softmaxSample(out, &rng, top, self.temperature_for_sampling);
                     const copy = try clone(P, out, st.programs.items[chosen]);

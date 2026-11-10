@@ -158,7 +158,7 @@ re-recorded transcript differs, but the replay checks must still pass.
   `add_format_failure_as_feedback`, `log_dir`, wandb/MLflow. Merge iterates
   predictor names in program order where gepa uses a `set` (string-hash
   order); they differ only when one merge breaks two or more score ties.
-- MIPROv2 / SIMBA `teacher_settings`, `track_stats`, `log_dir`, parallel
+- MIPROv2 / SIMBA `track_stats`, `log_dir`, parallel
   threads (DSZig runs evaluations sequentially, like `num_threads=1`).
 - ReAct: trajectory truncation on context-window errors, async tools,
   Pydantic-typed tool arguments; a failing tool's observation is

@@ -128,6 +128,17 @@ pub const LabeledFewShot = struct {
     }
 };
 
+/// `teacher_settings`: the `dspy.context(...)` the teacher runs under.
+pub const TeacherSettings = struct {
+    lm: ?@FieldType(Context, "lm") = null,
+    adapter: ?@FieldType(Context, "adapter") = null,
+
+    pub fn apply(self: TeacherSettings, c: *Context) void {
+        if (self.lm) |l| c.lm = l;
+        if (self.adapter) |a| c.adapter = a;
+    }
+};
+
 /// `dspy.BootstrapFewShot`.
 pub const BootstrapFewShot = struct {
     metric: ?Metric = null,
@@ -137,6 +148,7 @@ pub const BootstrapFewShot = struct {
     max_rounds: usize = 1,
     /// DSPy `settings.max_errors` default.
     max_errors: usize = 10,
+    teacher_settings: TeacherSettings = .{},
 
     pub const Report = struct {
         bootstrapped: usize,
@@ -244,6 +256,7 @@ pub const BootstrapFewShot = struct {
         var c = ctx;
         c.arena = arena;
         c.trace = &trace;
+        self.teacher_settings.apply(&c);
         if (round_idx > 0) {
             c.lm_options.temperature = 1.0;
             c.lm_options.rollout_id = @intCast(round_idx);
@@ -312,6 +325,7 @@ pub const BootstrapFewShotWithRandomSearch = struct {
     num_candidate_programs: usize = 16,
     max_errors: usize = 10,
     stop_at_score: ?f64 = null,
+    teacher_settings: TeacherSettings = .{},
 
     pub const Candidate = struct { seed: i64, score: f64 };
 
@@ -410,6 +424,7 @@ pub const BootstrapFewShotWithRandomSearch = struct {
             .max_labeled_demos = self.max_labeled_demos,
             .max_rounds = self.max_rounds,
             .max_errors = self.max_errors,
+            .teacher_settings = self.teacher_settings,
         };
         return (try optimizer.compile(P, arena, gpa, ctx, student, teacher, shuffled)).program;
     }

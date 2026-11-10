@@ -58,6 +58,25 @@ test "BootstrapFewShot scores never drop across three generations" {
     for (scores[1..], scores[0 .. scores.len - 1]) |now, before| try testing.expect(now >= before);
 }
 
+test "teacher_settings runs bootstrapping under the teacher's LM" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    var silent: dszig.lm.ScriptedLM = .{ .responses = &.{} };
+    var keyword = rag.keywordLM();
+    const ctx: dszig.Context = .{ .arena = out.allocator(), .lm = silent.lm(), .retriever = rag.corpus.retriever() };
+    const trainset = try rag.trainset(out.allocator());
+    const optimizer: dszig.BootstrapFewShot = .{
+        .metric = rag.keywordMetric,
+        .max_bootstrapped_demos = 2,
+        .max_labeled_demos = 0,
+        .teacher_settings = .{ .lm = keyword.lm() },
+    };
+    const result = try optimizer.compile(rag.RAG, out.allocator(), testing.allocator, ctx, .{}, null, trainset);
+    try testing.expectEqual(@as(usize, 2), result.report.bootstrapped);
+    try testing.expectEqual(@as(usize, 0), silent.index);
+    try testing.expectEqual(@as(usize, 2), result.program.generate_answer.predict.state.demos.len);
+}
+
 test "Evaluate matches DSPy scores for the RAG fixture" {
     var out: std.heap.ArenaAllocator = .init(testing.allocator);
     defer out.deinit();

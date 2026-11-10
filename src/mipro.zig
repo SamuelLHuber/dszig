@@ -8,8 +8,7 @@
 //! The program-aware proposer needs the program's code, which DSPy reads with
 //! `inspect.getsource`; DSZig takes it as `Options.program_code` and runs
 //! without it, like `program_aware_proposer=False`, when none is given.
-//! Not supported: `teacher_settings`, `track_stats` program copies and
-//! `log_dir`.
+//! Not supported: `track_stats` program copies and `log_dir`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -362,6 +361,8 @@ pub const MIPROv2 = struct {
     max_errors: usize = 10,
     seed: u32 = 9,
     init_temperature: f64 = 1.0,
+    /// Used while bootstrapping demo candidates.
+    teacher_settings: optimize.TeacherSettings = .{},
 
     pub const Auto = enum {
         light,
@@ -543,6 +544,7 @@ pub const MIPROv2 = struct {
                     .max_bootstrapped_demos = size,
                     .max_labeled_demos = max_labeled,
                     .max_errors = self.max_errors,
+                    .teacher_settings = self.teacher_settings,
                 };
                 candidate = (try bootstrap.compile(P, out, gpa, ctx, student, teacher, shuffled)).program;
             }
