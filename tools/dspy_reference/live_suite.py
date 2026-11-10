@@ -110,6 +110,13 @@ def run_suite(lm):
         max_demos=SIMBA_DEMOS, num_threads=1,
     )
     out["dates_simba"] = pipeline(DateQA, simba, date_examples("train"), date_examples("dev"), float_metric)
+    gepa = dspy.GEPA(
+        metric=gepa_metric, max_metric_calls=GEPA_BUDGET, reflection_lm=dspy.settings.lm, num_threads=1, seed=0,
+        track_stats=True,
+    )
+    out["dates_gepa"] = pipeline(
+        DateQA, gepa, date_examples("train"), date_examples("dev"), float_metric, valset=date_examples("dev"),
+    )
     return out
 MIPRO_TRIALS = 12
 MIPRO_MINIBATCH = 4
@@ -120,10 +127,18 @@ SIMBA_BSIZE = 4
 SIMBA_CANDIDATES = 2
 SIMBA_STEPS = 2
 SIMBA_DEMOS = 2
+GEPA_BUDGET = 60
 
 
 def float_metric(example, pred, trace=None):
     return float(exact_metric(example, pred))
+
+
+def gepa_metric(gold, pred, trace=None, pred_name=None, pred_trace=None):
+    score = float_metric(gold, pred)
+    if pred_name is None or score:
+        return score
+    return dspy.Prediction(score=score, feedback=f"Expected {gold.answer}.")
 
 
 def corpus_search(query: str) -> list[str]:
@@ -171,6 +186,10 @@ def pipeline(make, optimizer, trainset, devset, metric, **compile_kwargs):
     result["trials"] = trial_rows(compiled.trial_logs, n_predictors) if isinstance(optimizer, dspy.MIPROv2) else []
     logs = compiled.trial_logs if isinstance(optimizer, dspy.SIMBA) else {}
     result["train_scores"] = [logs[k].get("train_score") for k in sorted(logs)]
+    if isinstance(optimizer, dspy.GEPA):
+        r = compiled.detailed_results
+        result["instructions"] = [[p.signature.instructions for _, p in c.named_predictors()] for c in r.candidates]
+        result["scores"] = list(r.val_aggregate_scores)
     with tempfile.TemporaryDirectory() as tmp:
         path = pathlib.Path(tmp) / "program.json"
         compiled.save(str(path))

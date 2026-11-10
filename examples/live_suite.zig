@@ -114,7 +114,7 @@ pub const Pipeline = struct {
     train_scores: []const ?f64 = &.{},
 };
 
-pub const pipeline_names = .{ "rag", "dates", "dates_search", "dates_mipro", "dates_mipro_aware", "rag_react", "dates_copro", "dates_simba" };
+pub const pipeline_names = .{ "rag", "dates", "dates_search", "dates_mipro", "dates_mipro_aware", "rag_react", "dates_copro", "dates_simba", "dates_gepa" };
 
 pub const Result = struct {
     cases: [case_count]Case,
@@ -126,6 +126,7 @@ pub const Result = struct {
     rag_react: Pipeline,
     dates_copro: Pipeline,
     dates_simba: Pipeline,
+    dates_gepa: Pipeline,
 };
 
 pub fn run(arena: Allocator, gpa: Allocator, lm: dszig.LM) !Result {
@@ -178,7 +179,26 @@ pub fn run(arena: Allocator, gpa: Allocator, lm: dszig.LM) !Result {
         .max_demos = simba_demos,
     };
     result.dates_simba = try pipeline(DateQA, arena, gpa, ctx, simba, dates_train, dates_dev, exactMetric);
+    const gepa: dszig.GEPA = .{ .metric = gepaMetric, .max_metric_calls = gepa_budget };
+    result.dates_gepa = try pipeline(DateQA, arena, gpa, ctx, gepa, dates_train, dates_dev, exactMetric);
     return result;
+}
+
+pub const gepa_budget = 60;
+
+/// GEPA feedback: the gold answer when the prediction misses.
+pub fn gepaMetric(
+    arena: Allocator,
+    example: *const dszig.Example,
+    prediction: *const Record,
+    trace: ?*const dszig.Trace,
+    pred_name: ?[]const u8,
+    _: ?*const dszig.Trace.Step,
+) dszig.gepa.Feedback {
+    const score = exactMetric(arena, example, prediction, trace);
+    if (pred_name == null or score != 0) return .{ .score = score };
+    const gold = example.record.get("answer").?.string;
+    return .{ .score = score, .feedback = std.fmt.allocPrint(arena, "Expected {s}.", .{gold}) catch "" };
 }
 
 pub const mipro_trials = 12;
@@ -258,6 +278,17 @@ fn pipeline(
             .artifact = try dszig.state.saveAlloc(arena, &compiled.program),
             .scores = compiled.scores,
             .train_scores = compiled.train_scores,
+        };
+    }
+    if (@TypeOf(optimizer) == dszig.GEPA) {
+        const compiled = try optimizer.compile(P, arena, ctx, .{}, trainset, .{ .valset = devset });
+        const optimized = try dszig.optimize.evaluate(P, gpa, ctx, &compiled.program, devset, metric, 10);
+        return .{
+            .baseline = baseline.score,
+            .optimized = optimized.score,
+            .artifact = try dszig.state.saveAlloc(arena, &compiled.program),
+            .instructions = compiled.candidates,
+            .scores = compiled.val_aggregate_scores,
         };
     }
     if (@TypeOf(optimizer) == dszig.COPRO) {
