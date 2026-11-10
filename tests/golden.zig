@@ -446,6 +446,52 @@ test "nested Pydantic-style fields format, parse and validate like DSPy" {
     try testing.expectEqual(@as(usize, 0), typed.pairs[1].len);
 }
 
+const Inventory = struct { items: dszig.Dict(i64), where: dszig.Dict(Address) };
+
+const Tally = dszig.Signature(struct {
+    pub const instructions = "Tally things.";
+    pub const Input = struct { counts: dszig.Dict(i64), inventory: Inventory };
+    pub const Output = struct {
+        scores: dszig.Dict(f64),
+        groups: dszig.Dict([]const []const u8),
+        homes: dszig.Dict(Address),
+        deep: dszig.Dict(dszig.Dict(i64)),
+    };
+});
+
+test "dict[str, T] fields format, parse and validate like DSPy" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const want = try std.json.parseFromSliceLeaky(Value, arena, nested_case, .{});
+    const predictor: dszig.Predict(Tally) = .{};
+    const view = try predictor.state.view(arena);
+    const inputs = try dszig.value.toRecord(arena, Tally.Input, .{
+        .counts = .{ .keys = &.{ "b", "a" }, .values = &.{ 2, 1 } },
+        .inventory = .{
+            .items = .{ .keys = &.{"x"}, .values = &.{1} },
+            .where = .{ .keys = &.{"h"}, .values = &.{.{ .city = "Oslo", .zip_code = 5 }} },
+        },
+    });
+    for (want.object.get("dict_cases").?.array.items) |case| {
+        const adapter: dszig.Adapter = if (std.mem.eql(u8, case.object.get("adapter").?.string, "chat")) .chat else .json;
+        const messages = try adapter.format(arena, view, &.{}, &inputs);
+        const want_messages = case.object.get("messages").?.array.items;
+        try testing.expectEqual(want_messages.len, messages.len);
+        for (want_messages, messages) |w, got| {
+            try testing.expectEqualStrings(w.object.get("role").?.string, got.role.name());
+            try testing.expectEqualStrings(w.object.get("content").?.string, got.content);
+        }
+    }
+    const parsed = try dszig.Adapter.chat.parse(arena, view, want.object.get("dict_completion").?.string);
+    try testing.expectEqualStrings(try compact(arena, want.object.get("dict_outputs").?), try compact(arena, .{ .object = parsed }));
+    const typed = try dszig.value.fromRecord(arena, Tally.Output, &parsed);
+    try testing.expectEqual(@as(f64, 2.5), typed.scores.get("a").?);
+    try testing.expectEqual(@as(i64, 9), typed.homes.get("bo").?.zip_code);
+    try testing.expectEqual(@as(i64, 2), typed.deep.get("k").?.get("z").?);
+    try testing.expectEqual(@as(usize, 0), typed.groups.get("y").?.len);
+}
+
 /// tools/dspy_reference/gen_gepa.py's MockLM: task answers are right when the
 /// instruction carries the advice; reflection proposes a fixed sequence.
 const GepaMock = struct {

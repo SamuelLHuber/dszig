@@ -45,6 +45,9 @@ pub const Kind = enum {
 /// A `dict[str, str]` field value: every value is a `.string`.
 pub const StrDict = struct { map: std.json.ObjectMap };
 
+/// `dict[str, V]` for any supported nested `V`.
+pub const Dict = nested.Dict;
+
 pub const Field = struct {
     name: []const u8,
     kind: Kind,

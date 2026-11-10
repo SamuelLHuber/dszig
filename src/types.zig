@@ -11,6 +11,33 @@ const Value = std.json.Value;
 
 pub const Error = error{ ParseValue, OutOfMemory };
 
+/// `dict[str, V]`: keys and values in insertion order.
+pub fn Dict(comptime V: type) type {
+    return struct {
+        const Self = @This();
+        pub const dszig_dict_value = V;
+
+        keys: []const []const u8 = &.{},
+        values: []const V = &.{},
+
+        pub fn get(self: Self, key: []const u8) ?V {
+            for (self.keys, self.values) |k, v| {
+                if (std.mem.eql(u8, k, key)) return v;
+            }
+            return null;
+        }
+    };
+}
+
+pub fn isDict(comptime T: type) bool {
+    return @typeInfo(T) == .@"struct" and @hasDecl(T, "dszig_dict_value");
+}
+
+/// A struct typed as a Pydantic model (not a dict).
+fn isModel(comptime T: type) bool {
+    return @typeInfo(T) == .@"struct" and T != std.json.ObjectMap and !isDict(T) and !@hasField(T, "map");
+}
+
 /// Types that need the JSON-typed field kind.
 pub fn isNested(comptime T: type) bool {
     if (T == []const u8 or T == []const []const u8 or T == std.json.ObjectMap) return false;
@@ -40,6 +67,7 @@ pub fn pyName(comptime T: type) []const u8 {
         if (T == []const u8) return "str";
         if (T == bool) return "bool";
         if (T == std.json.ObjectMap) return "dict[str, Any]";
+        if (isDict(T)) return "dict[str, " ++ pyName(T.dszig_dict_value) ++ "]";
         return switch (@typeInfo(T)) {
             .int => "int",
             .float => "float",
@@ -107,6 +135,7 @@ fn entriesOf(comptime T: type) []const Entry {
         if (T == []const u8) return &.{.{ .key = "type", .val = quote("string") }};
         if (T == bool) return &.{.{ .key = "type", .val = quote("boolean") }};
         if (T == std.json.ObjectMap) return &.{ .{ .key = "type", .val = quote("object") }, .{ .key = "additionalProperties", .val = "true" } };
+        if (isDict(T)) return &.{ .{ .key = "type", .val = quote("object") }, .{ .key = "additionalProperties", .val = render(entriesOf(T.dszig_dict_value)) } };
         return switch (@typeInfo(T)) {
             .int => &.{.{ .key = "type", .val = quote("integer") }},
             .float => &.{.{ .key = "type", .val = quote("number") }},
@@ -135,7 +164,7 @@ fn modelEntries(comptime S: type) []const Entry {
         var n_required = 0;
         for (info.field_names, info.field_types, 0..) |name, FT, i| {
             var e: []const Entry = entriesOf(FT) ++ &[_]Entry{.{ .key = "title", .val = quote(title(name)) }};
-            if (@typeInfo(FT) == .@"struct") e = entriesOf(FT);
+            if (isModel(FT)) e = entriesOf(FT);
             if (hasDefault(S, i)) {
                 if (@typeInfo(FT) != .optional or @as(*const FT, @ptrCast(@alignCast(info.field_attrs[i].default_value_ptr.?))).* != null) {
                     @compileError("dszig: model field `" ++ name ++ "` may only default to null");
@@ -161,6 +190,7 @@ fn collectDefs(comptime T: type, comptime seen: []const type) []const type {
     comptime {
         var out = seen;
         if (T == std.json.ObjectMap) return out;
+        if (isDict(T)) return collectDefs(T.dszig_dict_value, out);
         switch (@typeInfo(T)) {
             .optional => |o| out = collectDefs(o.child, out),
             .pointer => |p| if (T != []const u8) {
@@ -181,7 +211,7 @@ fn collectDefs(comptime T: type, comptime seen: []const type) []const type {
 pub fn schema(comptime T: type) []const u8 {
     comptime {
         @setEvalBranchQuota(1_000_000);
-        const is_model = @typeInfo(T) == .@"struct";
+        const is_model = isModel(T);
         const all = collectDefs(T, &.{});
         const defs = if (is_model) all[1..] else all;
         var top: []const Entry = if (is_model) modelEntries(T) else entriesOf(T);
@@ -202,6 +232,14 @@ pub fn schema(comptime T: type) []const u8 {
 pub fn validate(comptime T: type, arena: Allocator, v: Value) Error!Value {
     if (T == []const u8) return if (v == .string) v else error.ParseValue;
     if (T == std.json.ObjectMap) return if (v == .object) v else error.ParseValue;
+    if (comptime isDict(T)) {
+        if (v != .object) return error.ParseValue;
+        var out: std.json.ObjectMap = .empty;
+        try out.ensureTotalCapacity(arena, v.object.count());
+        var it = v.object.iterator();
+        while (it.next()) |e| out.putAssumeCapacity(e.key_ptr.*, try validate(T.dszig_dict_value, arena, e.value_ptr.*));
+        return .{ .object = out };
+    }
     if (T == bool) return switch (v) {
         .bool => v,
         .integer => |i| if (i == 0 or i == 1) Value{ .bool = i == 1 } else error.ParseValue,

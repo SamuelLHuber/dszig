@@ -13,6 +13,7 @@ const Writer = std.Io.Writer;
 
 const pyjson = @import("pyjson.zig");
 const signature = @import("signature.zig");
+const types = @import("types.zig");
 const Field = signature.Field;
 
 pub const Record = ObjectMap;
@@ -352,6 +353,12 @@ pub fn toValue(arena: Allocator, comptime T: type, v: T) Allocator.Error!Value {
     if (T == bool) return .{ .bool = v };
     if (T == std.json.ObjectMap) return .{ .object = v };
     if (T == signature.StrDict) return .{ .object = v.map };
+    if (comptime types.isDict(T)) {
+        var map: ObjectMap = .empty;
+        try map.ensureTotalCapacity(arena, v.keys.len);
+        for (v.keys, v.values) |k, x| map.putAssumeCapacity(k, try toValue(arena, T.dszig_dict_value, x));
+        return .{ .object = map };
+    }
     return switch (@typeInfo(T)) {
         .int => .{ .integer = @intCast(v) },
         .float => .{ .float = @floatCast(v) },
@@ -395,6 +402,16 @@ pub fn fromValue(arena: Allocator, comptime T: type, v: Value) ConvertError!T {
     if (T == signature.StrDict) {
         _ = strDict(v) catch return error.TypeMismatch;
         return .{ .map = v.object };
+    }
+    if (comptime types.isDict(T)) {
+        if (v != .object) return error.TypeMismatch;
+        const keys = try arena.alloc([]const u8, v.object.count());
+        const values = try arena.alloc(T.dszig_dict_value, keys.len);
+        for (v.object.keys(), v.object.values(), keys, values) |k, x, *ko, *vo| {
+            ko.* = k;
+            vo.* = try fromValue(arena, T.dszig_dict_value, x);
+        }
+        return .{ .keys = keys, .values = values };
     }
     switch (@typeInfo(T)) {
         .int => {

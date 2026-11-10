@@ -53,5 +53,57 @@
     ],
     "maybe": "None",
     "age": null
+  },
+  "dict_cases": [
+    {
+      "adapter": "chat",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Your input fields are:\n1. `counts` (dict[str, int]): \n2. `inventory` (Inventory):\nYour output fields are:\n1. `scores` (dict[str, float]): \n2. `groups` (dict[str, list[str]]): \n3. `homes` (dict[str, Address]): \n4. `deep` (dict[str, dict[str, int]]):\nAll interactions will be structured in the following way, with the appropriate values filled in.\n\n[[ ## counts ## ]]\n{counts}\n\n[[ ## inventory ## ]]\n{inventory}\n\n[[ ## scores ## ]]\n{scores}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"additionalProperties\": {\"type\": \"number\"}}\n\n[[ ## groups ## ]]\n{groups}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"additionalProperties\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}}\n\n[[ ## homes ## ]]\n{homes}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"$defs\": {\"Address\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"title\": \"City\"}, \"zip_code\": {\"type\": \"integer\", \"title\": \"Zip Code\"}}, \"required\": [\"city\", \"zip_code\"], \"title\": \"Address\"}}, \"additionalProperties\": {\"$ref\": \"#/$defs/Address\"}}\n\n[[ ## deep ## ]]\n{deep}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"additionalProperties\": {\"type\": \"object\", \"additionalProperties\": {\"type\": \"integer\"}}}\n\n[[ ## completed ## ]]\nIn adhering to this structure, your objective is: \n        Tally things."
+        },
+        {
+          "role": "user",
+          "content": "[[ ## counts ## ]]\n{\"b\": 2, \"a\": 1}\n\n[[ ## inventory ## ]]\n{\"items\": {\"x\": 1}, \"where\": {\"h\": {\"city\": \"Oslo\", \"zip_code\": 5}}}\n\nRespond with the corresponding output fields, starting with the field `[[ ## scores ## ]]` (must be formatted as a valid Python dict[str, float]), then `[[ ## groups ## ]]` (must be formatted as a valid Python dict[str, list[str]]), then `[[ ## homes ## ]]` (must be formatted as a valid Python dict[str, Address]), then `[[ ## deep ## ]]` (must be formatted as a valid Python dict[str, dict[str, int]]), and then ending with the marker for `[[ ## completed ## ]]`."
+        }
+      ]
+    },
+    {
+      "adapter": "json",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Your input fields are:\n1. `counts` (dict[str, int]): \n2. `inventory` (Inventory):\nYour output fields are:\n1. `scores` (dict[str, float]): \n2. `groups` (dict[str, list[str]]): \n3. `homes` (dict[str, Address]): \n4. `deep` (dict[str, dict[str, int]]):\nAll interactions will be structured in the following way, with the appropriate values filled in.\n\nInputs will have the following structure:\n\n[[ ## counts ## ]]\n{counts}\n\n[[ ## inventory ## ]]\n{inventory}\n\nOutputs will be a JSON object with the following fields.\n\n{\n  \"scores\": \"{scores}        # note: the value you produce must adhere to the JSON schema: {\\\"type\\\": \\\"object\\\", \\\"additionalProperties\\\": {\\\"type\\\": \\\"number\\\"}}\",\n  \"groups\": \"{groups}        # note: the value you produce must adhere to the JSON schema: {\\\"type\\\": \\\"object\\\", \\\"additionalProperties\\\": {\\\"type\\\": \\\"array\\\", \\\"items\\\": {\\\"type\\\": \\\"string\\\"}}}\",\n  \"homes\": \"{homes}        # note: the value you produce must adhere to the JSON schema: {\\\"type\\\": \\\"object\\\", \\\"$defs\\\": {\\\"Address\\\": {\\\"type\\\": \\\"object\\\", \\\"properties\\\": {\\\"city\\\": {\\\"type\\\": \\\"string\\\", \\\"title\\\": \\\"City\\\"}, \\\"zip_code\\\": {\\\"type\\\": \\\"integer\\\", \\\"title\\\": \\\"Zip Code\\\"}}, \\\"required\\\": [\\\"city\\\", \\\"zip_code\\\"], \\\"title\\\": \\\"Address\\\"}}, \\\"additionalProperties\\\": {\\\"$ref\\\": \\\"#/$defs/Address\\\"}}\",\n  \"deep\": \"{deep}        # note: the value you produce must adhere to the JSON schema: {\\\"type\\\": \\\"object\\\", \\\"additionalProperties\\\": {\\\"type\\\": \\\"object\\\", \\\"additionalProperties\\\": {\\\"type\\\": \\\"integer\\\"}}}\"\n}\nIn adhering to this structure, your objective is: \n        Tally things."
+        },
+        {
+          "role": "user",
+          "content": "[[ ## counts ## ]]\n{\"b\": 2, \"a\": 1}\n\n[[ ## inventory ## ]]\n{\"items\": {\"x\": 1}, \"where\": {\"h\": {\"city\": \"Oslo\", \"zip_code\": 5}}}\n\nRespond with a JSON object in the following order of fields: `scores` (must be formatted as a valid Python dict[str, float]), then `groups` (must be formatted as a valid Python dict[str, list[str]]), then `homes` (must be formatted as a valid Python dict[str, Address]), then `deep` (must be formatted as a valid Python dict[str, dict[str, int]])."
+        }
+      ]
+    }
+  ],
+  "dict_completion": "[[ ## scores ## ]]\n{\"b\": 1, \"a\": \"2.5\"}\n\n[[ ## groups ## ]]\n{\"x\": [\"p\"], \"y\": []}\n\n[[ ## homes ## ]]\n{\"bo\": {\"city\": \"X\", \"zip_code\": \"9\"}}\n\n[[ ## deep ## ]]\n{\"k\": {\"z\": 2.0}}\n\n[[ ## completed ## ]]",
+  "dict_outputs": {
+    "scores": {
+      "b": 1.0,
+      "a": 2.5
+    },
+    "groups": {
+      "x": [
+        "p"
+      ],
+      "y": []
+    },
+    "homes": {
+      "bo": {
+        "city": "X",
+        "zip_code": 9
+      }
+    },
+    "deep": {
+      "k": {
+        "z": 2
+      }
+    }
   }
 }

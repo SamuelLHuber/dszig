@@ -163,9 +163,7 @@ re-recorded transcript differs, but the replay checks must still pass.
 - ReAct: trajectory truncation on context-window errors, async tools,
   Pydantic-typed tool arguments; a failing tool's observation is
   `Execution error in <tool>: <ErrorName>` (DSPy embeds a Python traceback).
-- `dict[str, T]` fields other than `dict[str, Any]` (`std.json.ObjectMap`)
-  and `dict[str, str]` (`signature.StrDict`); unions other than
-  `Optional[T]`; images and other custom DSPy types. DSPy repairs malformed
+- Unions other than `Optional[T]`; images and other custom DSPy types. DSPy repairs malformed
   JSON answers with `json_repair`; DSZig parses strict JSON plus `None`,
   `True` and `False`.
 - `CachedLM` keeps DSPy's semantics (keys include `rollout_id`, failures

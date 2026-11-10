@@ -7,6 +7,7 @@ pub const tpe = @import("tpe.zig");
 pub const pickle = @import("pickle.zig");
 pub const signature = @import("signature.zig");
 pub const Signature = signature.Signature;
+pub const Dict = signature.Dict;
 pub const value = @import("value.zig");
 pub const adapter = @import("adapter.zig");
 pub const Adapter = adapter.Adapter;
