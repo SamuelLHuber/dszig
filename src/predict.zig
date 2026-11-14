@@ -479,14 +479,22 @@ pub const Param = union(enum) {
 
 pub const NamedParam = struct { name: []const u8, param: Param };
 
-/// Compare runtime signature state, not merely the native field identity.
+/// DSPy's Signature.equals compares instructions and named field metadata,
+/// not annotation types, field order, or signature class identity.
 pub fn sameSignature(a: *const PredictState, b: *const PredictState) bool {
     if (a == b) return true;
-    if (a.fields.ptr != b.fields.ptr or a.fields.len != b.fields.len) return false;
+    if (a.fields.len != b.fields.len or a.input_count != b.input_count) return false;
     if (!std.mem.eql(u8, a.instructions, b.instructions)) return false;
-    if (a.descs.len != b.descs.len or a.prefixes.len != b.prefixes.len) return false;
-    for (a.descs, b.descs) |x, y| if (!std.mem.eql(u8, x, y)) return false;
-    for (a.prefixes, b.prefixes) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+    if (a.descs.len != a.fields.len or b.descs.len != b.fields.len or
+        a.prefixes.len != a.fields.len or b.prefixes.len != b.fields.len) return false;
+    for (a.fields, 0..) |field, i| {
+        const j = if (a.fields.ptr == b.fields.ptr) i else for (b.fields, 0..) |other, index| {
+            if (std.mem.eql(u8, field.name, other.name)) break index;
+        } else return false;
+        if ((i < a.input_count) != (j < b.input_count)) return false;
+        if (!std.mem.eql(u8, a.descs[i], b.descs[j])) return false;
+        if (!std.mem.eql(u8, a.prefixes[i], b.prefixes[j])) return false;
+    }
     return true;
 }
 
@@ -805,6 +813,35 @@ test "CoT plan fallback avoids task field collisions and honors disabled native 
     try testing.expectEqualStrings("Check the facts.", out.reasoning.?.content);
     try testing.expectEqualStrings("Done.", out.plan_2);
     try testing.expectEqualStrings("Paris", out.answer);
+}
+
+test "signature equality compares named roles and metadata rather than order or annotations" {
+    const A = signature.Signature(struct {
+        pub const instructions = "identity";
+        pub const Input = struct { question: []const u8, count: i64 };
+        pub const Output = struct { answer: []const u8 };
+    });
+    const B = signature.Signature(struct {
+        pub const instructions = "identity";
+        pub const Input = struct { count: []const u8, question: i64 };
+        pub const Output = struct { answer: f64 };
+    });
+    const C = signature.Signature(struct {
+        pub const instructions = "identity";
+        pub const Input = struct { question: []const u8, answer: []const u8 };
+        pub const Output = struct { count: i64 };
+    });
+    const a: Predict(A) = .{};
+    var b: Predict(B) = .{};
+    const c: Predict(C) = .{};
+    try testing.expect(sameSignature(&a.state, &b.state));
+    try testing.expect(sameSignature(&b.state, &a.state));
+    try testing.expect(!sameSignature(&a.state, &c.state));
+    b.state.instructions = "changed";
+    try testing.expect(!sameSignature(&a.state, &b.state));
+    b.state.instructions = "identity";
+    b.state.descs = &.{ "changed", b.state.descs[1], b.state.descs[2] };
+    try testing.expect(!sameSignature(&a.state, &b.state));
 }
 
 test "in-memory retriever ranks by overlap" {

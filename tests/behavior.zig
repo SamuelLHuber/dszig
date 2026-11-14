@@ -38,6 +38,45 @@ const LearningLM = struct {
     }
 };
 
+test "Evaluate uses Python decimal ties-to-even without intermediate rounding or overflow" {
+    const P = struct {
+        pub const Input = struct { score: f64 };
+        pub const Output = struct {};
+        pub fn forward(_: *const @This(), _: dszig.Context, _: Input) !Output {
+            return .{};
+        }
+        fn metric(_: Allocator, example: *const dszig.Example, _: *const dszig.value.Record, _: ?*const dszig.Trace) f64 {
+            return example.record.get("score").?.float;
+        }
+    };
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var unused: dszig.lm.ScriptedLM = .{ .responses = &.{} };
+    const ctx: dszig.Context = .{ .arena = arena, .lm = unused.lm() };
+    // Exact result encodings from actual DSPy 3.5 Evaluate with one example.
+    const cases = [_]struct { metric: f64, bits: u64 }{
+        .{ .metric = 0.02675, .bits = 0x4005_5c28_f5c2_8f5c },
+        .{ .metric = 0.00125, .bits = 0x3fbe_b851_eb85_1eb8 },
+        .{ .metric = 0.00375, .bits = 0x3fd8_51eb_851e_b852 },
+        .{ .metric = -0.00125, .bits = 0xbfbe_b851_eb85_1eb8 },
+        .{ .metric = -0.00375, .bits = 0xbfd8_51eb_851e_b852 },
+        .{ .metric = -1e-20, .bits = 0x8000_0000_0000_0000 },
+        .{ .metric = 1e300, .bits = 0x7ea2_aa4f_4a40_5be2 },
+        .{ .metric = 1e308, .bits = 0x7ff0_0000_0000_0000 },
+        .{ .metric = -std.math.inf(f64), .bits = 0xfff0_0000_0000_0000 },
+    };
+    var example: dszig.Example = .{ .record = .empty, .input_keys = &.{"score"} };
+    for (cases) |case| {
+        try example.record.put(arena, "score", .{ .float = case.metric });
+        const result = try dszig.optimize.evaluate(P, testing.allocator, ctx, &.{}, &.{example}, P.metric, 1);
+        try testing.expectEqual(case.bits, @as(u64, @bitCast(result.score)));
+    }
+    try example.record.put(arena, "score", .{ .float = std.math.nan(f64) });
+    const result = try dszig.optimize.evaluate(P, testing.allocator, ctx, &.{}, &.{example}, P.metric, 1);
+    try testing.expect(std.math.isNan(result.score));
+}
+
 test "BootstrapFewShot scores never drop across three generations" {
     var out: std.heap.ArenaAllocator = .init(testing.allocator);
     defer out.deinit();
@@ -75,6 +114,48 @@ test "teacher_settings runs bootstrapping under the teacher's LM" {
     try testing.expectEqual(@as(usize, 2), result.report.bootstrapped);
     try testing.expectEqual(@as(usize, 0), silent.index);
     try testing.expectEqual(@as(usize, 2), result.program.generate_answer.predict.state.demos.len);
+}
+
+test "BootstrapFewShot zero rounds retains labeled demos and zero errors propagates first failure" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    const arena = out.allocator();
+    const Sig = dszig.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: []const u8 };
+    });
+    const P = dszig.Predict(Sig);
+    const FailingLM = struct {
+        calls: usize = 0,
+        fn complete(ptr: *anyopaque, _: Allocator, _: dszig.lm.Request) dszig.lm.Error![]const dszig.lm.Completion {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.LMFailure;
+        }
+    };
+    var failing: FailingLM = .{};
+    const ctx: dszig.Context = .{ .arena = arena, .lm = .{ .ptr = &failing, .vtable = &.{ .complete = FailingLM.complete } } };
+    const trainset = [_]dszig.Example{
+        try dszig.Example.fromJson(arena, "{\"question\":\"q0\",\"answer\":\"a0\"}", &.{"question"}),
+        try dszig.Example.fromJson(arena, "{\"question\":\"q1\",\"answer\":\"a1\"}", &.{"question"}),
+        try dszig.Example.fromJson(arena, "{\"question\":\"q2\",\"answer\":\"a2\"}", &.{"question"}),
+    };
+    var optimizer: dszig.BootstrapFewShot = .{ .max_rounds = 0, .max_errors = 0, .max_labeled_demos = 2 };
+    const result = try optimizer.compile(P, arena, testing.allocator, ctx, .{}, null, &trainset);
+    try testing.expect(result.program.compiled);
+    try testing.expectEqual(@as(usize, 0), result.report.attempts);
+    try testing.expectEqual(@as(usize, 0), failing.calls);
+    const demos = result.program.state.demos;
+    try testing.expectEqual(@as(usize, 2), demos.len);
+    // Actual pinned DSPy selects these labels after its shuffle and sample.
+    try testing.expectEqualStrings("q2", demos[0].get("question").?.string);
+    try testing.expectEqualStrings("a2", demos[0].get("answer").?.string);
+    try testing.expectEqualStrings("q1", demos[1].get("question").?.string);
+    try testing.expectEqualStrings("a1", demos[1].get("answer").?.string);
+    optimizer.max_rounds = 1;
+    optimizer.max_labeled_demos = 0;
+    try testing.expectError(error.LMFailure, optimizer.compile(P, arena, testing.allocator, ctx, .{}, null, &trainset));
+    try testing.expectEqual(@as(usize, 1), failing.calls);
 }
 
 test "BootstrapFewShot zero threshold accepts a zero score while null rejects it" {

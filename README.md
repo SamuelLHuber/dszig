@@ -120,6 +120,17 @@ retain the actual continuation and raw provider response independently.
 A named surface in this table is not a claim that every Python option or provider
 route is implemented. The limits below are part of the compatibility contract.
 
+`BootstrapFewShot` accepts zero rounds: no teacher attempts run, but labeled
+demos are still selected. A zero error budget propagates the first teacher
+failure instead of rejecting the option or swallowing that failure.
+Teacher signature matching follows DSPy's named field roles, descriptions,
+prefixes and instructions; annotation types and field order do not decide
+signature equality.
+
+`optimize.evaluate` follows Python's exact `round(score, 2)`, including
+ties-to-even, binary decimal boundaries such as `2.675 → 2.67`, signed zero
+and nonfinite scores. It does not round an already-rounded `score * 100`.
+
 `BestOfN(P).init(program, options)` takes a typed reward callback, an attempt
 count and a threshold. Its output is optional: DSPy returns no prediction when
 no reward exceeds negative infinity, including all-NaN rewards or no attempts.
@@ -202,7 +213,7 @@ scores, saved artifact bytes, instruction candidates, trial logs, candidate
 scores and SIMBA train scores. It is **mock-provider behavioral evidence**, not
 proof of real-model performance or complete DSPy equivalence.
 
-Local verification on 2026-11-14 passed **156/156 tests and all 28 build steps**
+Local verification on 2026-11-14 passed **159/159 tests**
 in both Debug and ReleaseSafe. The actual replay executable consumed the entire
 fixture and matched every adapter case and pipeline. The independent real-DSPy
 reference gate also passed. These results establish only the coverage described

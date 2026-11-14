@@ -82,7 +82,28 @@ pub fn evaluate(
         sum += metric(c.arena, example, &prediction, null);
     }
     const ratio = 100.0 * sum / @as(f64, @floatFromInt(devset.len));
-    return .{ .score = @round(ratio * 100.0) / 100.0, .sum = sum, .total = devset.len, .errors = errors };
+    return .{ .score = roundScore(ratio), .sum = sum, .total = devset.len, .errors = errors };
+}
+
+/// Python round(x, 2): round the exact binary value to cents, ties to even.
+/// Floating multiplication by 100 would round once before the tie decision.
+fn roundScore(score: f64) f64 {
+    if (!std.math.isFinite(score) or @abs(score) >= 0x1.0p46) return score;
+    const bits: u64 = @bitCast(score);
+    const negative = bits >> 63 != 0;
+    const exponent: i32 = @as(i32, @intCast((bits >> 52) & 0x7ff)) - 1023;
+    // Subnormals and sufficiently small normals round to signed zero.
+    if (exponent <= -12) return if (negative) -@as(f64, 0) else 0;
+    const mantissa = (bits & 0x000f_ffff_ffff_ffff) | (@as(u64, 1) << 52);
+    const scaled = mantissa * 100;
+    const shift: u6 = @intCast(52 - exponent);
+    var cents = scaled >> shift;
+    const remainder = scaled & ((@as(u64, 1) << shift) - 1);
+    const half = @as(u64, 1) << (shift - 1);
+    if (remainder > half or (remainder == half and cents & 1 != 0)) cents += 1;
+    // Below 2^46, cents fits in 53 bits, so its float conversion is exact.
+    const rounded = @as(f64, @floatFromInt(cents)) / 100.0;
+    return if (negative) -rounded else rounded;
 }
 
 pub fn runProgram(comptime P: type, ctx: Context, program: *const P, example: *const Example) !Record {
@@ -172,8 +193,6 @@ pub const BootstrapFewShot = struct {
         teacher_in: ?P,
         trainset: []const Example,
     ) !Result(P) {
-        assert(self.max_rounds > 0);
-        assert(self.max_errors > 0);
         if (student_in.compiled) return error.StudentCompiled;
         var student = student_in;
         try predict.resetDemos(out, &student);
