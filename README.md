@@ -6,7 +6,7 @@ allocators and execution context are explicit.
 
 **This is not a feature-complete or fully identical implementation of DSPy.** The
 cross-runtime gates cover the behaviors below, not every DSPy capability. In
-particular, the Python-executing RLM/Flex stack, fine-tuning, embeddings,
+particular, the Python-executing RLM/Flex stack, fine-tuning,
 multimodal content, and streaming are not implemented. See [Compatibility limits](#compatibility-limits).
 
 ## Example
@@ -108,7 +108,7 @@ retain the actual continuation and raw provider response independently.
 | Class-style signatures and typed fields | `Signature`, `Dict`, scalar/string/list/optional/model fields, literal enums, field descriptions/defaults, compile-time rejection of invalid signatures |
 | Chat, JSON and XML adapters | `Adapter.chat`, `.json`, `.xml`; independent prompt/parse fixtures, strict response-schema construction, JSON fallback, typed XML and Unicode key handling |
 | Prediction and reasoning | `Predict`, `ChainOfThought`, `BestOfN`, `MultiChainComparison`, explicit `Context`, typed outputs, serialized `Trace`, named predictor/parameter discovery |
-| Retrieval | `Retrieve`, a retriever vtable and lexical `InMemoryRetriever` |
+| Retrieval and embeddings | `Retrieve`, lexical `InMemoryRetriever`, custom/OpenAI/Azure `Embedder`, float32 `KNN` and per-query `KNNFewShot` |
 | Evaluation and few-shot search | `optimize.evaluate`, `LabeledFewShot`, `BootstrapFewShot`, `BootstrapFewShotWithRandomSearch`, teacher context, zero thresholds and positional multi-use trace selection |
 | Instruction optimization | `MIPROv2`, its program-aware proposer and an Optuna 4.5.0 TPE port; `COPRO`; `SIMBA`; supported instance-frontier `GEPA` paths against gepa 0.1.4 |
 | Agents and tools | `ReAct`, comptime `Tool`, `History`, `ToolCalls`, tool results, native declarations and text tool calls, typed submit, retained history |
@@ -136,6 +136,32 @@ returns typed `rationale` plus the original outputs. Default temperature is
 formatting, ignored input tracing and predictor state roundtrips have
 source-backed coverage. These modules were also exercised through an actual
 native executable, independently of the existing nine-pipeline replay fixture.
+
+`Embedder.initCustom` accepts a native callback returning float32, float64 or
+rectangular JSON vectors; `initHosted` supports `openai/` and `azure/` models
+through the existing `std.http` transport. Hosted environment values are explicit,
+not read implicitly from the process. `embed(arena, texts, options)` returns a
+contiguous float32 matrix owned by the caller. Batch-size/caching overrides,
+merged request options, SDK response-index sorting and base64 vectors are
+supported. Its bounded per-instance cache retains successful raw batches before
+final float32 conversion, including the reference's conversion-error behavior.
+It is not DSPy's shared Python disk cache.
+
+Hosted timeouts preserve per-operation inactivity rather than imposing a total
+request deadline: the SDK defaults are 600 seconds for reads/writes and 5 seconds
+for connection setup; explicit null disables both. Azure token callbacks refresh
+before every attempt, including retries, and callback failures retain their
+native error identity. Request-local clients keep timed connections from escaping
+their I/O adapter's lifetime. The shared transport still bounds response bytes.
+
+`KNN.init(arena, k, trainset, &embedder)` embeds training inputs once;
+`call(arena, ordered_kwargs)` uses raw float32 dot products without normalization.
+`KNNFewShot(P)` retrieves and bootstraps again on each forward. Its compiled
+program borrows the optimizer, original student and optional teacher, so their
+addresses must remain stable and their lifetimes must cover every forward.
+Predictor discovery exposes the visible student's namespace, not hidden captures.
+Both optimizers and embedding output arenas must outlive the values borrowing
+them. NumPy sorting/BLAS portability limits are explicit below.
 
 ## Cross-runtime verification
 
@@ -170,11 +196,21 @@ scores, saved artifact bytes, instruction candidates, trial logs, candidate
 scores and SIMBA train scores. It is **mock-provider behavioral evidence**, not
 proof of real-model performance or complete DSPy equivalence.
 
-Local verification on 2026-11-14 passed **127/127 tests and all 28 build steps**
+Local verification on 2026-11-14 passed **155/155 tests and all 28 build steps**
 in both Debug and ReleaseSafe. The actual replay executable consumed the entire
 fixture and matched every adapter case and pipeline. The independent real-DSPy
 reference gate also passed. These results establish only the coverage described
 above, not the missing capabilities listed below.
+
+Additional native executable checks exercised hosted OpenAI/Azure embeddings,
+base64/index ordering, cache reuse, vector KNN, repeated KNNFewShot predictions
+and retained traces against a scripted localhost HTTP provider. Azure checks
+covered refreshed retry credentials, explicit Authorization precedence and
+callback errors. Transport checks covered idle headers/body, a 903 ms dripping
+body under a 120 ms inactivity timeout, disabled/zero timeouts, and the existing
+Chat Completions/Responses CLIs. An exhaustive native representation digest
+matched actual pinned CPython `repr` for all 1,112,064 Unicode scalar values.
+These are protocol and formatting checks, not homelab or real-model evidence.
 
 The existing `tests/fixtures/live/*gpt-4o-mini.json` recordings were made against
 **DSPy 3.4.1**. They remain unchanged as historical artifacts. They are not
@@ -225,11 +261,11 @@ The following prevent a claim that DSZig can do everything DSPy can:
   LocalInterpreter, InterpreterPool or complete Python execution environment.
   DSPy's RLM/Flex execute arbitrary Python and can import real DSPy inside the
   guest. A restricted expression evaluator is not an identical implementation.
-- **Other modules and optimizers:** no general Refine, Parallel, KNN,
+- **Other modules and optimizers:** no general Refine, Parallel,
   AvatarOptimizer, BetterTogether, BootstrapFinetune,
-  KNNFewShot, BootstrapFewShotWithOptuna, InferRules or bootstrap_trace_data.
+  BootstrapFewShotWithOptuna, InferRules or bootstrap_trace_data.
 - **Providers and media:** no complete lm15 provider catalog/routing/auth/error
-  taxonomy, Embedder/embedding retrievers/ColBERTv2, Image/Audio/BoundingBox/File,
+  taxonomy, embedding providers beyond OpenAI/Azure, ColBERTv2, Image/Audio/BoundingBox/File,
   rich media tool results, provider training lifecycle or native streaming.
 - **Dynamic Python APIs:** no general Python Module/BaseModule/Example/Prediction/
   Completions object model, dynamic signature syntax, arbitrary Pydantic custom
@@ -245,6 +281,15 @@ The following prevent a claim that DSZig can do everything DSPy can:
   logging integrations, and some MIPROv2/SIMBA/COPRO statistics/logging options.
   Evaluation runs sequentially rather than implementing DSPy's parallel and
   async execution. SIMBA uses Zig `@exp`, not NumPy's implementation.
+- **Embedding numerical portability:** KNN ports NumPy 2.4.6's scalar quicksort,
+  including unstable ties and its heapsort fallback. Other NumPy SIMD dispatches
+  can order ties differently. Native strict float32 dot accumulation is not
+  bitwise identical to BLAS: the locked Apple Accelerate reference returns 2
+  for `[1e8, 1, -1e8, 1]` dotted with ones, whereas the scalar kernel returns 1;
+  reference accumulation also changes with matrix shape. Cancellation-sensitive
+  neighbor rankings are therefore a known incompatibility, not a parity claim.
+  Python string representations use the pinned CPython 3.11 Unicode 14 tables;
+  classification can differ from other Python/Unicode releases.
 - **Persistence and errors:** cache files/key hashing are not DSPy's diskcache
   format; LM/provider/training state is not a complete DSPy save/load port.
   Python exception tracebacks are not reconstructed from native Zig errors.

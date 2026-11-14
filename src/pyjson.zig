@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const python_unicode = @import("python_unicode.zig");
 const Value = std.json.Value;
 const Writer = std.Io.Writer;
 
@@ -209,13 +210,35 @@ pub fn writeRepr(w: *Writer, v: Value, depth: u32) Error!void {
     }
 }
 
-/// Python `repr(str)` for ASCII control handling; non-ASCII is printed as-is.
+/// Python `repr(str)`, including Unicode printability and quote selection.
 pub fn writeReprString(w: *Writer, s: []const u8) Writer.Error!void {
     const has_single = std.mem.indexOfScalar(u8, s, '\'') != null;
     const has_double = std.mem.indexOfScalar(u8, s, '"') != null;
     const quote: u8 = if (has_single and !has_double) '"' else '\'';
     try w.writeByte(quote);
-    for (s) |c| {
+    var index: usize = 0;
+    while (index < s.len) {
+        const c = s[index];
+        if (c >= 0x80) {
+            const width = std.unicode.utf8ByteSequenceLength(c) catch 1;
+            if (width <= s.len - index) {
+                const codepoint = std.unicode.utf8Decode(s[index..][0..width]) catch null;
+                if (codepoint) |cp| {
+                    if (python_unicode.isPrintable(cp)) {
+                        try w.writeAll(s[index..][0..width]);
+                    } else if (cp <= 0xff) {
+                        try w.print("\\x{x:0>2}", .{cp});
+                    } else if (cp <= 0xffff) {
+                        try w.print("\\u{x:0>4}", .{cp});
+                    } else {
+                        try w.print("\\U{x:0>8}", .{cp});
+                    }
+                    index += width;
+                    continue;
+                }
+            }
+        }
+        index += 1;
         switch (c) {
             '\\' => try w.writeAll("\\\\"),
             '\n' => try w.writeAll("\\n"),

@@ -1,5 +1,5 @@
 //! Evaluation and few-shot optimizers: `Evaluate`, `LabeledFewShot`,
-//! `BootstrapFewShot` (ports of DSPy 3.4.1 `dspy.evaluate` and
+//! `BootstrapFewShot` (ports of DSPy 3.5.0 `dspy.evaluate` and
 //! `dspy.teleprompt`). Random choices use the CPython `random.Random` port,
 //! so a Zig compile selects the same demos as DSPy for the same inputs.
 
@@ -188,6 +188,9 @@ pub const BootstrapFewShot = struct {
             if (!std.mem.eql(u8, s.name, t.name)) return error.ProgramMismatch;
             if (s.param.predict.fields.ptr != t.param.predict.fields.ptr) return error.ProgramMismatch;
         }
+        // DSPy's bootstrap loop has no final example index for an empty set.
+        // Preserve that failure instead of silently returning an untrained copy.
+        if (trainset.len == 0) return error.EmptyBootstrapTrainset;
 
         const name2traces = try out.alloc(std.ArrayList(Record), teacher_preds.len);
         for (name2traces) |*l| l.* = .empty;

@@ -9,6 +9,7 @@ const Writer = std.Io.Writer;
 
 const adapter = @import("adapter.zig");
 const pyjson = @import("pyjson.zig");
+const TimedIo = @import("timed_io.zig");
 pub const inference = @import("inference.zig");
 const Message = adapter.Message;
 pub const FunctionTool = inference.FunctionTool;
@@ -630,6 +631,12 @@ pub const History = struct {
     }
 };
 
+/// Request-arena-owned headers are prepared anew before each network attempt.
+pub const HeaderProvider = struct {
+    context: *anyopaque,
+    prepare: *const fn (*anyopaque, Allocator, []const std.http.Header) anyerror![]const std.http.Header,
+};
+
 /// OpenAI-compatible Chat Completions and Responses clients on `std.http`.
 pub const OpenAI = struct {
     client: *std.http.Client,
@@ -651,6 +658,12 @@ pub const OpenAI = struct {
     /// `num_retries`). Backoff doubles from `retry_base_ms`.
     max_retries: u8 = 3,
     retry_base_ms: u32 = 500,
+    /// Per-network-operation inactivity limit; null disables it.
+    timeout_ns: ?u64 = null,
+    /// DNS/TCP limit; null inherits timeout_ns.
+    connect_timeout_ns: ?u64 = null,
+    /// Authentication providers are refreshed on every attempt, not per call.
+    header_provider: ?HeaderProvider = null,
 
     pub const Api = enum { chat_completions, responses };
 
@@ -928,6 +941,25 @@ pub const OpenAI = struct {
         };
     }
 
+    /// Send a JSON request through the same bounded, retrying transport used by
+    /// generation. `path` is relative to `base_url`; response values own their
+    /// strings in `arena`. Additional headers support compatible provider APIs.
+    pub fn postJson(self: *OpenAI, arena: Allocator, path: []const u8, body: std.json.Value, headers: []const std.http.Header) anyerror!std.json.Value {
+        const url = try std.fmt.allocPrint(arena, "{s}/{s}", .{
+            std.mem.trimEnd(u8, self.base_url, "/"),
+            std.mem.trimStart(u8, path, "/"),
+        });
+        const auth = if (self.api_key) |key| try std.fmt.allocPrint(arena, "Bearer {s}", .{key}) else null;
+        var encoded: Writer.Allocating = .init(arena);
+        pyjson.writeJson(&encoded.writer, body, .compact) catch |err| return switch (err) {
+            error.WriteFailed => error.OutOfMemory,
+            error.JsonTooDeep => error.LMFailure,
+        };
+        const response = try self.fetchWithRetries(arena, url, auth, encoded.written(), headers);
+        defer self.client.allocator.free(response.body);
+        return parseJson(arena, response.body);
+    }
+
     fn complete(ptr: *anyopaque, arena: Allocator, request: Request) Error![]const Completion {
         const self: *OpenAI = @ptrCast(@alignCast(ptr));
         const body = try self.requestBody(arena, request);
@@ -935,13 +967,19 @@ pub const OpenAI = struct {
         const url = try std.fmt.allocPrint(arena, "{s}/{s}", .{ std.mem.trimEnd(u8, self.base_url, "/"), path });
         const auth = if (self.api_key) |key| try std.fmt.allocPrint(arena, "Bearer {s}", .{key}) else null;
         if (self.api == .chat_completions) {
-            const response = try self.fetchWithRetries(url, auth, body);
+            const response = self.fetchWithRetries(arena, url, auth, body, &.{}) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.LMFailure,
+            };
             defer self.client.allocator.free(response.body);
             return parseCompletions(arena, response.body);
         }
         const out = try arena.alloc(Completion, request.options.n);
         for (out) |*completion| {
-            const response = try self.fetchWithRetries(url, auth, body);
+            const response = self.fetchWithRetries(arena, url, auth, body, &.{}) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.LMFailure,
+            };
             defer self.client.allocator.free(response.body);
             completion.* = try parseResponsesResponse(arena, response.body);
         }
@@ -952,13 +990,30 @@ pub const OpenAI = struct {
 
     /// Uses the same std.http request flow as Client.fetch, with a body limit
     /// applied during transfer rather than after an unbounded allocation.
-    fn fetch(self: *OpenAI, url: []const u8, auth: ?[]const u8, body: []const u8) !HttpResponse {
+    fn fetch(self: *OpenAI, url: []const u8, auth: ?[]const u8, body: []const u8, headers: []const std.http.Header) !HttpResponse {
+        var selected_headers: std.http.Client.Request.Headers = .{
+            .content_type = .{ .override = "application/json" },
+            .authorization = if (auth) |token| .{ .override = token } else .default,
+        };
+        for (headers) |header| {
+            if (std.ascii.eqlIgnoreCase(header.name, "content-type")) {
+                selected_headers.content_type = .omit;
+            } else if (std.ascii.eqlIgnoreCase(header.name, "authorization")) {
+                selected_headers.authorization = .omit;
+            } else if (std.ascii.eqlIgnoreCase(header.name, "host")) {
+                selected_headers.host = .omit;
+            } else if (std.ascii.eqlIgnoreCase(header.name, "user-agent")) {
+                selected_headers.user_agent = .omit;
+            } else if (std.ascii.eqlIgnoreCase(header.name, "accept-encoding")) {
+                selected_headers.accept_encoding = .omit;
+            } else if (std.ascii.eqlIgnoreCase(header.name, "connection")) {
+                selected_headers.connection = .omit;
+            }
+        }
         var request = try self.client.request(.POST, try std.Uri.parse(url), .{
             .redirect_behavior = .unhandled,
-            .headers = .{
-                .content_type = .{ .override = "application/json" },
-                .authorization = if (auth) |value| .{ .override = value } else .default,
-            },
+            .extra_headers = headers,
+            .headers = selected_headers,
         });
         defer request.deinit();
         request.transfer_encoding = .{ .content_length = body.len };
@@ -982,18 +1037,53 @@ pub const OpenAI = struct {
         return .{ .status = status, .body = response_body };
     }
 
-    fn fetchWithRetries(self: *OpenAI, url: []const u8, auth: ?[]const u8, body: []const u8) Error!HttpResponse {
+    fn fetchWithRetries(self: *OpenAI, arena: Allocator, url: []const u8, auth: ?[]const u8, body: []const u8, headers: []const std.http.Header) anyerror!HttpResponse {
+        if (self.timeout_ns == null and self.connect_timeout_ns == null)
+            return self.fetchRetried(arena, url, auth, body, headers, null);
+        var timed: TimedIo = .{
+            .inner = self.client.io,
+            .timeout_ns = self.timeout_ns,
+            .connect_timeout_ns = self.connect_timeout_ns orelse self.timeout_ns,
+        };
+        // Connections retain their Io. Never install a stack adapter into a
+        // shared client or reuse those connections after the adapter dies.
+        var isolated: std.http.Client = .{
+            .allocator = self.client.allocator,
+            .io = timed.io(),
+            .tls_buffer_size = self.client.tls_buffer_size,
+            .ssl_key_log = self.client.ssl_key_log,
+            .read_buffer_size = self.client.read_buffer_size,
+            .write_buffer_size = self.client.write_buffer_size,
+            .http_proxy = self.client.http_proxy,
+            .https_proxy = self.client.https_proxy,
+        };
+        defer isolated.deinit();
+        var scoped = self.*;
+        scoped.client = &isolated;
+        return scoped.fetchRetried(arena, url, auth, body, headers, &timed);
+    }
+
+    fn fetchRetried(self: *OpenAI, arena: Allocator, url: []const u8, auth: ?[]const u8, body: []const u8, headers: []const std.http.Header, timed: ?*TimedIo) anyerror!HttpResponse {
         var attempt: u8 = 0;
         while (true) : (attempt += 1) {
-            const response: ?HttpResponse = self.fetch(url, auth, body) catch |err| switch (err) {
+            const prepared = if (self.header_provider) |provider|
+                try provider.prepare(provider.context, arena, headers)
+            else
+                headers;
+            if (timed) |timer| timer.resetFailure();
+            var last_error: anyerror = error.LMFailure;
+            const response: ?HttpResponse = self.fetch(url, auth, body, prepared) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.StreamTooLong => return error.LMFailure,
-                else => null,
+                else => failed: {
+                    if (timed) |timer| last_error = timer.failure() orelse error.LMFailure;
+                    break :failed null;
+                },
             };
             const status: ?std.http.Status = if (response) |r| r.status else null;
             if (status == .ok) return response.?;
             if (response) |r| self.client.allocator.free(r.body);
-            if (!retryable(status) or attempt >= self.max_retries) return error.LMFailure;
+            if (!retryable(status) or attempt >= self.max_retries) return last_error;
             const delay_ms = @as(i64, self.retry_base_ms) << @as(u6, @intCast(@min(attempt, 31)));
             std.Io.sleep(self.client.io, .fromMilliseconds(delay_ms), .awake) catch return error.LMFailure;
         }

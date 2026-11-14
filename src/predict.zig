@@ -482,8 +482,13 @@ pub const NamedParam = struct { name: []const u8, param: Param };
 /// `module.named_parameters()`: DSPy names (`self`, `predict`,
 /// `generate_answer.predict`, `hops[0]`), skipping compiled sub-modules.
 pub fn namedParameters(arena: Allocator, program: anytype) Allocator.Error![]NamedParam {
-    var out: std.ArrayList(NamedParam) = .empty;
     const P = @typeInfo(@TypeOf(program)).pointer.child;
+    // Wrappers replacing a module's forward method retain that module's
+    // parameter namespace instead of exposing their capture/storage fields.
+    if (@hasDecl(P, "dszig_parameter_target")) {
+        return namedParameters(arena, &@field(program, P.dszig_parameter_target));
+    }
+    var out: std.ArrayList(NamedParam) = .empty;
     if (@hasDecl(P, "is_dszig_predict")) {
         try out.append(arena, .{ .name = "self", .param = .{ .predict = &program.state } });
     } else {
@@ -522,6 +527,11 @@ fn visit(arena: Allocator, out: *std.ArrayList(NamedParam), name: []const u8, pt
                 return out.append(arena, .{ .name = name, .param = .{ .predict = &ptr.state } });
             }
             if (!isModule(T)) return;
+            if (@hasDecl(T, "dszig_parameter_target")) {
+                const Target = discoveryTargetType(T);
+                if (!@hasDecl(Target, "is_dszig_predict") and ptr.compiled) return;
+                return visit(arena, out, name, &@field(ptr, T.dszig_parameter_target));
+            }
             if (ptr.compiled) return;
             try walk(arena, out, name, ptr);
         },
@@ -530,6 +540,13 @@ fn visit(arena: Allocator, out: *std.ArrayList(NamedParam), name: []const u8, pt
         },
         else => {},
     }
+}
+
+fn discoveryTargetType(comptime T: type) type {
+    if (@hasDecl(T, "dszig_parameter_target")) {
+        return discoveryTargetType(@FieldType(T, T.dszig_parameter_target));
+    }
+    return T;
 }
 
 fn isModule(comptime T: type) bool {
