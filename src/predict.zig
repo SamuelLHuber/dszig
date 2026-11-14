@@ -35,6 +35,26 @@ pub const Context = struct {
     json_fallback: bool = true,
     /// Implicit XML and JSON enable native History; explicit Chat opts in.
     use_native_function_calling: ?bool = null,
+    /// Scoped adapter wrappers prepare a signature and kwargs before formatting.
+    preparation: ?Preparation = null,
+};
+
+/// Adapter-call state before native field adaptation and JSON fallback.
+pub const PreparedCall = struct {
+    signature_class: *const anyopaque,
+    view: adapter_mod.View,
+    inputs: *const Record,
+};
+
+/// A borrowed, synchronous adapter wrapper. Its storage must outlive the call.
+/// Wrappers explicitly invoke their captured parent to preserve nesting order.
+pub const Preparation = struct {
+    ptr: *const anyopaque,
+    prepare_fn: *const fn (*const anyopaque, Allocator, PreparedCall) Error!PreparedCall,
+
+    pub fn apply(self: Preparation, arena: Allocator, call: PreparedCall) Error!PreparedCall {
+        return self.prepare_fn(self.ptr, arena, call);
+    }
 };
 
 pub const Trace = struct {
@@ -83,6 +103,8 @@ fn orderedRecordEqual(a: *const Record, b: *const Record) bool {
 /// optimizers change. Slices point to static or caller-arena memory and are
 /// replaced, never mutated in place, so copying a program is a cheap clone.
 pub const PredictState = struct {
+    /// Class identity survives program copies; structural equality is separate.
+    signature_class: *const anyopaque,
     fields: []const Field,
     input_count: usize,
     instructions: []const u8,
@@ -108,17 +130,25 @@ pub const PredictState = struct {
         state.demos = &.{};
     }
 
+    /// Signature.with_instructions/with_updated_fields/load_state return a new
+    /// class even when the resulting metadata is structurally unchanged.
+    pub fn forkSignatureClass(state: *PredictState, arena: Allocator) Allocator.Error!void {
+        const identity = try arena.create(u8);
+        identity.* = 0;
+        state.signature_class = identity;
+    }
+
     /// Run one LM call: format, complete, parse (with JSON fallback), trace.
     pub fn call(state: *const PredictState, ctx: Context, inputs: *const Record) Error!Record {
-        const view_ = try state.view(ctx.arena);
-        const outputs = runAdapter(ctx, ctx.adapter, view_, state.demos, inputs) catch |err| switch (err) {
+        const prepared = try state.prepare(ctx, inputs);
+        const outputs = runAdapter(ctx, ctx.adapter, prepared.view, state.demos, prepared.inputs) catch |err| switch (err) {
             error.AdapterParse => if (ctx.adapter != .json and ctx.json_fallback)
-                try runAdapter(ctx, .json, view_, state.demos, inputs)
+                try runAdapter(ctx, .json, prepared.view, state.demos, prepared.inputs)
             else
                 return err,
             else => return err,
         };
-        if (ctx.trace) |t| try t.record(state, inputs, &outputs);
+        if (ctx.trace) |t| try t.record(state, prepared.inputs, &outputs);
         return outputs;
     }
 
@@ -130,16 +160,25 @@ pub const PredictState = struct {
         var ctx = ctx_in;
         ctx.lm_options.n = n;
         if (n > 1 and (ctx.lm_options.temperature orelse 0) <= 0.15) ctx.lm_options.temperature = 0.7;
-        const view_ = try state.view(ctx.arena);
-        const outputs = runAdapterMany(ctx, ctx.adapter, view_, state.demos, inputs) catch |err| switch (err) {
+        const prepared = try state.prepare(ctx, inputs);
+        const outputs = runAdapterMany(ctx, ctx.adapter, prepared.view, state.demos, prepared.inputs) catch |err| switch (err) {
             error.AdapterParse => if (ctx.adapter != .json and ctx.json_fallback)
-                try runAdapterMany(ctx, .json, view_, state.demos, inputs)
+                try runAdapterMany(ctx, .json, prepared.view, state.demos, prepared.inputs)
             else
                 return err,
             else => return err,
         };
-        if (ctx.trace) |t| try t.record(state, inputs, &outputs[0]);
+        if (ctx.trace) |t| try t.record(state, prepared.inputs, &outputs[0]);
         return outputs;
+    }
+
+    fn prepare(state: *const PredictState, ctx: Context, inputs: *const Record) Error!PreparedCall {
+        const call_: PreparedCall = .{
+            .signature_class = state.signature_class,
+            .view = try state.view(ctx.arena),
+            .inputs = inputs,
+        };
+        return if (ctx.preparation) |wrapper| wrapper.apply(ctx.arena, call_) else call_;
     }
 };
 
@@ -295,7 +334,10 @@ pub fn Predict(comptime Sig: type) type {
             break :blk p;
         };
 
+        var signature_class_token: u8 = 0;
+
         state: PredictState = .{
+            .signature_class = &signature_class_token,
             .fields = Sig.fields,
             .input_count = Sig.input_fields_list.len,
             .instructions = Sig.instructions,
@@ -330,7 +372,10 @@ pub fn PredictFields(comptime fields: []const Field, comptime input_count: usize
             break :blk p;
         };
 
+        var signature_class_token: u8 = 0;
+
         state: PredictState = .{
+            .signature_class = &signature_class_token,
             .fields = fields,
             .input_count = input_count,
             .instructions = instructions,

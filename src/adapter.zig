@@ -164,7 +164,7 @@ fn fieldDescriptions(w: *Writer, fields: []const Field) pyjson.Error!void {
         if (i > 0) try w.writeByte('\n');
         try w.print("{d}. `{s}` ({s}): ", .{ i + 1, f.name, f.type_name });
         if (!isDefaultDesc(f)) try w.writeAll(f.desc);
-        if (f.type_description.len > 0) try w.print("\n    Type description of {s}: {s}", .{ f.type_name, f.type_description });
+        if (f.type_description.len > 0) try w.print("\n    Type description of {s}: {s}", .{ if (f.type_description_name.len > 0) f.type_description_name else f.type_name, f.type_description });
     }
 }
 
@@ -176,7 +176,7 @@ fn isDefaultDesc(f: Field) bool {
 /// TypeAdapter(field.annotation).json_schema(), shared by typed XML and
 /// provider response schemas. The XML schema variant retains model field order.
 pub fn fieldSchema(arena: Allocator, field: Field) Error!Value {
-    if (field.kind == .json) {
+    if (field.kind == .json or field.code_type) {
         const source = if (field.xml_schema.len > 0) field.xml_schema else field.schema;
         return std.json.parseFromSliceLeaky(Value, arena, source, .{}) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,
@@ -245,12 +245,12 @@ pub fn responseFormat(arena: Allocator, view: View, supports_schema: bool) Error
         if (schema_type != null and schema_type.? == .string and std.mem.eql(u8, schema_type.?.string, "object") and
             model_title != null and model_title.? == .string)
         {
-            const name = model_title.?.string;
+            const name = if (field.schema_definition_name.len > 0) field.schema_definition_name else model_title.?.string;
             try definitions.put(arena, name, schema);
             var reference: Record = .empty;
             try reference.put(arena, "$ref", .{ .string = try std.fmt.allocPrint(arena, "#/$defs/{s}", .{name}) });
             schema = .{ .object = reference };
-        } else if (!schema.object.contains("$ref") and !schema.object.contains("title")) {
+        } else if (!schema.object.contains("title") and needsFieldTitle(schema)) {
             try schema.object.put(arena, "title", .{ .string = try schemaTitle(arena, field.name) });
         }
         if (field.default_value) |default_value| try schema.object.put(arena, "default", try default_value(arena));
@@ -265,6 +265,16 @@ pub fn responseFormat(arena: Allocator, view: View, supports_schema: bool) Error
     var schema: Value = .{ .object = root };
     try enforceRequired(arena, &schema, 0);
     return .{ .json_schema = .{ .name = "DSPyProgramOutputs", .schema = schema } };
+}
+
+fn needsFieldTitle(schema: Value) bool {
+    if (schema.object.contains("$ref")) return false;
+    if (schema.object.get("anyOf")) |branches| {
+        if (branches == .array) for (branches.array.items) |branch| {
+            if (branch == .object and branch.object.contains("$ref")) return false;
+        };
+    }
+    return true;
 }
 
 fn schemaTitle(arena: Allocator, name: []const u8) Allocator.Error![]const u8 {
@@ -550,7 +560,7 @@ fn outputRequirements(adapter: Adapter, w: *Writer, view: View) Writer.Error!voi
         }
         if (f.native_tool_calls) {
             try w.writeAll(" (must be a JSON object like {\"tool_calls\": [{\"name\": \"...\", \"args\": {...}}]})");
-        } else if (f.kind != .str or f.native_reasoning) {
+        } else if (f.kind != .str or f.native_reasoning or f.code_type) {
             try w.print(" (must be formatted as a valid Python {s})", .{f.type_name});
         }
     }

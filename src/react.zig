@@ -508,6 +508,7 @@ fn strictAccepts(comptime T: type, input: Value) bool {
 /// JSON schemas describe Python integers, whereas native callbacks/output
 /// structs can use narrower integer storage. Reject overflow before submission.
 fn nativeFits(comptime T: type, input: Value) bool {
+    if (comptime @import("code.zig").isCode(T)) return input == .string;
     if (T == []const u8 or T == bool or T == Record or T == signature.StrDict) return true;
     if (comptime types.isDict(T)) {
         for (input.object.values()) |item| if (!nativeFits(T.dszig_dict_value, item)) return false;
@@ -610,6 +611,41 @@ fn appendEvent(arena: Allocator, events: *std.ArrayList(Record), history: *Histo
 
 fn writeText(w: *Writer, text: []const u8) Allocator.Error!void {
     w.writeAll(text) catch return error.OutOfMemory;
+}
+
+test "ReAct submit validates Code models but retains custom string results" {
+    const testing = std.testing;
+    const Code = @import("code.zig").Code;
+    const Sig = signature.Signature(struct {
+        pub const Input = struct {};
+        pub const Output = struct { result: Code, snippets: []const Code };
+    });
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var script: @import("lm.zig").ScriptedLM = .{ .responses = &.{
+        "{\"next_thought\":\"Submit code.\",\"tool_calls\":{\"tool_calls\":[{\"name\":\"submit\",\"args\":" ++
+            "{\"result\":{\"code\":\"```python\\nrun()\\n```\"},\"snippets\":[{\"code\":\"```x```\"}]}}]}}",
+    } };
+    const agent: ReActIters(Sig, &.{}, 1) = .{};
+    const inputs: Record = .empty;
+    const prediction = try agent.run(.{ .arena = arena, .lm = script.lm(), .adapter = .json, .json_fallback = false }, &inputs);
+    const out = try value.fromRecord(arena, Sig.Output, &prediction.outputs);
+    try testing.expectEqualStrings("run()", out.result.code);
+    try testing.expectEqualStrings("x", out.snippets[0].code);
+    try testing.expectEqualStrings("run()", prediction.outputs.get("result").?.string);
+    try testing.expectEqual(TerminationReason.submit, prediction.termination_reason);
+    const invalid = try std.json.parseFromSliceLeaky(Value, arena, "{\"result\":{\"code\":7},\"snippets\":[]}", .{});
+    const submit: Tool = comptime .{
+        .name = "submit",
+        .args = &.{ Arg.typed("result", Code), Arg.typed("snippets", []const Code) },
+        .func = struct {
+            fn call(_: Context, args: *const Record) ToolError!Value {
+                return args.get("result") orelse error.InvalidArguments;
+            }
+        }.call,
+    };
+    try testing.expectError(error.InvalidArguments, normalizeArgs(submit, arena, &invalid.object));
 }
 
 test "ReAct typed tools and submit preserve exact wide integers" {

@@ -153,6 +153,36 @@ pub fn lower(arena: Allocator, cps: []const u21) Allocator.Error![]u21 {
     return out.items;
 }
 
+/// Compile-time `str.lower` for static type metadata, without an allocator.
+/// Shares the runtime mapping and context rule, without normalizing the text.
+pub fn lowerComptime(comptime text: []const u8) []const u8 {
+    return comptime result: {
+        @setEvalBranchQuota(1_000_000);
+        var codepoints: [text.len]u21 = undefined;
+        var count: usize = 0;
+        var iterator = (std.unicode.Utf8View.init(text) catch @compileError("dszig: lowercase text must be valid UTF-8")).iterator();
+        while (iterator.nextCodepoint()) |cp| {
+            codepoints[count] = cp;
+            count += 1;
+        }
+        const cps = codepoints[0..count];
+        var out: []const u8 = "";
+        for (cps, 0..) |cp, i| {
+            const lowered: []const u21 = if (cp == capital_sigma)
+                &.{if (finalSigma(cps, i)) 0x3c2 else 0x3c3}
+            else
+                mapped(&tables.lower, &tables.lower_pool, cp) orelse &.{cp};
+            for (lowered) |lower_cp| {
+                var buffer: [4]u8 = undefined;
+                const len = std.unicode.utf8Encode(lower_cp, &buffer) catch unreachable;
+                const encoded = buffer[0..len].*;
+                out = out ++ encoded;
+            }
+        }
+        break :result out;
+    };
+}
+
 fn finalSigma(cps: []const u21, i: usize) bool {
     var j = i;
     while (j > 0 and inRanges(&tables.case_ignorable, cps[j - 1])) j -= 1;
@@ -160,6 +190,19 @@ fn finalSigma(cps: []const u21, i: usize) bool {
     j = i + 1;
     while (j < cps.len and inRanges(&tables.case_ignorable, cps[j])) j += 1;
     return j == cps.len or !inRanges(&tables.cased, cps[j]);
+}
+
+test "compile-time lower shares Unicode expansion and final-sigma rules without NFD" {
+    inline for (.{
+        .{ "JAVA", "java" },
+        .{ "Café", "café" },
+        .{ "İΣ", "i\u{307}ς" },
+        .{ "ΣAΣ", "σaς" },
+        .{ "AΣ\u{301}B", "aσ\u{301}b" },
+        .{ "AΣ\u{301}", "aς\u{301}" },
+    }) |case| {
+        try std.testing.expectEqualStrings(case[1], lowerComptime(case[0]));
+    }
 }
 
 test "NFD, lower and final sigma" {

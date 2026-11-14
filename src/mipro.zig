@@ -768,6 +768,7 @@ pub const MIPROv2 = struct {
             var candidate = program;
             for (try predict.namedPredictors(out, &candidate), 0..) |p, i| {
                 const stride: usize = if (demos.len > 0) 2 else 1;
+                try p.param.predict.forkSignatureClass(out);
                 p.param.predict.instructions = instructions[i][chosen[i * stride]];
                 if (demos.len > 0) p.param.predict.demos = demos[i][chosen[i * stride + 1]];
             }

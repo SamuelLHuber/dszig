@@ -475,7 +475,9 @@ pub const SIMBA = struct {
         const advice = outputs.get("module_advice").?.object;
         for (preds) |p| {
             const tip = advice.get(p.name) orelse continue;
-            p.param.predict.instructions = try std.fmt.allocPrint(out, "{s}\n\n{s}", .{ p.param.predict.instructions, tip.string });
+            const instruction = try std.fmt.allocPrint(out, "{s}\n\n{s}", .{ p.param.predict.instructions, tip.string });
+            try p.param.predict.forkSignatureClass(out);
+            p.param.predict.instructions = instruction;
         }
     }
 };

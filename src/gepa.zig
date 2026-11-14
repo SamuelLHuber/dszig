@@ -163,7 +163,10 @@ pub const GEPA = struct {
                 copy.* = e.student.*;
                 const preds = try predict.namedPredictors(e.out, copy);
                 assert(preds.len == candidate.len);
-                for (preds, candidate) |p, text| p.param.predict.instructions = text;
+                for (preds, candidate) |p, text| {
+                    try p.param.predict.forkSignatureClass(e.out);
+                    p.param.predict.instructions = text;
+                }
                 return copy;
             }
 

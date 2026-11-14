@@ -217,6 +217,7 @@ pub const COPRO = struct {
     fn setSignature(out: Allocator, state: *predict.PredictState, instruction: []const u8, prefix: []const u8) Allocator.Error!void {
         const prefixes = try out.dupe([]const u8, state.prefixes);
         prefixes[prefixes.len - 1] = prefix;
+        try state.forkSignatureClass(out);
         state.instructions = instruction;
         state.prefixes = prefixes;
     }

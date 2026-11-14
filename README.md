@@ -105,12 +105,12 @@ retain the actual continuation and raw provider response independently.
 
 | DSPy surface | Native Zig surface and coverage |
 |---|---|
-| Class-style signatures and typed fields | `Signature`, `Dict`, scalar/string/list/optional/model fields, literal enums, field descriptions/defaults, compile-time rejection of invalid signatures |
+| Class-style signatures and typed fields | `Signature`, `Dict`, `Code`, `CodeWithLanguage`, scalar/string/list/optional/model fields, literal enums, field descriptions/defaults, compile-time rejection of invalid signatures |
 | Chat, JSON and XML adapters | `Adapter.chat`, `.json`, `.xml`; independent prompt/parse fixtures, strict response-schema construction, JSON fallback, typed XML and Unicode key handling |
-| Prediction and reasoning | `Predict`, `ChainOfThought`, `BestOfN`, `MultiChainComparison`, explicit `Context`, typed outputs, serialized `Trace`, named predictor/parameter discovery |
-| Retrieval and embeddings | `Retrieve`, lexical `InMemoryRetriever`, custom/OpenAI/Azure `Embedder`, float32 `KNN` and per-query `KNNFewShot` |
-| Evaluation and few-shot search | `optimize.evaluate`, `LabeledFewShot`, `BootstrapFewShot`, `BootstrapFewShotWithRandomSearch`, teacher context, zero thresholds and positional multi-use trace selection |
-| Instruction optimization | `MIPROv2`, its program-aware proposer and an Optuna 4.5.0 TPE port; `COPRO`; `SIMBA`; supported instance-frontier `GEPA` paths against gepa 0.1.4 |
+| Prediction and reasoning | `Predict`, `ChainOfThought`, `BestOfN`, `Refine`, `MultiChainComparison`, explicit `Context`, typed outputs, serialized `Trace`, named predictor/parameter discovery |
+| Retrieval and embeddings | `Retrieve`, lexical `InMemoryRetriever`, custom/OpenAI/Azure `Embedder`, float32 `KNN`, per-query `KNNFewShot`, and brute-force `Embeddings`/`EmbeddingsWithScores` with NumPy persistence |
+| Evaluation and few-shot search | `optimize.evaluate`, `LabeledFewShot`, `BootstrapFewShot`, `BootstrapFewShotWithRandomSearch`, `BootstrapFewShotWithOptuna`, teacher context, zero thresholds and positional multi-use trace selection |
+| Instruction optimization | `InferRules`; `MIPROv2`, its program-aware proposer and an Optuna 4.5.0 TPE port; `COPRO`; `SIMBA`; supported instance-frontier `GEPA` paths against gepa 0.1.4 |
 | Agents and tools | `ReAct`, comptime `Tool`, `History`, `ToolCalls`, tool results, native declarations and text tool calls, typed submit, retained history |
 | Voting | `Ensemble`, `ensemble.majority`, Unicode text normalization; exact Python numeric equality, NaN object identity and source-order fallback behavior |
 | LM boundary | `LM`, native `lm.OpenAI` Chat Completions/Responses, scripted/keyword LMs, recording/replay wrappers and typed native protocol metadata |
@@ -131,6 +131,34 @@ signature equality.
 ties-to-even, binary decimal boundaries such as `2.675 → 2.67`, signed zero
 and nonfinite scores. It does not round an already-rounded `score * 100`.
 
+`BootstrapFewShotWithOptuna.compile` takes explicit `std.Io` and a required
+`max_demos` bootstrap limit. Each candidate selects exactly one demo per
+predictor. The optimizer retains every trial and uses Optuna 4.5's independent
+integer TPE, distinct from MIPROv2's categorical/multivariate sampler. An
+explicit seed reproduces the source-backed NumPy RandomState and integer TPE
+sequence probes; an unset seed obtains system entropy. The numerical portability
+limit below still applies. An actual native sampler executable matched all
+134 independent source suggestions, including stable objective ties, 300-row
+history, missing/failed observations, queued values and changing bounds.
+A native optimizer executable exercised bootstrap,
+20 candidate evaluations and the optimized typed predictor through 128 LM
+calls, selecting the same first best trial, score and demos as real DSPy.
+
+`InferRules.init(arena, options)` constructs a persistent rules-induction program.
+Keep that arena alive for the optimizer's lifetime. `compile` bootstraps once,
+evaluates rule candidates and returns an optional winning program; all-NaN or
+negative-infinity scores can leave it null. Its induction RNG, instruction
+metadata and teacher-settings binding persist across calls. An explicit borrowed
+`teacher_settings_ref` models shared settings mutation; value settings are
+captured by value. Candidate evaluation snapshots are independent, while
+instruction mutations propagate across matching native signature-class identities
+in the reachable caller/teacher/candidate graph, including an earlier winning
+program. Class identity survives program copies and remains distinct from
+structural signature equality. Instruction-replacement optimizers and state
+restoration create fresh class identities.
+An actual native executable exercised rule induction, selection and the returned
+typed predictor against the independently observed DSPy behavior.
+
 `BestOfN(P).init(program, options)` takes a typed reward callback, an attempt
 count and a threshold. Its output is optional: DSPy returns no prediction when
 no reward exceeds negative infinity, including all-NaN rewards or no attempts.
@@ -139,6 +167,43 @@ only the winning program trace is retained, excluding reward-function calls.
 The signed failure budget persists across calls, including DSPy's unusual
 index-versus-remaining-budget failure boundary. Program values follow the same
 immutable-slice ownership convention as the existing optimizers.
+
+`Refine(P).init(program, options)` additionally takes `module_code` and
+`reward_code`: the actual source text that Python obtains through introspection
+must be supplied explicitly in Zig. It generates real `OfferFeedback` predictions
+between attempts, applies per-signature hints through the adapter, and selects
+the first strictly best result. Shared signature classes use the last matching
+predictor name; empty advice installs no wrapper. Feedback calls use the outer
+LM/options and remain in its trace; reward calls do not enter the selected
+program trace. A native executable matched **14 actual DSPy cases and all
+66 recorded prompts and rollout/temperature settings exactly**, together with
+outputs, outer traces and persistent failure budgets. Coverage includes distinct versus shared
+signature classes, missing/empty advice, null thresholds, NaN/infinite rewards,
+and small-decimal feedback serialization.
+
+`Code` defaults to Python; `CodeWithLanguage("JAVA")` keeps the supplied language
+in its description and lowercases only the Markdown fence. Validation extracts
+the first multiline fenced match before considering inline fences; unfenced
+source remains untrimmed. Native typed predictions, nested collections, adapters,
+provider schemas, state demos and ReAct submit preserve Code's raw-string wire
+representation while retaining its model validation.
+A native executable also exercised a typed Code prediction, fenced output,
+language-specialized instance preservation through the base validator,
+raw-string traces and saved-demo restoration.
+
+`Embeddings` and `EmbeddingsWithScores` embed the corpus once, normalize float32
+vectors when requested and expose explicit batched queries. Their signed `k`
+follows `[:k]`, including empty results for zero, rather than KNN's reverse
+slice. Scores widen the float32 calculation to float64 like NumPy `tolist()`,
+preserving comparisons such as `0.800000011920929 > 0.8`. `save`, `load` and
+`fromSaved` use DSPy's `config.json`/`corpus_embeddings.npy` layout; supported
+float32 arrays include NPY versions 1–3, both byte orders and C/Fortran storage.
+The embedder and initial corpus are borrowed; initialized retrievers own their
+vectors and loaded configuration and require `deinit`.
+An actual native executable loaded six independently generated Python saves
+without recomputing the corpus and matched their retrieval results. Real DSPy
+then loaded both normalized and raw native saves and reproduced the same indices,
+passages, float64 scores and query-only embedding calls.
 
 `MultiChainComparison(Sig, M)` accepts exactly `M` ordered completion records
 and the original typed inputs. It constructs the student-attempt fields and
@@ -213,7 +278,7 @@ scores, saved artifact bytes, instruction candidates, trial logs, candidate
 scores and SIMBA train scores. It is **mock-provider behavioral evidence**, not
 proof of real-model performance or complete DSPy equivalence.
 
-Local verification on 2026-11-14 passed **159/159 tests**
+Local verification on 2026-11-14 passed **225/225 tests**
 in both Debug and ReleaseSafe. The actual replay executable consumed the entire
 fixture and matched every adapter case and pipeline. The independent real-DSPy
 reference gate also passed. These results establish only the coverage described
@@ -231,6 +296,23 @@ HTTPS check covered untimed and timed clients followed by a fresh untimed TLS
 handshake, proving the caller's trust remained usable. An exhaustive native
 representation digest matched actual pinned CPython `repr` for all 1,112,064 Unicode scalar values.
 These are protocol and formatting checks, not homelab or real-model evidence.
+
+The independent optimizer source probes can also be run directly:
+
+```sh
+uv run --project tools/dspy_reference --locked tools/dspy_reference/infer_rules_oracle.py
+uv run --project tools/dspy_reference --locked tools/dspy_reference/bootstrap_optuna_oracle.py
+uv run --project tools/dspy_reference --locked tools/dspy_reference/code_oracle.py
+uv run --project tools/dspy_reference --locked tools/dspy_reference/embeddings_oracle.py
+uv run --project tools/dspy_reference --locked tools/dspy_reference/refine_oracle.py
+```
+
+These execute actual pinned DSPy/Optuna. They cover rule metadata/settings
+persistence, source alias mutations and failure timing, independent integer TPE
+suggestions and optimizer probes, Code validation/adapters, dense retrieval and
+NumPy persistence, and Refine feedback/selection. Native behavior tests preserve
+the corresponding source-backed consumer boundaries; the probes do not add
+real-model inference evidence.
 
 The existing `tests/fixtures/live/*gpt-4o-mini.json` recordings were made against
 **DSPy 3.4.1**. They remain unchanged as historical artifacts. They are not
@@ -281,9 +363,17 @@ The following prevent a claim that DSZig can do everything DSPy can:
   LocalInterpreter, InterpreterPool or complete Python execution environment.
   DSPy's RLM/Flex execute arbitrary Python and can import real DSPy inside the
   guest. A restricted expression evaluator is not an identical implementation.
-- **Other modules and optimizers:** no general Refine, Parallel,
-  AvatarOptimizer, BetterTogether, BootstrapFinetune,
-  BootstrapFewShotWithOptuna, InferRules or bootstrap_trace_data.
+- **Other modules and optimizers:** no Parallel,
+  AvatarOptimizer, BetterTogether, BootstrapFinetune or bootstrap_trace_data.
+- **Optimizer execution and shared identity:** `InferRules` and
+  `BootstrapFewShotWithOptuna` currently support serial evaluation
+  (`num_threads = null` or `1`), rejecting other explicit
+  settings. InferRules' signature-alias propagation does not update arbitrary external
+  instances outside the reachable program graph. Canonical Zig signature/Code
+  types and default CoT construction do not reproduce every fresh dynamic Python
+  class identity; Refine shares this boundary. Mid-bootstrap mutation of a
+  borrowed teacher-settings object is not reflected after Bootstrap's entry
+  snapshot.
 - **Providers and media:** no complete lm15 provider catalog/routing/auth/error
   taxonomy, embedding providers beyond OpenAI/Azure, ColBERTv2, Image/Audio/BoundingBox/File,
   rich media tool results, provider training lifecycle or native streaming.
@@ -291,7 +381,8 @@ The following prevent a claim that DSZig can do everything DSPy can:
   Completions object model, dynamic signature syntax, arbitrary Pydantic custom
   models/validators, custom Type hierarchy, TwoStepAdapter, generic callbacks,
   settings singleton, usage accounting, asyncify/syncify or streamify equivalents.
-- **Type and parsing boundaries:** tagged unions beyond optional types and some
+- **Type and parsing boundaries:** Code's generated schema-definition name
+  collisions fail closed. Tagged unions beyond optional types and some
   Pydantic model defaults are not native signature types. JSON repair is not
   implemented; strict JSON and the existing limited Python-literal parser are
   not equivalent to `json_repair` for malformed output. XML golden cases that
@@ -301,6 +392,19 @@ The following prevent a claim that DSZig can do everything DSPy can:
   logging integrations, and some MIPROv2/SIMBA/COPRO statistics/logging options.
   Evaluation runs sequentially rather than implementing DSPy's parallel and
   async execution. SIMBA uses Zig `@exp`, not NumPy's implementation.
+- **Integer TPE numerical portability:** the independent sampler uses a native
+  extended-precision logarithm before binary64 rounding to reproduce the observed
+  source acquisition/selection boundaries. A separate 10,009-value primitive
+  diagnostic still differs from Darwin libm/NumPy at six inputs. Matching the
+  observed trial sequences does not prove every possible history has identical
+  floating-point decisions; no libc dependency or input-specific correction hides
+  that limit.
+- **Dense retrieval boundaries:** FAISS construction/indexed saves are unsupported;
+  the default threshold of 20,000 corpus items therefore fails explicitly rather
+  than silently changing index algorithms. Retrieval caching and Python
+  Unbatchify's background scheduler are not implemented. Persistence accepts
+  float32 arrays, not arbitrary NumPy dtypes/ranks. Scalar sorting and the observed
+  NEON einsum arithmetic are not all-platform NumPy CPU-dispatch equivalence.
 - **Embedding numerical portability:** KNN ports NumPy 2.4.6's scalar quicksort,
   including unstable ties and its heapsort fallback. Other NumPy SIMD dispatches
   can order ties differently. Native strict float32 dot accumulation is not

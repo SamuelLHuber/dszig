@@ -8,6 +8,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
+const code = @import("code.zig");
 
 pub const Error = error{ ParseValue, OutOfMemory };
 
@@ -117,7 +118,31 @@ fn renderOrdered(comptime entries: []const Entry) []const u8 {
 }
 
 fn quote(comptime s: []const u8) []const u8 {
-    return "\"" ++ s ++ "\"";
+    comptime {
+        var out: []const u8 = "\"";
+        var iterator = (std.unicode.Utf8View.init(s) catch @compileError("dszig: schema text must be valid UTF-8")).iterator();
+        while (iterator.nextCodepoint()) |cp| {
+            out = out ++ switch (cp) {
+                '"' => "\\\"",
+                '\\' => "\\\\",
+                '\n' => "\\n",
+                '\r' => "\\r",
+                '\t' => "\\t",
+                0x08 => "\\b",
+                0x0c => "\\f",
+                else => if (cp < 0x20 or cp >= 0x7f) blk: {
+                    if (cp <= 0xffff) break :blk std.fmt.comptimePrint("\\u{x:0>4}", .{cp});
+                    const scalar = cp - 0x10000;
+                    break :blk std.fmt.comptimePrint("\\u{x:0>4}\\u{x:0>4}", .{ 0xd800 + (scalar >> 10), 0xdc00 + (scalar & 0x3ff) });
+                } else &[_]u8{@intCast(cp)},
+            };
+        }
+        return out ++ "\"";
+    }
+}
+
+fn definitionName(comptime T: type) []const u8 {
+    return if (code.isCode(T)) T.schema_name else modelName(T);
 }
 
 /// Python `name.replace("_", " ").title()`.
@@ -152,7 +177,7 @@ fn entriesOf(comptime T: type) []const Entry {
             },
             .optional => |o| &.{.{ .key = "anyOf", .val = "[" ++ render(entriesOf(o.child)) ++ ", {\"type\": \"null\"}]" }},
             .pointer => |p| &.{ .{ .key = "type", .val = quote("array") }, .{ .key = "items", .val = render(entriesOf(p.child)) } },
-            .@"struct" => &.{.{ .key = "$ref", .val = quote("#/$defs/" ++ modelName(T)) }},
+            .@"struct" => &.{.{ .key = "$ref", .val = quote("#/$defs/" ++ definitionName(T)) }},
             else => @compileError("dszig: unsupported nested type " ++ @typeName(T)),
         };
     }
@@ -170,7 +195,7 @@ fn modelEntries(comptime S: type, comptime ordered_properties: bool) []const Ent
         var n_required = 0;
         for (info.field_names, info.field_types, 0..) |name, FT, i| {
             var e: []const Entry = entriesOf(FT) ++ &[_]Entry{.{ .key = "title", .val = quote(title(name)) }};
-            if (isModel(FT)) e = entriesOf(FT);
+            if (isModel(FT) or (@typeInfo(FT) == .optional and isModel(@typeInfo(FT).optional.child))) e = entriesOf(FT);
             if (hasDefault(S, i)) {
                 if (@typeInfo(FT) != .optional or @as(*const FT, @ptrCast(@alignCast(info.field_attrs[i].default_value_ptr.?))).* != null) {
                     @compileError("dszig: model field `" ++ name ++ "` may only default to null");
@@ -183,7 +208,9 @@ fn modelEntries(comptime S: type, comptime ordered_properties: bool) []const Ent
             props[i] = .{ .key = name, .val = render(e) };
         }
         const final = props;
-        const description: []const Entry = if (S == @import("signature.zig").Reasoning)
+        const description: []const Entry = if (code.isCode(S) and S.schema_description_json.len > 0)
+            &.{.{ .key = "description", .val = S.schema_description_json }}
+        else if (S == @import("signature.zig").Reasoning)
             &.{.{ .key = "description", .val = "\"Reasoning type in DSPy.\\n\\nThis type is useful when you want the DSPy output to include the reasoning of the LM. We build this type so that\\nDSPy can support the reasoning model and non-reasoning model with the same code.\\n\\nThis is a str-like type, you can convert a string directly to a Reasoning object, and from DSPy adapters'\\nperspective, `Reasoning` is treated as a string.\"" }}
         else
             &.{};
@@ -219,12 +246,12 @@ fn collectDefs(comptime T: type, comptime seen: []const type) []const type {
 
 /// `json.dumps(_get_json_schema(T))`.
 pub fn schema(comptime T: type) []const u8 {
-    return schemaImpl(T, false);
+    return comptime schemaImpl(T, false);
 }
 
 /// XML and native schemas preserve the model's field declaration order.
 pub fn schemaXml(comptime T: type) []const u8 {
-    return schemaImpl(T, true);
+    return comptime schemaImpl(T, true);
 }
 
 fn schemaImpl(comptime T: type, comptime ordered_properties: bool) []const u8 {
@@ -237,8 +264,8 @@ fn schemaImpl(comptime T: type, comptime ordered_properties: bool) []const u8 {
         if (defs.len > 0) {
             var d: [defs.len]Entry = undefined;
             for (defs, 0..) |D, i| {
-                for (defs[0..i]) |E| if (std.mem.eql(u8, modelName(D), modelName(E))) @compileError("dszig: two models named " ++ modelName(D));
-                d[i] = .{ .key = modelName(D), .val = render(modelEntries(D, ordered_properties)) };
+                for (defs[0..i]) |E| if (std.mem.eql(u8, definitionName(D), definitionName(E))) @compileError("dszig: two models share schema definition name " ++ definitionName(D));
+                d[i] = .{ .key = definitionName(D), .val = render(modelEntries(D, ordered_properties)) };
             }
             const final = d;
             top = top ++ &[_]Entry{.{ .key = "$defs", .val = render(&final) }};
@@ -249,6 +276,7 @@ fn schemaImpl(comptime T: type, comptime ordered_properties: bool) []const u8 {
 
 /// Pydantic lax-mode `TypeAdapter(T).validate_python(v)`, as a JSON value.
 pub fn validate(comptime T: type, arena: Allocator, v: Value) Error!Value {
+    if (comptime code.isCode(T)) return T.validate(arena, v);
     if (T == @import("signature.zig").Reasoning) {
         const content = if (v == .object) v.object.get("content") orelse return error.ParseValue else v;
         return if (content == .string) content else error.ParseValue;

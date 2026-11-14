@@ -19,6 +19,7 @@ const std = @import("std");
 const nested = @import("types.zig");
 const History = @import("history.zig").History;
 const ToolCalls = @import("tool.zig").ToolCalls;
+const code = @import("code.zig");
 const assert = std.debug.assert;
 
 /// Field value kinds supported in v0.1, with their DSPy annotation.
@@ -60,6 +61,14 @@ pub const Field = struct {
     type_name: []const u8,
     /// Documentation supplied by custom DSPy types, independent of user desc.
     type_description: []const u8 = "",
+    /// A nested annotation names its custom type, not the surrounding list/union.
+    type_description_name: []const u8 = "",
+    /// Code is text on the wire but keeps its own model validator and schema.
+    code_type: bool = false,
+    /// Direct, optional, list, or dictionary Code annotations use literal XML.
+    code_annotation: bool = false,
+    /// Custom class names can differ from Pydantic's safe definition keys.
+    schema_definition_name: []const u8 = "",
     /// `desc` as stored by DSPy: user text, or `${name}` when none given.
     desc: []const u8,
     /// `prefix` as stored by DSPy: `infer_prefix(name) + ":"`.
@@ -86,6 +95,8 @@ pub const Field = struct {
     nullable: bool = false,
     /// Lazily encode a declared Zig field default into the per-call arena.
     default_value: ?*const fn (std.mem.Allocator) std.mem.Allocator.Error!std.json.Value = null,
+    /// Refine masks Python objects before serialization, not their wire forms.
+    refine_mask: ?@import("feedback.zig").Mask = null,
 };
 
 /// An absent field differs from an explicit null value.
@@ -195,18 +206,23 @@ fn fieldsOf(comptime T: type, comptime role: []const u8, comptime descriptions: 
                 .desc = descriptionFor(name, descriptions) orelse "${" ++ name ++ "}",
                 .prefix = inferPrefix(name) ++ ":",
                 .literals = if (kind == .literal) std.meta.fieldNames(FT) else &.{},
-                .schema = if (FT == History) History.schema else if (FT == ToolCalls) ToolCalls.schema else if (kind == .json) nested.schema(FT) else "",
-                .xml_schema = if (FT == History) History.schema else if (FT == ToolCalls) ToolCalls.schema else if (kind == .json) nested.schemaXml(FT) else "",
-                .validate = if (FT == History) History.validate else if (FT == ToolCalls) ToolCalls.validate else if (kind == .json) nested.Validator(FT) else null,
+                .schema = if (FT == History) History.schema else if (FT == ToolCalls) ToolCalls.schema else if (kind == .json or code.isCode(FT)) nested.schema(FT) else "",
+                .xml_schema = if (FT == History) History.schema else if (FT == ToolCalls) ToolCalls.schema else if (kind == .json or code.isCode(FT)) nested.schemaXml(FT) else "",
+                .validate = if (FT == History) History.validate else if (FT == ToolCalls) ToolCalls.validate else if (kind == .json or code.isCode(FT)) nested.Validator(FT) else null,
                 .optional_str = nested.isOptionalStr(FT),
                 .reasoning_type = FT == Reasoning or FT == ?Reasoning,
                 // DSPy adapts direct Reasoning annotations, not Optional unions.
                 .native_reasoning = FT == Reasoning,
-                .xml_literal = FT == History or FT == ToolCalls or FT == ?Reasoning,
+                .xml_literal = FT == History or FT == ToolCalls or FT == ?Reasoning or code.annotationType(FT) != null,
                 .native_tool_calls = FT == ToolCalls,
-                .type_description = if (FT == ToolCalls) ToolCalls.description else "",
+                .type_description = if (code.annotationType(FT)) |C| C.description else if (FT == ToolCalls) ToolCalls.description else "",
+                .type_description_name = if (code.annotationType(FT)) |C| C.model_name else "",
+                .code_type = code.isCode(FT),
+                .code_annotation = code.annotationType(FT) != null,
+                .schema_definition_name = if (code.isCode(FT)) FT.schema_name else "",
                 .nullable = @typeInfo(FT) == .optional,
                 .default_value = if (info.field_attrs[i].default_value_ptr) |raw| defaultProvider(FT, raw) else null,
+                .refine_mask = @import("feedback.zig").masker(FT),
             };
         }
         return out;
@@ -231,7 +247,7 @@ fn descriptionFor(comptime name: []const u8, comptime descriptions: []const Desc
 
 /// Map a Zig field type onto a supported DSPy annotation.
 pub fn kindOf(comptime T: type, comptime name: []const u8) Kind {
-    if (T == []const u8 or T == Reasoning) return .str;
+    if (T == []const u8 or T == Reasoning or code.isCode(T)) return .str;
     if (T == []const []const u8) return .str_list;
     if (T == bool) return .boolean;
     if (T == std.json.ObjectMap) return .json_object;
@@ -258,6 +274,7 @@ pub fn kindOf(comptime T: type, comptime name: []const u8) Kind {
 }
 
 fn typeName(comptime T: type, comptime kind: Kind) []const u8 {
+    if (code.isCode(T)) return T.model_name;
     return switch (kind) {
         .str => "str",
         .str_list => "list[str]",

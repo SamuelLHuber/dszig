@@ -134,7 +134,7 @@ pub fn BestOfN(comptime P: type) type {
 /// exact past i64/i128 rather than passing through a lossy float conversion.
 const RolloutError = Allocator.Error || error{UnsupportedRolloutId};
 
-fn rolloutAt(arena: Allocator, start: Value, index: usize) RolloutError!Value {
+pub fn rolloutAt(arena: Allocator, start: Value, index: usize) RolloutError!Value {
     return switch (start) {
         .integer => |n| integerRollout(arena, n, index),
         .bool => |b| integerRollout(arena, @intFromBool(b), index),

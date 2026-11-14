@@ -14,6 +14,7 @@ const Writer = std.Io.Writer;
 const pyjson = @import("pyjson.zig");
 const signature = @import("signature.zig");
 const types = @import("types.zig");
+const code = @import("code.zig");
 const Field = signature.Field;
 
 pub const Record = ObjectMap;
@@ -81,6 +82,16 @@ fn formatBlob(w: *Writer, v: Value) pyjson.Error!void {
 
 /// `parse_value(value, annotation)` for a value taken from a chat section.
 pub fn parseText(arena: Allocator, field: Field, text: []const u8) ParseError!Value {
+    if (field.code_type) {
+        const validate = field.validate orelse return error.ParseValue;
+        const candidate = try parseNestedCandidate(arena, text, true);
+        return validate(arena, candidate) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            // DSPy retries a direct custom Type against the original string,
+            // but does not apply this fallback to Optional/list/dict unions.
+            error.ParseValue => validate(arena, .{ .string = text }),
+        };
+    }
     return switch (field.kind) {
         .str => .{ .string = text },
         .literal => parseLiteralText(field, text),
@@ -96,6 +107,11 @@ pub fn parseText(arena: Allocator, field: Field, text: []const u8) ParseError!Va
 
 /// `parse_value(value, annotation)` for a value taken from a JSON object.
 pub fn parseJsonValue(arena: Allocator, field: Field, v: Value) ParseError!Value {
+    if (field.code_type) {
+        if (v == .string) return parseText(arena, field, v.string);
+        const validate = field.validate orelse return error.ParseValue;
+        return validate(arena, v);
+    }
     if (field.reasoning_type and field.kind == .str) return types.validate(signature.Reasoning, arena, v);
     if (field.kind == .str) {
         if (v == .string) return v;
@@ -142,20 +158,34 @@ pub fn parseJsonValue(arena: Allocator, field: Field, v: Value) ParseError!Value
 /// literal, then the text itself, validated against the type.
 fn parseNestedText(arena: Allocator, field: Field, text: []const u8) ParseError!Value {
     if (field.optional_str) return .{ .string = text };
-    const t = pyStrip(text);
-    const candidate: Value = std.json.parseFromSliceLeaky(Value, arena, t, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => if (std.mem.eql(u8, t, "None"))
-            Value.null
-        else if (std.mem.eql(u8, t, "True"))
-            Value{ .bool = true }
-        else if (std.mem.eql(u8, t, "False"))
-            Value{ .bool = false }
-        else
-            Value{ .string = text },
-    };
+    const candidate = try parseNestedCandidate(arena, text, field.code_annotation);
     const validate = field.validate orelse return error.ParseValue;
     return validate(arena, candidate);
+}
+
+fn parseNestedCandidate(arena: Allocator, text: []const u8, code_annotation: bool) ParseError!Value {
+    const t = pyStrip(text);
+    return std.json.parseFromSliceLeaky(Value, arena, t, .{}) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => blk: {
+            if (code_annotation) {
+                const filtered = code.Code.init(text).code;
+                if (filtered.ptr != text.ptr or filtered.len != text.len) {
+                    if (std.json.parseFromSliceLeaky(Value, arena, filtered, .{})) |candidate| {
+                        break :blk candidate;
+                    } else |parse_err| if (parse_err == error.OutOfMemory) return error.OutOfMemory;
+                }
+            }
+            break :blk if (std.mem.eql(u8, t, "None"))
+                Value.null
+            else if (std.mem.eql(u8, t, "True"))
+                Value{ .bool = true }
+            else if (std.mem.eql(u8, t, "False"))
+                Value{ .bool = false }
+            else
+                Value{ .string = text };
+        },
+    };
 }
 
 fn strDict(v: Value) ParseError!Value {
@@ -360,6 +390,7 @@ pub fn toRecord(arena: Allocator, comptime T: type, value: T) Allocator.Error!Re
 }
 
 pub fn toValue(arena: Allocator, comptime T: type, v: T) Allocator.Error!Value {
+    if (comptime code.isCode(T)) return v.toValue();
     if (T == signature.Reasoning) return .{ .string = v.content };
     if (T == @import("tool.zig").ToolCalls) return v.toValue(arena);
     if (T == Value) return v;
@@ -410,6 +441,7 @@ pub fn fromRecord(arena: Allocator, comptime T: type, record: *const Record) Con
 }
 
 pub fn fromValue(arena: Allocator, comptime T: type, v: Value) ConvertError!T {
+    if (comptime code.isCode(T)) return T.fromValue(v) catch error.TypeMismatch;
     if (T == Value) return v;
     if (T == @import("tool.zig").ToolCalls) return T.fromValue(arena, v) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,

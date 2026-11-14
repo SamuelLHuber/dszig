@@ -127,6 +127,7 @@ fn loadPredict(arena: Allocator, s: *predict.PredictState, saved: *const Record)
         prefixes[i] = try arena.dupe(u8, prefix.string);
         descs[i] = try arena.dupe(u8, desc.string);
     }
+    try s.forkSignatureClass(arena);
     s.descs = descs;
     s.prefixes = prefixes;
     const demos = saved.get("demos") orelse return error.MissingState;

@@ -170,7 +170,9 @@ fn less(a: f32, b: f32) bool {
     return a < b or (std.math.isNan(b) and !std.math.isNan(a));
 }
 
-fn argsort(scores: []const f32, indices: []usize) void {
+/// Ascending NumPy scalar argsort, including unstable ties and NaNs last.
+/// `scores` and `indices` must have identical lengths and must not alias.
+pub fn argsort(scores: []const f32, indices: []usize) void {
     assert(scores.len == indices.len);
     for (indices, 0..) |*index, i| index.* = i;
     if (indices.len < 2) return;
