@@ -518,10 +518,10 @@ pub const Retriever = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
-        search: *const fn (ptr: *const anyopaque, arena: Allocator, query: []const u8, k: u32) Allocator.Error![]const []const u8,
+        search: *const fn (ptr: *const anyopaque, arena: Allocator, query: []const u8, k: i64) anyerror![]const []const u8,
     };
 
-    pub fn search(r: Retriever, arena: Allocator, query: []const u8, k: u32) Allocator.Error![]const []const u8 {
+    pub fn search(r: Retriever, arena: Allocator, query: []const u8, k: i64) anyerror![]const []const u8 {
         return r.vtable.search(r.ptr, arena, query, k);
     }
 };
@@ -535,7 +535,7 @@ pub const InMemoryRetriever = struct {
         return .{ .ptr = self, .vtable = &.{ .search = search } };
     }
 
-    fn search(ptr: *const anyopaque, arena: Allocator, query: []const u8, k: u32) Allocator.Error![]const []const u8 {
+    fn search(ptr: *const anyopaque, arena: Allocator, query: []const u8, k: i64) Allocator.Error![]const []const u8 {
         const self: *const InMemoryRetriever = @ptrCast(@alignCast(ptr));
         const Scored = struct { index: usize, score: usize };
         const scored = try arena.alloc(Scored, self.passages.len);
@@ -545,7 +545,10 @@ pub const InMemoryRetriever = struct {
                 return a.score > b.score or (a.score == b.score and a.index < b.index);
             }
         }.lessThan);
-        const n = @min(k, scored.len);
+        const n: usize = if (k < 0)
+            scored.len - @as(usize, @intCast(@min(@as(u64, scored.len), @abs(k))))
+        else
+            @intCast(@min(@as(u64, scored.len), @as(u64, @intCast(k))));
         const out = try arena.alloc([]const u8, n);
         for (out, scored[0..n]) |*o, s| o.* = self.passages[s.index];
         return out;
@@ -580,9 +583,9 @@ pub const InMemoryRetriever = struct {
 
 /// `dspy.Retrieve(k)`.
 pub const Retrieve = struct {
-    k: u32 = 3,
+    k: i64 = 3,
 
-    pub fn forward(self: *const Retrieve, ctx: Context, query: []const u8) Error![]const []const u8 {
+    pub fn forward(self: *const Retrieve, ctx: Context, query: []const u8) anyerror![]const []const u8 {
         const r = ctx.retriever orelse return error.NoRetriever;
         return r.search(ctx.arena, query, self.k);
     }

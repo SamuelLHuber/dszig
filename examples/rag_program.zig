@@ -20,7 +20,7 @@ pub const RAG = struct {
     pub const Input = struct { question: []const u8 };
     pub const Output = dszig.ChainOfThought(QA).Output;
 
-    pub fn forward(self: *const RAG, ctx: dszig.Context, input: Input) dszig.predict.Error!Output {
+    pub fn forward(self: *const RAG, ctx: dszig.Context, input: Input) anyerror!Output {
         const context = try self.retrieve.forward(ctx, input.question);
         return self.generate_answer.forward(ctx, .{ .context = context, .question = input.question });
     }
@@ -96,7 +96,7 @@ pub const MultiHop = struct {
     pub const Input = struct { question: []const u8 };
     pub const Output = dszig.ChainOfThought(QA).Output;
 
-    pub fn forward(self: *const MultiHop, ctx: dszig.Context, input: Input) dszig.predict.Error!Output {
+    pub fn forward(self: *const MultiHop, ctx: dszig.Context, input: Input) anyerror!Output {
         var context: []const []const u8 = &.{};
         var query = input.question;
         for (0..2) |_| {

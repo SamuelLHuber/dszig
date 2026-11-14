@@ -229,7 +229,10 @@ pub const AgentQA = dszig.Signature(struct {
 fn corpusSearch(ctx: dszig.Context, args: *const Record) dszig.react.ToolError!Value {
     const query = args.get("query") orelse return error.InvalidArguments;
     const retriever = ctx.retriever orelse return error.ToolFailed;
-    const passages = try retriever.search(ctx.arena, query.string, 2);
+    const passages = retriever.search(ctx.arena, query.string, 2) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.ToolFailed,
+    };
     var list: std.json.Array = .init(ctx.arena);
     for (passages) |p| try list.append(.{ .string = p });
     return .{ .array = list };

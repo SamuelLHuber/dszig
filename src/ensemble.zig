@@ -208,6 +208,7 @@ test "majority counts aliased NaN identity but not separate equal NaN bits" {
 
 pub fn Ensemble(comptime P: type, comptime n: usize) type {
     comptime assert(n > 0);
+    const ProgramError = @typeInfo(@typeInfo(@TypeOf(P.forward)).@"fn".return_type.?).error_union.error_set;
     const output_fields = @typeInfo(P.Output).@"struct".field_names;
     comptime assert(output_fields.len > 0);
     return struct {
@@ -223,7 +224,7 @@ pub fn Ensemble(comptime P: type, comptime n: usize) type {
         compiled: bool = false,
 
         /// `reduce_fn=dspy.majority`.
-        pub fn forward(self: *const Self, ctx: Context, input: Input) (predict.Error || Error)!Output {
+        pub fn forward(self: *const Self, ctx: Context, input: Input) (ProgramError || predict.Error || Error)!Output {
             const outputs = try self.forwardAll(ctx, input);
             const records = try ctx.arena.alloc(Record, outputs.len);
             for (outputs, records) |o, *r| r.* = try value.toRecord(ctx.arena, Output, o);
@@ -231,7 +232,7 @@ pub fn Ensemble(comptime P: type, comptime n: usize) type {
         }
 
         /// `reduce_fn=None`: every sampled program's output, in sample order.
-        pub fn forwardAll(self: *const Self, ctx: Context, input: Input) predict.Error![]const Output {
+        pub fn forwardAll(self: *const Self, ctx: Context, input: Input) (ProgramError || predict.Error)![]const Output {
             const k = self.size orelse n;
             assert(k > 0 and k <= n);
             const indices = try ctx.arena.alloc(usize, k);

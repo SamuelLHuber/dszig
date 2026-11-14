@@ -249,7 +249,7 @@ test "compiled sub-modules are frozen out of the parameter walk" {
         compiled: bool = false,
         pub const Input = rag.RAG.Input;
         pub const Output = rag.RAG.Output;
-        pub fn forward(self: *const @This(), ctx: dszig.Context, input: Input) dszig.predict.Error!Output {
+        pub fn forward(self: *const @This(), ctx: dszig.Context, input: Input) anyerror!Output {
             return self.inner.forward(ctx, input);
         }
     };

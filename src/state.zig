@@ -92,8 +92,8 @@ pub fn loadState(arena: Allocator, program: anytype, state: Value) LoadError!voi
         switch (p.param) {
             .predict => |s| try loadPredict(arena, s, &saved.object),
             .retrieve => |r| if (saved.object.get("k")) |k| {
-                if (k != .integer or k.integer < 0 or k.integer > std.math.maxInt(u32)) return error.InvalidState;
-                r.k = @intCast(k.integer);
+                if (k != .integer) return error.InvalidState;
+                r.k = k.integer;
             },
         }
     }

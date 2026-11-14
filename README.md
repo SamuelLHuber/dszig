@@ -108,7 +108,7 @@ retain the actual continuation and raw provider response independently.
 | Class-style signatures and typed fields | `Signature`, `Dict`, `Code`, `CodeWithLanguage`, scalar/string/list/optional/model fields, literal enums, field descriptions/defaults, compile-time rejection of invalid signatures |
 | Chat, JSON, XML and two-stage adapters | `Adapter.chat`, `.json`, `.xml`, `.two_step`; `TwoStepAdapter` with a separate extraction LM; independent prompt/parse fixtures, strict response-schema construction, JSON fallback, typed XML and Unicode key handling |
 | Prediction and reasoning | `Predict`, `ChainOfThought`, `BestOfN`, `Refine`, `MultiChainComparison`, explicit `Context`, typed outputs, serialized `Trace`, named predictor/parameter discovery |
-| Retrieval and embeddings | `Retrieve`, lexical `InMemoryRetriever`, custom/OpenAI/Azure `Embedder`, float32 `KNN`, per-query `KNNFewShot`, and brute-force `Embeddings`/`EmbeddingsWithScores` with NumPy persistence |
+| Retrieval and embeddings | `Retrieve`, lexical `InMemoryRetriever`, HTTP `ColBERTv2` with shared mutable-graph memory caching, custom/OpenAI/Azure `Embedder`, float32 `KNN`, per-query `KNNFewShot`, and brute-force `Embeddings`/`EmbeddingsWithScores` with NumPy persistence |
 | Evaluation and few-shot search | `optimize.evaluate`, `LabeledFewShot`, `BootstrapFewShot`, `BootstrapFewShotWithRandomSearch`, `BootstrapFewShotWithOptuna`, teacher context, zero thresholds and positional multi-use trace selection |
 | Instruction optimization | `InferRules`; `MIPROv2`, its program-aware proposer and an Optuna 4.5.0 TPE port; `COPRO`; `SIMBA`; supported instance-frontier `GEPA` paths against gepa 0.1.4 |
 | Agents and tools | `ReAct`, comptime `Tool`, `History`, `ToolCalls`, tool results, native declarations and text tool calls, typed submit, retained history |
@@ -266,6 +266,27 @@ formatting, ignored input tracing and predictor state roundtrips have
 source-backed coverage. These modules were also exercised through an actual
 native executable, independently of the existing nine-pipeline replay fixture.
 
+`ColBERTv2.init(arena, &client, &cache, options)` supports GET and POST retrieval.
+The caller owns the `std.http.Client` and `request_cache.Cache`; both must outlive
+the retriever. `forward(query, k)` accepts signed `i64` counts and returns a
+leased result: call `result.deinit()` when finished. GET preserves DSPy's double
+negative slicing and synthesized `long_text`; POST slices once and preserves
+the server's `long_text`, including missing or non-string values.
+`result.simplify(arena)` returns graph values borrowing that lease, while
+`retriever()` adapts to the string-only `Context.retriever` interface and copies
+returned strings into the context arena. Retrieval failures propagate through
+`Retrieve`, RAG and Ensemble before generation.
+
+The two ColBERT cache layers retain the same first raw payload. Returned rows
+are shallow copies: initial top-level edits are private, but nested edits reach
+cached data, including list appends that reallocate. Cache hits are memoized
+deep copies, isolating their later mutations. Result leases survive replacement,
+eviction and cache destruction. The cache mutex protects entries, not mutable
+graphs; callers must serialize graph mutations against concurrent readers.
+Memory caching can be disabled or bounded with a positive `max_entries`;
+zero capacity fails on insertion. GET's `k > 100` guard follows cache lookup,
+so preseeded inner or outer hits bypass it, as upstream does.
+
 `Embedder.initCustom` accepts a native callback returning float32, float64 or
 rectangular JSON vectors; `initHosted` supports `openai/` and `azure/` models
 through the existing `std.http` transport. Hosted environment values are explicit,
@@ -331,7 +352,7 @@ scores, saved artifact bytes, instruction candidates, trial logs, candidate
 scores and SIMBA train scores. It is **mock-provider behavioral evidence**, not
 proof of real-model performance or complete DSPy equivalence.
 
-Local verification on 2026-11-14 passed **239/239 tests**
+Local verification on 2026-11-14 passed **253/253 tests**
 in both Debug and ReleaseSafe. The actual replay executable consumed the entire
 fixture and matched every adapter case and pipeline. The independent real-DSPy
 reference gate also passed. These results establish only the coverage described
@@ -354,6 +375,19 @@ unchanged callback errors, response-size rejection, an inactivity timeout and
 the actual live CLI against a scripted localhost provider. Generation retains
 its existing HTTP-200-only success policy; status-inspecting consumers use the
 same bounded transfer and timeout implementation without generation retries.
+An actual native ColBERT executable also matched the pinned DSPy oracle's
+**81 HTTP requests byte-for-byte**, with 87 value/error-category/alias checks:
+GET/POST and signed slicing, Unicode URLs and JSON bodies, typed/missing
+`long_text`, malformed-response cache timing, two-layer promotion, nested
+mutation isolation, eviction, distinct request keys and preseeded cap bypass.
+A separate HTTP consumer exercised negative-`k` Retrieve, RAG and Ensemble,
+preserved retrieval errors before LM invocation, and verified copied strings
+after cache destruction. Five scripted generation prompts were used, not a
+real inference endpoint. Redirect checks matched 57 actual requests across
+GET/POST 301/302/303/307/308, relative Unicode redirects, cross-port credential
+stripping and redirect-loop termination. URI requoting matched pinned requests
+across all 1,112,064 Unicode scalar values; this is not full requests/session
+equivalence.
 These are protocol and formatting checks, not homelab or real-model evidence.
 
 The independent optimizer source probes can also be run directly:
@@ -366,6 +400,7 @@ uv run --project tools/dspy_reference --locked tools/dspy_reference/embeddings_o
 uv run --project tools/dspy_reference --locked tools/dspy_reference/refine_oracle.py
 uv run --project tools/dspy_reference --locked tools/dspy_reference/refine_react_oracle.py
 uv run --project tools/dspy_reference --locked tools/dspy_reference/two_step_oracle.py
+uv run --project tools/dspy_reference --locked tools/dspy_reference/colbertv2_oracle.py
 ```
 
 These execute actual pinned DSPy/Optuna. They cover rule metadata/settings
@@ -437,8 +472,16 @@ The following prevent a claim that DSZig can do everything DSPy can:
   borrowed teacher-settings object is not reflected after Bootstrap's entry
   snapshot.
 - **Providers and media:** no complete lm15 provider catalog/routing/auth/error
-  taxonomy, embedding providers beyond OpenAI/Azure, ColBERTv2, Image/Audio/BoundingBox/File,
+  taxonomy, embedding providers beyond OpenAI/Azure, Image/Audio/BoundingBox/File,
   rich media tool results, provider training lifecycle or native streaming.
+- **ColBERT HTTP/cache boundaries:** no Python diskcache/key interoperability,
+  requests cookie jar, proxy/netrc/IDNA/session behavior or complete Python
+  exception type/message reconstruction. Native JSON rejects bare NaN/Infinity
+  and unpaired surrogate escapes accepted by the Python JSON backend. HTTP
+  response bytes are bounded explicitly; graph-to-JSON conversion rejects cycles
+  and nesting beyond 1,000 levels, while cache graph cloning preserves aliases
+  and cycles. Native cache zero-capacity rejection occurs on insertion rather
+  than Python's constructor.
 - **Dynamic Python APIs:** no general Python Module/BaseModule/Example/Prediction/
   Completions object model, dynamic signature syntax, arbitrary Pydantic custom
   models/validators, custom Type hierarchy, generic callbacks,

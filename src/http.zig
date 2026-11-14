@@ -2,8 +2,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const TimedIo = @import("timed_io.zig");
+const unicode = @import("unicode.zig");
 
-/// Request-arena-owned headers are refreshed before every network attempt.
+/// Request-arena-owned headers are refreshed before each retry attempt.
 pub const HeaderProvider = struct {
     context: *anyopaque,
     prepare: *const fn (*anyopaque, Allocator, []const std.http.Header) anyerror![]const std.http.Header,
@@ -36,6 +37,10 @@ pub const Transport = struct {
     success: enum { ok, any } = .any,
     failure_error: anyerror = error.HttpFailure,
     response_limit_error: anyerror = error.ResponseTooLarge,
+    max_redirects: u8 = 0,
+    normalize_url: bool = false,
+
+    const WireResponse = struct { response: Response, location: ?[]const u8 };
 
     pub fn send(self: *const Transport, arena: Allocator, input: Request) anyerror!Response {
         if (self.timeout_ns == null and self.connect_timeout_ns == null)
@@ -84,7 +89,7 @@ pub const Transport = struct {
                 prepared.headers = try provider.prepare(provider.context, arena, input.headers);
             if (timed) |timer| timer.resetFailure();
             var last_error = self.failure_error;
-            const response: ?Response = self.fetch(prepared) catch |err| switch (err) {
+            const response: ?Response = self.fetch(arena, prepared) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.StreamTooLong => return self.response_limit_error,
                 else => failed: {
@@ -107,7 +112,42 @@ pub const Transport = struct {
         }
     }
 
-    fn fetch(self: *const Transport, input: Request) !Response {
+    fn fetch(self: *const Transport, arena: Allocator, input: Request) !Response {
+        var current = input;
+        if (self.normalize_url) current.url = try requoteUri(arena, current.url);
+        var redirects: u8 = 0;
+        while (true) {
+            const wire = try self.fetchOnce(arena, current);
+            const location = wire.location orelse return wire.response;
+            // The body has been consumed before opening another request.
+            defer self.client.allocator.free(wire.response.body);
+            if (redirects >= self.max_redirects) return error.TooManyHttpRedirects;
+            const base = try std.Uri.parse(current.url);
+            const target = if (self.normalize_url) try requoteUri(arena, location) else location;
+            const auxiliary = try arena.alloc(u8, current.url.len + 2 * target.len + 1);
+            @memcpy(auxiliary[0..target.len], target);
+            var remaining = auxiliary;
+            var resolved = try base.resolveInPlace(target.len, &remaining);
+            if (resolved.fragment == null or componentBytes(resolved.fragment.?).len == 0)
+                resolved.fragment = base.fragment;
+            const remove_auth = stripAuth(base, resolved);
+            const remove_body = wire.response.status != .temporary_redirect and
+                wire.response.status != .permanent_redirect;
+            current.headers = try redirectedHeaders(arena, current.headers, remove_auth, remove_body);
+            if (remove_auth) current.authorization = null;
+            if ((wire.response.status == .see_other or wire.response.status == .found) and current.method != .HEAD or
+                wire.response.status == .moved_permanently and current.method == .POST)
+                current.method = .GET;
+            if (remove_body) {
+                current.body = null;
+                current.content_type = null;
+            }
+            current.url = try std.fmt.allocPrint(arena, "{f}", .{resolved});
+            redirects += 1;
+        }
+    }
+
+    fn fetchOnce(self: *const Transport, arena: Allocator, input: Request) !WireResponse {
         var selected_headers: std.http.Client.Request.Headers = .{
             .content_type = if (input.content_type) |kind| .{ .override = kind } else .default,
             .authorization = if (input.authorization) |token| .{ .override = token } else .default,
@@ -133,7 +173,7 @@ pub const Transport = struct {
             .headers = selected_headers,
         });
         defer request.deinit();
-        return self.transferRequest(&request, input.body) catch |err| {
+        return self.transferRequest(arena, &request, input.body) catch |err| {
             if (request.connection) |connection| {
                 if (connection.stream_reader.err) |read_error| {
                     if (read_error == error.Canceled) return error.Canceled;
@@ -146,8 +186,9 @@ pub const Transport = struct {
         };
     }
 
-    fn transferRequest(self: *const Transport, request: *std.http.Client.Request, body: ?[]const u8) !Response {
-        if (body) |bytes| {
+    fn transferRequest(self: *const Transport, arena: Allocator, request: *std.http.Client.Request, body: ?[]const u8) !WireResponse {
+        if (body != null or request.method.requestHasBody()) {
+            const bytes = body orelse "";
             request.transfer_encoding = .{ .content_length = bytes.len };
             var payload = try request.sendBodyUnflushed(&.{});
             try payload.writer.writeAll(bytes);
@@ -158,6 +199,10 @@ pub const Transport = struct {
         }
         var response = try request.receiveHead(&.{});
         const status = response.head.status;
+        const location = if (self.max_redirects > 0 and isRedirect(status))
+            if (response.head.location) |text| if (text.len > 0) try arena.dupe(u8, text) else null else null
+        else
+            null;
         const decompress_buffer: []u8 = switch (response.head.content_encoding) {
             .identity => &.{},
             .zstd => try self.client.allocator.alloc(u8, std.compress.zstd.default_window_len),
@@ -169,16 +214,215 @@ pub const Transport = struct {
         var decompress: std.http.Decompress = undefined;
         const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
         return .{
-            .status = status,
-            .body = try reader.allocRemaining(self.client.allocator, .limited(self.max_response_bytes)),
+            .response = .{
+                .status = status,
+                .body = try reader.allocRemaining(self.client.allocator, .limited(self.max_response_bytes)),
+            },
+            .location = location,
         };
     }
 };
+
+/// Requests-compatible URI quoting, including Unicode decimal percent pairs.
+/// Unchanged input is borrowed; changed text belongs to `arena`.
+pub fn requoteUri(arena: Allocator, input: []const u8) (Allocator.Error || error{InvalidUtf8})![]const u8 {
+    if (!std.unicode.utf8ValidateSlice(input)) return error.InvalidUtf8;
+    var allow_percent = true;
+    for (input, 0..) |byte, i| {
+        if (byte != '%') continue;
+        const pair = percentPair(input[i + 1 ..]) orelse continue;
+        if (alphaNumeric(pair.first) and alphaNumeric(pair.second) and
+            (hexValue(pair.first) == null or hexValue(pair.second) == null))
+        {
+            allow_percent = false;
+            break;
+        }
+    }
+
+    var size: usize = 0;
+    var changed = false;
+    var i: usize = 0;
+    while (i < input.len) {
+        if (allow_percent and input[i] == '%') {
+            if (unreservedEscape(input[i + 1 ..])) |decoded| {
+                size += 1;
+                i += 1 + decoded.bytes;
+                changed = true;
+                continue;
+            }
+        }
+        const safe = safeUriByte(input[i], allow_percent);
+        size += if (safe) @as(usize, 1) else 3;
+        changed = changed or !safe;
+        i += 1;
+    }
+    if (!changed) return input;
+    const out = try arena.alloc(u8, size);
+    const hex = "0123456789ABCDEF";
+    i = 0;
+    var written: usize = 0;
+    while (i < input.len) {
+        if (allow_percent and input[i] == '%') {
+            if (unreservedEscape(input[i + 1 ..])) |decoded| {
+                out[written] = decoded.byte;
+                written += 1;
+                i += 1 + decoded.bytes;
+                continue;
+            }
+        }
+        const byte = input[i];
+        if (safeUriByte(byte, allow_percent)) {
+            out[written] = byte;
+            written += 1;
+        } else {
+            out[written..][0..3].* = .{ '%', hex[byte >> 4], hex[byte & 15] };
+            written += 3;
+        }
+        i += 1;
+    }
+    return out;
+}
+
+const PercentPair = struct { first: u21, second: u21, bytes: usize };
+fn percentPair(text: []const u8) ?PercentPair {
+    var iterator = std.unicode.Utf8View.initUnchecked(text).iterator();
+    const first = iterator.nextCodepoint() orelse return null;
+    const second = iterator.nextCodepoint() orelse return null;
+    return .{ .first = first, .second = second, .bytes = iterator.i };
+}
+
+const DecodedEscape = struct { byte: u8, bytes: usize };
+fn unreservedEscape(text: []const u8) ?DecodedEscape {
+    const pair = percentPair(text) orelse return null;
+    const high = hexValue(pair.first) orelse return null;
+    const low = hexValue(pair.second) orelse return null;
+    const byte = high * 16 + low;
+    if (!unreserved(byte)) return null;
+    return .{ .byte = byte, .bytes = pair.bytes };
+}
+
+fn alphaNumeric(cp: u21) bool {
+    return cp != '_' and unicode.isWord(cp);
+}
+
+fn hexValue(cp: u21) ?u8 {
+    if (cp >= 'a' and cp <= 'f') return @intCast(cp - 'a' + 10);
+    if (cp >= 'A' and cp <= 'F') return @intCast(cp - 'A' + 10);
+    // CPython 3.11 / Unicode14 Nd zeroes. int(text,16) accepts these decimal
+    // digits, not every numeric character accepted by str.isalnum().
+    const zeroes = [_]u21{
+        0x30,    0x660,   0x6f0,   0x7c0,   0x966,   0x9e6,   0xa66,   0xae6,   0xb66,   0xbe6,
+        0xc66,   0xce6,   0xd66,   0xde6,   0xe50,   0xed0,   0xf20,   0x1040,  0x1090,  0x17e0,
+        0x1810,  0x1946,  0x19d0,  0x1a80,  0x1a90,  0x1b50,  0x1bb0,  0x1c40,  0x1c50,  0xa620,
+        0xa8d0,  0xa900,  0xa9d0,  0xa9f0,  0xaa50,  0xabf0,  0xff10,  0x104a0, 0x10d30, 0x11066,
+        0x110f0, 0x11136, 0x111d0, 0x112f0, 0x11450, 0x114d0, 0x11650, 0x116c0, 0x11730, 0x118e0,
+        0x11950, 0x11c50, 0x11d50, 0x11da0, 0x16a60, 0x16ac0, 0x16b50, 0x1d7ce, 0x1d7d8, 0x1d7e2,
+        0x1d7ec, 0x1d7f6, 0x1e140, 0x1e2f0, 0x1e950, 0x1fbf0,
+    };
+    for (zeroes) |zero| {
+        if (cp < zero) break;
+        if (cp - zero < 10) return @intCast(cp - zero);
+    }
+    return null;
+}
+
+fn unreserved(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or std.mem.indexOfScalar(u8, "-._~", byte) != null;
+}
+
+fn safeUriByte(byte: u8, allow_percent: bool) bool {
+    return unreserved(byte) or (allow_percent and byte == '%') or
+        std.mem.indexOfScalar(u8, "!#$&'()*+,/:;=?@[]", byte) != null;
+}
+
+fn isRedirect(status: std.http.Status) bool {
+    return switch (status) {
+        .moved_permanently, .found, .see_other, .temporary_redirect, .permanent_redirect => true,
+        else => false,
+    };
+}
+
+fn componentBytes(component: std.Uri.Component) []const u8 {
+    return switch (component) {
+        .raw, .percent_encoded => |text| text,
+    };
+}
+
+/// Match requests' origin/port rules without carrying credentials to a new
+/// host or a downgrade. The conventional HTTP-to-HTTPS upgrade keeps auth.
+fn stripAuth(old: std.Uri, new: std.Uri) bool {
+    const old_host = if (old.host) |host| componentBytes(host) else "";
+    const new_host = if (new.host) |host| componentBytes(host) else "";
+    if (!std.ascii.eqlIgnoreCase(old_host, new_host)) return true;
+    const old_http = std.ascii.eqlIgnoreCase(old.scheme, "http");
+    const new_https = std.ascii.eqlIgnoreCase(new.scheme, "https");
+    if (old_http and (old.port == null or old.port == 80) and new_https and
+        (new.port == null or new.port == 443)) return false;
+    if (!std.ascii.eqlIgnoreCase(old.scheme, new.scheme)) return true;
+    const default_port: ?u16 = if (old_http) 80 else if (new_https) 443 else null;
+    if ((old.port == null or old.port == default_port) and
+        (new.port == null or new.port == default_port)) return false;
+    return old.port != new.port;
+}
+
+fn redirectedHeaders(arena: Allocator, headers: []const std.http.Header, remove_auth: bool, remove_body: bool) Allocator.Error![]const std.http.Header {
+    var count: usize = 0;
+    for (headers) |header| {
+        if (!dropRedirectHeader(header.name, remove_auth, remove_body)) count += 1;
+    }
+    if (count == headers.len) return headers;
+    const filtered = try arena.alloc(std.http.Header, count);
+    var index: usize = 0;
+    for (headers) |header| {
+        if (dropRedirectHeader(header.name, remove_auth, remove_body)) continue;
+        filtered[index] = header;
+        index += 1;
+    }
+    return filtered;
+}
+
+fn dropRedirectHeader(name: []const u8, remove_auth: bool, remove_body: bool) bool {
+    return std.ascii.eqlIgnoreCase(name, "cookie") or
+        (remove_auth and std.ascii.eqlIgnoreCase(name, "authorization")) or
+        (remove_body and (std.ascii.eqlIgnoreCase(name, "content-type") or
+            std.ascii.eqlIgnoreCase(name, "content-length") or
+            std.ascii.eqlIgnoreCase(name, "transfer-encoding")));
+}
 
 /// Transport failures, HTTP 429 and server errors are retryable.
 pub fn retryable(status: ?std.http.Status) bool {
     const s = status orelse return true;
     return s == .too_many_requests or @backingInt(s) >= 500;
+}
+
+test "URI quoting preserves requests Unicode and invalid percent rules" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const cases = .{
+        .{ "http://x/%7e/%2f/a b?x=ä#🙂", "http://x/~/%2f/a%20b?x=%C3%A4#%F0%9F%99%82" },
+        .{ "http://x/%GG/a%7E", "http://x/%25GG/a%257E" },
+        .{ "http://x/%４１/%١f", "http://x/A/%%D9%A1f" },
+        .{ "http://x/%éA/%7E", "http://x/%25%C3%A9A/%257E" },
+        .{ "http://x/%_A/%", "http://x/%_A/%" },
+        .{ "http://x/%A%41/%1/%%", "http://x/%AA/%1/%%" },
+        .{ "http://x/\x00\x1f\x7f[]~!", "http://x/%00%1F%7F[]~!" },
+    };
+    inline for (cases) |case|
+        try std.testing.expectEqualStrings(case[1], try requoteUri(arena.allocator(), case[0]));
+}
+
+test "redirect authorization follows host and default-port boundaries" {
+    const cases = .{
+        .{ "http://example.org/a", "https://example.org/b", false },
+        .{ "http://example.org:80/a", "https://example.org:443/b", false },
+        .{ "https://example.org/a", "https://EXAMPLE.ORG:443/b", false },
+        .{ "http://example.org:8080/a", "http://example.org:8080/b", false },
+        .{ "https://example.org/a", "http://example.org/b", true },
+        .{ "http://example.org/a", "http://example.org:8080/b", true },
+        .{ "https://example.org/a", "https://other.example.org/b", true },
+    };
+    inline for (cases) |case|
+        try std.testing.expectEqual(case[2], stripAuth(try std.Uri.parse(case[0]), try std.Uri.parse(case[1])));
 }
 
 test "HTTP retry classification preserves terminal client errors" {
