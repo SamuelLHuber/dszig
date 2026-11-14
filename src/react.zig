@@ -158,6 +158,7 @@ pub fn ReActIters(comptime Sig: type, comptime user_tools: []const Tool, comptim
             fields[index].type_name = types.pyName(Optional);
             fields[index].schema = typeSchema(Optional);
             fields[index].validate = TypedValidator(Optional).run;
+            fields[index].xml_validate = types.XmlValidator(Optional);
             fields[index].python_str = @import("python_str.zig").renderer(Optional);
             fields[index].refine_mask = @import("feedback.zig").masker(Optional);
             fields[index].optional_str = types.isOptionalStr(Optional);

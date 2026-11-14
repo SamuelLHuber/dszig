@@ -25,6 +25,7 @@ pub const ChainOfThoughtWithOptions = predict.ChainOfThoughtWithOptions;
 pub const Reasoning = signature.Reasoning;
 pub const Code = @import("code.zig").Code;
 pub const CodeWithLanguage = @import("code.zig").CodeWithLanguage;
+pub const BoundingBox = @import("bounding_box.zig").BoundingBox;
 pub const History = @import("history.zig").History;
 pub const Retrieve = predict.Retrieve;
 pub const colbertv2 = @import("colbertv2.zig");

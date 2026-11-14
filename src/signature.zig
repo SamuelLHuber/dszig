@@ -82,6 +82,8 @@ pub const Field = struct {
     /// TypeAdapter schemas preserve model field order for XML/native output.
     xml_schema: []const u8 = "",
     validate: ?*const fn (std.mem.Allocator, std.json.Value) nested.Error!std.json.Value = null,
+    /// XML decoded containers override a model's configured strictness.
+    xml_validate: ?*const fn (std.mem.Allocator, std.json.Value) nested.Error!std.json.Value = null,
     /// Python `str(value)` for declared types whose JSON lowering loses the
     /// Pydantic repr (models, Code, containers of them). Null uses `pyjson.writeStr`.
     python_str: ?python_str.Render = null,
@@ -199,11 +201,12 @@ pub fn isSignature(comptime T: type) bool {
 
 /// XMLAdapter unwraps only the outer Optional and inspects only an immediate
 /// list item. Recursive custom-type discovery is a separate description rule.
-fn codeXmlLiteral(comptime T: type) bool {
+fn customXmlLiteral(comptime T: type) bool {
     const annotation = if (@typeInfo(T) == .optional) @typeInfo(T).optional.child else T;
-    if (code.isCode(annotation)) return true;
+    const BoundingBox = @import("bounding_box.zig").BoundingBox;
+    if (code.isCode(annotation) or annotation == BoundingBox) return true;
     return switch (@typeInfo(annotation)) {
-        .pointer => |p| p.size == .slice and code.isCode(p.child),
+        .pointer => |p| p.size == .slice and (code.isCode(p.child) or p.child == BoundingBox),
         else => false,
     };
 }
@@ -224,12 +227,13 @@ fn fieldsOf(comptime T: type, comptime role: []const u8, comptime descriptions: 
                 .schema = if (FT == History) History.schema else if (FT == ToolCalls) ToolCalls.schema else if (kind == .json or code.isCode(FT)) nested.schema(FT) else "",
                 .xml_schema = if (FT == History) History.schema else if (FT == ToolCalls) ToolCalls.schema else if (kind == .json or code.isCode(FT)) nested.schemaXml(FT) else "",
                 .validate = if (FT == History) History.validate else if (FT == ToolCalls) ToolCalls.validate else if (kind == .json or code.isCode(FT)) nested.Validator(FT) else null,
+                .xml_validate = if (FT == History) History.validate else if (FT == ToolCalls) ToolCalls.validate else if (kind == .json) nested.XmlValidator(FT) else null,
                 .python_str = python_str.renderer(FT),
                 .optional_str = nested.isOptionalStr(FT),
                 .reasoning_type = FT == Reasoning or FT == ?Reasoning,
                 // DSPy adapts direct Reasoning annotations, not Optional unions.
                 .native_reasoning = FT == Reasoning,
-                .xml_literal = FT == History or FT == ToolCalls or FT == ?Reasoning or codeXmlLiteral(FT),
+                .xml_literal = FT == History or FT == ToolCalls or FT == ?Reasoning or customXmlLiteral(FT),
                 .native_tool_calls = FT == ToolCalls,
                 .type_description = if (code.annotationType(FT)) |C| C.description else if (FT == ToolCalls) ToolCalls.description else "",
                 .type_description_name = if (code.annotationType(FT)) |C| C.model_name else "",

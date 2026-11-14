@@ -481,6 +481,7 @@ pub fn ChainOfThoughtWithOptions(comptime Sig: type, comptime options: ChainOfTh
             f.python_str = null;
             f.xml_schema = "";
             f.validate = null;
+            f.xml_validate = null;
             f.optional_str = false;
             f.xml_literal = false;
             f.nullable = false;

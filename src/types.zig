@@ -9,6 +9,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
 const code = @import("code.zig");
+const BoundingBox = @import("bounding_box.zig").BoundingBox;
 
 pub const Error = error{ ParseValue, OutOfMemory };
 
@@ -192,6 +193,7 @@ fn modelEntries(comptime S: type, comptime ordered_properties: bool) []const Ent
         for (info.field_names, info.field_types, 0..) |name, FT, i| {
             var e: []const Entry = entriesOf(FT) ++ &[_]Entry{.{ .key = "title", .val = quote(title(name)) }};
             if (isModel(FT) or (@typeInfo(FT) == .optional and isModel(@typeInfo(FT).optional.child))) e = entriesOf(FT);
+            if (S == BoundingBox) e = e ++ &[_]Entry{.{ .key = "description", .val = quote(BoundingBox.edge_descriptions[i]) }};
             if (hasDefault(S, i)) {
                 if (@typeInfo(FT) != .optional or @as(*const FT, @ptrCast(@alignCast(info.field_attrs[i].default_value_ptr.?))).* != null) {
                     @compileError("dszig: model field `" ++ name ++ "` may only default to null");
@@ -206,6 +208,8 @@ fn modelEntries(comptime S: type, comptime ordered_properties: bool) []const Ent
         const final = props;
         const description: []const Entry = if (code.isCode(S) and S.schema_description_json.len > 0)
             &.{.{ .key = "description", .val = S.schema_description_json }}
+        else if (S == BoundingBox)
+            &.{.{ .key = "description", .val = quote(BoundingBox.schema_description) }}
         else if (S == @import("signature.zig").Reasoning)
             &.{.{ .key = "description", .val = "\"Reasoning type in DSPy.\\n\\nThis type is useful when you want the DSPy output to include the reasoning of the LM. We build this type so that\\nDSPy can support the reasoning model and non-reasoning model with the same code.\\n\\nThis is a str-like type, you can convert a string directly to a Reasoning object, and from DSPy adapters'\\nperspective, `Reasoning` is treated as a string.\"" }}
         else
@@ -215,7 +219,7 @@ fn modelEntries(comptime S: type, comptime ordered_properties: bool) []const Ent
             .{ .key = "properties", .val = if (ordered_properties) renderOrdered(&final) else render(&final) },
             .{ .key = "required", .val = required ++ "]" },
             .{ .key = "title", .val = quote(modelName(S)) },
-        } ++ description;
+        } ++ description ++ (if (S == BoundingBox) &[_]Entry{.{ .key = "additionalProperties", .val = "false" }} else &[_]Entry{});
     }
 }
 
@@ -270,9 +274,17 @@ fn schemaImpl(comptime T: type, comptime ordered_properties: bool) []const u8 {
     }
 }
 
-/// Pydantic lax-mode `TypeAdapter(T).validate_python(v)`, as a JSON value.
+/// `TypeAdapter(T).validate_python(v)`, including configured model strictness.
 pub fn validate(comptime T: type, arena: Allocator, v: Value) Error!Value {
+    return validateMode(T, arena, v, false);
+}
+
+fn validateMode(comptime T: type, arena: Allocator, v: Value, comptime xml_lax: bool) Error!Value {
     if (comptime code.isCode(T)) return T.validate(arena, v);
+    if (T == BoundingBox) {
+        const box = (if (xml_lax) BoundingBox.fromXmlValue(v) else BoundingBox.fromValue(v)) catch return error.ParseValue;
+        return box.toValue(arena);
+    }
     if (T == @import("signature.zig").Reasoning) {
         const content = if (v == .object) v.object.get("content") orelse return error.ParseValue else v;
         return if (content == .string) content else error.ParseValue;
@@ -284,7 +296,7 @@ pub fn validate(comptime T: type, arena: Allocator, v: Value) Error!Value {
         var out: std.json.ObjectMap = .empty;
         try out.ensureTotalCapacity(arena, v.object.count());
         var it = v.object.iterator();
-        while (it.next()) |e| out.putAssumeCapacity(e.key_ptr.*, try validate(T.dszig_dict_value, arena, e.value_ptr.*));
+        while (it.next()) |e| out.putAssumeCapacity(e.key_ptr.*, try validateMode(T.dszig_dict_value, arena, e.value_ptr.*, xml_lax));
         return .{ .object = out };
     }
     if (T == bool) return switch (v) {
@@ -316,12 +328,12 @@ pub fn validate(comptime T: type, arena: Allocator, v: Value) Error!Value {
             if (std.meta.stringToEnum(T, v.string) == null) return error.ParseValue;
             return v;
         },
-        .optional => |o| return if (v == .null) v else validate(o.child, arena, v),
+        .optional => |o| return if (v == .null) v else validateMode(o.child, arena, v, xml_lax),
         .pointer => |p| {
             if (v != .array) return error.ParseValue;
             var out: std.json.Array = .init(arena);
             try out.ensureTotalCapacity(v.array.items.len);
-            for (v.array.items) |item| out.appendAssumeCapacity(try validate(p.child, arena, item));
+            for (v.array.items) |item| out.appendAssumeCapacity(try validateMode(p.child, arena, item, xml_lax));
             return .{ .array = out };
         },
         .@"struct" => |s| {
@@ -329,7 +341,7 @@ pub fn validate(comptime T: type, arena: Allocator, v: Value) Error!Value {
             var out: std.json.ObjectMap = .empty;
             inline for (s.field_names, s.field_types, 0..) |name, FT, i| {
                 if (v.object.get(name)) |fv| {
-                    try out.put(arena, name, try validate(FT, arena, fv));
+                    try out.put(arena, name, try validateMode(FT, arena, fv, xml_lax));
                 } else if (comptime hasDefault(T, i)) {
                     try out.put(arena, name, .null);
                 } else return error.ParseValue;
@@ -346,6 +358,15 @@ fn boolText(s: []const u8) Error!Value {
     for (yes) |w| if (std.ascii.eqlIgnoreCase(s, w)) return .{ .bool = true };
     for (no) |w| if (std.ascii.eqlIgnoreCase(s, w)) return .{ .bool = false };
     return error.ParseValue;
+}
+
+/// XML's decoded object/list path passes strict=False to TypeAdapter.
+pub fn XmlValidator(comptime T: type) *const fn (Allocator, Value) Error!Value {
+    return struct {
+        fn run(arena: Allocator, v: Value) Error!Value {
+            return validateMode(T, arena, v, true);
+        }
+    }.run;
 }
 
 pub fn Validator(comptime T: type) *const fn (Allocator, Value) Error!Value {

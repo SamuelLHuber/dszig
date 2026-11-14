@@ -105,7 +105,7 @@ retain the actual continuation and raw provider response independently.
 
 | DSPy surface | Native Zig surface and coverage |
 |---|---|
-| Class-style signatures and typed fields | `Signature`, `Dict`, `Code`, `CodeWithLanguage`, scalar/string/list/optional/model fields, literal enums, field descriptions/defaults, compile-time rejection of invalid signatures |
+| Class-style signatures and typed fields | `Signature`, `Dict`, `Code`, `CodeWithLanguage`, `BoundingBox`, scalar/string/list/optional/model fields, literal enums, field descriptions/defaults, compile-time rejection of invalid signatures |
 | Chat, JSON, XML and two-stage adapters | `Adapter.chat`, `.json`, `.xml`, `.two_step`; `TwoStepAdapter` with a separate extraction LM; independent prompt/parse fixtures, strict response-schema construction, JSON fallback, typed XML and Unicode key handling |
 | Prediction and reasoning | `Predict`, `ChainOfThought`, `BestOfN`, `Refine`, `MultiChainComparison`, explicit `Context`, typed outputs, serialized `Trace`, named predictor/parameter discovery |
 | Retrieval and embeddings | `Retrieve`, lexical `InMemoryRetriever`, HTTP `ColBERTv2` with shared mutable-graph memory caching, custom/OpenAI/Azure `Embedder`, float32 `KNN`, per-query `KNNFewShot`, and brute-force `Embeddings`/`EmbeddingsWithScores` with NumPy persistence |
@@ -119,6 +119,20 @@ retain the actual continuation and raw provider response independently.
 
 A named surface in this table is not a claim that every Python option or provider
 route is implemented. The limits below are part of the compatibility contract.
+
+`BoundingBox.init(top, bottom, left, right)` constructs normalized image
+geometry with finite edges in `[0, 1]` and strictly positive width/height.
+Invalid edges are rejected, never clamped or reordered. Strict JSON/model
+decoding rejects string/bool edges, missing fields and extra properties;
+integer JSON numbers become floats. Structured XML follows the source's
+explicit lax override for decoded containers, while JSON literal leaves retain
+strict validation. `format(&writer)` emits the source's JSON spacing and float
+rendering without allocating an intermediate object; `toValue(arena)` returns
+structured geometry rather than a media marker. A native executable matched
+50 actual DSPy validation cases, the complete schema, all three exact adapter
+prompts/parses, and typed Predict results. Native boxes are Zig values: use
+`const` for immutable bindings; direct field mutation does not reproduce
+Python's frozen-model assignment exception.
 
 `TwoStepAdapter` uses a natural-language first-stage prompt and an independent
 ChatAdapter extraction stage. Configure it with borrowed model handles:
@@ -352,7 +366,7 @@ scores, saved artifact bytes, instruction candidates, trial logs, candidate
 scores and SIMBA train scores. It is **mock-provider behavioral evidence**, not
 proof of real-model performance or complete DSPy equivalence.
 
-Local verification on 2026-11-14 passed **253/253 tests**
+Local verification on 2026-11-15 passed **256/256 tests**
 in both Debug and ReleaseSafe. The actual replay executable consumed the entire
 fixture and matched every adapter case and pipeline. The independent real-DSPy
 reference gate also passed. These results establish only the coverage described
@@ -401,6 +415,7 @@ uv run --project tools/dspy_reference --locked tools/dspy_reference/refine_oracl
 uv run --project tools/dspy_reference --locked tools/dspy_reference/refine_react_oracle.py
 uv run --project tools/dspy_reference --locked tools/dspy_reference/two_step_oracle.py
 uv run --project tools/dspy_reference --locked tools/dspy_reference/colbertv2_oracle.py
+uv run --project tools/dspy_reference --locked tools/dspy_reference/bounding_box_oracle.py
 ```
 
 These execute actual pinned DSPy/Optuna. They cover rule metadata/settings
@@ -472,7 +487,7 @@ The following prevent a claim that DSZig can do everything DSPy can:
   borrowed teacher-settings object is not reflected after Bootstrap's entry
   snapshot.
 - **Providers and media:** no complete lm15 provider catalog/routing/auth/error
-  taxonomy, embedding providers beyond OpenAI/Azure, Image/Audio/BoundingBox/File,
+  taxonomy, embedding providers beyond OpenAI/Azure, Image/Audio/File,
   rich media tool results, provider training lifecycle or native streaming.
 - **ColBERT HTTP/cache boundaries:** no Python diskcache/key interoperability,
   requests cookie jar, proxy/netrc/IDNA/session behavior or complete Python

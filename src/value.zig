@@ -442,6 +442,7 @@ pub fn fromRecord(arena: Allocator, comptime T: type, record: *const Record) Con
 
 pub fn fromValue(arena: Allocator, comptime T: type, v: Value) ConvertError!T {
     if (comptime code.isCode(T)) return T.fromValue(v) catch error.TypeMismatch;
+    if (T == @import("bounding_box.zig").BoundingBox) return T.fromValue(v) catch error.TypeMismatch;
     if (T == Value) return v;
     if (T == @import("tool.zig").ToolCalls) return T.fromValue(arena, v) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,

@@ -282,7 +282,11 @@ pub const XmlAdapter = struct {
                 continue;
             }
             const decoded = try elementsValue(arena, group, schema, get(schema, "$defs"), 0);
-            const parsed = try adapter.parseFieldValue(arena, field, decoded);
+            var parsing_field = field;
+            if ((decoded == .object or decoded == .array) and group[0].children.len > 0) {
+                if (field.xml_validate) |validate| parsing_field.validate = validate;
+            }
+            const parsed = try adapter.parseFieldValue(arena, parsing_field, decoded);
             try result.put(arena, field.name, parsed);
         }
         return result;
