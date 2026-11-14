@@ -186,7 +186,7 @@ pub const BootstrapFewShot = struct {
         if (student_preds.len != teacher_preds.len) return error.ProgramMismatch;
         for (student_preds, teacher_preds) |s, t| {
             if (!std.mem.eql(u8, s.name, t.name)) return error.ProgramMismatch;
-            if (s.param.predict.fields.ptr != t.param.predict.fields.ptr) return error.ProgramMismatch;
+            if (!predict.sameSignature(s.param.predict, t.param.predict)) return error.ProgramMismatch;
         }
         // DSPy's bootstrap loop has no final example index for an empty set.
         // Preserve that failure instead of silently returning an untrained copy.

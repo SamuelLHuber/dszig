@@ -479,6 +479,17 @@ pub const Param = union(enum) {
 
 pub const NamedParam = struct { name: []const u8, param: Param };
 
+/// Compare runtime signature state, not merely the native field identity.
+pub fn sameSignature(a: *const PredictState, b: *const PredictState) bool {
+    if (a == b) return true;
+    if (a.fields.ptr != b.fields.ptr or a.fields.len != b.fields.len) return false;
+    if (!std.mem.eql(u8, a.instructions, b.instructions)) return false;
+    if (a.descs.len != b.descs.len or a.prefixes.len != b.prefixes.len) return false;
+    for (a.descs, b.descs) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+    for (a.prefixes, b.prefixes) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+    return true;
+}
+
 /// `module.named_parameters()`: DSPy names (`self`, `predict`,
 /// `generate_answer.predict`, `hops[0]`), skipping compiled sub-modules.
 pub fn namedParameters(arena: Allocator, program: anytype) Allocator.Error![]NamedParam {

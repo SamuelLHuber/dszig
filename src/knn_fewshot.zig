@@ -436,3 +436,57 @@ test "KNNFewShot observes live optimizer options and retrieval state after compi
     try testing.expectEqual(@as(usize, 4), events.embeddings.items.len);
     try testing.expectEqual(@as(usize, 0), program.visible.qa.state.demos.len);
 }
+
+test "KNNFewShot validates live teacher metadata before empty-neighborhood bootstrap failure" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var events: TestEvents = .{ .arena = arena };
+    var model = embedding.Embedder.initCustom(testing.allocator, .{ .context = &events, .embed = TestEvents.embed }, .{ .caching = false });
+    defer model.deinit();
+    var unused_lm: lm_mod.ScriptedLM = .{ .responses = &.{} };
+    const ctx: Context = .{ .arena = arena, .lm = unused_lm.lm() };
+    var optimizer = try KNNFewShot(TestProgram).init(arena, 1, try testTrainset(arena), &model, .{
+        .max_bootstrapped_demos = 0,
+        .max_labeled_demos = 0,
+    });
+    var student: TestProgram = .{ .marker = "student", .events = &events };
+    var teacher: TestProgram = .{ .marker = "teacher", .events = &events };
+    const program = try optimizer.compile(arena, testing.allocator, ctx, &student, &teacher);
+    const Mutation = enum { instructions, desc, prefix };
+    for ([_]Mutation{ .instructions, .desc, .prefix }) |mutation| {
+        teacher.qa.state = student.qa.state;
+        var descs = [_][]const u8{ student.qa.state.descs[0], student.qa.state.descs[1] };
+        var prefixes = [_][]const u8{ student.qa.state.prefixes[0], student.qa.state.prefixes[1] };
+        descs[0] = "A changed teacher description.";
+        prefixes[0] = "Changed question:";
+        switch (mutation) {
+            .instructions => teacher.qa.state.instructions = "A changed teacher instruction.",
+            .desc => teacher.qa.state.descs = &descs,
+            .prefix => teacher.qa.state.prefixes = &prefixes,
+        }
+        // Runtime metadata can differ while the comptime field slice is shared.
+        // The borrowed teacher is deliberately changed after wrapper compile.
+        try testing.expect(student.qa.state.fields.ptr == teacher.qa.state.fields.ptr);
+        for ([_]isize{ 1, -2 }) |k| {
+            optimizer.knn.k = k;
+            try testing.expectError(error.ProgramMismatch, program.forward(ctx, .{ .question = "red-query" }));
+        }
+    }
+    // Signature equality compares text, not slice identity. An equivalent
+    // teacher with separately allocated metadata reaches the source empty-set
+    // failure, instead of being rejected by predictor mapping.
+    teacher.qa.state = student.qa.state;
+    teacher.qa.state.instructions = try arena.dupe(u8, student.qa.state.instructions);
+    const descs = try arena.alloc([]const u8, student.qa.state.descs.len);
+    const prefixes = try arena.alloc([]const u8, student.qa.state.prefixes.len);
+    for (student.qa.state.descs, descs) |text, *copy| copy.* = try arena.dupe(u8, text);
+    for (student.qa.state.prefixes, prefixes) |text, *copy| copy.* = try arena.dupe(u8, text);
+    teacher.qa.state.descs = descs;
+    teacher.qa.state.prefixes = prefixes;
+    optimizer.knn.k = -2;
+    try testing.expectError(error.EmptyBootstrapTrainset, program.forward(ctx, .{ .question = "red-query" }));
+    try testing.expectEqual(@as(usize, 0), unused_lm.index);
+    try testing.expectEqual(@as(usize, 0), events.forwards.items.len);
+    try testing.expectEqualStrings(student.qa.state.instructions, program.visible.qa.state.instructions);
+}

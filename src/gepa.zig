@@ -397,7 +397,7 @@ pub const GEPA = struct {
                     for (runs, ids) |run, id| {
                         const prediction = run.prediction orelse continue;
                         var matching: std.ArrayList(*const Trace.Step) = .empty;
-                        for (run.trace.steps.items) |*step| if (sameSignature(step.predictor, module)) try matching.append(e.out, step);
+                        for (run.trace.steps.items) |*step| if (predict.sameSignature(step.predictor, module)) try matching.append(e.out, step);
                         if (matching.items.len == 0) continue;
                         const step = matching.items[e.adapter_rng.randbelow(matching.items.len)];
                         const fb = e.gepa.metric(e.out, &e.trainset[id], &prediction, run.trace, e.names[k], step);
@@ -725,16 +725,6 @@ fn sumScores(runs: []const GEPA.Run) f64 {
     var sum: f64 = 0;
     for (runs) |r| sum += r.score;
     return sum;
-}
-
-/// DSPy's `Signature.equals`: same fields and instructions.
-fn sameSignature(a: *const predict.PredictState, b: *const predict.PredictState) bool {
-    if (a == b) return true;
-    if (a.fields.ptr != b.fields.ptr or a.fields.len != b.fields.len) return false;
-    if (!std.mem.eql(u8, a.instructions, b.instructions)) return false;
-    for (a.descs, b.descs) |x, y| if (!std.mem.eql(u8, x, y)) return false;
-    for (a.prefixes, b.prefixes) |x, y| if (!std.mem.eql(u8, x, y)) return false;
-    return true;
 }
 
 /// Python `str(float)`.

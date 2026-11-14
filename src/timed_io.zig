@@ -63,8 +63,19 @@ fn callTimed(self: *TimedIo, ns: u64, comptime function: anytype, args: std.meta
         .raw = .fromNanoseconds(ns),
         .clock = .awake,
     } };
-    select.async(.timer, Io.Timeout.sleep, .{ timeout, self.inner });
-    switch (try select.await()) {
+    // async may execute inline when its worker budget is exhausted. A timer
+    // must run concurrently, even when the operation already completed.
+    select.concurrent(.timer, Io.Timeout.sleep, .{ timeout, self.inner }) catch |err| {
+        self.recordFailure(err);
+        return error.Canceled;
+    };
+    const completed = select.await() catch |err| {
+        // External cancellation wins over a deadline recorded by another
+        // address attempt sharing this request's adapter.
+        self.failure_code.store(@intFromError(err), .monotonic);
+        return err;
+    };
+    switch (completed) {
         .operation => |result| return result,
         .timer => |result| {
             try result;

@@ -152,7 +152,11 @@ request deadline: the SDK defaults are 600 seconds for reads/writes and 5 second
 for connection setup; explicit null disables both. Azure token callbacks refresh
 before every attempt, including retries, and callback failures retain their
 native error identity. Request-local clients keep timed connections from escaping
-their I/O adapter's lifetime. The shared transport still bounds response bytes.
+their I/O adapter's lifetime and preserve independently owned copies of the
+caller's initialized TLS trust store. Deadline tasks remain concurrent even when
+the async worker budget is exhausted. External transport cancellation is not
+retried; the low-level JSON transport preserves `Canceled`. The shared transport
+still bounds response bytes.
 
 `KNN.init(arena, k, trainset, &embedder)` embeds training inputs once;
 `call(arena, ordered_kwargs)` uses raw float32 dot products without normalization.
@@ -160,6 +164,8 @@ their I/O adapter's lifetime. The shared transport still bounds response bytes.
 program borrows the optimizer, original student and optional teacher, so their
 addresses must remain stable and their lifetimes must cover every forward.
 Predictor discovery exposes the visible student's namespace, not hidden captures.
+Bootstrap mapping checks the live student/teacher instructions, descriptions and
+prefixes before reporting an empty training neighborhood.
 Both optimizers and embedding output arenas must outlive the values borrowing
 them. NumPy sorting/BLAS portability limits are explicit below.
 
@@ -196,7 +202,7 @@ scores, saved artifact bytes, instruction candidates, trial logs, candidate
 scores and SIMBA train scores. It is **mock-provider behavioral evidence**, not
 proof of real-model performance or complete DSPy equivalence.
 
-Local verification on 2026-11-14 passed **155/155 tests and all 28 build steps**
+Local verification on 2026-11-14 passed **156/156 tests and all 28 build steps**
 in both Debug and ReleaseSafe. The actual replay executable consumed the entire
 fixture and matched every adapter case and pipeline. The independent real-DSPy
 reference gate also passed. These results establish only the coverage described
@@ -208,8 +214,11 @@ and retained traces against a scripted localhost HTTP provider. Azure checks
 covered refreshed retry credentials, explicit Authorization precedence and
 callback errors. Transport checks covered idle headers/body, a 903 ms dripping
 body under a 120 ms inactivity timeout, disabled/zero timeouts, and the existing
-Chat Completions/Responses CLIs. An exhaustive native representation digest
-matched actual pinned CPython `repr` for all 1,112,064 Unicode scalar values.
+Chat Completions/Responses CLIs. Further actual HTTP checks exercised an exhausted
+async worker budget and cancellation without duplicate attempts. A private-CA
+HTTPS check covered untimed and timed clients followed by a fresh untimed TLS
+handshake, proving the caller's trust remained usable. An exhaustive native
+representation digest matched actual pinned CPython `repr` for all 1,112,064 Unicode scalar values.
 These are protocol and formatting checks, not homelab or real-model evidence.
 
 The existing `tests/fixtures/live/*gpt-4o-mini.json` recordings were made against

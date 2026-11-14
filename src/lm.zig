@@ -1016,6 +1016,22 @@ pub const OpenAI = struct {
             .headers = selected_headers,
         });
         defer request.deinit();
+        return self.transferRequest(&request, body) catch |err| {
+            // HTTP Reader/Writer erase the underlying cancellation into
+            // ReadFailed/WriteFailed. Recover it before deciding to retry.
+            if (request.connection) |connection| {
+                if (connection.stream_reader.err) |read_error| {
+                    if (read_error == error.Canceled) return error.Canceled;
+                }
+                if (connection.stream_writer.err) |write_error| {
+                    if (write_error == error.Canceled) return error.Canceled;
+                }
+            }
+            return err;
+        };
+    }
+
+    fn transferRequest(self: *OpenAI, request: *std.http.Client.Request, body: []const u8) !HttpResponse {
         request.transfer_encoding = .{ .content_length = body.len };
         var payload = try request.sendBodyUnflushed(&.{});
         try payload.writer.writeAll(body);
@@ -1058,6 +1074,21 @@ pub const OpenAI = struct {
             .https_proxy = self.client.https_proxy,
         };
         defer isolated.deinit();
+        if (!std.http.Client.disable_tls) {
+            try self.client.ca_bundle_lock.lockShared(self.client.io);
+            defer self.client.ca_bundle_lock.unlockShared(self.client.io);
+            isolated.now = self.client.now;
+            if (self.client.now != null) {
+                // Bundle keys are DER offsets. Copy both backing bytes and
+                // index with a context pointing to the independently owned copy.
+                try isolated.ca_bundle.bytes.appendSlice(isolated.allocator, self.client.ca_bundle.bytes.items);
+                try isolated.ca_bundle.map.ensureTotalCapacityContext(isolated.allocator, self.client.ca_bundle.map.count(), .{ .cb = &isolated.ca_bundle });
+                var entries = self.client.ca_bundle.map.iterator();
+                while (entries.next()) |entry| {
+                    isolated.ca_bundle.map.putAssumeCapacityContext(entry.key_ptr.*, entry.value_ptr.*, .{ .cb = &isolated.ca_bundle });
+                }
+            }
+        }
         var scoped = self.*;
         scoped.client = &isolated;
         return scoped.fetchRetried(arena, url, auth, body, headers, &timed);
@@ -1076,7 +1107,11 @@ pub const OpenAI = struct {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.StreamTooLong => return error.LMFailure,
                 else => failed: {
-                    if (timed) |timer| last_error = timer.failure() orelse error.LMFailure;
+                    const cause = if (timed) |timer| timer.failure() else null;
+                    if (cause) |failure| {
+                        if (failure == error.Canceled) return error.Canceled;
+                    } else if (err == error.Canceled) return error.Canceled;
+                    last_error = cause orelse error.LMFailure;
                     break :failed null;
                 },
             };
@@ -1085,7 +1120,7 @@ pub const OpenAI = struct {
             if (response) |r| self.client.allocator.free(r.body);
             if (!retryable(status) or attempt >= self.max_retries) return last_error;
             const delay_ms = @as(i64, self.retry_base_ms) << @as(u6, @intCast(@min(attempt, 31)));
-            std.Io.sleep(self.client.io, .fromMilliseconds(delay_ms), .awake) catch return error.LMFailure;
+            try std.Io.sleep(self.client.io, .fromMilliseconds(delay_ms), .awake);
         }
     }
 
