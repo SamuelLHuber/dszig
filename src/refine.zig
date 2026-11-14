@@ -405,7 +405,7 @@ test "Refine masks ReAct custom objects in feedback without changing stored trac
         "<next_thought>ready</next_thought><tool_calls>{\"tool_calls\":[{\"name\":\"submit\",\"args\":{\"answer\":\"8\"}}]}</tool_calls>",
     } };
     var trace: Trace = .{ .arena = arena };
-    var refined = Refine(Agent).init(.{}, .{
+    var refined = Refine(Agent).init(try Agent.init(arena), .{
         .n = 2,
         .reward_fn = struct {
             fn score(_: Context, _: *const Agent.Input, output: *const Agent.Output) anyerror!f64 {
@@ -435,6 +435,47 @@ test "Refine masks ReAct custom objects in feedback without changing stored trac
     try testing.expectEqualStrings("ready", outputs.get("next_thought").?.string);
     try testing.expect(trace.steps.items[1].inputs.get("history").? == .object);
     try testing.expect(trace.steps.items[1].outputs.get("tool_calls").? == .object);
+}
+
+test "Refine assigns separate advice to independent ReAct instances" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const Agent = @import("react.zig").ReAct(TestSignature, &.{});
+    const Pair = struct {
+        pub const Input = TestSignature.Input;
+        pub const Output = Agent.Output;
+        first: Agent,
+        last: Agent,
+
+        pub fn forward(self: *const @This(), ctx: Context, input: Input) @import("react.zig").Error!Output {
+            const first = try self.first.forward(ctx, input);
+            return self.last.forward(ctx, .{ .question = first.answer });
+        }
+    };
+    const seven = "<next_thought>ready</next_thought><tool_calls>{\"tool_calls\":[{\"name\":\"submit\",\"args\":{\"answer\":\"7\"}}]}</tool_calls>";
+    const eight = "<next_thought>ready</next_thought><tool_calls>{\"tool_calls\":[{\"name\":\"submit\",\"args\":{\"answer\":\"8\"}}]}</tool_calls>";
+    var lm: lm_mod.ScriptedLM = .{ .responses = &.{
+        seven,                                                                                                                     seven,
+        "<discussion>Improve.</discussion><advice>{\"first.react\":\"first-specific\",\"last.react\":\"last-specific\"}</advice>", eight,
+        eight,
+    } };
+    var trace: Trace = .{ .arena = arena };
+    var refined = Refine(Pair).init(.{ .first = try Agent.init(arena), .last = try Agent.init(arena) }, .{
+        .n = 2,
+        .reward_fn = struct {
+            fn score(_: Context, _: *const Pair.Input, output: *const Pair.Output) anyerror!f64 {
+                return std.fmt.parseFloat(f64, output.answer);
+            }
+        }.score,
+        .threshold = .{ .integer = 100 },
+        .module_code = "AgentPair",
+        .reward_code = "score",
+    });
+    const result = (try refined.forward(.{ .arena = arena, .lm = lm.lm(), .trace = &trace }, .{ .question = "q" })).?;
+    try testing.expectEqualStrings("8", result.answer);
+    try testing.expectEqualStrings("first-specific", trace.steps.items[1].inputs.get("hint_").?.string);
+    try testing.expectEqualStrings("last-specific", trace.steps.items[2].inputs.get("hint_").?.string);
 }
 
 test "Refine retains exact integer thresholds beyond binary64 and binary128 precision" {

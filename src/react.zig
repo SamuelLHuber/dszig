@@ -189,9 +189,17 @@ pub fn ReActIters(comptime Sig: type, comptime user_tools: []const Tool, comptim
         };
         pub const react_fields: []const Field = &react_field_array;
 
-        react: predict.PredictFields(react_fields, n_in + 3, instructions) = .{},
+        react: predict.PredictFields(react_fields, n_in + 3, instructions),
         max_iters: usize = default_max_iters,
         compiled: bool = false,
+
+        /// Each agent constructs a fresh derived signature class. Copies retain
+        /// that identity; the arena must outlive the agent and its copies.
+        pub fn init(arena: Allocator) Allocator.Error!Self {
+            var self: Self = .{ .react = .{} };
+            try self.react.state.forkSignatureClass(arena);
+            return self;
+        }
 
         pub const Prediction = struct {
             outputs: Record,
@@ -643,7 +651,7 @@ test "ReAct forward retains final history and termination metadata" {
             &.{ "{\"next_thought\":\"retry\",\"tool_calls\":{\"tool_calls\":[]}}", submit }
         else
             &.{submit} };
-        const agent: ReActIters(Sig, &.{}, 1) = .{};
+        const agent = try ReActIters(Sig, &.{}, 1).init(arena);
         const output = try agent.forward(.{ .arena = arena, .lm = script.lm(), .adapter = .json, .json_fallback = false }, .{});
         const record = try value.toRecord(arena, @TypeOf(output), output);
         try testing.expectEqualStrings("retained", record.get("answer").?.string);
@@ -668,7 +676,7 @@ test "ReAct submit validates Code models but retains custom string results" {
         "{\"next_thought\":\"Submit code.\",\"tool_calls\":{\"tool_calls\":[{\"name\":\"submit\",\"args\":" ++
             "{\"result\":{\"code\":\"```python\\nrun()\\n```\"},\"snippets\":[{\"code\":\"```x```\"}]}}]}}",
     } };
-    const agent: ReActIters(Sig, &.{}, 1) = .{};
+    const agent = try ReActIters(Sig, &.{}, 1).init(arena);
     const inputs: Record = .empty;
     const prediction = try agent.run(.{ .arena = arena, .lm = script.lm(), .adapter = .json, .json_fallback = false }, &inputs);
     const out = try value.fromRecord(arena, Sig.Output, &prediction.outputs);
@@ -734,7 +742,7 @@ test "ReAct typed tools and submit preserve exact wide integers" {
             "{\"name\":\"submit\",\"args\":{\"answer\":18446744073709551615,\"payload\":{\"id\":340282366920938463463374607431768211455}," ++
             "\"numbers\":[10000000000000000000,18446744073709551615],\"ratio\":10000000000000000000}}]}}",
     } };
-    const agent: ReActIters(Sig, &.{ typed, basic }, 2) = .{};
+    const agent = try ReActIters(Sig, &.{ typed, basic }, 2).init(arena);
     const inputs = try value.toRecord(arena, Sig.Input, .{ .seed = std.math.maxInt(u64) });
     const prediction = try agent.run(.{ .arena = arena, .lm = script.lm(), .adapter = .json, .json_fallback = false }, &inputs);
     const out = try value.fromRecord(arena, Sig.Output, &prediction.outputs);

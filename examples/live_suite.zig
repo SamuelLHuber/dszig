@@ -148,18 +148,18 @@ pub fn run(arena: Allocator, gpa: Allocator, lm: dszig.LM) !Result {
     ctx.retriever = rag.corpus.retriever();
     const rag_set = try rag.trainset(arena);
     const rag_optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 2, .max_labeled_demos = 3 };
-    result.rag = try pipeline(rag.RAG, arena, gpa, ctx, rag_optimizer, rag_set, rag_set, rag.keywordMetric);
+    result.rag = try pipeline(rag.RAG, .{}, arena, gpa, ctx, rag_optimizer, rag_set, rag_set, rag.keywordMetric);
     const dates_optimizer: dszig.BootstrapFewShot = .{ .metric = exactMetric, .max_bootstrapped_demos = 4, .max_labeled_demos = 8 };
     const dates_train = try dateExamples(arena, .train);
     const dates_dev = try dateExamples(arena, .dev);
-    result.dates = try pipeline(DateQA, arena, gpa, ctx, dates_optimizer, dates_train, dates_dev, exactMetric);
+    result.dates = try pipeline(DateQA, .{}, arena, gpa, ctx, dates_optimizer, dates_train, dates_dev, exactMetric);
     const search: dszig.BootstrapFewShotWithRandomSearch = .{
         .metric = exactMetric,
         .max_bootstrapped_demos = 2,
         .max_labeled_demos = 2,
         .num_candidate_programs = 4,
     };
-    result.dates_search = try pipeline(DateQA, arena, gpa, ctx, search, dates_train, dates_dev, exactMetric);
+    result.dates_search = try pipeline(DateQA, .{}, arena, gpa, ctx, search, dates_train, dates_dev, exactMetric);
     const mipro: dszig.MIPROv2 = .{
         .metric = exactMetric,
         .auto = null,
@@ -167,14 +167,14 @@ pub fn run(arena: Allocator, gpa: Allocator, lm: dszig.LM) !Result {
         .max_bootstrapped_demos = 2,
         .max_labeled_demos = 2,
     };
-    result.dates_mipro = try pipeline(DateQA, arena, gpa, ctx, mipro, dates_train, dates_dev, exactMetric);
+    result.dates_mipro = try pipeline(DateQA, .{}, arena, gpa, ctx, mipro, dates_train, dates_dev, exactMetric);
     var aware = mipro;
     aware.num_candidates = 2;
-    result.dates_mipro_aware = try pipeline(DateQA, arena, gpa, ctx, aware, dates_train, dates_dev, exactMetric);
+    result.dates_mipro_aware = try pipeline(DateQA, .{}, arena, gpa, ctx, aware, dates_train, dates_dev, exactMetric);
     const react_optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 2, .max_labeled_demos = 0 };
-    result.rag_react = try pipeline(RagAgent, arena, gpa, ctx, react_optimizer, rag_set, rag_set, rag.keywordMetric);
+    result.rag_react = try pipeline(RagAgent, try RagAgent.init(arena), arena, gpa, ctx, react_optimizer, rag_set, rag_set, rag.keywordMetric);
     const copro: dszig.COPRO = .{ .metric = exactMetric, .breadth = copro_breadth, .depth = copro_depth };
-    result.dates_copro = try pipeline(DateQA, arena, gpa, ctx, copro, dates_train, dates_dev, exactMetric);
+    result.dates_copro = try pipeline(DateQA, .{}, arena, gpa, ctx, copro, dates_train, dates_dev, exactMetric);
     const simba: dszig.SIMBA = .{
         .metric = exactMetric,
         .bsize = simba_bsize,
@@ -182,9 +182,9 @@ pub fn run(arena: Allocator, gpa: Allocator, lm: dszig.LM) !Result {
         .max_steps = simba_steps,
         .max_demos = simba_demos,
     };
-    result.dates_simba = try pipeline(DateQA, arena, gpa, ctx, simba, dates_train, dates_dev, exactMetric);
+    result.dates_simba = try pipeline(DateQA, .{}, arena, gpa, ctx, simba, dates_train, dates_dev, exactMetric);
     const gepa: dszig.GEPA = .{ .metric = gepaMetric, .max_metric_calls = gepa_budget };
-    result.dates_gepa = try pipeline(DateQA, arena, gpa, ctx, gepa, dates_train, dates_dev, exactMetric);
+    result.dates_gepa = try pipeline(DateQA, .{}, arena, gpa, ctx, gepa, dates_train, dates_dev, exactMetric);
     return result;
 }
 
@@ -245,6 +245,7 @@ pub const RagAgent = dszig.react.ReActIters(AgentQA, &.{.{
 }}, react_max_iters);
 fn pipeline(
     comptime P: type,
+    student: P,
     arena: Allocator,
     gpa: Allocator,
     ctx: dszig.Context,
@@ -253,7 +254,7 @@ fn pipeline(
     devset: []const dszig.Example,
     metric: dszig.optimize.Metric,
 ) !Pipeline {
-    const baseline = try dszig.optimize.evaluate(P, gpa, ctx, &P{}, devset, metric, 10);
+    const baseline = try dszig.optimize.evaluate(P, gpa, ctx, &student, devset, metric, 10);
     if (@TypeOf(optimizer) == dszig.MIPROv2) {
         const aware = optimizer.num_candidates == 2;
         const options: dszig.MIPROv2.Options = .{
@@ -263,7 +264,7 @@ fn pipeline(
             .program_aware_proposer = aware,
             .program_code = dates_program_code,
         };
-        const compiled = try optimizer.compile(P, arena, gpa, ctx, null, .{}, null, trainset, options);
+        const compiled = try optimizer.compile(P, arena, gpa, ctx, null, student, null, trainset, options);
         const optimized = try dszig.optimize.evaluate(P, gpa, ctx, &compiled.program, devset, metric, 10);
         return .{
             .baseline = baseline.score,
@@ -275,7 +276,7 @@ fn pipeline(
         };
     }
     if (@TypeOf(optimizer) == dszig.SIMBA) {
-        const compiled = try optimizer.compile(P, arena, ctx, .{}, trainset, .{ .program_code = dates_class_source });
+        const compiled = try optimizer.compile(P, arena, ctx, student, trainset, .{ .program_code = dates_class_source });
         const optimized = try dszig.optimize.evaluate(P, gpa, ctx, &compiled.program, devset, metric, 10);
         return .{
             .baseline = baseline.score,
@@ -286,7 +287,7 @@ fn pipeline(
         };
     }
     if (@TypeOf(optimizer) == dszig.GEPA) {
-        const compiled = try optimizer.compile(P, arena, ctx, .{}, trainset, .{ .valset = devset });
+        const compiled = try optimizer.compile(P, arena, ctx, student, trainset, .{ .valset = devset });
         const optimized = try dszig.optimize.evaluate(P, gpa, ctx, &compiled.program, devset, metric, 10);
         return .{
             .baseline = baseline.score,
@@ -297,7 +298,7 @@ fn pipeline(
         };
     }
     if (@TypeOf(optimizer) == dszig.COPRO) {
-        const compiled = try optimizer.compile(P, arena, gpa, ctx, null, .{}, trainset);
+        const compiled = try optimizer.compile(P, arena, gpa, ctx, null, student, trainset);
         const optimized = try dszig.optimize.evaluate(P, gpa, ctx, &compiled.program, devset, metric, 10);
         const scores = try arena.alloc(f64, compiled.candidates.len);
         for (scores, compiled.candidates) |*s, c| s.* = c.score;
@@ -310,9 +311,9 @@ fn pipeline(
     }
     const search = @TypeOf(optimizer) == dszig.BootstrapFewShotWithRandomSearch;
     const compiled = if (search)
-        try optimizer.compile(P, arena, gpa, ctx, .{}, null, trainset, null)
+        try optimizer.compile(P, arena, gpa, ctx, student, null, trainset, null)
     else
-        try optimizer.compile(P, arena, gpa, ctx, .{}, null, trainset);
+        try optimizer.compile(P, arena, gpa, ctx, student, null, trainset);
     const optimized = try dszig.optimize.evaluate(P, gpa, ctx, &compiled.program, devset, metric, 10);
     return .{
         .baseline = baseline.score,

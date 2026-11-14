@@ -208,6 +208,13 @@ thresholds beyond machine widths use `.number_string`; reward comparisons do
 not round them to a floating-point threshold. Feedback retains DSPy's
 `<non-serializable: int>` masking beyond orjson's integer range.
 
+Construct agents with `ReAct(Sig, tools).init(arena)` or
+`react.ReActIters(...).init(arena)`. Each agent gets a fresh derived signature
+class; program copies retain its identity. The arena must outlive the agent and
+its copies. This prevents separate agents from receiving each other's Refine
+advice. A two-agent native run matched DSPy's complete prediction and feedback,
+including all five exact prompts and independently assigned hints.
+
 Typed `ReAct.forward` returns the signature's outputs plus `History` and
 `termination_reason`, including forced-submit results. A reproduced Refine/ReAct
 regression verifies that feedback masks History, Tool and ToolCalls objects
@@ -324,7 +331,7 @@ scores, saved artifact bytes, instruction candidates, trial logs, candidate
 scores and SIMBA train scores. It is **mock-provider behavioral evidence**, not
 proof of real-model performance or complete DSPy equivalence.
 
-Local verification on 2026-11-14 passed **237/237 tests**
+Local verification on 2026-11-14 passed **238/238 tests**
 in both Debug and ReleaseSafe. The actual replay executable consumed the entire
 fixture and matched every adapter case and pipeline. The independent real-DSPy
 reference gate also passed. These results establish only the coverage described

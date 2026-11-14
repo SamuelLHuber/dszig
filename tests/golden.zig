@@ -251,7 +251,8 @@ fn checkReact(comptime Agent: type, name: []const u8) !void {
     var history: dszig.lm.History = .{ .arena = arena };
     var scripted: dszig.lm.ScriptedLM = .{ .responses = completions, .history = &history };
     const ctx: dszig.Context = .{ .arena = arena, .lm = scripted.lm() };
-    const agent: Agent = .{ .max_iters = @intCast(case.get("max_iters").?.integer) };
+    var agent = try Agent.init(arena);
+    agent.max_iters = @intCast(case.get("max_iters").?.integer);
     var inputs: Record = .empty;
     try inputs.put(arena, "question", .{ .string = "When did Apollo 11 land?" });
     const prediction = try agent.run(ctx, &inputs);
@@ -285,7 +286,8 @@ test "ReAct records invalid arguments as tool errors before forced typed submit"
         "<next_thought>\nSubmit the answer.\n</next_thought>\n\n<tool_calls>\n{\"tool_calls\": [{\"name\": \"submit\", \"args\": {\"answer\": \"none\"}}]}\n</tool_calls>",
     } };
     const ctx: dszig.Context = .{ .arena = arena, .lm = scripted.lm() };
-    const agent: dszig.ReAct(AgentQA, &.{add_tool}) = .{ .max_iters = 2 };
+    var agent = try dszig.ReAct(AgentQA, &.{add_tool}).init(arena);
+    agent.max_iters = 2;
     var inputs: Record = .empty;
     try inputs.put(arena, "question", .{ .string = "?" });
     const prediction = try agent.run(ctx, &inputs);

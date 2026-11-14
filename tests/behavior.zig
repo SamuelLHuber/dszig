@@ -825,7 +825,8 @@ test "ReAct typed submit returns every nested list nullable enum and bounded out
         \\{"tool_calls":[{"name":"submit","args":{"answer":"Paris","details":{"city":"Paris","zip_code":9},"ids":[1,2],"note":null,"label":"pos","count":255}}]}
         \\</tool_calls>
     } };
-    const agent: dszig.ReAct(StructuredSubmit, &.{}) = .{ .max_iters = 1 };
+    var agent = try dszig.ReAct(StructuredSubmit, &.{}).init(arena);
+    agent.max_iters = 1;
     const output = try agent.forward(.{ .arena = arena, .lm = scripted.lm() }, .{ .question = "Return the result." });
     try testing.expectEqualStrings("Paris", output.answer);
     try testing.expectEqualStrings("Paris", output.details.city);
@@ -841,7 +842,8 @@ test "ReAct rejects malformed typed final values before returning any output" {
     var out: std.heap.ArenaAllocator = .init(testing.allocator);
     defer out.deinit();
     const arena = out.allocator();
-    const agent: dszig.ReAct(StructuredSubmit, &.{}) = .{ .max_iters = 0 };
+    var agent = try dszig.ReAct(StructuredSubmit, &.{}).init(arena);
+    agent.max_iters = 0;
     const inputs = try dszig.value.toRecord(arena, StructuredSubmit.Input, .{ .question = "Return the result." });
     for ([_][]const u8{
         "{\"answer\":\"Paris\",\"details\":{\"city\":\"Paris\",\"zip_code\":9},\"ids\":[1,2],\"note\":null,\"label\":\"pos\",\"count\":256}",
@@ -885,7 +887,8 @@ test "ReAct reuses structured History across calls without replacing prior event
         "<next_thought>\nSecond result.\n</next_thought>\n<tool_calls>\n{\"tool_calls\":[{\"id\":\"submit-berlin\",\"name\":\"submit\",\"args\":{\"answer\":\"Berlin\"}}]}\n</tool_calls>",
     }, .history = &requests };
     const ctx: dszig.Context = .{ .arena = arena, .lm = scripted.lm() };
-    const agent: dszig.ReAct(QA, &.{}) = .{ .max_iters = 1 };
+    var agent = try dszig.ReAct(QA, &.{}).init(arena);
+    agent.max_iters = 1;
     var history: dszig.History = .{};
     const first_inputs = try dszig.value.toRecord(arena, QA.Input, .{ .question = "First question?" });
     const first = try agent.runWithOptions(ctx, &first_inputs, .{ .history = &history });
