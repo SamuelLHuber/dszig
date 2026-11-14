@@ -107,7 +107,7 @@ retain the actual continuation and raw provider response independently.
 |---|---|
 | Class-style signatures and typed fields | `Signature`, `Dict`, scalar/string/list/optional/model fields, literal enums, field descriptions/defaults, compile-time rejection of invalid signatures |
 | Chat, JSON and XML adapters | `Adapter.chat`, `.json`, `.xml`; independent prompt/parse fixtures, strict response-schema construction, JSON fallback, typed XML and Unicode key handling |
-| Prediction and reasoning | `Predict`, `ChainOfThought`, explicit `Context`, typed outputs, serialized `Trace`, named predictor/parameter discovery |
+| Prediction and reasoning | `Predict`, `ChainOfThought`, `BestOfN`, `MultiChainComparison`, explicit `Context`, typed outputs, serialized `Trace`, named predictor/parameter discovery |
 | Retrieval | `Retrieve`, a retriever vtable and lexical `InMemoryRetriever` |
 | Evaluation and few-shot search | `optimize.evaluate`, `LabeledFewShot`, `BootstrapFewShot`, `BootstrapFewShotWithRandomSearch`, teacher context, zero thresholds and positional multi-use trace selection |
 | Instruction optimization | `MIPROv2`, its program-aware proposer and an Optuna 4.5.0 TPE port; `COPRO`; `SIMBA`; supported instance-frontier `GEPA` paths against gepa 0.1.4 |
@@ -119,6 +119,23 @@ retain the actual continuation and raw provider response independently.
 
 A named surface in this table is not a claim that every Python option or provider
 route is implemented. The limits below are part of the compatibility contract.
+
+`BestOfN(P).init(program, options)` takes a typed reward callback, an attempt
+count and a threshold. Its output is optional: DSPy returns no prediction when
+no reward exceeds negative infinity, including all-NaN rewards or no attempts.
+Each attempt has its own program value and rollout ID at temperature 1.0;
+only the winning program trace is retained, excluding reward-function calls.
+The signed failure budget persists across calls, including DSPy's unusual
+index-versus-remaining-budget failure boundary. Program values follow the same
+immutable-slice ownership convention as the existing optimizers.
+
+`MultiChainComparison(Sig, M)` accepts exactly `M` ordered completion records
+and the original typed inputs. It constructs the student-attempt fields and
+returns typed `rationale` plus the original outputs. Default temperature is
+0.7; explicit context options override it. Signature collisions, first-line
+formatting, ignored input tracing and predictor state roundtrips have
+source-backed coverage. These modules were also exercised through an actual
+native executable, independently of the existing nine-pipeline replay fixture.
 
 ## Cross-runtime verification
 
@@ -153,7 +170,7 @@ scores, saved artifact bytes, instruction candidates, trial logs, candidate
 scores and SIMBA train scores. It is **mock-provider behavioral evidence**, not
 proof of real-model performance or complete DSPy equivalence.
 
-Local verification on 2026-11-14 passed **110/110 tests and all 28 build steps**
+Local verification on 2026-11-14 passed **127/127 tests and all 28 build steps**
 in both Debug and ReleaseSafe. The actual replay executable consumed the entire
 fixture and matched every adapter case and pipeline. The independent real-DSPy
 reference gate also passed. These results establish only the coverage described
@@ -208,8 +225,8 @@ The following prevent a claim that DSZig can do everything DSPy can:
   LocalInterpreter, InterpreterPool or complete Python execution environment.
   DSPy's RLM/Flex execute arbitrary Python and can import real DSPy inside the
   guest. A restricted expression evaluator is not an identical implementation.
-- **Other modules and optimizers:** no general BestOfN, Refine, Parallel, KNN,
-  MultiChainComparison, AvatarOptimizer, BetterTogether, BootstrapFinetune,
+- **Other modules and optimizers:** no general Refine, Parallel, KNN,
+  AvatarOptimizer, BetterTogether, BootstrapFinetune,
   KNNFewShot, BootstrapFewShotWithOptuna, InferRules or bootstrap_trace_data.
 - **Providers and media:** no complete lm15 provider catalog/routing/auth/error
   taxonomy, Embedder/embedding retrievers/ColBERTv2, Image/Audio/BoundingBox/File,
