@@ -29,7 +29,7 @@ pub fn pyStrip(s: []const u8) []const u8 {
 
 /// `format_field_value(field_info, value)`.
 pub fn formatFieldValue(w: *Writer, field: Field, v: Value) pyjson.Error!void {
-    if (field.native_reasoning and v == .object) {
+    if (field.reasoning_type and v == .object) {
         if (v.object.get("content")) |content| {
             if (content == .string) return w.writeAll(content.string);
         }
@@ -96,6 +96,7 @@ pub fn parseText(arena: Allocator, field: Field, text: []const u8) ParseError!Va
 
 /// `parse_value(value, annotation)` for a value taken from a JSON object.
 pub fn parseJsonValue(arena: Allocator, field: Field, v: Value) ParseError!Value {
+    if (field.reasoning_type and field.kind == .str) return types.validate(signature.Reasoning, arena, v);
     if (field.kind == .str) {
         if (v == .string) return v;
         var aw: Writer.Allocating = .init(arena);
@@ -114,14 +115,11 @@ pub fn parseJsonValue(arena: Allocator, field: Field, v: Value) ParseError!Value
             .integer => |i| if (i == 0 or i == 1) Value{ .bool = i == 1 } else error.ParseValue,
             else => error.ParseValue,
         },
-        .int => switch (v) {
-            .integer => v,
-            .float => |f| floatToInt(f),
-            else => error.ParseValue,
-        },
+        .int => parseInteger(v),
         .float => switch (v) {
             .float => v,
             .integer => |i| Value{ .float = @floatFromInt(i) },
+            .number_string => |s| parseFloatText(s),
             else => error.ParseValue,
         },
         .str_list => switch (v) {
@@ -215,17 +213,30 @@ fn parseBoolText(text: []const u8) ParseError!Value {
     return error.ParseValue;
 }
 
-fn parseIntText(text: []const u8) ParseError!Value {
+/// Normalize an integer scalar without narrowing exact decimal JSON numbers.
+/// Text is borrowed, like parseText; the typed decoder enforces the Zig width.
+pub fn parseInteger(v: Value) error{ParseValue}!Value {
+    return switch (v) {
+        .integer => v,
+        .string, .number_string => |s| parseIntText(s),
+        .float => |f| floatToInt(f),
+        else => error.ParseValue,
+    };
+}
+
+fn parseIntText(text: []const u8) error{ParseValue}!Value {
     const t = pyStrip(text);
     if (!isJsonNumber(t)) return error.ParseValue;
-    if (std.fmt.parseInt(i64, t, 10)) |i| return .{ .integer = i } else |_| {}
+    if (std.json.isNumberFormattedLikeAnInteger(t)) return Value.parseFromNumberSlice(t);
     const f = std.fmt.parseFloat(f64, t) catch return error.ParseValue;
     return floatToInt(f);
 }
 
-fn floatToInt(f: f64) ParseError!Value {
+fn floatToInt(f: f64) error{ParseValue}!Value {
     if (!std.math.isFinite(f) or @trunc(f) != f) return error.ParseValue;
-    if (@abs(f) > 9.007199254740992e15) return error.ParseValue;
+    // Pydantic's lax float-to-int conversion excludes both i64 endpoints.
+    // Integer tokens take the exact path above and are not limited to i64.
+    if (f <= -0x1p63 or f >= 0x1p63) return error.ParseValue;
     return .{ .integer = @intFromFloat(f) };
 }
 
@@ -369,7 +380,10 @@ pub fn toValue(arena: Allocator, comptime T: type, v: T) Allocator.Error!Value {
         return .{ .object = map };
     }
     return switch (@typeInfo(T)) {
-        .int => .{ .integer = @intCast(v) },
+        .int => if (std.math.cast(i64, v)) |i|
+            .{ .integer = i }
+        else
+            .{ .number_string = try std.fmt.allocPrint(arena, "{d}", .{v}) },
         .float => .{ .float = @floatCast(v) },
         .@"enum" => .{ .string = @tagName(v) },
         .optional => |o| if (v) |x| try toValue(arena, o.child, x) else .null,
@@ -433,13 +447,15 @@ pub fn fromValue(arena: Allocator, comptime T: type, v: Value) ConvertError!T {
         return .{ .keys = keys, .values = values };
     }
     switch (@typeInfo(T)) {
-        .int => {
-            if (v != .integer) return error.TypeMismatch;
-            return std.math.cast(T, v.integer) orelse error.TypeMismatch;
+        .int => return switch (v) {
+            .integer => |i| std.math.cast(T, i) orelse error.TypeMismatch,
+            .number_string => |s| std.fmt.parseInt(T, s, 10) catch error.TypeMismatch,
+            else => error.TypeMismatch,
         },
         .float => return switch (v) {
             .float => |f| @floatCast(f),
             .integer => |i| @floatFromInt(i),
+            .number_string => |s| std.fmt.parseFloat(T, s) catch error.TypeMismatch,
             else => error.TypeMismatch,
         },
         .@"enum" => {
@@ -478,13 +494,16 @@ pub fn pyEqual(a: Value, b: Value) bool {
         .integer => |i| switch (b) {
             .integer => |j| i == j,
             .float => |f| floatEqualsInt(f, i),
+            .number_string => |s| integerStringEqualsValue(s, a),
             else => false,
         },
         .float => |f| switch (b) {
             .integer => |i| floatEqualsInt(f, i),
             .float => |g| f == g,
+            .number_string => |s| integerStringEqualsValue(s, a),
             else => false,
         },
+        .number_string => |s| integerStringEqualsValue(s, b),
         .null => b == .null,
         .string => |s| b == .string and std.mem.eql(u8, s, b.string),
         .array => |x| blk: {
@@ -505,6 +524,56 @@ pub fn recordEqual(a: *const Record, b: *const Record) bool {
         if (!pyEqual(entry.value_ptr.*, other)) return false;
     }
     return true;
+}
+
+const IntegerText = struct {
+    negative: bool,
+    digits: []const u8,
+
+    fn parse(text: []const u8) ?IntegerText {
+        if (text.len == 0) return null;
+        const negative = text[0] == '-';
+        const digits = text[@intFromBool(negative)..];
+        if (digits.len == 0) return null;
+        for (digits) |c| if (!std.ascii.isDigit(c)) return null;
+        var start: usize = 0;
+        while (start + 1 < digits.len and digits[start] == '0') start += 1;
+        const normalized = digits[start..];
+        return .{ .negative = negative and !std.mem.eql(u8, normalized, "0"), .digits = normalized };
+    }
+
+    fn eql(a: IntegerText, b: IntegerText) bool {
+        return a.negative == b.negative and std.mem.eql(u8, a.digits, b.digits);
+    }
+};
+
+fn integerStringEqualsValue(text: []const u8, v: Value) bool {
+    const a = IntegerText.parse(text) orelse return false;
+    // Every finite integral f64 fits in u1024. Formatting its exact integer
+    // magnitude, rather than rounding the decimal text to f64, preserves Python
+    // equality even for integers above 2^53 and beyond native machine words.
+    var buffer: [310]u8 = undefined;
+    const other = switch (v) {
+        .number_string => |s| s,
+        .integer => |i| std.fmt.bufPrint(&buffer, "{d}", .{i}) catch unreachable,
+        .float => |f| blk: {
+            if (!std.math.isFinite(f) or f != @trunc(f)) return false;
+            // LLVM cannot lower f64-to-arbitrary-width integer casts on every
+            // target. Reconstruct the exact integral magnitude from binary64.
+            const bits: u64 = @bitCast(@abs(f));
+            const exponent: u11 = @intCast(bits >> 52);
+            var magnitude: u1024 = if (exponent == 0) 0 else (bits & 0x000f_ffff_ffff_ffff) | 0x0010_0000_0000_0000;
+            if (magnitude != 0) {
+                if (exponent >= 1075)
+                    magnitude <<= @intCast(exponent - 1075)
+                else
+                    magnitude >>= @intCast(1075 - exponent);
+            }
+            break :blk std.fmt.bufPrint(&buffer, "{s}{d}", .{ if (f < 0) "-" else "", magnitude }) catch unreachable;
+        },
+        else => return false,
+    };
+    return a.eql(IntegerText.parse(other) orelse return false);
 }
 
 fn floatEqualsInt(f: f64, i: i64) bool {
@@ -591,6 +660,112 @@ test "parse_value parity with DSPy 3.4.1" {
     try ok.check(arena, .literal, "Literal[y]", "y");
     try ok.fails(arena, .literal, "z");
     try ok.check(arena, .literal, "x ", "x");
+}
+
+test "native integer widths preserve exact unquoted decimal values" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+
+    var empty: [0]u8 = .{};
+    var fixed: std.heap.FixedBufferAllocator = .init(&empty);
+    try testing.expectEqual(@as(i64, 42), (try toValue(fixed.allocator(), u256, 42)).integer);
+    try testing.expectEqual(@as(i64, -42), (try toValue(fixed.allocator(), i256, -42)).integer);
+    try testing.expectEqual(std.math.minInt(i64), (try toValue(fixed.allocator(), i128, std.math.minInt(i64))).integer);
+
+    inline for (.{ u64, u65, u128, u256, i65, i128, i256 }) |T| {
+        inline for (.{ std.math.minInt(T), std.math.maxInt(T) }) |integer| {
+            const encoded = try toValue(arena, T, integer);
+            try testing.expectEqual(@as(T, integer), try fromValue(arena, T, encoded));
+            const expected = try std.fmt.allocPrint(arena, "{d}", .{integer});
+            const json = try std.json.Stringify.valueAlloc(arena, encoded, .{});
+            try testing.expectEqualStrings(expected, json);
+            var prompt: Writer.Allocating = .init(arena);
+            try formatFieldValue(&prompt.writer, testField(.int), encoded);
+            try testing.expectEqualStrings(expected, prompt.written());
+            const parsed = try std.json.parseFromSliceLeaky(Value, arena, json, .{});
+            try testing.expectEqual(@as(T, integer), try fromValue(arena, T, try parseJsonValue(arena, testField(.int), parsed)));
+            try testing.expectEqual(@as(T, integer), try fromValue(arena, T, try parseText(arena, testField(.int), expected)));
+            try testing.expect(pyEqual(encoded, try cloneValue(arena, encoded)));
+        }
+    }
+
+    inline for (.{
+        .{ @as(u64, 10_000_000_000_000_000_000), "10000000000000000000" },
+        .{ std.math.maxInt(u64), "18446744073709551615" },
+    }) |case| {
+        const encoded = try toValue(arena, u64, case[0]);
+        try testing.expectEqualStrings(case[1], encoded.number_string);
+        var rendered: Writer.Allocating = .init(arena);
+        try pyjson.writeJson(&rendered.writer, encoded, .compact);
+        try testing.expectEqualStrings(case[1], rendered.written());
+        try testing.expectEqual(case[0], try fromValue(arena, u64, try parseInteger(.{ .string = case[1] })));
+    }
+    try testing.expectError(error.TypeMismatch, fromValue(arena, i64, .{ .number_string = "18446744073709551615" }));
+    try testing.expectError(error.TypeMismatch, fromValue(arena, u64, .{ .number_string = "18446744073709551616" }));
+    try testing.expectError(error.TypeMismatch, fromValue(arena, u64, .{ .number_string = "-1" }));
+    try testing.expectError(error.TypeMismatch, fromValue(arena, u64, .{ .number_string = "1.5" }));
+    try testing.expectEqual(@as(i64, 10_000_000_000_000_000), (try parseInteger(.{ .float = 1e16 })).integer);
+    try testing.expectError(error.ParseValue, parseInteger(.{ .float = 0x1p63 }));
+    try testing.expectError(error.ParseValue, parseInteger(.{ .float = -0x1p63 }));
+}
+
+test "nested native integers round trip through typed validation" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const Payload = struct {
+        id: u64,
+        optional: ?u128,
+        items: []const i128,
+        counts: signature.Dict(u64),
+    };
+    const original: Payload = .{
+        .id = std.math.maxInt(u64),
+        .optional = std.math.maxInt(u128),
+        .items = &.{ std.math.minInt(i128), std.math.maxInt(i128) },
+        .counts = .{ .keys = &.{"large"}, .values = &.{10_000_000_000_000_000_000} },
+    };
+    const encoded = try toValue(arena, Payload, original);
+    const json = try std.json.Stringify.valueAlloc(arena, encoded, .{});
+    const parsed = try std.json.parseFromSliceLeaky(Value, arena, json, .{});
+    const checked = try types.validate(Payload, arena, parsed);
+    const decoded = try fromValue(arena, Payload, checked);
+    try testing.expectEqual(original.id, decoded.id);
+    try testing.expectEqual(original.optional, decoded.optional);
+    try testing.expectEqualSlices(i128, original.items, decoded.items);
+    try testing.expectEqual(original.counts.get("large"), decoded.counts.get("large"));
+    try testing.expect(pyEqual(encoded, checked));
+    try testing.expectError(error.ParseValue, types.validate(u64, arena, .{ .number_string = "18446744073709551616" }));
+    try testing.expectError(error.ParseValue, types.validate(i64, arena, encoded.object.get("id").?));
+    const signed_text = try types.validate(u64, arena, .{ .string = "+18_446_744_073_709_551_615" });
+    try testing.expectEqual(std.math.maxInt(u64), try fromValue(arena, u64, signed_text));
+    try testing.expectEqualStrings("18446744073709551615", signed_text.number_string);
+}
+
+test "wide integer equality is exact across JSON representations" {
+    const maximum: Value = .{ .number_string = "18446744073709551615" };
+    try testing.expect(pyEqual(maximum, maximum));
+    try testing.expect(!pyEqual(maximum, .{ .number_string = "18446744073709551614" }));
+    try testing.expect(!pyEqual(maximum, .{ .float = 0x1p64 }));
+    try testing.expect(!pyEqual(.{ .float = 0x1p64 }, maximum));
+    try testing.expect(pyEqual(.{ .number_string = "10000000000000000000" }, .{ .float = 1e19 }));
+    try testing.expect(pyEqual(.{ .float = -0x1p127 }, .{ .number_string = "-170141183460469231731687303715884105728" }));
+    try testing.expect(!pyEqual(.{ .float = -0x1p127 }, .{ .number_string = "-170141183460469231731687303715884105727" }));
+    try testing.expect(pyEqual(.{ .number_string = "9223372036854775807" }, .{ .integer = std.math.maxInt(i64) }));
+    try testing.expect(pyEqual(.{ .integer = std.math.minInt(i64) }, .{ .number_string = "-9223372036854775808" }));
+    try testing.expect(pyEqual(.{ .number_string = "1" }, .{ .bool = true }));
+    try testing.expect(!pyEqual(maximum, .{ .string = "18446744073709551615" }));
+    try testing.expect(!pyEqual(maximum, .{ .float = std.math.inf(f64) }));
+    try testing.expect(!pyEqual(maximum, .{ .float = std.math.nan(f64) }));
+    try testing.expect(pyEqual(.{ .number_string = "0" }, .{ .float = -0.0 }));
+    try testing.expect(!pyEqual(.{ .number_string = "0" }, .{ .float = 0x1p-1074 }));
+    const largest_float_integer: u1024 = @as(u1024, 0x001f_ffff_ffff_ffff) << 971;
+    var buffer: [310]u8 = undefined;
+    const exact = try std.fmt.bufPrint(&buffer, "{d}", .{largest_float_integer});
+    try testing.expect(pyEqual(.{ .number_string = exact }, .{ .float = 0x1.fffffffffffffp1023 }));
+    const adjacent = try std.fmt.bufPrint(&buffer, "{d}", .{largest_float_integer + 1});
+    try testing.expect(!pyEqual(.{ .number_string = adjacent }, .{ .float = 0x1.fffffffffffffp1023 }));
 }
 
 test "typed record round trip" {

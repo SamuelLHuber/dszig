@@ -261,7 +261,9 @@ test "CachedLM preserves native summaries and calls across eviction-independent 
 
 test "CachedLM survives every allocation failure" {
     const messages = [_]adapter.Message{.{ .role = .user, .content = "hi" }};
-    try testing.checkAllAllocationFailures(testing.allocator, struct {
+    // In-place arena growth makes fault sites address-dependent on some allocators.
+    var stable_backing = testing.FailingAllocator.init(testing.allocator, .{ .resize_fail_index = 0 });
+    try testing.checkAllAllocationFailures(stable_backing.allocator(), struct {
         fn run(gpa: Allocator, msgs: []const adapter.Message) !void {
             var arena_state: std.heap.ArenaAllocator = .init(gpa);
             defer arena_state.deinit();

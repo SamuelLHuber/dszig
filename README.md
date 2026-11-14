@@ -58,6 +58,10 @@ This migration is not a relabeling of the previous 3.4.1 implementation:
   and DSPy's formatting and parsing rules. Explicit `Adapter.chat` and
   `Adapter.json` remain available. Missing output defaults are applied in
   signature order; an absent value and an explicit null are distinct.
+- **Typed integers retain their range.** Values outside signed 64-bit range
+  remain unquoted JSON integers rather than being rounded through `f64` or
+  narrowed to `i64`. The same representation is used by typed predictions,
+  nested fields, ReAct tool arguments/results and numeric majority voting.
 - **ChainOfThought uses native reasoning or a plan fallback.** Native reasoning
   fields are removed from the prompt for an advertised capable LM. Otherwise
   the default wire field is `plan`, with collision-safe names such as `plan_2`.
@@ -65,6 +69,9 @@ This migration is not a relabeling of the previous 3.4.1 implementation:
   the content string, not a `{content: ...}` object. Use
   `ChainOfThoughtWithOptions(Sig, .{ .rationale_field_type = []const u8 })` when
   explicitly requesting a normal string rationale, as DSPy permits.
+  A user-declared `?Reasoning` output remains a nullable model field; it does not
+  inherit ChainOfThought's native-reasoning routing. Required Reasoning values
+  are validated even when the provider response schema describes them as strings.
 - **ReAct uses structured History and typed `submit`.** There is no legacy
   `finish`/`extract` agent implementation. Calls include turn budgets, multiple
   tool calls/results, error observations, final-submit attempts and termination
@@ -105,7 +112,7 @@ retain the actual continuation and raw provider response independently.
 | Evaluation and few-shot search | `optimize.evaluate`, `LabeledFewShot`, `BootstrapFewShot`, `BootstrapFewShotWithRandomSearch`, teacher context, zero thresholds and positional multi-use trace selection |
 | Instruction optimization | `MIPROv2`, its program-aware proposer and an Optuna 4.5.0 TPE port; `COPRO`; `SIMBA`; supported instance-frontier `GEPA` paths against gepa 0.1.4 |
 | Agents and tools | `ReAct`, comptime `Tool`, `History`, `ToolCalls`, tool results, native declarations and text tool calls, typed submit, retained history |
-| Voting | `Ensemble`, `ensemble.majority`, Unicode text normalization; non-string scalar votes use Python numeric equality without losing integer precision |
+| Voting | `Ensemble`, `ensemble.majority`, Unicode text normalization; exact Python numeric equality, NaN object identity and source-order fallback behavior |
 | LM boundary | `LM`, native `lm.OpenAI` Chat Completions/Responses, scripted/keyword LMs, recording/replay wrappers and typed native protocol metadata |
 | Cache | `CachedLM`, per-candidate/request identity, LRU eviction, rich-response JSON dump/load; failed calls are not cached |
 | State | `state.save`, `saveAlloc`, `load`, with DSPy 3.5.0 dependency metadata and program JSON artifact comparisons |
@@ -146,7 +153,7 @@ scores, saved artifact bytes, instruction candidates, trial logs, candidate
 scores and SIMBA train scores. It is **mock-provider behavioral evidence**, not
 proof of real-model performance or complete DSPy equivalence.
 
-Local verification on 2026-11-14 passed **94/94 tests and all 28 build steps**
+Local verification on 2026-11-14 passed **110/110 tests and all 28 build steps**
 in both Debug and ReleaseSafe. The actual replay executable consumed the entire
 fixture and matched every adapter case and pipeline. The independent real-DSPy
 reference gate also passed. These results establish only the coverage described
@@ -228,6 +235,10 @@ The following prevent a claim that DSZig can do everything DSPy can:
   rejects the `json_mode` argument supplied by module state dumping. The RAG
   reference uses a small Retrieve subclass accepting that argument; this is an
   explicit upstream workaround, not evidence that stock DSPy can save that RAG.
+  DSPy's strict JSON response-schema transformation can also close nested
+  dictionary objects, excluding otherwise valid nonempty dictionaries. DSZig
+  preserves that upstream behavior; schema-capable nested dictionary outputs
+  are not claimed to be free of this source limitation.
 
 The finite parity gate should grow with real capabilities. Missing APIs must not
 be represented by stubs, ignored options, fabricated results, or a claim of full

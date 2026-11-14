@@ -212,7 +212,9 @@ pub fn fieldSchema(arena: Allocator, field: Field) Error!Value {
 }
 
 /// JSONAdapter chooses a provider format before execution, never by retrying an
-/// LM call. Direct dictionaries cannot meet Structured Outputs' closed schema.
+/// LM call. Match DSPy 3.5's root-only dictionary guard, including its upstream
+/// limitation: nested dictionaries reach enforceRequired and lose their keys.
+/// Optional dictionary anyOf branches are not traversed and remain open.
 pub fn responseFormat(arena: Allocator, view: View, supports_schema: bool) Error!inference.ResponseFormat {
     if (!supports_schema) return .json_object;
     for (view.outputs) |field| {
@@ -768,6 +770,106 @@ test "JSON response format closes model objects and falls back for direct mappin
         pub const Output = struct { names: signature.StrDict };
     });
     try testing.expect((try responseFormat(arena, .{ .instructions = "", .inputs = Mapping.input_fields_list, .outputs = Mapping.output_fields_list }, true)) == .json_object);
+}
+
+test "JSON response schemas retain upstream nested dictionary limitations without rejecting parsed keys" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const ModelWithMapping = struct {
+        pub const model_name = "ModelWithMapping";
+        labels: signature.Dict(i64),
+    };
+    const ReferencedMapping = struct {
+        pub const model_name = "ReferencedMapping";
+        item: ModelWithMapping,
+    };
+    const Sig = signature.Signature(struct {
+        pub const Input = struct {};
+        pub const Output = struct {
+            model: ModelWithMapping,
+            list: []const signature.Dict(i64),
+            definitions: ReferencedMapping,
+            optional: ?signature.Dict(i64),
+            optional_model: ?ModelWithMapping,
+        };
+    });
+    const view: View = .{ .instructions = "", .inputs = Sig.input_fields_list, .outputs = Sig.output_fields_list };
+    const chosen = try responseFormat(arena, view, true);
+    try testing.expect(chosen == .json_schema);
+    const root = chosen.json_schema.schema.object;
+    const properties = root.get("properties").?.object;
+    const definitions = root.get("$defs").?.object;
+    const model = definitions.get("ModelWithMapping").?.object;
+    const mapping = model.get("properties").?.object.get("labels").?.object;
+    try testing.expect(!mapping.get("additionalProperties").?.bool);
+    try testing.expectEqual(@as(usize, 0), mapping.get("properties").?.object.count());
+    try testing.expectEqual(@as(usize, 0), mapping.get("required").?.array.items.len);
+    const list_mapping = properties.get("list").?.object.get("items").?.object;
+    try testing.expect(!list_mapping.get("additionalProperties").?.bool);
+    try testing.expectEqual(@as(usize, 0), list_mapping.get("properties").?.object.count());
+    try testing.expectEqual(@as(usize, 0), list_mapping.get("required").?.array.items.len);
+    const referenced = definitions.get("ReferencedMapping").?.object;
+    try testing.expect(!referenced.get("additionalProperties").?.bool);
+    try testing.expectEqualStrings(
+        "#/$defs/ModelWithMapping",
+        referenced.get("properties").?.object.get("item").?.object.get("$ref").?.string,
+    );
+    const optional = properties.get("optional").?.object.get("anyOf").?.array.items;
+    try testing.expectEqualStrings("integer", optional[0].object.get("additionalProperties").?.object.get("type").?.string);
+    try testing.expect(!optional[0].object.contains("properties"));
+    try testing.expect(!optional[0].object.contains("required"));
+    try testing.expectEqualStrings("null", optional[1].object.get("type").?.string);
+    const optional_model = properties.get("optional_model").?.object.get("anyOf").?.array.items;
+    try testing.expectEqualStrings("#/$defs/ModelWithMapping", optional_model[0].object.get("$ref").?.string);
+    try testing.expectEqualStrings("null", optional_model[1].object.get("type").?.string);
+    try testing.expect(!root.get("additionalProperties").?.bool);
+    try testing.expectEqual(@as(usize, 5), root.get("required").?.array.items.len);
+
+    // Upstream's generated provider schema is over-restrictive, but parsing
+    // still validates against the annotation and accepts nonempty dictionaries.
+    const parsed = try Adapter.json.parse(arena, view,
+        \\{"model":{"labels":{"allowed":7}},"list":[{"allowed":8}],"definitions":{"item":{"labels":{"allowed":9}}},"optional":{"allowed":10},"optional_model":{"labels":{"allowed":11}}}
+    );
+    try testing.expectEqual(@as(i64, 7), parsed.get("model").?.object.get("labels").?.object.get("allowed").?.integer);
+    try testing.expectEqual(@as(i64, 8), parsed.get("list").?.array.items[0].object.get("allowed").?.integer);
+    try testing.expectEqual(@as(i64, 9), parsed.get("definitions").?.object.get("item").?.object.get("labels").?.object.get("allowed").?.integer);
+    try testing.expectEqual(@as(i64, 10), parsed.get("optional").?.object.get("allowed").?.integer);
+    try testing.expectEqual(@as(i64, 11), parsed.get("optional_model").?.object.get("labels").?.object.get("allowed").?.integer);
+}
+
+test "JSON nullable custom Reasoning retains its model schema and accepts explicit null" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const Sig = signature.Signature(struct {
+        pub const Input = struct {};
+        pub const Output = struct { analysis: ?signature.Reasoning, answer: []const u8 };
+    });
+    const view: View = .{ .instructions = "", .inputs = Sig.input_fields_list, .outputs = Sig.output_fields_list };
+    const chosen = try responseFormat(arena, view, true);
+    try testing.expect(chosen == .json_schema);
+    const root = chosen.json_schema.schema.object;
+    const analysis = root.get("properties").?.object.get("analysis").?.object;
+    const alternatives = analysis.get("anyOf").?.array.items;
+    try testing.expectEqualStrings("#/$defs/Reasoning", alternatives[0].object.get("$ref").?.string);
+    try testing.expectEqualStrings("null", alternatives[1].object.get("type").?.string);
+    const reasoning = root.get("$defs").?.object.get("Reasoning").?.object;
+    try testing.expect(!reasoning.get("additionalProperties").?.bool);
+    try testing.expectEqualStrings("string", reasoning.get("properties").?.object.get("content").?.object.get("type").?.string);
+    try testing.expectEqualStrings("content", reasoning.get("required").?.array.items[0].string);
+    const nulls = try Adapter.json.parse(arena, view, "{\"analysis\":null,\"answer\":\"yes\"}");
+    try testing.expect(nulls.get("analysis").? == .null);
+    const omitted = try Adapter.json.parse(arena, view, "{\"answer\":\"yes\"}");
+    try testing.expect(omitted.get("analysis").? == .null);
+    for ([_][]const u8{
+        "{\"analysis\":\"\",\"answer\":\"yes\"}",
+        "{\"analysis\":{\"content\":\"\"},\"answer\":\"yes\"}",
+    }) |completion| {
+        const empty = try Adapter.json.parse(arena, view, completion);
+        try testing.expectEqualStrings("", empty.get("analysis").?.string);
+    }
+    try testing.expectError(error.AdapterParse, Adapter.json.parse(arena, view, "{\"analysis\":{\"content\":7},\"answer\":\"yes\"}"));
 }
 
 test "adapter defaults follow signature order and preserve explicit null" {

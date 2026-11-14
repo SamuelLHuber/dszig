@@ -1,4 +1,4 @@
-//! `dspy.Ensemble` and `dspy.majority` (DSPy 3.4.1).
+//! `dspy.Ensemble` and `dspy.majority` (DSPy 3.5.0).
 //!
 //! `Ensemble(P, n)` runs every program (or, with `size`, a `random.sample`
 //! of them drawn from `rng`, which stands in for Python's global `random`)
@@ -69,35 +69,54 @@ fn isArticle(run: []const u21) bool {
 /// completion whose normalized `field` is the most common normalized value
 /// (ties go to the value seen first; empty normalizations are ignored
 /// unless every one is empty). Non-string scalars keep Python equality.
+/// DSPy's winning-NaN quirk is retained: the final equality search finds
+/// no match, so it returns the last completion instead.
 pub const Error = Allocator.Error || error{ UnhashableVote, MissingVoteField };
+
+const VoteKey = struct {
+    value: Value,
+    // Inline scalars have no Python object identity. Only shared Record
+    // field storage represents identity; equal NaN bits must not merge.
+    identity: *const Value,
+
+    fn equal(a: VoteKey, b: VoteKey) bool {
+        return a.identity == b.identity or value.pyEqual(a.value, b.value);
+    }
+};
 
 pub fn majority(arena: Allocator, completions: []const Record, field: []const u8) Error!usize {
     assert(completions.len > 0);
-    const keys = try arena.alloc(Value, completions.len);
-    for (completions, keys) |*c, *k| k.* = try normalizedKey(arena, c.get(field) orelse return error.MissingVoteField);
+    const keys = try arena.alloc(VoteKey, completions.len);
+    for (completions, keys) |*c, *k| {
+        const original = c.getPtr(field) orelse return error.MissingVoteField;
+        k.* = .{ .value = try normalizedKey(arena, original.*), .identity = original };
+    }
     var any_kept = false;
-    for (keys) |k| any_kept = any_kept or k != .null;
+    for (keys) |k| any_kept = any_kept or k.value != .null;
     var best: ?usize = null;
     var best_count: usize = 0;
     for (keys, 0..) |k, i| {
-        if (any_kept and k == .null) continue;
+        if (any_kept and k.value == .null) continue;
         if (firstIndex(keys[0..i], k, any_kept) != null) continue;
         var count: usize = 0;
         for (keys) |other| {
-            if (value.pyEqual(k, other)) count += 1;
+            if (k.equal(other)) count += 1;
         }
         if (count > best_count) {
             best = i;
             best_count = count;
         }
     }
-    return best.?;
+    // best already names the first occurrence. DSPy's final search uses
+    // equality alone: a non-reflexive winning NaN falls through to the last row.
+    const winner = best.?;
+    return if (value.pyEqual(keys[winner].value, keys[winner].value)) winner else completions.len - 1;
 }
 
-fn firstIndex(keys: []const Value, k: Value, skip_null: bool) ?usize {
+fn firstIndex(keys: []const VoteKey, k: VoteKey, skip_null: bool) ?usize {
     for (keys, 0..) |other, i| {
-        if (skip_null and other == .null) continue;
-        if (value.pyEqual(k, other)) return i;
+        if (skip_null and other.value == .null) continue;
+        if (k.equal(other)) return i;
     }
     return null;
 }
@@ -127,6 +146,64 @@ test "majority distinguishes text from numbers and groups Python numeric equals"
     try records[1].put(arena, "answer", .{ .integer = 9_007_199_254_740_992 });
     try records[2].put(arena, "answer", .{ .float = 9_007_199_254_740_992.0 });
     try std.testing.expectEqual(@as(usize, 1), try majority(arena, &records, "answer"));
+}
+
+test "majority matches DSPy NaN result fallback and ordinary first ties" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const nan: Value = .{ .float = std.math.nan(f64) };
+    const seven: Value = .{ .integer = 7 };
+    const cases = [_]struct { votes: []const Value, winner: usize }{
+        .{ .votes = &.{nan}, .winner = 0 },
+        .{ .votes = &.{ nan, nan }, .winner = 1 },
+        .{ .votes = &.{ nan, .null }, .winner = 1 },
+        .{ .votes = &.{ nan, nan, .null }, .winner = 2 },
+        .{ .votes = &.{ nan, seven }, .winner = 1 },
+        .{ .votes = &.{ seven, nan }, .winner = 0 },
+        .{ .votes = &.{ nan, seven, seven }, .winner = 1 },
+        .{ .votes = &.{ nan, nan, seven }, .winner = 2 },
+        .{ .votes = &.{ .null, nan, seven }, .winner = 2 },
+        .{ .votes = &.{ .null, .{ .string = "the" }, .null }, .winner = 0 },
+        .{ .votes = &.{ .{ .integer = 8 }, seven, seven, .{ .integer = 8 } }, .winner = 0 },
+    };
+    for (cases) |case| {
+        const records = try arena.alloc(Record, case.votes.len);
+        for (records, case.votes, 0..) |*record, vote, i| {
+            record.* = .empty;
+            try record.put(arena, "answer", vote);
+            try record.put(arena, "marker", .{ .integer = @intCast(i) });
+        }
+        const winner = try majority(arena, records, "answer");
+        try std.testing.expectEqual(case.winner, winner);
+        try std.testing.expectEqual(@as(i64, @intCast(case.winner)), records[winner].get("marker").?.integer);
+    }
+}
+
+test "majority counts aliased NaN identity but not separate equal NaN bits" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var records: [4]Record = @splat(.empty);
+    for (&records, 0..) |*record, i| {
+        const answer: Value = switch (i) {
+            0 => .{ .integer = 7 },
+            3 => .{ .integer = 8 },
+            else => .{ .float = std.math.nan(f64) },
+        };
+        try record.put(arena, "answer", answer);
+        try record.put(arena, "marker", .{ .integer = @intCast(i) });
+    }
+    // Separate NaNs each receive one vote, so the first ordinary key wins.
+    var winner = try majority(arena, &records, "answer");
+    try std.testing.expectEqual(@as(usize, 0), winner);
+    try std.testing.expectEqual(@as(i64, 0), records[winner].get("marker").?.integer);
+    // Shared field storage is representable identity: the NaN now wins the
+    // count, then DSPy's equality-only result search falls through to row 3.
+    records[2] = records[1];
+    winner = try majority(arena, &records, "answer");
+    try std.testing.expectEqual(@as(usize, 3), winner);
+    try std.testing.expectEqual(@as(i64, 3), records[winner].get("marker").?.integer);
 }
 
 pub fn Ensemble(comptime P: type, comptime n: usize) type {

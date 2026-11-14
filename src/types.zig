@@ -64,7 +64,7 @@ pub fn modelName(comptime T: type) []const u8 {
 /// `get_annotation_name(annotation)`.
 pub fn pyName(comptime T: type) []const u8 {
     comptime {
-        if (T == []const u8) return "str";
+        if (T == []const u8 or T == @import("signature.zig").Reasoning) return "str";
         if (T == bool) return "bool";
         if (T == std.json.ObjectMap) return "dict[str, Any]";
         if (isDict(T)) return "dict[str, " ++ pyName(T.dszig_dict_value) ++ "]";
@@ -183,12 +183,16 @@ fn modelEntries(comptime S: type, comptime ordered_properties: bool) []const Ent
             props[i] = .{ .key = name, .val = render(e) };
         }
         const final = props;
-        return &.{
+        const description: []const Entry = if (S == @import("signature.zig").Reasoning)
+            &.{.{ .key = "description", .val = "\"Reasoning type in DSPy.\\n\\nThis type is useful when you want the DSPy output to include the reasoning of the LM. We build this type so that\\nDSPy can support the reasoning model and non-reasoning model with the same code.\\n\\nThis is a str-like type, you can convert a string directly to a Reasoning object, and from DSPy adapters'\\nperspective, `Reasoning` is treated as a string.\"" }}
+        else
+            &.{};
+        return &[_]Entry{
             .{ .key = "type", .val = quote("object") },
             .{ .key = "properties", .val = if (ordered_properties) renderOrdered(&final) else render(&final) },
             .{ .key = "required", .val = required ++ "]" },
             .{ .key = "title", .val = quote(modelName(S)) },
-        };
+        } ++ description;
     }
 }
 
@@ -245,6 +249,10 @@ fn schemaImpl(comptime T: type, comptime ordered_properties: bool) []const u8 {
 
 /// Pydantic lax-mode `TypeAdapter(T).validate_python(v)`, as a JSON value.
 pub fn validate(comptime T: type, arena: Allocator, v: Value) Error!Value {
+    if (T == @import("signature.zig").Reasoning) {
+        const content = if (v == .object) v.object.get("content") orelse return error.ParseValue else v;
+        return if (content == .string) content else error.ParseValue;
+    }
     if (T == []const u8) return if (v == .string) v else error.ParseValue;
     if (T == std.json.ObjectMap) return if (v == .object) v else error.ParseValue;
     if (comptime isDict(T)) {
@@ -262,16 +270,21 @@ pub fn validate(comptime T: type, arena: Allocator, v: Value) Error!Value {
         else => error.ParseValue,
     };
     switch (@typeInfo(T)) {
-        .int => return switch (v) {
-            .integer => v,
-            .float => |f| if (f == @trunc(f) and @abs(f) < 9.2e18) Value{ .integer = @intFromFloat(f) } else error.ParseValue,
-            .string => |s| .{ .integer = std.fmt.parseInt(i64, std.mem.trim(u8, s, " \t\n\r"), 10) catch return error.ParseValue },
-            else => error.ParseValue,
+        .int => {
+            const value = @import("value.zig");
+            const parsed = value.parseInteger(v) catch if (v == .string) blk: {
+                // Preserve Pydantic's integer-string coercions (sign and digit
+                // separators), while emitting canonical JSON for wide values.
+                const integer = std.fmt.parseInt(T, std.mem.trim(u8, v.string, " \t\n\r"), 10) catch return error.ParseValue;
+                break :blk try value.toValue(arena, T, integer);
+            } else return error.ParseValue;
+            _ = value.fromValue(arena, T, parsed) catch return error.ParseValue;
+            return parsed;
         },
         .float => return switch (v) {
             .float => v,
             .integer => |i| .{ .float = @floatFromInt(i) },
-            .string => |s| .{ .float = std.fmt.parseFloat(f64, std.mem.trim(u8, s, " \t\n\r")) catch return error.ParseValue },
+            .string, .number_string => |s| .{ .float = std.fmt.parseFloat(f64, std.mem.trim(u8, s, " \t\n\r")) catch return error.ParseValue },
             else => error.ParseValue,
         },
         .@"enum" => {

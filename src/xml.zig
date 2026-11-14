@@ -15,6 +15,7 @@ const Error = adapter.Error;
 const Writer = std.Io.Writer;
 const max_depth = pyjson.max_depth;
 const empty_schema: Value = .{ .object = .empty };
+const reasoning_schema = @import("types.zig").schemaXml(signature.Reasoning);
 
 fn get(node: Value, key: []const u8) Value {
     return if (node == .object) node.object.get(key) orelse .null else .null;
@@ -251,7 +252,18 @@ pub const XmlAdapter = struct {
 
     pub fn parse(arena: Allocator, view: adapter.View, completion: []const u8) Error!Record {
         var schemas: Record = .empty;
-        for (view.outputs) |field| try schemas.put(arena, field.name, try fieldSchema(arena, field));
+        for (view.outputs) |field| {
+            // Unlike JSONAdapter's provider schema, XML parsing uses the
+            // actual Reasoning model schema, including its required content.
+            const schema = if (field.reasoning_type and field.kind == .str)
+                std.json.parseFromSliceLeaky(Value, arena, reasoning_schema, .{}) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.AdapterParse,
+                }
+            else
+                try fieldSchema(arena, field);
+            try schemas.put(arena, field.name, schema);
+        }
         var root_schema: Record = .empty;
         try root_schema.put(arena, "properties", .{ .object = schemas });
         const text = try stripPrefix(view, completion);
@@ -932,6 +944,45 @@ test "runtime number unions preserve large integers and dictionary key schemas r
     }
 }
 
+test "runtime integer schemas preserve Python sized integers including float first unions" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const schemas = [_][]const u8{
+        "{\"type\":\"integer\"}",
+        "{\"anyOf\":[{\"type\":\"number\"},{\"type\":\"integer\"}]}",
+    };
+    const integers = [_][]const u8{
+        "18446744073709551615",
+        "-18446744073709551616",
+        "340282366920938463463374607431768211455",
+    };
+    const adapters = [_]adapter.Adapter{ .xml, .chat, .json };
+    for (schemas) |schema| {
+        const fields = [_]Field{.{
+            .name = "result",
+            .kind = .json,
+            .type_name = "int",
+            .desc = "${result}",
+            .prefix = "Result:",
+            .schema = schema,
+        }};
+        const view: adapter.View = .{ .instructions = "", .inputs = &.{}, .outputs = &fields };
+        for (integers) |integer| {
+            const completions = [_][]const u8{
+                try std.fmt.allocPrint(arena, "<result>{s}</result>", .{integer}),
+                try std.fmt.allocPrint(arena, "[[ ## result ## ]]\n{s}", .{integer}),
+                try std.fmt.allocPrint(arena, "{{\"result\":{s}}}", .{integer}),
+            };
+            for (adapters, completions) |which, completion| {
+                const parsed = try which.parse(arena, view, completion);
+                try testing.expect(parsed.get("result").? == .number_string);
+                try testing.expectEqualStrings(integer, parsed.get("result").?.number_string);
+            }
+        }
+    }
+}
+
 test "XML Unicode framing whitespace is trimmed without stripping multiline content" {
     var memory: std.heap.ArenaAllocator = .init(testing.allocator);
     defer memory.deinit();
@@ -967,6 +1018,94 @@ test "XML nullable self closing empty string and omitted optional are distinct" 
     try testing.expectEqual(@as(i64, 7), literal_null.get("count").?.integer);
     const reminder = try XmlAdapter.requirements(arena, view.outputs);
     try testing.expect(std.mem.endsWith(u8, reminder, " For null, self-close the field's own tag. For an empty string, use an opening and closing tag with no content."));
+}
+
+test "XML custom nullable Reasoning distinguishes null empty content and omitted output" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const Sig = signature.Signature(struct {
+        pub const Input = struct {};
+        pub const Output = struct { analysis: ?signature.Reasoning, answer: []const u8 };
+    });
+    const view: adapter.View = .{ .instructions = "", .inputs = Sig.input_fields_list, .outputs = Sig.output_fields_list };
+    for ([_][]const u8{
+        "<analysis/><answer>yes</answer>",
+        "<analysis /><answer>yes</answer>",
+        "<answer>yes</answer>",
+    }) |completion| {
+        const parsed = try XmlAdapter.parse(arena, view, completion);
+        try testing.expect(parsed.get("analysis").? == .null);
+        try testing.expectEqualStrings("yes", parsed.get("answer").?.string);
+    }
+    for ([_][]const u8{
+        "<analysis></analysis><answer>yes</answer>",
+        "<analysis><content></content></analysis><answer>yes</answer>",
+    }) |completion| {
+        const parsed = try XmlAdapter.parse(arena, view, completion);
+        try testing.expectEqualStrings("", parsed.get("analysis").?.string);
+    }
+    for ([_][]const u8{
+        "<analysis>step</analysis><answer>yes</answer>",
+        "<analysis><content>step</content></analysis><answer>yes</answer>",
+    }) |completion| {
+        const parsed = try XmlAdapter.parse(arena, view, completion);
+        try testing.expectEqualStrings("step", parsed.get("analysis").?.string);
+    }
+    const structure = try XmlAdapter.fieldStructure(arena, view.outputs);
+    try testing.expect(std.mem.indexOf(u8, structure, "<content>") == null);
+    const requirements = try XmlAdapter.requirements(arena, view.outputs);
+    try testing.expect(std.mem.indexOf(u8, requirements, "For null, self-close the field's own tag.") != null);
+
+    const Required = signature.Signature(struct {
+        pub const Input = struct {};
+        pub const Output = struct { plan: signature.Reasoning, answer: []const u8 };
+    });
+    const required_view: adapter.View = .{ .instructions = "", .inputs = Required.input_fields_list, .outputs = Required.output_fields_list };
+    try testing.expectError(error.AdapterParse, XmlAdapter.parse(arena, required_view, "<answer>yes</answer>"));
+    try testing.expectError(error.AdapterParse, adapter.Adapter.json.parse(arena, required_view, "{\"plan\":null,\"answer\":\"yes\"}"));
+}
+
+test "required Reasoning and default CoT distinguish null forms from explicit empty content" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const Required = signature.Signature(struct {
+        pub const Input = struct {};
+        pub const Output = struct { plan: signature.Reasoning, answer: []const u8 };
+    });
+    const view: adapter.View = .{ .instructions = "", .inputs = Required.input_fields_list, .outputs = Required.output_fields_list };
+    for ([_][]const u8{
+        "<plan/><answer>yes</answer>",
+        "<plan></plan><answer>yes</answer>",
+        "<plan>\n\n</plan><answer>yes</answer>",
+    }) |completion| try testing.expectError(error.AdapterParse, XmlAdapter.parse(arena, view, completion));
+    for ([_][]const u8{
+        "<plan>step</plan><answer>yes</answer>",
+        "<plan><content>step</content></plan><answer>yes</answer>",
+    }) |completion| {
+        const parsed = try XmlAdapter.parse(arena, view, completion);
+        try testing.expectEqualStrings("step", parsed.get("plan").?.string);
+    }
+    const empty_content = try XmlAdapter.parse(arena, view, "<plan><content></content></plan><answer>yes</answer>");
+    try testing.expectEqualStrings("", empty_content.get("plan").?.string);
+
+    const Task = signature.Signature(struct {
+        pub const Input = struct {};
+        pub const Output = struct { answer: []const u8 };
+    });
+    const cot: @import("predict.zig").ChainOfThought(Task) = .{};
+    var script: @import("lm.zig").ScriptedLM = .{ .responses = &.{
+        "<answer>yes</answer>",
+        "{\"answer\":\"yes\"}",
+        "{\"plan\":{\"content\":\"\"},\"answer\":\"yes\"}",
+    } };
+    const context: @import("predict.zig").Context = .{ .arena = arena, .lm = script.lm(), .json_fallback = false };
+    try testing.expectError(error.AdapterParse, cot.forward(context, .{}));
+    const json_context: @import("predict.zig").Context = .{ .arena = arena, .lm = script.lm(), .adapter = .json, .json_fallback = false };
+    try testing.expectError(error.AdapterParse, cot.forward(json_context, .{}));
+    const json_content = try cot.forward(json_context, .{});
+    try testing.expectEqualStrings("", json_content.reasoning.?.content);
 }
 
 test "XML typed nested objects list items literals nulls and mapping keys" {

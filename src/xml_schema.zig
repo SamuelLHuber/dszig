@@ -56,7 +56,8 @@ pub fn parse(arena: Allocator, schema: Value, input: Value) Error!Value {
 fn exactType(schema: Value, input: Value) bool {
     const tag = text(get(schema, "type"));
     if (std.mem.eql(u8, tag, "string")) return input == .string;
-    if (std.mem.eql(u8, tag, "integer")) return input == .integer;
+    if (std.mem.eql(u8, tag, "integer")) return input == .integer or
+        (input == .number_string and std.mem.indexOfAny(u8, input.number_string, ".eE") == null);
     if (std.mem.eql(u8, tag, "number")) return input == .float;
     if (std.mem.eql(u8, tag, "boolean")) return input == .bool;
     if (std.mem.eql(u8, tag, "null")) return input == .null;
@@ -113,7 +114,7 @@ fn validate(arena: Allocator, schema: Value, definitions: Value, input: Value, d
     if (schema_type == .null) return input;
     if (typeIs(schema, "null")) return if (input == .null) input else error.ParseValue;
     if (typeIs(schema, "string")) return if (input == .string) input else error.ParseValue;
-    if (typeIs(schema, "integer")) return types.validate(i64, arena, input);
+    if (typeIs(schema, "integer")) return value.parseInteger(input);
     if (typeIs(schema, "number")) return types.validate(f64, arena, input);
     if (typeIs(schema, "boolean")) return types.validate(bool, arena, input);
     if (typeIs(schema, "array")) {

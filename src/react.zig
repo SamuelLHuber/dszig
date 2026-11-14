@@ -174,7 +174,7 @@ pub fn ReActIters(comptime Sig: type, comptime user_tools: []const Tool, comptim
             .{ .name = "history", .kind = .json, .type_name = "History", .desc = "${history}", .prefix = "History:", .schema = History.schema, .validate = History.validate },
             .{ .name = "tools", .kind = .json, .type_name = "list[Tool]", .desc = "${tools}", .prefix = "Tools:", .schema = "{\"type\": \"array\", \"items\": {\"type\": \"string\"}}", .xml_literal = true, .native_tools = true },
             .{ .name = "turn_budget", .kind = .str, .type_name = "str", .desc = "Your current turn and how many turns remain before you must submit.", .prefix = "Turn Budget:" },
-            .{ .name = "next_thought", .kind = .str, .type_name = "str", .desc = "${next_thought}", .prefix = "Next Thought:", .native_reasoning = true },
+            .{ .name = "next_thought", .kind = .str, .type_name = "str", .desc = "${next_thought}", .prefix = "Next Thought:", .reasoning_type = true, .native_reasoning = true },
             .{ .name = "tool_calls", .kind = .json, .type_name = "ToolCalls", .desc = "${tool_calls}", .prefix = "Tool Calls:", .schema = ToolCalls.schema, .validate = ToolCalls.validate, .xml_literal = true, .native_tool_calls = true, .type_description = ToolCalls.description },
         };
         pub const react_fields: []const Field = &react_field_array;
@@ -401,14 +401,28 @@ fn normalizeBasicArg(schema_type: []const u8, item: Value) ToolError!Value {
         if (item.float < -9223372036854775808.0 or item.float >= 9223372036854775808.0) return error.InvalidArguments;
         return .{ .integer = @intFromFloat(item.float) };
     }
-    if (std.mem.eql(u8, schema_type, "number") and item == .integer) return .{ .float = @floatFromInt(item.integer) };
+    if (std.mem.eql(u8, schema_type, "integer") and item == .number_string)
+        return value.parseInteger(item) catch error.InvalidArguments;
+    if (std.mem.eql(u8, schema_type, "number")) return switch (item) {
+        .integer => |integer| .{ .float = @floatFromInt(integer) },
+        .number_string => |text| .{ .float = std.fmt.parseFloat(f64, text) catch return error.InvalidArguments },
+        else => item,
+    };
     return item;
 }
 
 fn schemaAccepts(schema_type: []const u8, item: Value) bool {
     if (std.mem.eql(u8, schema_type, "string")) return item == .string;
-    if (std.mem.eql(u8, schema_type, "integer")) return item == .integer or (item == .float and std.math.isFinite(item.float) and item.float == @trunc(item.float));
-    if (std.mem.eql(u8, schema_type, "number")) return item == .integer or item == .float;
+    if (std.mem.eql(u8, schema_type, "integer")) return switch (item) {
+        .integer => true,
+        .float => |float| std.math.isFinite(float) and float == @trunc(float),
+        .number_string => blk: {
+            _ = value.parseInteger(item) catch break :blk false;
+            break :blk true;
+        },
+        else => false,
+    };
+    if (std.mem.eql(u8, schema_type, "number")) return item == .integer or item == .float or item == .number_string;
     if (std.mem.eql(u8, schema_type, "boolean")) return item == .bool;
     if (std.mem.eql(u8, schema_type, "array")) return item == .array;
     if (std.mem.eql(u8, schema_type, "object")) return item == .object;
@@ -500,7 +514,14 @@ fn nativeFits(comptime T: type, input: Value) bool {
         return true;
     }
     return switch (@typeInfo(T)) {
-        .int => std.math.cast(T, input.integer) != null,
+        .int => switch (input) {
+            .integer => |integer| std.math.cast(T, integer) != null,
+            .number_string => |text| blk: {
+                _ = std.fmt.parseInt(T, text, 10) catch break :blk false;
+                break :blk true;
+            },
+            else => false,
+        },
         .float, .@"enum" => true,
         .optional => |optional| input == .null or nativeFits(optional.child, input),
         .pointer => |pointer| blk: {
@@ -589,6 +610,75 @@ fn appendEvent(arena: Allocator, events: *std.ArrayList(Record), history: *Histo
 
 fn writeText(w: *Writer, text: []const u8) Allocator.Error!void {
     w.writeAll(text) catch return error.OutOfMemory;
+}
+
+test "ReAct typed tools and submit preserve exact wide integers" {
+    const testing = std.testing;
+    const Payload = struct { id: u128 };
+    const Callback = struct {
+        fn typed(ctx: Context, args: *const Record) ToolError!Value {
+            const Args = struct { count: u64, payload: Payload, ratio: f64 };
+            const decoded = value.fromRecord(ctx.arena, Args, args) catch return error.InvalidArguments;
+            if (decoded.count != std.math.maxInt(u64) or decoded.payload.id != std.math.maxInt(u128) or
+                decoded.ratio != 1e19) return error.InvalidArguments;
+            return value.toValue(ctx.arena, u64, decoded.count);
+        }
+
+        fn basic(_: Context, args: *const Record) ToolError!Value {
+            const count = args.get("count") orelse return error.InvalidArguments;
+            const ratio = args.get("ratio") orelse return error.InvalidArguments;
+            if (count != .number_string or !std.mem.eql(u8, count.number_string, "18446744073709551615") or
+                ratio != .float or ratio.float != 1e19) return error.InvalidArguments;
+            return count;
+        }
+    };
+    const typed: Tool = comptime .{
+        .name = "typed",
+        .args = &.{ Arg.typed("count", u64), Arg.typed("payload", Payload), Arg.typed("ratio", f64) },
+        .func = Callback.typed,
+    };
+    const basic: Tool = comptime .{
+        .name = "basic",
+        .args = &.{ .{ .name = "count", .schema_type = "integer" }, .{ .name = "ratio", .schema_type = "number" } },
+        .func = Callback.basic,
+    };
+    const Sig = signature.Signature(struct {
+        pub const Input = struct { seed: u64 };
+        pub const Output = struct { answer: u64, payload: Payload, numbers: []const u64, ratio: f64 };
+    });
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var script: @import("lm.zig").ScriptedLM = .{ .responses = &.{
+        "{\"next_thought\":\"Check values.\",\"tool_calls\":{\"tool_calls\":[" ++
+            "{\"name\":\"typed\",\"args\":{\"count\":18446744073709551615,\"payload\":{\"id\":340282366920938463463374607431768211455},\"ratio\":10000000000000000000}}," ++
+            "{\"name\":\"basic\",\"args\":{\"count\":18446744073709551615,\"ratio\":10000000000000000000}}]}}",
+        "{\"next_thought\":\"Submit.\",\"tool_calls\":{\"tool_calls\":[" ++
+            "{\"name\":\"submit\",\"args\":{\"answer\":18446744073709551615,\"payload\":{\"id\":340282366920938463463374607431768211455}," ++
+            "\"numbers\":[10000000000000000000,18446744073709551615],\"ratio\":10000000000000000000}}]}}",
+    } };
+    const agent: ReActIters(Sig, &.{ typed, basic }, 2) = .{};
+    const inputs = try value.toRecord(arena, Sig.Input, .{ .seed = std.math.maxInt(u64) });
+    const prediction = try agent.run(.{ .arena = arena, .lm = script.lm(), .adapter = .json, .json_fallback = false }, &inputs);
+    const out = try value.fromRecord(arena, Sig.Output, &prediction.outputs);
+    try testing.expectEqual(std.math.maxInt(u64), out.answer);
+    try testing.expectEqual(std.math.maxInt(u128), out.payload.id);
+    try testing.expectEqualSlices(u64, &.{ 10_000_000_000_000_000_000, std.math.maxInt(u64) }, out.numbers);
+    try testing.expectEqual(@as(f64, 1e19), out.ratio);
+    try testing.expectEqual(TerminationReason.submit, prediction.termination_reason);
+    try testing.expectEqual(@as(usize, 2), prediction.history.messages.len);
+    const calls = try ToolCalls.fromValue(arena, prediction.history.messages[0].get("tool_calls").?);
+    const results = calls.tool_call_results.?.tool_call_results;
+    try testing.expectEqual(@as(usize, 2), results.len);
+    for (results) |result| {
+        try testing.expect(!result.is_error);
+        try testing.expectEqualStrings("18446744073709551615", result.value.number_string);
+    }
+    var invalid: Record = .empty;
+    try invalid.put(arena, "count", .{ .number_string = "18446744073709551616" });
+    try invalid.put(arena, "payload", try value.toValue(arena, Payload, .{ .id = std.math.maxInt(u128) }));
+    try invalid.put(arena, "ratio", .{ .number_string = "10000000000000000000" });
+    try testing.expectError(error.InvalidArguments, normalizeArgs(typed, arena, &invalid));
 }
 
 fn parseDefault(arena: Allocator, text: []const u8) adapter.Error!Value {

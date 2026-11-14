@@ -363,9 +363,12 @@ pub fn ChainOfThoughtWithOptions(comptime Sig: type, comptime options: ChainOfTh
             f.kind = .str;
             f.type_name = "str";
             f.schema = "";
+            f.xml_schema = "";
             f.validate = null;
             f.optional_str = false;
+            f.xml_literal = false;
             f.nullable = false;
+            f.reasoning_type = true;
             f.native_reasoning = true;
             f.reasoning_fallback = "plan";
         }
@@ -596,6 +599,121 @@ test "predict and chain of thought run through the adapter with trace" {
     try testing.expectEqualStrings("Lyon", fallback.answer);
     try testing.expectEqual(@as(usize, 2), trace.steps.items.len);
     try testing.expect(trace.steps.items[0].predictor == &cot.predict.state);
+}
+
+test "typed Predict retains wide integer inputs and outputs across adapters" {
+    const Wide = signature.Signature(struct {
+        pub const Input = struct { n: u64, nested: struct { id: u64 } };
+        pub const Output = struct { answer: u64 };
+    });
+    const InspectingLM = struct {
+        response: []const u8,
+
+        fn complete(ptr: *anyopaque, a: Allocator, request: lm_mod.Request) lm_mod.Error![]const lm_mod.Completion {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const text = request.messages[request.messages.len - 1].content;
+            if (std.mem.indexOf(u8, text, "10000000000000000000") == null or
+                std.mem.indexOf(u8, text, "18446744073709551615") == null or
+                std.mem.indexOf(u8, text, "\"18446744073709551615\"") != null or
+                std.mem.indexOf(u8, text, "\"10000000000000000000\"") != null) return error.LMFailure;
+            const out = try a.alloc(lm_mod.Completion, 1);
+            out[0] = .{ .text = self.response };
+            return out;
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    inline for (.{
+        .{ Adapter.chat, "[[ ## answer ## ]]\n18446744073709551615\n\n[[ ## completed ## ]]" },
+        .{ Adapter.json, "{\"answer\":18446744073709551615}" },
+        .{ Adapter.xml, "<answer>18446744073709551615</answer>" },
+    }) |case| {
+        var model: InspectingLM = .{ .response = case[1] };
+        const predict: Predict(Wide) = .{};
+        const out = try predict.forward(.{
+            .arena = memory.allocator(),
+            .lm = .{ .ptr = &model, .vtable = &.{ .complete = InspectingLM.complete } },
+            .adapter = case[0],
+            .json_fallback = false,
+        }, .{ .n = 10_000_000_000_000_000_000, .nested = .{ .id = std.math.maxInt(u64) } });
+        try testing.expectEqual(std.math.maxInt(u64), out.answer);
+    }
+}
+
+test "typed Predict preserves custom nullable Reasoning null and empty content" {
+    const Custom = signature.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { analysis: ?signature.Reasoning, answer: []const u8 };
+    });
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    // Optional custom Reasoning remains a text output even on a reasoning LM:
+    // upstream native adaptation only handles a direct Reasoning annotation.
+    inline for (.{ false, true }) |supports_native| {
+        inline for (.{ false, true }) |disabled| {
+            inline for (.{
+                .{ Adapter.json, "{\"analysis\":null,\"answer\":\"ok\"}", @as(?[]const u8, null) },
+                .{ Adapter.json, "{\"analysis\":\"\",\"answer\":\"ok\"}", @as(?[]const u8, "") },
+                .{ Adapter.json, "{\"analysis\":{\"content\":\"why\"},\"answer\":\"ok\"}", @as(?[]const u8, "why") },
+                .{ Adapter.xml, "<analysis /><answer>ok</answer>", @as(?[]const u8, null) },
+                .{ Adapter.xml, "<analysis></analysis><answer>ok</answer>", @as(?[]const u8, "") },
+                .{ Adapter.xml, "<analysis><content>why</content></analysis><answer>ok</answer>", @as(?[]const u8, "why") },
+            }) |case| {
+                var script: lm_mod.ScriptedLM = .{ .responses = &.{case[1]} };
+                var lm = script.lm();
+                lm.supports_reasoning = supports_native;
+                var trace: Trace = .{ .arena = memory.allocator() };
+                const predict: Predict(Custom) = .{};
+                const out = try predict.forward(.{
+                    .arena = memory.allocator(),
+                    .lm = lm,
+                    .adapter = case[0],
+                    .json_fallback = false,
+                    .lm_options = if (disabled) .{ .reasoning_effort = "none" } else .{},
+                    .trace = &trace,
+                }, .{ .question = "Explain?" });
+                try testing.expectEqualStrings("ok", out.answer);
+                if (case[2]) |expected| {
+                    try testing.expectEqualStrings(expected, out.analysis.?.content);
+                    try testing.expectEqualStrings(expected, trace.steps.items[0].outputs.get("analysis").?.string);
+                } else {
+                    try testing.expect(out.analysis == null);
+                    try testing.expect(trace.steps.items[0].outputs.get("analysis").? == .null);
+                }
+            }
+        }
+    }
+}
+
+test "default CoT fallback validates required Reasoning without changing native null injection" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    inline for (.{
+        .{ Adapter.json, "{\"plan\":null,\"answer\":\"ok\"}", @as(?[]const u8, null) },
+        .{ Adapter.json, "{\"plan\":{},\"answer\":\"ok\"}", @as(?[]const u8, null) },
+        .{ Adapter.json, "{\"plan\":7,\"answer\":\"ok\"}", @as(?[]const u8, null) },
+        .{ Adapter.json, "{\"plan\":\"\",\"answer\":\"ok\"}", @as(?[]const u8, "") },
+        .{ Adapter.json, "{\"plan\":{\"content\":\"why\"},\"answer\":\"ok\"}", @as(?[]const u8, "why") },
+        .{ Adapter.xml, "<plan /><answer>ok</answer>", @as(?[]const u8, null) },
+        .{ Adapter.xml, "<plan></plan><answer>ok</answer>", @as(?[]const u8, null) },
+        .{ Adapter.xml, "<plan><content></content></plan><answer>ok</answer>", @as(?[]const u8, "") },
+    }) |case| {
+        var script: lm_mod.ScriptedLM = .{ .responses = &.{case[1]} };
+        const cot: ChainOfThought(QA) = .{};
+        const ctx: Context = .{
+            .arena = memory.allocator(),
+            .lm = script.lm(),
+            .adapter = case[0],
+            .json_fallback = false,
+        };
+        if (case[2]) |expected| {
+            const out = try cot.forward(ctx, .{ .question = "Explain?" });
+            try testing.expectEqualStrings(expected, out.reasoning.?.content);
+            try testing.expectEqualStrings("ok", out.answer);
+        } else {
+            try testing.expectError(error.AdapterParse, cot.forward(ctx, .{ .question = "Explain?" }));
+        }
+    }
 }
 
 test "native reasoning preserves absent summaries and records actual content" {

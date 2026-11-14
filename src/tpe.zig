@@ -84,12 +84,14 @@ pub const Sampler = struct {
         const mpe_below = try Estimator.init(scratch, params, order.items, trials, below.items);
         const mpe_above = try Estimator.init(scratch, params, order.items, trials, above.items);
         const samples = try mpe_below.sample(scratch, &s.rng, params, order.items);
+        // Reuse one workspace for both mixtures and every candidate.
+        const terms = try scratch.alloc(f64, @max(mpe_below.weights.len, mpe_above.weights.len));
 
         var best: usize = 0;
         var best_acq: f64 = -std.math.inf(f64);
         for (0..n_ei_candidates) |c| {
             const x = samples[c * order.items.len ..][0..order.items.len];
-            const acq = mpe_below.logPdf(params, order.items, x) - mpe_above.logPdf(params, order.items, x);
+            const acq = mpe_below.logPdf(params, order.items, x, terms[0..mpe_below.weights.len]) - mpe_above.logPdf(params, order.items, x, terms[0..mpe_above.weights.len]);
             if (c == 0 or acq > best_acq) {
                 best = c;
                 best_acq = acq;
@@ -198,10 +200,8 @@ const Estimator = struct {
         return out;
     }
 
-    fn logPdf(e: Estimator, params: []const Param, order: []const usize, x: []const usize) f64 {
-        var buf: [256]f64 = undefined;
-        assert(e.weights.len <= buf.len);
-        const terms = buf[0..e.weights.len];
+    fn logPdf(e: Estimator, params: []const Param, order: []const usize, x: []const usize, terms: []f64) f64 {
+        assert(terms.len == e.weights.len);
         var max: f64 = -std.math.inf(f64);
         for (terms, e.weights, 0..) |*t, w, j| {
             var v: f64 = 0;
@@ -250,4 +250,52 @@ pub fn pairwiseSum(xs: []const f64) f64 {
     var n2 = n / 2;
     n2 -= n2 % 8;
     return pairwiseSum(xs[0..n2]) + pairwiseSum(xs[n2..]);
+}
+
+test "TPE retains all kernels beyond 300 completed observations" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const params = [_]Param{.{ .name = "choice", .choices = 2 }};
+    var choices: [300][1]usize = @splat(.{0});
+    choices[299][0] = 1;
+    var trials: [300]Trial = undefined;
+    var members: [300]usize = undefined;
+    for (&trials, &members, &choices, 0..) |*trial, *member, *choice, i| {
+        trial.* = .{ .params = choice, .value = 0 };
+        member.* = i;
+    }
+    const estimator = try Estimator.init(arena, &params, &.{0}, &trials, &members);
+    try std.testing.expectEqual(@as(usize, 301), estimator.weights.len);
+    const terms = try arena.alloc(f64, estimator.weights.len);
+    // Optuna 4.5.0's _ParzenEstimator: the final observation is the only
+    // vote for choice 1, so truncating the long history changes its density.
+    try std.testing.expectApproxEqAbs(@as(f64, 0.9876113913805615), @exp(estimator.logPdf(&params, &.{0}, &.{0}, terms)), 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.01238860861943882), @exp(estimator.logPdf(&params, &.{0}, &.{1}, terms)), 1e-12);
+}
+
+test "TPE suggestions match Optuna after 300 completed trials" {
+    var scratch: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer scratch.deinit();
+    const params = [_]Param{
+        .{ .name = "z_instruction", .choices = 3 },
+        .{ .name = "a_demos", .choices = 4 },
+        .{ .name = "fixed", .choices = 1 },
+    };
+    var choices: [304][3]usize = undefined;
+    var trials: [304]Trial = undefined;
+    for (0..300) |i| {
+        choices[i] = .{ i % 3, (i / 3) % 4, 0 };
+        trials[i] = .{ .params = &choices[i], .value = @floatFromInt((i * 17) % 101) };
+    }
+    // Independently probed with Optuna 4.5.0 TPESampler(seed=19,
+    // multivariate=True), maximizing the same completed-trial history.
+    const expected = [_][3]usize{ .{ 0, 1, 0 }, .{ 0, 3, 0 }, .{ 2, 3, 0 }, .{ 0, 1, 0 } };
+    var sampler: Sampler = .init(19);
+    for (expected, 300..) |want, i| {
+        _ = scratch.reset(.retain_capacity);
+        try sampler.sample(scratch.allocator(), &params, trials[0..i], &choices[i]);
+        try std.testing.expectEqualSlices(usize, &want, &choices[i]);
+        trials[i] = .{ .params = &choices[i], .value = @floatFromInt((i * 17) % 101) };
+    }
 }

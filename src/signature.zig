@@ -73,7 +73,9 @@ pub const Field = struct {
     xml_schema: []const u8 = "",
     validate: ?*const fn (std.mem.Allocator, std.json.Value) nested.Error!std.json.Value = null,
     optional_str: bool = false,
-    /// Native Reasoning fields are omitted from prompts when the LM supports it.
+    /// Actual Reasoning type identity, including Optional[Reasoning].
+    reasoning_type: bool = false,
+    /// Direct Reasoning annotations can use the LM's native reasoning feature.
     native_reasoning: bool = false,
     /// Default CoT uses this wire name only when native reasoning is unavailable.
     reasoning_fallback: ?[]const u8 = null,
@@ -197,8 +199,10 @@ fn fieldsOf(comptime T: type, comptime role: []const u8, comptime descriptions: 
                 .xml_schema = if (FT == History) History.schema else if (FT == ToolCalls) ToolCalls.schema else if (kind == .json) nested.schemaXml(FT) else "",
                 .validate = if (FT == History) History.validate else if (FT == ToolCalls) ToolCalls.validate else if (kind == .json) nested.Validator(FT) else null,
                 .optional_str = nested.isOptionalStr(FT),
-                .native_reasoning = FT == Reasoning or FT == ?Reasoning,
-                .xml_literal = FT == History or FT == ToolCalls,
+                .reasoning_type = FT == Reasoning or FT == ?Reasoning,
+                // DSPy adapts direct Reasoning annotations, not Optional unions.
+                .native_reasoning = FT == Reasoning,
+                .xml_literal = FT == History or FT == ToolCalls or FT == ?Reasoning,
                 .native_tool_calls = FT == ToolCalls,
                 .type_description = if (FT == ToolCalls) ToolCalls.description else "",
                 .nullable = @typeInfo(FT) == .optional,
@@ -227,7 +231,7 @@ fn descriptionFor(comptime name: []const u8, comptime descriptions: []const Desc
 
 /// Map a Zig field type onto a supported DSPy annotation.
 pub fn kindOf(comptime T: type, comptime name: []const u8) Kind {
-    if (T == []const u8 or T == Reasoning or T == ?Reasoning) return .str;
+    if (T == []const u8 or T == Reasoning) return .str;
     if (T == []const []const u8) return .str_list;
     if (T == bool) return .boolean;
     if (T == std.json.ObjectMap) return .json_object;

@@ -532,7 +532,7 @@ fn maskReasoningFields(out: Allocator, fields: []const signature.Field, record: 
     var masked = record.*;
     var copied = false;
     for (fields) |field| {
-        if (!field.native_reasoning) continue;
+        if (!field.reasoning_type) continue;
         const item = record.get(field.name) orelse continue;
         if (item == .null) continue;
         if (!copied) {
@@ -630,6 +630,8 @@ test "feedback masks typed Reasoning without masking ordinary strings or mutatin
         pub const Input = struct {};
         pub const Output = struct {
             analysis: ?signature.Reasoning,
+            direct: signature.Reasoning,
+            empty: ?signature.Reasoning,
             reasoning: []const u8,
             absent: ?signature.Reasoning,
         };
@@ -639,14 +641,20 @@ test "feedback masks typed Reasoning without masking ordinary strings or mutatin
     const out = arena.allocator();
     const original = try value.toRecord(out, Sig.Output, .{
         .analysis = .{ .content = "Actual reasoning." },
+        .direct = .{ .content = "Direct reasoning." },
+        .empty = .{ .content = "" },
         .reasoning = "An ordinary string.",
         .absent = null,
     });
     const masked = try maskReasoningFields(out, Sig.output_fields_list, &original);
     try std.testing.expectEqualStrings("<non-serializable: Reasoning>", masked.get("analysis").?.string);
+    try std.testing.expectEqualStrings("<non-serializable: Reasoning>", masked.get("direct").?.string);
+    try std.testing.expectEqualStrings("<non-serializable: Reasoning>", masked.get("empty").?.string);
     try std.testing.expectEqualStrings("An ordinary string.", masked.get("reasoning").?.string);
     try std.testing.expect(masked.get("absent").? == .null);
     try std.testing.expectEqualStrings("Actual reasoning.", original.get("analysis").?.string);
+    try std.testing.expectEqualStrings("Direct reasoning.", original.get("direct").?.string);
+    try std.testing.expectEqualStrings("", original.get("empty").?.string);
 }
 
 test "roundHalfEven matches Python round" {
