@@ -106,7 +106,7 @@ retain the actual continuation and raw provider response independently.
 | DSPy surface | Native Zig surface and coverage |
 |---|---|
 | Class-style signatures and typed fields | `Signature`, `Dict`, `Code`, `CodeWithLanguage`, scalar/string/list/optional/model fields, literal enums, field descriptions/defaults, compile-time rejection of invalid signatures |
-| Chat, JSON and XML adapters | `Adapter.chat`, `.json`, `.xml`; independent prompt/parse fixtures, strict response-schema construction, JSON fallback, typed XML and Unicode key handling |
+| Chat, JSON, XML and two-stage adapters | `Adapter.chat`, `.json`, `.xml`, `.two_step`; `TwoStepAdapter` with a separate extraction LM; independent prompt/parse fixtures, strict response-schema construction, JSON fallback, typed XML and Unicode key handling |
 | Prediction and reasoning | `Predict`, `ChainOfThought`, `BestOfN`, `Refine`, `MultiChainComparison`, explicit `Context`, typed outputs, serialized `Trace`, named predictor/parameter discovery |
 | Retrieval and embeddings | `Retrieve`, lexical `InMemoryRetriever`, custom/OpenAI/Azure `Embedder`, float32 `KNN`, per-query `KNNFewShot`, and brute-force `Embeddings`/`EmbeddingsWithScores` with NumPy persistence |
 | Evaluation and few-shot search | `optimize.evaluate`, `LabeledFewShot`, `BootstrapFewShot`, `BootstrapFewShotWithRandomSearch`, `BootstrapFewShotWithOptuna`, teacher context, zero thresholds and positional multi-use trace selection |
@@ -119,6 +119,28 @@ retain the actual continuation and raw provider response independently.
 
 A named surface in this table is not a claim that every Python option or provider
 route is implemented. The limits below are part of the compatibility contract.
+
+`TwoStepAdapter` uses a natural-language first-stage prompt and an independent
+ChatAdapter extraction stage. Configure it with borrowed model handles:
+
+```zig
+const two_step: dszig.TwoStepAdapter = .{
+    .extraction_model = extraction_client.lm(),
+    .extraction_options = .{ .temperature = 0.125 },
+};
+const ctx = two_step.context(base_ctx);
+```
+
+Both clients and `two_step` must outlive `ctx`. Main predictor options do not
+leak into extraction. Extraction retries with JSON on a parse failure, but
+failure never retries the main LM. Input/demo formatting follows Python `str`,
+including declared model, Code, Reasoning, History and Tool representations.
+The upstream `text` output/input collision is preserved rather than repaired.
+DSPy deprecated this adapter in 3.5; it remains part of the pinned 3.5 surface.
+An actual native executable matched **10 actual DSPy cases and 24 LM requests**
+exactly, including prompts, rollout/temperature settings, candidate outputs,
+output field order and retained traces. It also matched a typed first-stage
+prompt containing models, Code, Reasoning and History.
 
 `BootstrapFewShot` accepts zero rounds: no teacher attempts run, but labeled
 demos are still selected. A zero error budget propagates the first teacher
@@ -180,6 +202,10 @@ program trace. A native executable matched **14 actual DSPy cases and all
 outputs, outer traces and persistent failure budgets. Coverage includes distinct versus shared
 signature classes, missing/empty advice, null thresholds, NaN/infinite rewards,
 and small-decimal feedback serialization.
+A reproduced Refine/ReAct regression also verifies that feedback masks History,
+Tool and ToolCalls objects while retaining the original structured traces.
+An actual native executable matched the source feedback trajectory byte-for-byte
+and selected the same improved answer.
 
 `Code` defaults to Python; `CodeWithLanguage("JAVA")` keeps the supplied language
 in its description and lowercases only the Markdown fence. Validation extracts
@@ -278,7 +304,7 @@ scores, saved artifact bytes, instruction candidates, trial logs, candidate
 scores and SIMBA train scores. It is **mock-provider behavioral evidence**, not
 proof of real-model performance or complete DSPy equivalence.
 
-Local verification on 2026-11-14 passed **225/225 tests**
+Local verification on 2026-11-14 passed **231/231 tests**
 in both Debug and ReleaseSafe. The actual replay executable consumed the entire
 fixture and matched every adapter case and pipeline. The independent real-DSPy
 reference gate also passed. These results establish only the coverage described
@@ -305,12 +331,15 @@ uv run --project tools/dspy_reference --locked tools/dspy_reference/bootstrap_op
 uv run --project tools/dspy_reference --locked tools/dspy_reference/code_oracle.py
 uv run --project tools/dspy_reference --locked tools/dspy_reference/embeddings_oracle.py
 uv run --project tools/dspy_reference --locked tools/dspy_reference/refine_oracle.py
+uv run --project tools/dspy_reference --locked tools/dspy_reference/refine_react_oracle.py
+uv run --project tools/dspy_reference --locked tools/dspy_reference/two_step_oracle.py
 ```
 
 These execute actual pinned DSPy/Optuna. They cover rule metadata/settings
 persistence, source alias mutations and failure timing, independent integer TPE
 suggestions and optimizer probes, Code validation/adapters, dense retrieval and
-NumPy persistence, and Refine feedback/selection. Native behavior tests preserve
+NumPy persistence, Refine feedback/selection and ReAct object masking, and actual
+two-stage extraction/fallback. Native behavior tests preserve
 the corresponding source-backed consumer boundaries; the probes do not add
 real-model inference evidence.
 
@@ -379,7 +408,7 @@ The following prevent a claim that DSZig can do everything DSPy can:
   rich media tool results, provider training lifecycle or native streaming.
 - **Dynamic Python APIs:** no general Python Module/BaseModule/Example/Prediction/
   Completions object model, dynamic signature syntax, arbitrary Pydantic custom
-  models/validators, custom Type hierarchy, TwoStepAdapter, generic callbacks,
+  models/validators, custom Type hierarchy, generic callbacks,
   settings singleton, usage accounting, asyncify/syncify or streamify equivalents.
 - **Type and parsing boundaries:** Code's generated schema-definition name
   collisions fail closed. Tagged unions beyond optional types and some
@@ -387,6 +416,9 @@ The following prevent a claim that DSZig can do everything DSPy can:
   implemented; strict JSON and the existing limited Python-literal parser are
   not equivalent to `json_repair` for malformed output. XML golden cases that
   use a schema-backed runtime view do not prove a native Zig union type exists.
+  Python-style rendering recovers declared native type metadata, not arbitrary
+  objects already erased into `Value`/`Record`; a nested dynamic model inside
+  a History record therefore cannot retain its original Python class repr.
 - **Optimizer options:** unsupported GEPA custom code/instruction proposers,
   Flex components, other frontier/selection policies, format-failure feedback,
   logging integrations, and some MIPROv2/SIMBA/COPRO statistics/logging options.

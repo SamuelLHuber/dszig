@@ -1,5 +1,5 @@
-//! Prompt adapters: DSPy 3.5.0 XMLAdapter and explicit ChatAdapter /
-//! JSONAdapter. They turn (signature view, demos, inputs) into chat
+//! Prompt adapters: DSPy 3.5.0 XMLAdapter and explicit ChatAdapter,
+//! JSONAdapter and TwoStepAdapter. They turn (signature view, demos, inputs) into chat
 //! messages and parse an LM completion back into an output record.
 
 const std = @import("std");
@@ -67,11 +67,16 @@ pub const Adapter = enum {
     chat,
     json,
     xml,
+    two_step,
 
     pub fn format(adapter: Adapter, arena: Allocator, view: View, demos: []const Record, inputs: *const Record) Error![]Message {
         var messages: std.ArrayList(Message) = .empty;
         try messages.append(arena, .{ .role = .system, .content = try systemMessage(adapter, arena, view) });
         try formatDemos(adapter, arena, view, demos, &messages);
+        if (adapter == .two_step) {
+            try messages.append(arena, .{ .role = .user, .content = try twoStepFields(arena, view.inputs, inputs, "") });
+            return messages.items;
+        }
         var current_view = view;
         for (view.inputs) |field| {
             if (!std.mem.eql(u8, field.type_name, "History")) continue;
@@ -98,6 +103,8 @@ pub const Adapter = enum {
             .chat => parseChat(arena, view, completion),
             .json => parseJson(arena, view, completion),
             .xml => XmlAdapter.parse(arena, view, completion),
+            // Extraction needs its separate LM; use TwoStepAdapter.parse.
+            .two_step => error.AdapterParse,
         };
     }
 
@@ -107,15 +114,50 @@ pub const Adapter = enum {
             .chat => "ChatAdapter",
             .json => "JSONAdapter",
             .xml => "XMLAdapter",
+            .two_step => "TwoStepAdapter",
         };
     }
 };
+
+fn twoStepSystem(arena: Allocator, view: View) Error![]const u8 {
+    var aw: Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    w.writeAll("You are a helpful assistant that can solve tasks based on user input.\nAs input, you will be provided with:\n") catch return error.OutOfMemory;
+    try writeStripped(arena, w, fieldDescriptions, view.inputs);
+    w.writeAll("\nYour outputs must contain:\n") catch return error.OutOfMemory;
+    try writeStripped(arena, w, fieldDescriptions, view.outputs);
+    w.writeAll("\nYou should lay out your outputs in detail so that your answer can be understood by another agent") catch return error.OutOfMemory;
+    if (view.instructions.len > 0) {
+        w.writeAll("\nSpecific instructions: ") catch return error.OutOfMemory;
+        w.writeAll(view.instructions) catch return error.OutOfMemory;
+    }
+    return aw.written();
+}
+
+/// Unlike the structured adapters, this is Python str(value), including
+/// typed model representations rather than their JSON wire serialization.
+fn twoStepFields(arena: Allocator, fields: []const Field, record: *const Record, prefix: []const u8) Error![]const u8 {
+    var aw: Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    w.writeAll(prefix) catch return error.OutOfMemory;
+    for (fields) |field| {
+        const input = record.get(field.name) orelse continue;
+        w.print("\n\n{s}: ", .{field.name}) catch return error.OutOfMemory;
+        if (field.python_str) |render| {
+            w.writeAll(try render(arena, input)) catch return error.OutOfMemory;
+        } else {
+            pyjson.writeStr(w, input) catch |err| return mapWriteError(err);
+        }
+    }
+    return value.pyStrip(aw.written());
+}
 
 const incomplete_demo_prefix = "This is an example of the task, though some input or output fields are not supplied.";
 const missing_incomplete = "Not supplied for this particular example. ";
 const missing_complete = "Not supplied for this conversation history message. ";
 
 fn systemMessage(adapter: Adapter, arena: Allocator, view: View) Error![]const u8 {
+    if (adapter == .two_step) return twoStepSystem(arena, view);
     var aw: Writer.Allocating = .init(arena);
     const w = &aw.writer;
     writeAll(w, "Your input fields are:\n") catch return error.OutOfMemory;
@@ -386,7 +428,7 @@ fn writeStrippedStructure(adapter: Adapter, arena: Allocator, w: *Writer, view: 
     sw.writeAll("All interactions will be structured in the following way, with the appropriate values filled in.\n\n") catch
         return error.OutOfMemory;
     switch (adapter) {
-        .xml => unreachable,
+        .xml, .two_step => unreachable,
         .chat => {
             try structureFields(arena, sw, view.inputs, true);
             sw.writeAll("\n\n") catch return error.OutOfMemory;
@@ -528,6 +570,7 @@ pub fn formatAssistantPartial(adapter: Adapter, arena: Allocator, view: View, ou
 }
 
 fn userMessage(adapter: Adapter, arena: Allocator, view: View, inputs: *const Record, prefix: []const u8, main_request: bool) Error![]const u8 {
+    if (adapter == .two_step) return twoStepFields(arena, view.inputs, inputs, prefix);
     if (adapter == .xml) return XmlAdapter.user(arena, view, inputs, prefix, main_request);
     var aw: Writer.Allocating = .init(arena);
     const w = &aw.writer;
@@ -547,14 +590,14 @@ fn userMessage(adapter: Adapter, arena: Allocator, view: View, inputs: *const Re
 
 fn outputRequirements(adapter: Adapter, w: *Writer, view: View) Writer.Error!void {
     switch (adapter) {
-        .xml => unreachable,
+        .xml, .two_step => unreachable,
         .chat => try w.writeAll("Respond with the corresponding output fields, starting with the field "),
         .json => try w.writeAll("Respond with a JSON object in the following order of fields: "),
     }
     for (view.outputs, 0..) |f, i| {
         if (i > 0) try w.writeAll(", then ");
         switch (adapter) {
-            .xml => unreachable,
+            .xml, .two_step => unreachable,
             .chat => try w.print("`[[ ## {s} ## ]]`", .{f.name}),
             .json => try w.print("`{s}`", .{f.name}),
         }
@@ -565,7 +608,7 @@ fn outputRequirements(adapter: Adapter, w: *Writer, view: View) Writer.Error!voi
         }
     }
     switch (adapter) {
-        .xml => unreachable,
+        .xml, .two_step => unreachable,
         .chat => try w.writeAll(", and then ending with the marker for `[[ ## completed ## ]]`."),
         .json => try w.writeAll("."),
     }
@@ -573,11 +616,12 @@ fn outputRequirements(adapter: Adapter, w: *Writer, view: View) Writer.Error!voi
 
 /// `format_assistant_message_content`.
 fn assistantMessage(adapter: Adapter, arena: Allocator, view: View, outputs: *const Record, missing: []const u8) Error![]const u8 {
+    if (adapter == .two_step) return twoStepFields(arena, view.outputs, outputs, "");
     if (adapter == .xml) return XmlAdapter.fields(arena, view.outputs, outputs, true, missing);
     var aw: Writer.Allocating = .init(arena);
     const w = &aw.writer;
     switch (adapter) {
-        .xml => unreachable,
+        .xml, .two_step => unreachable,
         .chat => {
             var fw: Writer.Allocating = .init(arena);
             for (view.outputs, 0..) |f, i| {

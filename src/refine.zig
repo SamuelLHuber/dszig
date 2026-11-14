@@ -392,6 +392,39 @@ test "Refine maps actual signature classes with last-name precedence and retains
     }
 }
 
+test "Refine masks ReAct custom objects in feedback without changing stored traces" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const Agent = @import("react.zig").ReAct(TestSignature, &.{});
+    var lm: lm_mod.ScriptedLM = .{ .responses = &.{
+        "<next_thought>ready</next_thought><tool_calls>{\"tool_calls\":[{\"name\":\"submit\",\"args\":{\"answer\":\"7\"}}]}</tool_calls>",
+        "<discussion>Improve.</discussion><advice>{}</advice>",
+        "<next_thought>ready</next_thought><tool_calls>{\"tool_calls\":[{\"name\":\"submit\",\"args\":{\"answer\":\"8\"}}]}</tool_calls>",
+    } };
+    var trace: Trace = .{ .arena = arena };
+    var refined = Refine(Agent).init(.{}, .{
+        .n = 2,
+        .reward_fn = testScore,
+        .threshold = 100,
+        .module_code = "dspy.ReAct(QA, tools=[])",
+        .reward_code = "def score(inputs, prediction): return float(prediction.answer)",
+    });
+    const result = (try refined.forward(.{ .arena = arena, .lm = lm.lm(), .trace = &trace }, .{ .question = "q" })).?;
+    try testing.expectEqualStrings("8", result.answer);
+    const trajectory = try std.json.parseFromSliceLeaky(Value, arena, trace.steps.items[0].inputs.get("program_trajectory").?.string, .{});
+    const step = trajectory.array.items[0].object;
+    const inputs = step.get("inputs").?.object;
+    const outputs = step.get("outputs").?.object;
+    try testing.expect(inputs.get("history").? == .string);
+    try testing.expectEqualStrings("<non-serializable: History>", inputs.get("history").?.string);
+    try testing.expectEqualStrings("<non-serializable: Tool>", inputs.get("tools").?.array.items[0].string);
+    try testing.expectEqualStrings("<non-serializable: ToolCalls>", outputs.get("tool_calls").?.string);
+    try testing.expectEqualStrings("ready", outputs.get("next_thought").?.string);
+    try testing.expect(trace.steps.items[1].inputs.get("history").? == .object);
+    try testing.expect(trace.steps.items[1].outputs.get("tool_calls").? == .object);
+}
+
 fn nanScore(_: Context, _: *const TestSignature.Input, _: *const TestSignature.Output) anyerror!f64 {
     return std.math.nan(f64);
 }

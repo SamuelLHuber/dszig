@@ -20,6 +20,7 @@ const nested = @import("types.zig");
 const History = @import("history.zig").History;
 const ToolCalls = @import("tool.zig").ToolCalls;
 const code = @import("code.zig");
+const python_str = @import("python_str.zig");
 const assert = std.debug.assert;
 
 /// Field value kinds supported in v0.1, with their DSPy annotation.
@@ -81,6 +82,9 @@ pub const Field = struct {
     /// TypeAdapter schemas preserve model field order for XML/native output.
     xml_schema: []const u8 = "",
     validate: ?*const fn (std.mem.Allocator, std.json.Value) nested.Error!std.json.Value = null,
+    /// Python `str(value)` for declared types whose JSON lowering loses the
+    /// Pydantic repr (models, Code, containers of them). Null uses `pyjson.writeStr`.
+    python_str: ?python_str.Render = null,
     optional_str: bool = false,
     /// Actual Reasoning type identity, including Optional[Reasoning].
     reasoning_type: bool = false,
@@ -209,6 +213,7 @@ fn fieldsOf(comptime T: type, comptime role: []const u8, comptime descriptions: 
                 .schema = if (FT == History) History.schema else if (FT == ToolCalls) ToolCalls.schema else if (kind == .json or code.isCode(FT)) nested.schema(FT) else "",
                 .xml_schema = if (FT == History) History.schema else if (FT == ToolCalls) ToolCalls.schema else if (kind == .json or code.isCode(FT)) nested.schemaXml(FT) else "",
                 .validate = if (FT == History) History.validate else if (FT == ToolCalls) ToolCalls.validate else if (kind == .json or code.isCode(FT)) nested.Validator(FT) else null,
+                .python_str = python_str.renderer(FT),
                 .optional_str = nested.isOptionalStr(FT),
                 .reasoning_type = FT == Reasoning or FT == ?Reasoning,
                 // DSPy adapts direct Reasoning annotations, not Optional unions.

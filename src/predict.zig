@@ -27,6 +27,8 @@ pub const Context = struct {
     arena: Allocator,
     lm: lm_mod.LM,
     adapter: Adapter = .xml,
+    /// Borrowed extraction configuration when adapter is .two_step.
+    two_step: ?*const TwoStepAdapter = null,
     /// When set, every predictor call is appended (deep-copied).
     trace: ?*Trace = null,
     retriever: ?Retriever = null,
@@ -37,6 +39,67 @@ pub const Context = struct {
     use_native_function_calling: ?bool = null,
     /// Scoped adapter wrappers prepare a signature and kwargs before formatting.
     preparation: ?Preparation = null,
+};
+
+/// DSPy 3.5's two-stage adapter (deprecated upstream, but still supported).
+/// LM handles are borrowed; both models must outlive every execution context.
+/// Extraction has its own LM defaults, never the main predictor's options.
+pub const TwoStepAdapter = struct {
+    extraction_model: lm_mod.LM,
+    extraction_options: lm_mod.Options = .{},
+
+    pub fn context(self: *const TwoStepAdapter, base: Context) Context {
+        var ctx = base;
+        ctx.adapter = .two_step;
+        ctx.two_step = self;
+        return ctx;
+    }
+
+    pub fn parse(self: *const TwoStepAdapter, base: Context, original: adapter_mod.View, completion: []const u8) Error!Record {
+        var instructions: std.Io.Writer.Allocating = .init(base.arena);
+        const w = &instructions.writer;
+        w.writeAll("The input is a text that should contain all the necessary information to produce the fields ") catch return error.OutOfMemory;
+        for (original.outputs, 0..) |field, index| {
+            if (index > 0) w.writeAll(", ") catch return error.OutOfMemory;
+            w.print("`{s}`", .{field.name}) catch return error.OutOfMemory;
+        }
+        w.writeAll(".             Your job is to extract the fields from the text verbatim. Extract precisely the appropriate value (content) for each field.") catch return error.OutOfMemory;
+        var extractor: adapter_mod.View = .{
+            .instructions = instructions.written(),
+            .inputs = &.{.{ .name = "text", .kind = .str, .type_name = "str", .desc = "${text}", .prefix = "Text:" }},
+            .outputs = original.outputs,
+        };
+        // Python's {'text': InputField(), **outputs} preserves the first key's
+        // position when an output named text overwrites the extraction input.
+        if (original.findOutput("text")) |text_output| {
+            extractor.inputs = &.{};
+            if (!std.mem.eql(u8, original.outputs[0].name, "text")) {
+                const fields = try base.arena.alloc(Field, original.outputs.len);
+                fields[0] = text_output;
+                var index: usize = 1;
+                for (original.outputs) |field| {
+                    if (std.mem.eql(u8, field.name, "text")) continue;
+                    fields[index] = field;
+                    index += 1;
+                }
+                extractor.outputs = fields;
+            }
+        }
+        var inputs: Record = .empty;
+        try inputs.put(base.arena, "text", .{ .string = completion });
+        const ctx: Context = .{
+            .arena = base.arena,
+            .lm = self.extraction_model,
+            .adapter = .chat,
+            .lm_options = self.extraction_options,
+        };
+        const parsed = runAdapterMany(ctx, .chat, extractor, &.{}, &inputs) catch |err| switch (err) {
+            error.AdapterParse => try runAdapterMany(ctx, .json, extractor, &.{}, &inputs),
+            else => return err,
+        };
+        if (parsed.len == 0) return error.AdapterParse;
+        return parsed[0];
+    }
 };
 
 /// Adapter-call state before native field adaptation and JSON fallback.
@@ -142,7 +205,7 @@ pub const PredictState = struct {
     pub fn call(state: *const PredictState, ctx: Context, inputs: *const Record) Error!Record {
         const prepared = try state.prepare(ctx, inputs);
         const outputs = runAdapter(ctx, ctx.adapter, prepared.view, state.demos, prepared.inputs) catch |err| switch (err) {
-            error.AdapterParse => if (ctx.adapter != .json and ctx.json_fallback)
+            error.AdapterParse => if ((ctx.adapter == .chat or ctx.adapter == .xml) and ctx.json_fallback)
                 try runAdapter(ctx, .json, prepared.view, state.demos, prepared.inputs)
             else
                 return err,
@@ -162,7 +225,7 @@ pub const PredictState = struct {
         if (n > 1 and (ctx.lm_options.temperature orelse 0) <= 0.15) ctx.lm_options.temperature = 0.7;
         const prepared = try state.prepare(ctx, inputs);
         const outputs = runAdapterMany(ctx, ctx.adapter, prepared.view, state.demos, prepared.inputs) catch |err| switch (err) {
-            error.AdapterParse => if (ctx.adapter != .json and ctx.json_fallback)
+            error.AdapterParse => if ((ctx.adapter == .chat or ctx.adapter == .xml) and ctx.json_fallback)
                 try runAdapterMany(ctx, .json, prepared.view, state.demos, prepared.inputs)
             else
                 return err,
@@ -183,6 +246,7 @@ pub const PredictState = struct {
 };
 
 fn runAdapterMany(ctx: Context, adapter: Adapter, original: adapter_mod.View, demos: []const Record, inputs: *const Record) Error![]const Record {
+    if (adapter == .two_step and ctx.two_step == null) return error.AdapterParse;
     var options = ctx.lm_options;
     var request_tools: []const inference.FunctionTool = &.{};
     var tool_input: ?Field = null;
@@ -197,7 +261,7 @@ fn runAdapterMany(ctx: Context, adapter: Adapter, original: adapter_mod.View, de
     };
     // DSPy's implicit XML default enables native History rendering even if
     // this LM cannot execute native function declarations.
-    const native_policy = ctx.use_native_function_calling orelse (ctx.adapter != .chat);
+    const native_policy = ctx.use_native_function_calling orelse (ctx.adapter == .xml or ctx.adapter == .json);
     const use_native_tools = native_policy and ctx.lm.supports_function_calling and tool_output != null;
     if (!use_native_tools) {
         options.tool_choice = null;
@@ -266,14 +330,15 @@ fn runAdapterMany(ctx: Context, adapter: Adapter, original: adapter_mod.View, de
     const outputs = try ctx.arena.alloc(Record, completions.len);
     for (completions, outputs) |c, *o| {
         const has_tool_calls = use_native_tools and c.tool_calls.len > 0;
+        if (adapter == .two_step and c.text.len == 0 and !has_tool_calls) return error.AdapterParse;
         const parsed = if (has_tool_calls) blk: {
             if (c.text.len == 0 or processed.outputs.len == 0) break :blk Record.empty;
-            break :blk adapter.parse(ctx.arena, processed, c.text) catch |err| switch (err) {
+            break :blk parseCompletion(ctx, adapter, processed, c.text) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => Record.empty,
             };
-        } else try adapter.parse(ctx.arena, processed, c.text);
-        if (!needs_preprocess and !use_native_tools) {
+        } else try parseCompletion(ctx, adapter, processed, c.text);
+        if (!needs_preprocess and !use_native_tools and adapter != .two_step) {
             o.* = parsed;
             continue;
         }
@@ -295,6 +360,11 @@ fn runAdapterMany(ctx: Context, adapter: Adapter, original: adapter_mod.View, de
         }
     }
     return outputs;
+}
+
+fn parseCompletion(ctx: Context, adapter: Adapter, view_: adapter_mod.View, text: []const u8) Error!Record {
+    if (adapter == .two_step) return ctx.two_step.?.parse(ctx, view_, text);
+    return adapter.parse(ctx.arena, view_, text);
 }
 
 fn fallbackName(arena: Allocator, view_: adapter_mod.View, f: Field) Allocator.Error![]const u8 {
@@ -408,6 +478,7 @@ pub fn ChainOfThoughtWithOptions(comptime Sig: type, comptime options: ChainOfTh
             f.kind = .str;
             f.type_name = "str";
             f.schema = "";
+            f.python_str = null;
             f.xml_schema = "";
             f.validate = null;
             f.optional_str = false;
@@ -629,6 +700,90 @@ pub fn resetDemos(arena: Allocator, program: anytype) Allocator.Error!void {
 }
 
 const testing = std.testing;
+
+test "TwoStepAdapter isolates extraction options and retries only the extraction stage" {
+    const CountSignature = signature.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: i64 };
+    });
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var main_lm: lm_mod.ScriptedLM = .{ .responses = &.{"There are five."} };
+    var extraction_history: lm_mod.History = .{ .arena = arena };
+    var extraction_lm: lm_mod.ScriptedLM = .{
+        .responses = &.{ "not structured", "{\"answer\":5}" },
+        .history = &extraction_history,
+    };
+    var trace: Trace = .{ .arena = arena };
+    const two_step: TwoStepAdapter = .{
+        .extraction_model = extraction_lm.lm(),
+        .extraction_options = .{ .temperature = 0.125 },
+    };
+    const ctx = two_step.context(.{
+        .arena = arena,
+        .lm = main_lm.lm(),
+        .trace = &trace,
+        .lm_options = .{ .temperature = 0.9, .rollout_id = .{ .integer = 42 } },
+    });
+    const program: Predict(CountSignature) = .{};
+    const result = try program.forward(ctx, .{ .question = "How many?" });
+    try testing.expectEqual(@as(i64, 5), result.answer);
+    try testing.expectEqual(@as(usize, 1), main_lm.index);
+    try testing.expectEqual(@as(usize, 2), extraction_lm.index);
+    try testing.expectEqual(@as(usize, 1), trace.steps.items.len);
+    for (extraction_history.requests.items) |request| {
+        try testing.expectEqual(@as(?f64, 0.125), request.options.temperature);
+        try testing.expect(request.options.rollout_id == null);
+        try testing.expectEqual(@as(u32, 1), request.options.n);
+    }
+}
+
+test "TwoStepAdapter text output collision preserves original output order" {
+    const CollisionSignature = signature.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: []const u8, text: []const u8 };
+    });
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var main_lm: lm_mod.ScriptedLM = .{ .responses = &.{"freeform"} };
+    var extraction_lm: lm_mod.ScriptedLM = .{
+        .responses = &.{"[[ ## text ## ]]\nverbatim\n\n[[ ## answer ## ]]\nyes"},
+    };
+    const two_step: TwoStepAdapter = .{ .extraction_model = extraction_lm.lm() };
+    var trace: Trace = .{ .arena = arena };
+    const program: Predict(CollisionSignature) = .{};
+    const result = try program.forward(two_step.context(.{
+        .arena = arena,
+        .lm = main_lm.lm(),
+        .trace = &trace,
+    }), .{ .question = "q" });
+    try testing.expectEqualStrings("yes", result.answer);
+    try testing.expectEqualStrings("verbatim", result.text);
+    try testing.expectEqualStrings("answer", trace.steps.items[0].outputs.keys()[0]);
+    try testing.expectEqualStrings("text", trace.steps.items[0].outputs.keys()[1]);
+}
+
+test "TwoStepAdapter parse failure never retries the main LM" {
+    const FailureSignature = signature.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: []const u8 };
+    });
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var main_lm: lm_mod.ScriptedLM = .{ .responses = &.{ "main", "must not run" } };
+    var extraction_lm: lm_mod.ScriptedLM = .{ .responses = &.{ "bad chat", "bad json" } };
+    const two_step: TwoStepAdapter = .{ .extraction_model = extraction_lm.lm() };
+    var trace: Trace = .{ .arena = arena };
+    const ctx = two_step.context(.{ .arena = arena, .lm = main_lm.lm(), .trace = &trace });
+    const program: Predict(FailureSignature) = .{};
+    try testing.expectError(error.AdapterParse, program.forward(ctx, .{ .question = "q" }));
+    try testing.expectEqual(@as(usize, 1), main_lm.index);
+    try testing.expectEqual(@as(usize, 2), extraction_lm.index);
+    try testing.expectEqual(@as(usize, 0), trace.steps.items.len);
+}
 
 const QA = signature.Signature(struct {
     pub const Input = struct { question: []const u8 };

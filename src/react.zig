@@ -158,6 +158,8 @@ pub fn ReActIters(comptime Sig: type, comptime user_tools: []const Tool, comptim
             fields[index].type_name = types.pyName(Optional);
             fields[index].schema = typeSchema(Optional);
             fields[index].validate = TypedValidator(Optional).run;
+            fields[index].python_str = @import("python_str.zig").renderer(Optional);
+            fields[index].refine_mask = @import("feedback.zig").masker(Optional);
             fields[index].optional_str = types.isOptionalStr(Optional);
             fields[index].nullable = true;
         }
@@ -171,11 +173,11 @@ pub fn ReActIters(comptime Sig: type, comptime user_tools: []const Tool, comptim
         pub const all_tools: []const Tool = &tools;
         pub const react_instructions = instructions;
         const react_field_array = optional_inputs ++ [_]Field{
-            .{ .name = "history", .kind = .json, .type_name = "History", .desc = "${history}", .prefix = "History:", .schema = History.schema, .validate = History.validate },
-            .{ .name = "tools", .kind = .json, .type_name = "list[Tool]", .desc = "${tools}", .prefix = "Tools:", .schema = "{\"type\": \"array\", \"items\": {\"type\": \"string\"}}", .xml_literal = true, .native_tools = true },
+            .{ .name = "history", .kind = .json, .type_name = "History", .desc = "${history}", .prefix = "History:", .schema = History.schema, .validate = History.validate, .refine_mask = @import("feedback.zig").masker(History), .python_str = @import("python_str.zig").renderer(History) },
+            .{ .name = "tools", .kind = .json, .type_name = "list[Tool]", .desc = "${tools}", .prefix = "Tools:", .schema = "{\"type\": \"array\", \"items\": {\"type\": \"string\"}}", .xml_literal = true, .native_tools = true, .refine_mask = @import("feedback.zig").masker([]const Tool), .python_str = @import("python_str.zig").toolsRender },
             .{ .name = "turn_budget", .kind = .str, .type_name = "str", .desc = "Your current turn and how many turns remain before you must submit.", .prefix = "Turn Budget:" },
             .{ .name = "next_thought", .kind = .str, .type_name = "str", .desc = "${next_thought}", .prefix = "Next Thought:", .reasoning_type = true, .native_reasoning = true },
-            .{ .name = "tool_calls", .kind = .json, .type_name = "ToolCalls", .desc = "${tool_calls}", .prefix = "Tool Calls:", .schema = ToolCalls.schema, .validate = ToolCalls.validate, .xml_literal = true, .native_tool_calls = true, .type_description = ToolCalls.description },
+            .{ .name = "tool_calls", .kind = .json, .type_name = "ToolCalls", .desc = "${tool_calls}", .prefix = "Tool Calls:", .schema = ToolCalls.schema, .validate = ToolCalls.validate, .xml_literal = true, .native_tool_calls = true, .type_description = ToolCalls.description, .refine_mask = @import("feedback.zig").masker(ToolCalls), .python_str = @import("python_str.zig").renderer(ToolCalls) },
         };
         pub const react_fields: []const Field = &react_field_array;
 

@@ -16,6 +16,7 @@ pub const lm = @import("lm.zig");
 pub const LM = lm.LM;
 pub const predict = @import("predict.zig");
 pub const Context = predict.Context;
+pub const TwoStepAdapter = predict.TwoStepAdapter;
 pub const Trace = predict.Trace;
 pub const Predict = predict.Predict;
 pub const ChainOfThought = predict.ChainOfThought;
