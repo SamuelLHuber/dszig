@@ -1,4 +1,4 @@
-"""Regenerate tests/fixtures from DSPy 3.4.1. Run: uv run gen_fixtures.py"""
+"""Regenerate tests/fixtures from DSPy 3.5.0. Run: uv run gen_fixtures.py"""
 
 import json
 import pathlib
@@ -21,13 +21,13 @@ def run_case(name, module, adapter, demos, inputs, completion):
         "name": name,
         "messages": lm.calls[0]["messages"],
         "completion": completion,
-        "outputs": dict(pred.items()),
+        "outputs": ref.serialize_object(dict(pred.items())),
     }
 
 
 def format_cases():
     qa_demos = [
-        dspy.Example(augmented=True, context=["a fact"], question="q1?", reasoning="r1", answer="a1"),
+        dspy.Example(augmented=True, context=["a fact"], question="q1?", reasoning=dspy.Reasoning(content="r1"), answer="a1"),
         dspy.Example(question="q2?", answer="a2"),
     ]
     qa_inputs = {"context": ["Paris is the capital of France.", "multi\nline «x»"], "question": "What is the capital of France?"}
@@ -45,11 +45,18 @@ def format_cases():
         run_case("cot_qa_chat", dspy.ChainOfThought(ref.QA), dspy.ChatAdapter(), qa_demos, qa_inputs,
                  ref.chat("Paris is the capital.", "Paris")),
         run_case("cot_qa_json", dspy.ChainOfThought(ref.QA), dspy.JSONAdapter(), qa_demos, qa_inputs,
-                 '```json\n{"reasoning": "Because.", "answer": "Paris"}\n```'),
+                 '```json\n{"plan": "Because.", "answer": "Paris"}\n```'),
         run_case("typed_chat", dspy.Predict(ref.Typed), dspy.ChatAdapter(), typed_demos, typed_inputs, typed_chat),
         run_case("typed_json", dspy.Predict(ref.Typed), dspy.JSONAdapter(), typed_demos, typed_inputs, typed_json),
         run_case("indented_chat", dspy.Predict(ref.Indented), dspy.ChatAdapter(), [], {"text": "meh"},
                  "[[ ## label ## ]]\nLiteral['neg']\n\n[[ ## completed ## ]]"),
+        run_case("cot_qa_xml", dspy.ChainOfThought(ref.QA), dspy.XMLAdapter(), qa_demos, qa_inputs,
+                 ref.xml("Paris is the capital.", "Paris")),
+        run_case("typed_xml", dspy.Predict(ref.Typed), dspy.XMLAdapter(), typed_demos, typed_inputs,
+                 "<flag>\nTrue\n</flag>\n\n<count>\n42\n</count>\n\n<ratio>\n0.25\n</ratio>\n\n"
+                 "<label>\npos\n</label>\n\n<items>\n<item>\none\n</item>\n<item>\ntwo\n</item>\n</items>"),
+        run_case("indented_xml", dspy.Predict(ref.Indented), dspy.XMLAdapter(), [], {"text": "meh"},
+                 "<label>\nneg\n</label>"),
     ]
 
 

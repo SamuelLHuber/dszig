@@ -28,7 +28,7 @@ jobs:
         run: zig build examples -Doptimize=${{ matrix.optimize }} --summary all
 
   devenv:
-    name: devenv test (incl. DSPy 3.4.1 cross-check) / ${{ matrix.os }}
+    name: devenv test (incl. DSPy 3.5.0 cross-check) / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

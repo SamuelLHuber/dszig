@@ -36,7 +36,7 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit, DSPy golden, behaviour and compile-fail tests");
     test_step.dependOn(&run_unit_tests.step);
-    for ([_][]const u8{ "tests/golden.zig", "tests/behavior.zig", "tests/live_replay.zig", "tests/optuna.zig", "tests/pickle.zig" }) |path| {
+    for ([_][]const u8{ "tests/golden.zig", "tests/behavior.zig", "tests/live_replay.zig", "tests/optuna.zig", "tests/trace_selection.zig" }) |path| {
         const t = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path(path),
             .target = target,
@@ -74,6 +74,18 @@ pub fn build(b: *std.Build) void {
     run_live.addPassthruArgs();
     b.step("live", "Run examples/live.zig against a real OpenAI-compatible model").dependOn(&run_live.step);
     examples_step.dependOn(&live.step);
+
+    const replay = b.addExecutable(.{ .name = "replay", .root_module = b.createModule(.{
+        .root_source_file = b.path("examples/replay.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = imports,
+    }) });
+    b.installArtifact(replay);
+    const run_replay = b.addRunArtifact(replay);
+    run_replay.addPassthruArgs();
+    b.step("replay", "Verify a DSPy 3.5 transcript through the native Zig suite").dependOn(&run_replay.step);
+    examples_step.dependOn(&replay.step);
 }
 
 /// Each tests/compile_fail/<name>.zig must fail to compile with `message`.

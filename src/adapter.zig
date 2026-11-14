@@ -1,5 +1,5 @@
-//! Prompt adapters: byte-compatible ports of DSPy 3.4.1 `ChatAdapter` and
-//! `JSONAdapter`. They turn (signature view, demos, inputs) into chat
+//! Prompt adapters: DSPy 3.5.0 XMLAdapter and explicit ChatAdapter /
+//! JSONAdapter. They turn (signature view, demos, inputs) into chat
 //! messages and parse an LM completion back into an output record.
 
 const std = @import("std");
@@ -7,8 +7,12 @@ const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
 const Writer = std.Io.Writer;
+const inference = @import("inference.zig");
+const tool = @import("tool.zig");
 
 const pyjson = @import("pyjson.zig");
+pub const XmlAdapter = @import("xml.zig").XmlAdapter;
+const History = @import("history.zig").History;
 const signature = @import("signature.zig");
 const value = @import("value.zig");
 const Field = signature.Field;
@@ -18,13 +22,21 @@ pub const Role = enum {
     system,
     user,
     assistant,
+    tool,
 
     pub fn name(role: Role) []const u8 {
         return @tagName(role);
     }
 };
 
-pub const Message = struct { role: Role, content: []const u8 };
+pub const Message = struct {
+    role: Role,
+    content: []const u8,
+    reasoning: ?[]const u8 = null,
+    tool_calls: []const inference.ToolCall = &.{},
+    tool_call_id: ?[]const u8 = null,
+    continuation: []const inference.Continuation = &.{},
+};
 
 /// Runtime view of a signature, after instruction/description overrides
 /// loaded from state or set by an optimizer.
@@ -32,6 +44,7 @@ pub const View = struct {
     instructions: []const u8,
     inputs: []const Field,
     outputs: []const Field,
+    use_native_function_calling: bool = false,
 
     pub fn hasField(view: View, field_name: []const u8) bool {
         return view.findOutput(field_name) != null or view.findInput(field_name) != null;
@@ -53,12 +66,29 @@ pub const Error = error{ AdapterParse, JsonTooDeep } || Allocator.Error;
 pub const Adapter = enum {
     chat,
     json,
+    xml,
 
     pub fn format(adapter: Adapter, arena: Allocator, view: View, demos: []const Record, inputs: *const Record) Error![]Message {
         var messages: std.ArrayList(Message) = .empty;
         try messages.append(arena, .{ .role = .system, .content = try systemMessage(adapter, arena, view) });
         try formatDemos(adapter, arena, view, demos, &messages);
-        const content = try userMessage(adapter, arena, view, inputs, "", true);
+        var current_view = view;
+        for (view.inputs) |field| {
+            if (!std.mem.eql(u8, field.type_name, "History")) continue;
+            var ordinary: std.ArrayList(Field) = .empty;
+            for (view.inputs) |input_field| {
+                if (!std.mem.eql(u8, input_field.type_name, "History")) try ordinary.append(arena, input_field);
+            }
+            current_view.inputs = ordinary.items;
+            break;
+        }
+        for (view.inputs) |field| {
+            if (!std.mem.eql(u8, field.type_name, "History")) continue;
+            const history_value = inputs.get(field.name) orelse continue;
+            const history = try History.fromValue(arena, history_value);
+            try messages.appendSlice(arena, try history.format(adapter, arena, current_view));
+        }
+        const content = try userMessage(adapter, arena, current_view, inputs, "", true);
         if (content.len > 0) try messages.append(arena, .{ .role = .user, .content = content });
         return messages.items;
     }
@@ -67,6 +97,7 @@ pub const Adapter = enum {
         return switch (adapter) {
             .chat => parseChat(arena, view, completion),
             .json => parseJson(arena, view, completion),
+            .xml => XmlAdapter.parse(arena, view, completion),
         };
     }
 
@@ -75,6 +106,7 @@ pub const Adapter = enum {
         return switch (adapter) {
             .chat => "ChatAdapter",
             .json => "JSONAdapter",
+            .xml => "XMLAdapter",
         };
     }
 };
@@ -132,6 +164,7 @@ fn fieldDescriptions(w: *Writer, fields: []const Field) pyjson.Error!void {
         if (i > 0) try w.writeByte('\n');
         try w.print("{d}. `{s}` ({s}): ", .{ i + 1, f.name, f.type_name });
         if (!isDefaultDesc(f)) try w.writeAll(f.desc);
+        if (f.type_description.len > 0) try w.print("\n    Type description of {s}: {s}", .{ f.type_name, f.type_description });
     }
 }
 
@@ -140,8 +173,157 @@ fn isDefaultDesc(f: Field) bool {
         std.mem.eql(u8, f.desc[2 .. 2 + f.name.len], f.name) and f.desc[f.desc.len - 1] == '}';
 }
 
+/// TypeAdapter(field.annotation).json_schema(), shared by typed XML and
+/// provider response schemas. The XML schema variant retains model field order.
+pub fn fieldSchema(arena: Allocator, field: Field) Error!Value {
+    if (field.kind == .json) {
+        const source = if (field.xml_schema.len > 0) field.xml_schema else field.schema;
+        return std.json.parseFromSliceLeaky(Value, arena, source, .{}) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.AdapterParse,
+        };
+    }
+    const source: []const u8 = switch (field.kind) {
+        .str => "{\"type\":\"string\"}",
+        .boolean => "{\"type\":\"boolean\"}",
+        .int => "{\"type\":\"integer\"}",
+        .float => "{\"type\":\"number\"}",
+        .str_list => "{\"type\":\"array\",\"items\":{\"type\":\"string\"}}",
+        .json_object => "{\"type\":\"object\",\"additionalProperties\":true}",
+        .str_dict => "{\"type\":\"object\",\"additionalProperties\":{\"type\":\"string\"}}",
+        .literal => {
+            var out: Record = .empty;
+            if (field.literals.len == 1) {
+                try out.put(arena, "const", .{ .string = field.literals[0] });
+            } else {
+                var members: std.json.Array = .init(arena);
+                for (field.literals) |member| try members.append(.{ .string = member });
+                try out.put(arena, "enum", .{ .array = members });
+            }
+            try out.put(arena, "type", .{ .string = "string" });
+            return .{ .object = out };
+        },
+        .json => unreachable,
+    };
+    return std.json.parseFromSliceLeaky(Value, arena, source, .{}) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.AdapterParse,
+    };
+}
+
+/// JSONAdapter chooses a provider format before execution, never by retrying an
+/// LM call. Direct dictionaries cannot meet Structured Outputs' closed schema.
+pub fn responseFormat(arena: Allocator, view: View, supports_schema: bool) Error!inference.ResponseFormat {
+    if (!supports_schema) return .json_object;
+    for (view.outputs) |field| {
+        if (field.kind == .json_object or field.kind == .str_dict) return .json_object;
+        if (field.native_tool_calls and !view.use_native_function_calling) return .json_object;
+    }
+    var properties: Record = .empty;
+    var definitions: Record = .empty;
+    for (view.outputs) |field| {
+        if (field.native_tool_calls and view.use_native_function_calling) continue;
+        var schema = fieldSchema(arena, field) catch |err| switch (err) {
+            error.AdapterParse => return .json_object,
+            else => return err,
+        };
+        const additional = schema.object.get("additionalProperties");
+        if (additional) |mapping| {
+            if (mapping == .object or (mapping == .bool and mapping.bool)) return .json_object;
+        }
+        if (schema.object.get("$defs")) |defs| {
+            if (defs == .object) {
+                var it = defs.object.iterator();
+                while (it.next()) |entry| try definitions.put(arena, entry.key_ptr.*, entry.value_ptr.*);
+            }
+            _ = schema.object.orderedRemove("$defs");
+        }
+        const schema_type = schema.object.get("type");
+        const model_title = schema.object.get("title");
+        if (schema_type != null and schema_type.? == .string and std.mem.eql(u8, schema_type.?.string, "object") and
+            model_title != null and model_title.? == .string)
+        {
+            const name = model_title.?.string;
+            try definitions.put(arena, name, schema);
+            var reference: Record = .empty;
+            try reference.put(arena, "$ref", .{ .string = try std.fmt.allocPrint(arena, "#/$defs/{s}", .{name}) });
+            schema = .{ .object = reference };
+        } else if (!schema.object.contains("$ref") and !schema.object.contains("title")) {
+            try schema.object.put(arena, "title", .{ .string = try schemaTitle(arena, field.name) });
+        }
+        if (field.default_value) |default_value| try schema.object.put(arena, "default", try default_value(arena));
+        try properties.put(arena, field.name, schema);
+    }
+    var root: Record = .empty;
+    if (definitions.count() > 0) try root.put(arena, "$defs", .{ .object = definitions });
+    try root.put(arena, "additionalProperties", .{ .bool = false });
+    try root.put(arena, "properties", .{ .object = properties });
+    try root.put(arena, "title", .{ .string = "DSPyProgramOutputs" });
+    try root.put(arena, "type", .{ .string = "object" });
+    var schema: Value = .{ .object = root };
+    try enforceRequired(arena, &schema, 0);
+    return .{ .json_schema = .{ .name = "DSPyProgramOutputs", .schema = schema } };
+}
+
+fn schemaTitle(arena: Allocator, name: []const u8) Allocator.Error![]const u8 {
+    const title = try arena.dupe(u8, name);
+    var previous_cased = false;
+    for (title) |*byte| {
+        if (byte.* == '_') byte.* = ' ';
+        const cased = std.ascii.isAlphabetic(byte.*);
+        if (cased) byte.* = if (previous_cased) std.ascii.toLower(byte.*) else std.ascii.toUpper(byte.*);
+        previous_cased = cased;
+    }
+    return std.mem.trim(u8, title, " ");
+}
+
+/// Match DSPy's strict-schema traversal: direct object properties, array items,
+/// and definitions. Union schemas retain their upstream representation.
+fn enforceRequired(arena: Allocator, schema: *Value, depth: usize) Error!void {
+    if (depth >= pyjson.max_depth) return error.JsonTooDeep;
+    if (schema.* != .object) return;
+    const schema_type = schema.object.get("type") orelse .null;
+    if (schema_type == .string and std.mem.eql(u8, schema_type.string, "object")) {
+        if (!schema.object.contains("properties")) try schema.object.put(arena, "properties", .{ .object = .empty });
+        const props = schema.object.get("properties").?;
+        if (props == .object) {
+            var required: std.json.Array = .init(arena);
+            for (props.object.keys()) |name| try required.append(.{ .string = name });
+            try schema.object.put(arena, "required", .{ .array = required });
+            try schema.object.put(arena, "additionalProperties", .{ .bool = false });
+            const children = schema.object.getPtr("properties").?;
+            for (children.object.values()) |*child| try enforceRequired(arena, child, depth + 1);
+        }
+    }
+    if (schema_type == .string and std.mem.eql(u8, schema_type.string, "array")) {
+        if (schema.object.getPtr("items")) |item| try enforceRequired(arena, item, depth + 1);
+    }
+    for ([_][]const u8{ "$defs", "definitions" }) |key| {
+        if (schema.object.getPtr(key)) |defs| {
+            if (defs.* == .object) for (defs.object.values()) |*child| try enforceRequired(arena, child, depth + 1);
+        }
+    }
+}
+
+/// DSPy custom tool fields retain their own literal JSON conventions.
+fn formattedValue(arena: Allocator, field: Field, input: Value) Error!Value {
+    if (field.native_tools and input == .array) return tool.formatCatalogValue(arena, input);
+    if (field.native_tool_calls and input == .object) {
+        const calls = tool.ToolCalls.fromValue(arena, input) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.ParseValue => error.AdapterParse,
+        };
+        return calls.formatValue(arena);
+    }
+    return input;
+}
+
+pub fn writeFieldValue(arena: Allocator, w: *Writer, field: Field, input: Value) Error!void {
+    value.formatFieldValue(w, field, try formattedValue(arena, field, input)) catch |err| return mapWriteError(err);
+}
+
 /// `translate_field_type`.
-fn translateFieldType(w: *Writer, f: Field, is_input: bool) Writer.Error!void {
+pub fn translateFieldType(w: *Writer, f: Field, is_input: bool) Writer.Error!void {
     try w.print("{{{s}}}", .{f.name});
     if (is_input or f.kind == .str) return;
     try w.writeAll("        # note: the value you produce ");
@@ -183,11 +365,16 @@ fn structureFields(arena: Allocator, w: *Writer, fields: []const Field, is_input
 }
 
 fn writeStrippedStructure(adapter: Adapter, arena: Allocator, w: *Writer, view: View) Error!void {
+    if (adapter == .xml) {
+        w.writeAll(try XmlAdapter.fieldStructure(arena, view.outputs)) catch return error.OutOfMemory;
+        return;
+    }
     var aw: Writer.Allocating = .init(arena);
     const sw = &aw.writer;
     sw.writeAll("All interactions will be structured in the following way, with the appropriate values filled in.\n\n") catch
         return error.OutOfMemory;
     switch (adapter) {
+        .xml => unreachable,
         .chat => {
             try structureFields(arena, sw, view.inputs, true);
             sw.writeAll("\n\n") catch return error.OutOfMemory;
@@ -314,14 +501,29 @@ pub fn formatInputs(arena: Allocator, fields: []const Field, inputs: *const Reco
     return userMessage(.chat, arena, .{ .instructions = "", .inputs = fields, .outputs = &.{} }, inputs, "", false);
 }
 
+/// Render a history user turn using the same formatter as the current request.
+pub fn formatUser(adapter: Adapter, arena: Allocator, view: View, inputs: *const Record, main_request: bool) Error![]const u8 {
+    return userMessage(adapter, arena, view, inputs, "", main_request);
+}
+
+/// History assistant turns contain only fields actually supplied by that turn.
+pub fn formatAssistantPartial(adapter: Adapter, arena: Allocator, view: View, outputs: *const Record) Error![]const u8 {
+    var present: std.ArrayList(Field) = .empty;
+    for (view.outputs) |field| if (outputs.contains(field.name)) try present.append(arena, field);
+    var partial_view = view;
+    partial_view.outputs = present.items;
+    return assistantMessage(adapter, arena, partial_view, outputs, "");
+}
+
 fn userMessage(adapter: Adapter, arena: Allocator, view: View, inputs: *const Record, prefix: []const u8, main_request: bool) Error![]const u8 {
+    if (adapter == .xml) return XmlAdapter.user(arena, view, inputs, prefix, main_request);
     var aw: Writer.Allocating = .init(arena);
     const w = &aw.writer;
     w.writeAll(prefix) catch return error.OutOfMemory;
     for (view.inputs) |f| {
         const v = inputs.get(f.name) orelse continue;
         w.print("\n\n[[ ## {s} ## ]]\n", .{f.name}) catch return error.OutOfMemory;
-        value.formatFieldValue(w, f, v) catch |err| return mapWriteError(err);
+        try writeFieldValue(arena, w, f, v);
     }
     if (main_request) {
         w.writeAll("\n\n") catch return error.OutOfMemory;
@@ -333,18 +535,25 @@ fn userMessage(adapter: Adapter, arena: Allocator, view: View, inputs: *const Re
 
 fn outputRequirements(adapter: Adapter, w: *Writer, view: View) Writer.Error!void {
     switch (adapter) {
+        .xml => unreachable,
         .chat => try w.writeAll("Respond with the corresponding output fields, starting with the field "),
         .json => try w.writeAll("Respond with a JSON object in the following order of fields: "),
     }
     for (view.outputs, 0..) |f, i| {
         if (i > 0) try w.writeAll(", then ");
         switch (adapter) {
+            .xml => unreachable,
             .chat => try w.print("`[[ ## {s} ## ]]`", .{f.name}),
             .json => try w.print("`{s}`", .{f.name}),
         }
-        if (f.kind != .str) try w.print(" (must be formatted as a valid Python {s})", .{f.type_name});
+        if (f.native_tool_calls) {
+            try w.writeAll(" (must be a JSON object like {\"tool_calls\": [{\"name\": \"...\", \"args\": {...}}]})");
+        } else if (f.kind != .str or f.native_reasoning) {
+            try w.print(" (must be formatted as a valid Python {s})", .{f.type_name});
+        }
     }
     switch (adapter) {
+        .xml => unreachable,
         .chat => try w.writeAll(", and then ending with the marker for `[[ ## completed ## ]]`."),
         .json => try w.writeAll("."),
     }
@@ -352,16 +561,18 @@ fn outputRequirements(adapter: Adapter, w: *Writer, view: View) Writer.Error!voi
 
 /// `format_assistant_message_content`.
 fn assistantMessage(adapter: Adapter, arena: Allocator, view: View, outputs: *const Record, missing: []const u8) Error![]const u8 {
+    if (adapter == .xml) return XmlAdapter.fields(arena, view.outputs, outputs, true, missing);
     var aw: Writer.Allocating = .init(arena);
     const w = &aw.writer;
     switch (adapter) {
+        .xml => unreachable,
         .chat => {
             var fw: Writer.Allocating = .init(arena);
             for (view.outputs, 0..) |f, i| {
                 if (i > 0) fw.writer.writeAll("\n\n") catch return error.OutOfMemory;
                 fw.writer.print("[[ ## {s} ## ]]\n", .{f.name}) catch return error.OutOfMemory;
                 const v = outputs.get(f.name) orelse Value{ .string = missing };
-                value.formatFieldValue(&fw.writer, f, v) catch |err| return mapWriteError(err);
+                try writeFieldValue(arena, &fw.writer, f, v);
             }
             w.writeAll(value.pyStrip(fw.written())) catch return error.OutOfMemory;
             w.writeAll("\n\n[[ ## completed ## ]]\n") catch return error.OutOfMemory;
@@ -369,7 +580,7 @@ fn assistantMessage(adapter: Adapter, arena: Allocator, view: View, outputs: *co
         .json => {
             var record: Record = .empty;
             for (view.outputs) |f| {
-                try record.put(arena, f.name, outputs.get(f.name) orelse Value{ .string = missing });
+                try record.put(arena, f.name, try formattedValue(arena, f, outputs.get(f.name) orelse Value{ .string = missing }));
             }
             pyjson.writeJson(w, .{ .object = record }, .indent2) catch |err| return mapWriteError(err);
         },
@@ -395,6 +606,19 @@ fn matchHeader(s: []const u8) ?struct { name: []const u8, end: usize } {
 
 const Section = struct { header: ?[]const u8, lines: std.ArrayList([]const u8) };
 
+/// Native signatures retain their generated validator. Runtime schema-backed
+/// Fields use the same supported type vocabulary instead of dereferencing null.
+pub fn parseFieldValue(arena: Allocator, field: Field, input: Value) Error!Value {
+    const parsed = if (field.kind == .json and field.validate == null)
+        @import("xml_schema.zig").parse(arena, try fieldSchema(arena, field), input)
+    else
+        value.parseJsonValue(arena, field, input);
+    return parsed catch |err| switch (err) {
+        error.ParseValue => error.AdapterParse,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
+
 fn parseChat(arena: Allocator, view: View, completion: []const u8) Error!Record {
     var sections: std.ArrayList(Section) = .empty;
     try sections.append(arena, .{ .header = null, .lines = .empty });
@@ -416,19 +640,21 @@ fn parseChat(arena: Allocator, view: View, completion: []const u8) Error!Record 
         if (fields.contains(header)) continue;
         const field = view.findOutput(header) orelse continue;
         const joined = try std.mem.join(arena, "\n", section.lines.items);
-        const parsed = value.parseText(arena, field, value.pyStrip(joined)) catch |err| switch (err) {
-            error.ParseValue => return error.AdapterParse,
-            error.OutOfMemory => return error.OutOfMemory,
-        };
+        const parsed = try parseFieldValue(arena, field, .{ .string = value.pyStrip(joined) });
         try fields.put(arena, field.name, parsed);
     }
-    try requireAllOutputs(view, &fields);
+    try requireAllOutputs(arena, view, &fields);
     return fields;
 }
 
-fn requireAllOutputs(view: View, fields: *const Record) Error!void {
-    if (fields.count() != view.outputs.len) return error.AdapterParse;
-    for (view.outputs) |f| if (!fields.contains(f.name)) return error.AdapterParse;
+fn requireAllOutputs(arena: Allocator, view: View, fields: *Record) Error!void {
+    var completed: Record = .empty;
+    for (view.outputs) |field| {
+        const supplied = fields.get(field.name);
+        const parsed = supplied orelse (try signature.outputDefault(arena, field)) orelse return error.AdapterParse;
+        try completed.put(arena, field.name, parsed);
+    }
+    fields.* = completed;
 }
 
 fn parseJson(arena: Allocator, view: View, completion: []const u8) Error!Record {
@@ -440,13 +666,10 @@ fn parseJson(arena: Allocator, view: View, completion: []const u8) Error!Record 
     var it = object.iterator();
     while (it.next()) |entry| {
         const field = view.findOutput(entry.key_ptr.*) orelse continue;
-        const parsed = value.parseJsonValue(arena, field, entry.value_ptr.*) catch |err| switch (err) {
-            error.ParseValue => return error.AdapterParse,
-            error.OutOfMemory => return error.OutOfMemory,
-        };
+        const parsed = try parseFieldValue(arena, field, entry.value_ptr.*);
         try fields.put(arena, field.name, parsed);
     }
-    try requireAllOutputs(view, &fields);
+    try requireAllOutputs(arena, view, &fields);
     return fields;
 }
 
@@ -511,5 +734,77 @@ test "chat parse takes first section and requires all outputs" {
     try testing.expectEqualStrings("Paris", r.get("answer").?.string);
     try testing.expectError(error.AdapterParse, Adapter.chat.parse(arena, view, "[[ ## answer ## ]]\nx"));
     const j = try Adapter.json.parse(arena, view, "Sure:\n```json\n{\"answer\": \"Paris\", \"reasoning\": \"r\", \"x\": 1}\n```");
-    try testing.expectEqualStrings("answer", j.keys()[0]);
+    // DSPy 3.5 apply_output_field_defaults emits signature order.
+    try testing.expectEqualStrings("reasoning", j.keys()[0]);
+}
+
+test "JSON response format closes model objects and falls back for direct mappings" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const Item = struct {
+        pub const model_name = "Item";
+        count: i64,
+        note: ?[]const u8 = null,
+    };
+    const Sig = signature.Signature(struct {
+        pub const Input = struct {};
+        pub const Output = struct { item: Item, label: []const u8 };
+    });
+    const view: View = .{ .instructions = "", .inputs = Sig.input_fields_list, .outputs = Sig.output_fields_list };
+    const chosen = try responseFormat(arena, view, true);
+    try testing.expect(chosen == .json_schema);
+    try testing.expectEqualStrings("DSPyProgramOutputs", chosen.json_schema.name);
+    const root = chosen.json_schema.schema.object;
+    try testing.expect(!root.get("additionalProperties").?.bool);
+    try testing.expectEqual(@as(usize, 2), root.get("required").?.array.items.len);
+    const item = root.get("$defs").?.object.get("Item").?.object;
+    try testing.expect(!item.get("additionalProperties").?.bool);
+    try testing.expectEqual(@as(usize, 2), item.get("required").?.array.items.len);
+    try testing.expectEqualStrings("#/$defs/Item", root.get("properties").?.object.get("item").?.object.get("$ref").?.string);
+    try testing.expect((try responseFormat(arena, view, false)) == .json_object);
+    const Mapping = signature.Signature(struct {
+        pub const Input = struct {};
+        pub const Output = struct { names: signature.StrDict };
+    });
+    try testing.expect((try responseFormat(arena, .{ .instructions = "", .inputs = Mapping.input_fields_list, .outputs = Mapping.output_fields_list }, true)) == .json_object);
+}
+
+test "adapter defaults follow signature order and preserve explicit null" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const Sig = signature.Signature(struct {
+        pub const Input = struct {};
+        pub const Output = struct {
+            first: ?[]const u8 = "fallback",
+            second: ?i64,
+            required: []const u8,
+        };
+    });
+    const view: View = .{ .instructions = "", .inputs = Sig.input_fields_list, .outputs = Sig.output_fields_list };
+    const adapters = [_]Adapter{ .chat, .json, .xml };
+    const absent = [_][]const u8{
+        "[[ ## required ## ]]\nprovided",
+        "{\"required\":\"provided\"}",
+        "<required>provided</required>",
+    };
+    const explicit = [_][]const u8{
+        "[[ ## first ## ]]\nnull\n[[ ## required ## ]]\nprovided",
+        "{\"first\":null,\"required\":\"provided\"}",
+        "<first/><required>provided</required>",
+    };
+    for (adapters, absent, explicit) |which, absent_text, explicit_text| {
+        const completed = try which.parse(arena, view, absent_text);
+        try testing.expectEqualStrings("first", completed.keys()[0]);
+        try testing.expectEqualStrings("fallback", completed.get("first").?.string);
+        try testing.expect(completed.get("second").? == .null);
+        try testing.expectEqualStrings("provided", completed.get("required").?.string);
+        const supplied = try which.parse(arena, view, explicit_text);
+        // Optional[str] intentionally retains literal \"null\" in a text leaf.
+        if (which == .chat) {
+            try testing.expectEqualStrings("null", supplied.get("first").?.string);
+        } else try testing.expect(supplied.get("first").? == .null);
+        try testing.expectEqualStrings("provided", supplied.get("required").?.string);
+    }
 }

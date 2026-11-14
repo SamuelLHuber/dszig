@@ -1,10 +1,10 @@
 [project]
 name = "dszig-dspy-reference"
 version = "0.1.0"
-description = "Generates DSPy 3.4.1 golden fixtures and checks DSZig artifacts load in DSPy."
+description = "Generates DSPy 3.5.0 golden fixtures and checks DSZig artifacts load in DSPy."
 requires-python = "==3.11.*"
 dependencies = [
-    "dspy==3.4.1",
+    "dspy[numpy,optuna]==3.5.0",
     "optuna==4.5.0",
 ]
 

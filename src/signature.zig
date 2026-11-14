@@ -17,6 +17,8 @@
 
 const std = @import("std");
 const nested = @import("types.zig");
+const History = @import("history.zig").History;
+const ToolCalls = @import("tool.zig").ToolCalls;
 const assert = std.debug.assert;
 
 /// Field value kinds supported in v0.1, with their DSPy annotation.
@@ -45,6 +47,9 @@ pub const Kind = enum {
 /// A `dict[str, str]` field value: every value is a `.string`.
 pub const StrDict = struct { map: std.json.ObjectMap };
 
+/// DSPy native reasoning. Its custom serializer emits the content string.
+pub const Reasoning = struct { content: []const u8 };
+
 /// `dict[str, V]` for any supported nested `V`.
 pub const Dict = nested.Dict;
 
@@ -53,6 +58,8 @@ pub const Field = struct {
     kind: Kind,
     /// Python annotation as DSPy prints it, e.g. `list[str]`.
     type_name: []const u8,
+    /// Documentation supplied by custom DSPy types, independent of user desc.
+    type_description: []const u8 = "",
     /// `desc` as stored by DSPy: user text, or `${name}` when none given.
     desc: []const u8,
     /// `prefix` as stored by DSPy: `infer_prefix(name) + ":"`.
@@ -62,9 +69,37 @@ pub const Field = struct {
     /// `.json`: the Pydantic JSON schema, its validator, and whether the
     /// type is `Optional[str]` (whose text DSPy keeps unparsed).
     schema: []const u8 = "",
+    /// TypeAdapter schemas preserve model field order for XML/native output.
+    xml_schema: []const u8 = "",
     validate: ?*const fn (std.mem.Allocator, std.json.Value) nested.Error!std.json.Value = null,
     optional_str: bool = false,
+    /// Native Reasoning fields are omitted from prompts when the LM supports it.
+    native_reasoning: bool = false,
+    /// Default CoT uses this wire name only when native reasoning is unavailable.
+    reasoning_fallback: ?[]const u8 = null,
+    /// Custom DSPy content types keep their JSON conventions inside XML leaves.
+    xml_literal: bool = false,
+    native_tools: bool = false,
+    native_tool_calls: bool = false,
+    nullable: bool = false,
+    /// Lazily encode a declared Zig field default into the per-call arena.
+    default_value: ?*const fn (std.mem.Allocator) std.mem.Allocator.Error!std.json.Value = null,
 };
+
+/// An absent field differs from an explicit null value.
+pub fn outputDefault(arena: std.mem.Allocator, field: Field) std.mem.Allocator.Error!?std.json.Value {
+    if (field.default_value) |get| return try get(arena);
+    return if (field.nullable) @as(std.json.Value, .null) else null;
+}
+
+fn defaultProvider(comptime T: type, comptime raw: *const anyopaque) *const fn (std.mem.Allocator) std.mem.Allocator.Error!std.json.Value {
+    return struct {
+        fn get(arena: std.mem.Allocator) std.mem.Allocator.Error!std.json.Value {
+            const v: T = @as(*const T, @ptrCast(@alignCast(raw))).*;
+            return @import("value.zig").toValue(arena, T, v);
+        }
+    }.get;
+}
 
 pub const Description = struct { name: []const u8, text: []const u8 };
 
@@ -133,7 +168,8 @@ pub fn Make(
                 const info = @typeInfo(OutputT).@"struct";
                 const names = [_][:0]const u8{name} ++ info.field_names[0..info.field_names.len].*;
                 const types = [_]type{T} ++ info.field_types[0..info.field_types.len].*;
-                const NewOutput = @Struct(.auto, null, &names, &types, &@splat(.{}));
+                const attrs = [_]@TypeOf(info.field_attrs[0]){.{}} ++ info.field_attrs[0..info.field_attrs.len].*;
+                const NewOutput = @Struct(.auto, null, &names, &types, &attrs);
                 return Make(InputT, NewOutput, instructions_final, descriptions);
             }
         };
@@ -157,9 +193,16 @@ fn fieldsOf(comptime T: type, comptime role: []const u8, comptime descriptions: 
                 .desc = descriptionFor(name, descriptions) orelse "${" ++ name ++ "}",
                 .prefix = inferPrefix(name) ++ ":",
                 .literals = if (kind == .literal) std.meta.fieldNames(FT) else &.{},
-                .schema = if (kind == .json) nested.schema(FT) else "",
-                .validate = if (kind == .json) nested.Validator(FT) else null,
+                .schema = if (FT == History) History.schema else if (FT == ToolCalls) ToolCalls.schema else if (kind == .json) nested.schema(FT) else "",
+                .xml_schema = if (FT == History) History.schema else if (FT == ToolCalls) ToolCalls.schema else if (kind == .json) nested.schemaXml(FT) else "",
+                .validate = if (FT == History) History.validate else if (FT == ToolCalls) ToolCalls.validate else if (kind == .json) nested.Validator(FT) else null,
                 .optional_str = nested.isOptionalStr(FT),
+                .native_reasoning = FT == Reasoning or FT == ?Reasoning,
+                .xml_literal = FT == History or FT == ToolCalls,
+                .native_tool_calls = FT == ToolCalls,
+                .type_description = if (FT == ToolCalls) ToolCalls.description else "",
+                .nullable = @typeInfo(FT) == .optional,
+                .default_value = if (info.field_attrs[i].default_value_ptr) |raw| defaultProvider(FT, raw) else null,
             };
         }
         return out;
@@ -184,7 +227,7 @@ fn descriptionFor(comptime name: []const u8, comptime descriptions: []const Desc
 
 /// Map a Zig field type onto a supported DSPy annotation.
 pub fn kindOf(comptime T: type, comptime name: []const u8) Kind {
-    if (T == []const u8) return .str;
+    if (T == []const u8 or T == Reasoning or T == ?Reasoning) return .str;
     if (T == []const []const u8) return .str_list;
     if (T == bool) return .boolean;
     if (T == std.json.ObjectMap) return .json_object;
@@ -219,7 +262,7 @@ fn typeName(comptime T: type, comptime kind: Kind) []const u8 {
         .float => "float",
         .json_object => "dict[str, Any]",
         .str_dict => "dict[str, str]",
-        .json => nested.pyName(T),
+        .json => if (T == History) "History" else if (T == ToolCalls) "ToolCalls" else nested.pyName(T),
         .literal => blk: {
             var s: []const u8 = "Literal[";
             for (std.meta.fieldNames(T), 0..) |tag, i| {

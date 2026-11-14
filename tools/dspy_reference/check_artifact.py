@@ -22,7 +22,7 @@ def main():
     if resaved != original:
         sys.stderr.write("DSPy re-save differs from DSZig artifact\n")
         sys.exit(1)
-    print(f"ok: DSPy 3.4.1 loaded and re-saved {src} byte-for-byte ({len(original)} bytes)")
+    print(f"ok: DSPy {ref.dspy.__version__} loaded and re-saved {src} byte-for-byte ({len(original)} bytes)")
 
 
 if __name__ == "__main__":

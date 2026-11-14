@@ -14,6 +14,8 @@ const adapter_mod = @import("adapter.zig");
 const lm_mod = @import("lm.zig");
 const signature = @import("signature.zig");
 const value = @import("value.zig");
+const tool_mod = @import("tool.zig");
+const inference = @import("inference.zig");
 const Adapter = adapter_mod.Adapter;
 const Field = signature.Field;
 const Record = value.Record;
@@ -24,13 +26,15 @@ pub const Context = struct {
     /// Per-call scratch: prompts, completions, parsed outputs.
     arena: Allocator,
     lm: lm_mod.LM,
-    adapter: Adapter = .chat,
+    adapter: Adapter = .xml,
     /// When set, every predictor call is appended (deep-copied).
     trace: ?*Trace = null,
     retriever: ?Retriever = null,
     lm_options: lm_mod.Options = .{},
-    /// DSPy's ChatAdapter retries once with JSONAdapter on parse failure.
+    /// ChatAdapter and XMLAdapter retry once with JSONAdapter on parse failure.
     json_fallback: bool = true,
+    /// Implicit XML and JSON enable native History; explicit Chat opts in.
+    use_native_function_calling: ?bool = null,
 };
 
 pub const Trace = struct {
@@ -43,10 +47,16 @@ pub const Trace = struct {
         outputs: Record,
     };
 
-    pub fn record(t: *Trace, predictor: *const PredictState, inputs: *const Record, outputs: *const Record) Allocator.Error!void {
+    pub fn record(t: *Trace, predictor: *const PredictState, inputs: *const Record, outputs: *const Record) adapter_mod.Error!void {
+        var serialized_inputs = try value.cloneRecord(t.arena, inputs);
+        for (predictor.fields[0..predictor.input_count]) |f| {
+            if (!f.native_tools) continue;
+            const catalog = inputs.get(f.name) orelse continue;
+            try serialized_inputs.put(t.arena, f.name, try tool_mod.formatCatalogValue(t.arena, catalog));
+        }
         try t.steps.append(t.arena, .{
             .predictor = predictor,
-            .inputs = try value.cloneRecord(t.arena, inputs),
+            .inputs = serialized_inputs,
             .outputs = try value.cloneRecord(t.arena, outputs),
         });
     }
@@ -102,7 +112,7 @@ pub const PredictState = struct {
     pub fn call(state: *const PredictState, ctx: Context, inputs: *const Record) Error!Record {
         const view_ = try state.view(ctx.arena);
         const outputs = runAdapter(ctx, ctx.adapter, view_, state.demos, inputs) catch |err| switch (err) {
-            error.AdapterParse => if (ctx.adapter == .chat and ctx.json_fallback)
+            error.AdapterParse => if (ctx.adapter != .json and ctx.json_fallback)
                 try runAdapter(ctx, .json, view_, state.demos, inputs)
             else
                 return err,
@@ -122,7 +132,7 @@ pub const PredictState = struct {
         if (n > 1 and (ctx.lm_options.temperature orelse 0) <= 0.15) ctx.lm_options.temperature = 0.7;
         const view_ = try state.view(ctx.arena);
         const outputs = runAdapterMany(ctx, ctx.adapter, view_, state.demos, inputs) catch |err| switch (err) {
-            error.AdapterParse => if (ctx.adapter == .chat and ctx.json_fallback)
+            error.AdapterParse => if (ctx.adapter != .json and ctx.json_fallback)
                 try runAdapterMany(ctx, .json, view_, state.demos, inputs)
             else
                 return err,
@@ -133,22 +143,135 @@ pub const PredictState = struct {
     }
 };
 
-fn runAdapterMany(ctx: Context, adapter: Adapter, view_: adapter_mod.View, demos: []const Record, inputs: *const Record) Error![]const Record {
-    const messages = try adapter.format(ctx.arena, view_, demos, inputs);
+fn runAdapterMany(ctx: Context, adapter: Adapter, original: adapter_mod.View, demos: []const Record, inputs: *const Record) Error![]const Record {
     var options = ctx.lm_options;
-    options.json_mode = adapter == .json;
-    const completions = try ctx.lm.completeMany(ctx.arena, .{ .messages = messages, .options = options });
+    var request_tools: []const inference.FunctionTool = &.{};
+    var tool_input: ?Field = null;
+    var tool_output: ?Field = null;
+    for (original.inputs) |f| if (f.native_tools) {
+        tool_input = f;
+        break;
+    };
+    for (original.outputs) |f| if (f.native_tool_calls) {
+        tool_output = f;
+        break;
+    };
+    // DSPy's implicit XML default enables native History rendering even if
+    // this LM cannot execute native function declarations.
+    const native_policy = ctx.use_native_function_calling orelse (ctx.adapter != .chat);
+    const use_native_tools = native_policy and ctx.lm.supports_function_calling and tool_output != null;
+    if (!use_native_tools) {
+        options.tool_choice = null;
+        options.parallel_tool_calls = null;
+    }
+    const effort = options.reasoning_effort;
+    const native = ctx.lm.supports_reasoning and
+        !(options.reasoning_effort_present and effort == null) and
+        !(effort != null and (std.mem.eql(u8, effort.?, "none") or std.mem.eql(u8, effort.?, "off")));
+    var needs_preprocess = false;
+    for (original.outputs) |f| needs_preprocess = needs_preprocess or f.native_reasoning;
+    var processed = original;
+    processed.use_native_function_calling = native_policy;
+    if (use_native_tools) {
+        const field = tool_input orelse return error.AdapterParse;
+        request_tools = tool_mod.functionToolsFromValue(ctx.arena, inputs.get(field.name) orelse return error.AdapterParse) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.AdapterParse,
+        };
+        var fields: std.ArrayList(Field) = .empty;
+        try fields.ensureTotalCapacity(ctx.arena, original.inputs.len);
+        for (original.inputs) |f| if (!f.native_tools) {
+            fields.appendAssumeCapacity(f);
+        };
+        processed.inputs = fields.items;
+    }
+    var processed_demos = demos;
+    if (needs_preprocess or use_native_tools) {
+        var fields: std.ArrayList(Field) = .empty;
+        try fields.ensureTotalCapacity(ctx.arena, original.outputs.len);
+        for (original.outputs) |f| {
+            if (use_native_tools and f.native_tool_calls) continue;
+            if (f.native_reasoning and native) {
+                if (options.reasoning_effort == null) options.reasoning_effort = "low";
+                continue;
+            }
+            var wire = f;
+            if (f.native_reasoning) wire.name = try fallbackName(ctx.arena, original, f);
+            fields.appendAssumeCapacity(wire);
+        }
+        processed.outputs = fields.items;
+        const mapped = try ctx.arena.alloc(Record, demos.len);
+        for (demos, mapped) |demo, *dst| {
+            dst.* = demo;
+            for (original.outputs) |f| {
+                if (!f.native_reasoning or native) continue;
+                const name = try fallbackName(ctx.arena, original, f);
+                if (std.mem.eql(u8, name, f.name)) continue;
+                if (dst.*.get(f.name)) |v| {
+                    // Copy only records whose keys actually change.
+                    if (dst.*.keys().ptr == demo.keys().ptr) dst.* = try value.cloneRecord(ctx.arena, &demo);
+                    _ = dst.*.orderedRemove(f.name);
+                    const text = if (v == .object) v.object.get("content") orelse v else v;
+                    try dst.*.put(ctx.arena, name, text);
+                }
+            }
+        }
+        processed_demos = mapped;
+    }
+    if (adapter == .json and ctx.lm.supports_response_format)
+        options.response_format = try adapter_mod.responseFormat(ctx.arena, processed, ctx.lm.supports_response_schema);
+    // Explicit-null intent has now been resolved into the effective signature.
+    options.reasoning_effort_present = false;
+    const messages = try adapter.format(ctx.arena, processed, processed_demos, inputs);
+    const completions = try ctx.lm.completeResponses(ctx.arena, .{ .messages = messages, .options = options, .tools = request_tools });
     const outputs = try ctx.arena.alloc(Record, completions.len);
-    for (completions, outputs) |c, *o| o.* = try adapter.parse(ctx.arena, view_, c);
+    for (completions, outputs) |c, *o| {
+        const has_tool_calls = use_native_tools and c.tool_calls.len > 0;
+        const parsed = if (has_tool_calls) blk: {
+            if (c.text.len == 0 or processed.outputs.len == 0) break :blk Record.empty;
+            break :blk adapter.parse(ctx.arena, processed, c.text) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => Record.empty,
+            };
+        } else try adapter.parse(ctx.arena, processed, c.text);
+        if (!needs_preprocess and !use_native_tools) {
+            o.* = parsed;
+            continue;
+        }
+        o.* = .empty;
+        try o.ensureTotalCapacity(ctx.arena, original.outputs.len);
+        for (original.outputs) |f| {
+            const v = if (f.native_tool_calls and has_tool_calls)
+                tool_mod.callsFromNative(ctx.arena, c.tool_calls) catch |err| return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    else => error.AdapterParse,
+                }
+            else if (f.native_reasoning and native)
+                if (c.reasoning) |r| if (r.len > 0) std.json.Value{ .string = r } else .null else .null
+            else
+                parsed.get(if (f.native_reasoning) try fallbackName(ctx.arena, original, f) else f.name) orelse
+                    (try signature.outputDefault(ctx.arena, f)) orelse
+                    if (has_tool_calls or f.native_tool_calls) @as(std.json.Value, .null) else return error.AdapterParse;
+            o.putAssumeCapacity(f.name, v);
+        }
+    }
     return outputs;
 }
 
+fn fallbackName(arena: Allocator, view_: adapter_mod.View, f: Field) Allocator.Error![]const u8 {
+    const base = f.reasoning_fallback orelse return f.name;
+    if (!view_.hasField(base)) return base;
+    var suffix: usize = 2;
+    while (suffix <= view_.inputs.len + view_.outputs.len + 2) : (suffix += 1) {
+        const name = try std.fmt.allocPrint(arena, "{s}_{d}", .{ base, suffix });
+        if (!view_.hasField(name)) return name;
+    }
+    unreachable;
+}
+
 fn runAdapter(ctx: Context, adapter: Adapter, view_: adapter_mod.View, demos: []const Record, inputs: *const Record) Error!Record {
-    const messages = try adapter.format(ctx.arena, view_, demos, inputs);
-    var options = ctx.lm_options;
-    options.json_mode = adapter == .json;
-    const completion = try ctx.lm.complete(ctx.arena, .{ .messages = messages, .options = options });
-    return adapter.parse(ctx.arena, view_, completion);
+    assert(ctx.lm_options.n == 1);
+    return (try runAdapterMany(ctx, adapter, view_, demos, inputs))[0];
 }
 
 /// `dspy.Predict(Signature)`.
@@ -218,11 +341,47 @@ pub fn PredictFields(comptime fields: []const Field, comptime input_count: usize
     };
 }
 
-/// `dspy.ChainOfThought(Signature)`: prepends a `reasoning: str` output.
+/// DSPy 3.5 CoT uses native reasoning, or an explicit plan on other models.
 pub fn ChainOfThought(comptime Sig: type) type {
+    return ChainOfThoughtWithOptions(Sig, .{});
+}
+
+pub const ChainOfThoughtOptions = struct {
+    /// Explicit annotation requests a normal output, like rationale_field_type=str.
+    rationale_field_type: ?type = null,
+    rationale_description: ?[]const u8 = null,
+};
+
+pub fn ChainOfThoughtWithOptions(comptime Sig: type, comptime options: ChainOfThoughtOptions) type {
+    const use_default = options.rationale_field_type == null;
+    const Base = Sig.PrependOutput("reasoning", options.rationale_field_type orelse ?signature.Reasoning);
+    const extended_fields = comptime blk: {
+        var fields = Base.fields[0..Base.fields.len].*;
+        const f = &fields[Sig.input_fields_list.len];
+        f.desc = options.rationale_description orelse if (use_default) "A short plan for solving the task." else "${reasoning}";
+        if (use_default) {
+            f.kind = .str;
+            f.type_name = "str";
+            f.schema = "";
+            f.validate = null;
+            f.optional_str = false;
+            f.nullable = false;
+            f.native_reasoning = true;
+            f.reasoning_fallback = "plan";
+        }
+        break :blk fields;
+    };
     return struct {
         const Self = @This();
-        pub const Extended = Sig.PrependOutput("reasoning", []const u8);
+        pub const Extended = struct {
+            pub const Input = Sig.Input;
+            pub const Output = Base.Output;
+            pub const fields: []const Field = &extended_fields;
+            pub const input_fields_list = fields[0..Sig.input_fields_list.len];
+            pub const output_fields_list = fields[Sig.input_fields_list.len..];
+            pub const instructions = Sig.instructions;
+            pub const is_dszig_signature = true;
+        };
         pub const Input = Sig.Input;
         pub const Output = Extended.Output;
 
@@ -423,20 +582,83 @@ test "predict and chain of thought run through the adapter with trace" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     var script: lm_mod.ScriptedLM = .{ .responses = &.{
-        "[[ ## reasoning ## ]]\nParis is the capital.\n\n[[ ## answer ## ]]\nParis\n\n[[ ## completed ## ]]",
+        "<plan>\nParis is the capital.\n</plan>\n\n<answer>\nParis\n</answer>",
         "not parseable",
-        "{\"reasoning\": \"r\", \"answer\": \"Lyon\"}",
+        "{\"plan\": \"r\", \"answer\": \"Lyon\"}",
     } };
     var trace: Trace = .{ .arena = arena.allocator() };
     const ctx: Context = .{ .arena = arena.allocator(), .lm = script.lm(), .trace = &trace };
     const cot: ChainOfThought(QA) = .{};
     const out = try cot.forward(ctx, .{ .question = "Capital of France?" });
     try testing.expectEqualStrings("Paris", out.answer);
-    try testing.expectEqualStrings("Paris is the capital.", out.reasoning);
+    try testing.expectEqualStrings("Paris is the capital.", out.reasoning.?.content);
     const fallback = try cot.forward(ctx, .{ .question = "x" });
     try testing.expectEqualStrings("Lyon", fallback.answer);
     try testing.expectEqual(@as(usize, 2), trace.steps.items.len);
     try testing.expect(trace.steps.items[0].predictor == &cot.predict.state);
+}
+
+test "native reasoning preserves absent summaries and records actual content" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const Native = struct {
+        summary: ?[]const u8 = null,
+
+        fn complete(ptr: *anyopaque, a: Allocator, request: lm_mod.Request) lm_mod.Error![]const lm_mod.Completion {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (request.options.reasoning_effort == null or
+                !std.mem.eql(u8, request.options.reasoning_effort.?, "low")) return error.LMFailure;
+            // Native reasoning must never be requested as a text output as well.
+            if (std.mem.indexOf(u8, request.messages[0].content, "`reasoning`") != null or
+                std.mem.indexOf(u8, request.messages[0].content, "`plan`") != null) return error.LMFailure;
+            const out = try a.alloc(lm_mod.Completion, 1);
+            out[0] = .{ .text = "<answer>\nParis\n</answer>", .reasoning = self.summary };
+            return out;
+        }
+    };
+    var native: Native = .{};
+    var trace: Trace = .{ .arena = arena.allocator() };
+    const ctx: Context = .{
+        .arena = arena.allocator(),
+        .lm = .{ .ptr = &native, .vtable = &.{ .complete = Native.complete }, .supports_reasoning = true },
+        .trace = &trace,
+    };
+    const cot: ChainOfThought(QA) = .{};
+    const without = try cot.forward(ctx, .{ .question = "Capital?" });
+    try testing.expectEqualStrings("Paris", without.answer);
+    try testing.expectEqual(@as(?signature.Reasoning, null), without.reasoning);
+    try testing.expect(trace.steps.items[0].outputs.get("reasoning").? == .null);
+    native.summary = "Paris is France's capital.";
+    const with = try cot.forward(ctx, .{ .question = "Capital?" });
+    try testing.expectEqualStrings(native.summary.?, with.reasoning.?.content);
+    try testing.expectEqualStrings(native.summary.?, trace.steps.items[1].outputs.get("reasoning").?.string);
+    native.summary = "";
+    const empty = try cot.forward(ctx, .{ .question = "Capital?" });
+    try testing.expectEqual(@as(?signature.Reasoning, null), empty.reasoning);
+    try testing.expect(trace.steps.items[2].outputs.get("reasoning").? == .null);
+}
+
+test "CoT plan fallback avoids task field collisions and honors disabled native reasoning" {
+    const WithPlan = signature.Signature(struct {
+        pub const Input = struct { question: []const u8, plan: []const u8 };
+        pub const Output = struct { answer: []const u8, plan_2: []const u8 };
+    });
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var script: lm_mod.ScriptedLM = .{ .responses = &.{
+        "<plan_3>\nCheck the facts.\n</plan_3>\n\n<answer>\nParis\n</answer>\n\n<plan_2>\nDone.\n</plan_2>",
+    } };
+    var lm = script.lm();
+    lm.supports_reasoning = true;
+    const cot: ChainOfThought(WithPlan) = .{};
+    const out = try cot.forward(.{
+        .arena = arena.allocator(),
+        .lm = lm,
+        .lm_options = .{ .reasoning_effort = "none" },
+    }, .{ .question = "Capital?", .plan = "Use evidence." });
+    try testing.expectEqualStrings("Check the facts.", out.reasoning.?.content);
+    try testing.expectEqualStrings("Done.", out.plan_2);
+    try testing.expectEqualStrings("Paris", out.answer);
 }
 
 test "in-memory retriever ranks by overlap" {

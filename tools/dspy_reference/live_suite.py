@@ -7,9 +7,10 @@ A transcript is {"runtime", "model", "calls": [{"messages", "completion",
 import json
 import pathlib
 import tempfile
-from types import SimpleNamespace
 
 import dspy
+from dspy._vendor.lm15.serde import request_to_dict, response_from_dict, response_to_dict
+from dspy.lm15 import ContinuationState, Message, TextPart, ThinkingPart, ToolCallPart, ToolResultPart
 
 import reference as ref
 
@@ -43,7 +44,7 @@ def date_examples(split):
 
 def cases():
     qa_demos = [
-        dspy.Example(augmented=True, context=["a fact"], question="q1?", reasoning="r1", answer="a1"),
+        dspy.Example(augmented=True, context=["a fact"], question="q1?", reasoning=dspy.Reasoning(content="r1"), answer="a1"),
         dspy.Example(question="q2?", answer="a2"),
     ]
     qa_inputs = {"context": ["Paris is the capital of France.", "multi\nline «x»"], "question": "What is the capital of France?"}
@@ -58,6 +59,9 @@ def cases():
         ("typed_chat", lambda: dspy.Predict(ref.Typed), dspy.ChatAdapter(), typed_demos, typed_inputs),
         ("typed_json", lambda: dspy.Predict(ref.Typed), dspy.JSONAdapter(), typed_demos, typed_inputs),
         ("indented_chat", lambda: dspy.Predict(ref.Indented), dspy.ChatAdapter(), [], {"text": "meh"}),
+        ("cot_qa_xml", lambda: dspy.ChainOfThought(ref.QA), dspy.XMLAdapter(), qa_demos, qa_inputs),
+        ("typed_xml", lambda: dspy.Predict(ref.Typed), dspy.XMLAdapter(), typed_demos, typed_inputs),
+        ("indented_xml", lambda: dspy.Predict(ref.Indented), dspy.XMLAdapter(), [], {"text": "meh"}),
     ]
 
 
@@ -70,16 +74,16 @@ def run_suite(lm):
         (module.predict if hasattr(module, "predict") else module).demos = demos
         try:
             pred = module(**inputs)
-            out["cases"].append({"name": name, "outputs": dict(pred.items())})
+            out["cases"].append({"name": name, "outputs": ref.serialize_object(dict(pred.items()))})
         except Exception as e:  # noqa: BLE001 - parse failures are a result, compared across runtimes.
             out["cases"].append({"name": name, "error": type(e).__name__})
-    dspy.configure(lm=lm, rm=ref.in_memory_rm(ref.CORPUS), adapter=dspy.ChatAdapter())
+    dspy.configure(lm=lm, rm=ref.in_memory_rm(ref.CORPUS), adapter=None)
     rag_optimizer = dspy.BootstrapFewShot(metric=ref.keyword_metric, max_bootstrapped_demos=2, max_labeled_demos=3)
     out["rag"] = pipeline(ref.RAG, rag_optimizer, ref.trainset(), ref.trainset(), ref.keyword_metric)
     dates_optimizer = dspy.BootstrapFewShot(metric=exact_metric, max_bootstrapped_demos=4, max_labeled_demos=8)
     out["dates"] = pipeline(DateQA, dates_optimizer, date_examples("train"), date_examples("dev"), exact_metric)
     search = dspy.BootstrapFewShotWithRandomSearch(
-        metric=exact_metric, max_bootstrapped_demos=2, max_labeled_demos=2, num_candidate_programs=4
+        metric=exact_metric, max_bootstrapped_demos=2, max_labeled_demos=2, num_candidate_programs=4, num_threads=1
     )
     out["dates_search"] = pipeline(DateQA, search, date_examples("train"), date_examples("dev"), exact_metric)
     mipro = RecordedMIPROv2(
@@ -197,8 +201,109 @@ def pipeline(make, optimizer, trainset, devset, metric, **compile_kwargs):
     return result
 
 
-def completion_text(output):
-    return output if isinstance(output, str) else output["text"]
+
+def normalized_continuation(states):
+    return [{"provider": state.provider, "kind": state.kind, "data": state.data} for state in states]
+
+
+def restore_continuation(states):
+    return tuple(ContinuationState(provider=state["provider"], kind=state["kind"], data=state["data"])
+                 for state in states)
+
+
+def normalized_tool_calls(parts):
+    return [{"id": part.id, "name": part.name,
+             "arguments": json.dumps(part.input, ensure_ascii=False, separators=(",", ":")),
+             "continuation": normalized_continuation(part.continuation)}
+            for part in parts]
+
+
+def message_continuation(message):
+    states = list(message.continuation)
+    for part in message.parts:
+        if not isinstance(part, ToolCallPart):
+            states.extend(part.continuation)
+    return normalized_continuation(states)
+
+
+def text_parts(parts):
+    if any(not isinstance(part, TextPart) for part in parts):
+        raise TypeError("the shared transcript text projection cannot represent non-text media")
+    return "".join(part.text for part in parts)
+
+
+def normalized_messages(request):
+    messages = []
+    if request.system is not None:
+        system = request.system if isinstance(request.system, str) else text_parts(request.system)
+        messages.append({"role": "system", "content": system, "tool_calls": [], "tool_call_id": None,
+                         "reasoning": None, "continuation": []})
+    for message in request.messages:
+        if any(not isinstance(part, (TextPart, ThinkingPart, ToolCallPart, ToolResultPart)) for part in message.parts):
+            raise TypeError("the shared transcript cannot represent this lm15 part; canonical data is required")
+        results = message.parts_of(ToolResultPart)
+        if results:
+            if len(results) != len(message.parts):
+                raise TypeError("the shared transcript cannot flatten mixed tool-result content")
+            for result in results:
+                messages.append({"role": message.role, "content": text_parts(result.content), "tool_calls": [],
+                                 "tool_call_id": result.id, "reasoning": None,
+                                 "continuation": normalized_continuation((*message.continuation, *result.continuation))})
+        else:
+            messages.append({"role": message.role, "content": "".join(part.text for part in message.parts_of(TextPart)),
+                             "tool_calls": normalized_tool_calls(message.parts_of(ToolCallPart)),
+                             "tool_call_id": None,
+                             "reasoning": "".join(part.text for part in message.parts_of(ThinkingPart)) or None,
+                             "continuation": message_continuation(message)})
+    return messages
+
+
+def request_metadata(request, rollout):
+    """Shared Zig/Python text/native metadata; canonical request stays separate."""
+    messages = normalized_messages(request)
+    format_ = request.config.response_format
+    if format_ is not None and format_.get("type") == "json_schema":
+        format_ = {"type": "json_schema", **format_["json_schema"]}
+    choice = request.config.tool_choice
+    tools = []
+    for tool in request.tools:
+        if tool.type != "function":
+            raise TypeError(f"shared transcript cannot represent provider builtin tool {tool.name!r}")
+        tools.append({"name": tool.name, "description": tool.description or "", "parameters": tool.parameters, "strict": None})
+    return {
+        "messages": messages,
+        "tools": tools,
+        "options": {
+            "temperature": request.config.temperature,
+            "rollout_id": json.loads(json.dumps(rollout, ensure_ascii=False)),
+            "n": 1,
+            "reasoning_effort": request.config.reasoning.effort if request.config.reasoning is not None else None,
+            # Predictor-only explicit-null intent is consumed before this
+            # normalized engine Request; it is not a wire generation option.
+            "reasoning_effort_present": False,
+            "response_format": format_,
+            "tool_choice": {"mode": choice.mode, "allowed": list(choice.allowed)} if choice is not None else None,
+            "parallel_tool_calls": choice.parallel if choice is not None else None,
+        },
+    }
+
+
+def transcript_call(request, response, rollout):
+    """Keep canonical native protocol data as well as the shared Zig projection."""
+    reasoning = "".join(part.text for part in response.message.parts_of(ThinkingPart)) or None
+    calls = normalized_tool_calls(response.message.parts_of(ToolCallPart))
+    continuation = message_continuation(response.message)
+    return {
+        **request_metadata(request, rollout),
+        "completion": response.text or "",
+        **({"reasonings": [reasoning]} if reasoning is not None else {}),
+        "tool_calls": [calls] if calls else [],
+        "continuation": [continuation] if continuation else [],
+        "provider_data": [response.provider_data] if response.provider_data is not None else [],
+        "request": request_to_dict(request),
+        "response": response_to_dict(response, include_provider_data=True),
+        "response_model": response.model,
+    }
 
 
 class RecordingLM(dspy.LM):
@@ -206,50 +311,87 @@ class RecordingLM(dspy.LM):
     is shallow, so rollout copies share the list."""
 
     def __init__(self, model, **kwargs):
-        super().__init__(model, temperature=TEMPERATURE, cache=False, num_retries=8, **kwargs)
+        self._execution_controls = ref.ExecutionControls()
+        callbacks = [*kwargs.pop("callbacks", []), self._execution_controls]
+        super().__init__(model, temperature=TEMPERATURE, cache=False, num_retries=8, callbacks=callbacks, **kwargs)
         self.calls = []
 
     def update_history(self, entry):
         super().update_history(entry)
-        kwargs = {**self.kwargs, **entry["kwargs"]}
-        self.calls.append({
-            "messages": [dict(m) for m in entry["messages"]],
-            "completion": completion_text(entry["outputs"][0]),
-            **({"completions": [completion_text(o) for o in entry["outputs"]]} if len(entry["outputs"]) > 1 else {}),
-            "temperature": kwargs.get("temperature"),
-            "rollout_id": kwargs.get("rollout_id"),
-            "response_format": json.dumps(kwargs["response_format"], default=str) if "response_format" in kwargs else None,
-            "response_model": entry.get("response_model"),
-        })
+        self.calls.append(transcript_call(entry["request"], entry["response"], ref.rollout_id(self)))
 
 
-class ReplayLM(dspy.BaseLM):
+class ReplayLM(ref.ReferenceLM):
     """Answers each request with the first unused recorded call whose
     messages are identical; any other request is a mismatch."""
 
-    def __init__(self, calls):
+    def __init__(self, calls, supports_reasoning=False, capabilities=None):
         super().__init__(model="dszig/replay", model_type="chat", temperature=TEMPERATURE, max_tokens=None, cache=False)
+        self._reasoning_supported = supports_reasoning
+        self._capabilities = capabilities or {}
         self.calls = calls
         self.used = [False] * len(calls)
         self.misses = []
 
-    def forward(self, prompt=None, messages=None, **kwargs):
-        want = [{"role": m["role"], "content": m["content"]} for m in messages]
+    @property
+    def supports_reasoning(self):
+        return self._reasoning_supported
+
+    @property
+    def supports_function_calling(self):
+        return self._capabilities.get("supports_function_calling", False)
+
+    @property
+    def supports_response_schema(self):
+        return self._capabilities.get("supports_response_schema", False)
+
+    @property
+    def supported_params(self):
+        params = set(self._capabilities.get("supported_params", []))
+        if self._capabilities.get("supports_response_format", False):
+            params.add("response_format")
+        return params
+
+    def complete(self, request):
+        metadata = request_metadata(request, ref.rollout_id(self))
+        want = metadata["messages"]
         for i, call in enumerate(self.calls):
-            if not self.used[i] and call["messages"] == want:
-                self.used[i] = True
-                texts = call.get("completions", [call["completion"]])
-                choices = [
-                    SimpleNamespace(
-                        message=SimpleNamespace(content=text, tool_calls=None, reasoning_content=None),
-                        finish_reason="stop",
-                        index=i,
-                    )
-                    for i, text in enumerate(texts)
-                ]
-                return SimpleNamespace(choices=choices, usage={}, model=self.model)
+            if call["messages"] != want or call.get("tools", []) != metadata["tools"]:
+                continue
+            if call["options"] != metadata["options"]:
+                continue
+            if "request" in call:
+                recorded = {**call["request"], "model": request.model}
+                if recorded != request_to_dict(request):
+                    continue
+            # One canonical engine call is one candidate, with its exact
+            # adapter-assigned rollout identity and n=1.
+            if self.used[i]:
+                continue
+            text = call["completion"]
+            self.used[i] = True
+            if "response" in call:
+                return response_from_dict(call["response"])
+            native_calls = call.get("tool_calls", [])
+            continuations = call.get("continuation", [])
+            reasoning = (call.get("reasonings") or [None])[0]
+            provider_data = call.get("provider_data", [])
+            raw = provider_data[0] if provider_data else None
+            if native_calls or continuations or reasoning is not None or raw is not None:
+                from dataclasses import replace
+                parts = []
+                states = restore_continuation(continuations[0]) if continuations else ()
+                if reasoning is not None or states:
+                    parts.append(ThinkingPart(reasoning or "", continuation=states))
+                if text:
+                    parts.append(TextPart(text))
+                if native_calls:
+                    parts.extend(ToolCallPart(id=c["id"], name=c["name"], input=json.loads(c["arguments"]),
+                                              continuation=restore_continuation(c.get("continuation", [])))
+                                 for c in native_calls[0])
+                if not parts:
+                    parts.append(TextPart(text))
+                return replace(ref.text_response(self.model, text), message=Message.assistant(parts), provider_data=raw)
+            return ref.text_response(self.model, text)
         self.misses.append(want)
         raise RuntimeError("replay: request has no recorded twin")
-
-    def copy(self, **kwargs):
-        return self

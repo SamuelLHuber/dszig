@@ -1,4 +1,4 @@
-//! Golden tests against fixtures produced by real DSPy 3.4.1
+//! Golden tests against fixtures produced by real DSPy 3.5.0
 //! (tools/dspy_reference/gen_fixtures.py). Prompts must match byte for byte,
 //! parsed outputs must be equal, and the BootstrapFewShot artifact must be
 //! identical to the one DSPy saves for the same program, data and mock LM.
@@ -20,6 +20,7 @@ const simba_case = @embedFile("fixtures/simba.json");
 const gepa_case = @embedFile("fixtures/gepa.json");
 const gepa_merge_case = @embedFile("fixtures/gepa_merge.json");
 const nested_case = @embedFile("fixtures/nested.json");
+const xml_cases = @embedFile("fixtures/xml.json");
 const live_suite = @import("live_suite");
 const QA = rag.QA;
 
@@ -62,6 +63,22 @@ fn compact(arena: Allocator, v: Value) ![]const u8 {
     return aw.written();
 }
 
+fn expectMessages(arena: Allocator, expected: []const Value, actual: []const dszig.adapter.Message) !void {
+    // DSPy's fixture boundary is prompt_to_openai_messages, not just content.
+    // Use the production serializer to compare native calls and tool-result IDs
+    // as well, while keeping prompt text and argument strings byte-exact.
+    const provider: dszig.lm.OpenAI = .{ .client = undefined, .base_url = "http://unused", .model = "golden" };
+    const body = try provider.requestBody(arena, .{ .messages = actual });
+    const root = try std.json.parseFromSliceLeaky(Value, arena, body, .{});
+    const projected = root.object.get("messages").?.array.items;
+    try testing.expectEqual(expected.len, projected.len);
+    for (expected, projected) |want, got| {
+        try testing.expectEqualStrings(want.object.get("role").?.string, got.object.get("role").?.string);
+        try testing.expectEqualStrings(want.object.get("content").?.string, got.object.get("content").?.string);
+        try testing.expect(dszig.value.recordEqual(&want.object, &got.object));
+    }
+}
+
 fn runCase(
     comptime P: type,
     name: []const u8,
@@ -82,11 +99,14 @@ fn runCase(
     const output = try program.forward(ctx, input);
 
     const expected = case.get("messages").?.array.items;
-    const got = history.requests.items[0].messages;
-    try testing.expectEqual(expected.len, got.len);
-    for (expected, got) |e, g| {
-        try testing.expectEqualStrings(e.object.get("role").?.string, g.role.name());
-        try testing.expectEqualStrings(e.object.get("content").?.string, g.content);
+    try expectMessages(arena, expected, history.requests.items[0].messages);
+    if (comptime @hasField(P.Output, "reasoning")) {
+        const expected_reasoning = case.get("outputs").?.object.get("reasoning").?;
+        if (expected_reasoning == .null) {
+            try testing.expect(output.reasoning == null);
+        } else {
+            try testing.expectEqualStrings(expected_reasoning.string, output.reasoning.?.content);
+        }
     }
     const got_outputs = try dszig.value.toRecord(arena, P.Output, output);
     try testing.expectEqualStrings(
@@ -114,6 +134,11 @@ test "ChainOfThought JSONAdapter prompt and parse match DSPy" {
     try runCase(@TypeOf(cot), "cot_qa_json", .json, &cot, &cot.predict.state, qa_demos, qa_input);
 }
 
+test "ChainOfThought default XMLAdapter prompt and Reasoning match DSPy" {
+    var cot: dszig.ChainOfThought(QA) = .{};
+    try runCase(@TypeOf(cot), "cot_qa_xml", .xml, &cot, &cot.predict.state, qa_demos, qa_input);
+}
+
 const typed_demos =
     \\[{"text": "good", "tags": ["x"], "flag": true, "count": 3, "ratio": 0.5, "label": "pos", "items": ["a", "b"]},
     \\ {"text": "bad", "flag": false, "label": "neg"}]
@@ -130,9 +155,19 @@ test "typed fields JSONAdapter match DSPy" {
     try runCase(@TypeOf(p), "typed_json", .json, &p, &p.state, typed_demos, typed_input);
 }
 
+test "typed fields XMLAdapter match DSPy" {
+    var p: dszig.Predict(Typed) = .{};
+    try runCase(@TypeOf(p), "typed_xml", .xml, &p, &p.state, typed_demos, typed_input);
+}
+
 test "multi-line instructions match DSPy" {
     var p: dszig.Predict(Indented) = .{};
     try runCase(@TypeOf(p), "indented_chat", .chat, &p, &p.state, "[]", .{ .text = "meh" });
+}
+
+test "multi-line XMLAdapter instructions match DSPy" {
+    var p: dszig.Predict(Indented) = .{};
+    try runCase(@TypeOf(p), "indented_xml", .xml, &p, &p.state, "[]", .{ .text = "meh" });
 }
 
 test "BootstrapFewShot RAG artifact is byte-identical to DSPy" {
@@ -223,38 +258,53 @@ fn checkReact(comptime Agent: type, name: []const u8) !void {
     try testing.expectEqual(calls.len, history.requests.items.len);
     for (calls, history.requests.items) |c, request| {
         const want = c.object.get("messages").?.array.items;
-        try testing.expectEqual(want.len, request.messages.len);
-        for (want, request.messages) |w, got| {
-            try testing.expectEqualStrings(w.object.get("role").?.string, got.role.name());
-            try testing.expectEqualStrings(w.object.get("content").?.string, got.content);
-        }
+        try expectMessages(arena, want, request.messages);
     }
-    try testing.expectEqualStrings(try compact(arena, case.get("trajectory").?), try compact(arena, .{ .object = prediction.trajectory }));
+    try testing.expectEqualStrings(try compact(arena, case.get("history").?), try compact(arena, try prediction.history.toValue(arena)));
+    try testing.expectEqualStrings(case.get("termination_reason").?.string, @tagName(prediction.termination_reason));
     try testing.expectEqualStrings(try compact(arena, case.get("outputs").?), try compact(arena, .{ .object = prediction.outputs }));
 }
 
-test "ReAct prompts, trajectory and outputs match DSPy" {
+test "ReAct prompts structured history termination and outputs match DSPy" {
     try checkReact(dszig.ReAct(AgentQA, &.{ search_tool, add_tool }), "react_tools");
     try checkReact(dszig.ReAct(AgentQA, &.{search_tool}), "react_max_iters");
+    try checkReact(dszig.ReAct(AgentQA, &.{ search_tool, add_tool }), "react_batched");
+    try checkReact(dszig.ReAct(AgentQA, &.{search_tool}), "react_empty_tool_calls");
+    try checkReact(dszig.ReAct(AgentQA, &.{search_tool}), "react_parse_error");
+    try checkReact(dszig.ReAct(AgentQA, &.{search_tool}), "react_unknown_tool");
+    try checkReact(dszig.ReAct(AgentQA, &.{search_tool}), "react_zero_iters");
 }
 
-test "ReAct turns bad tool arguments into an execution-error observation" {
+test "ReAct records invalid arguments as tool errors before forced typed submit" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var scripted: dszig.lm.ScriptedLM = .{ .responses = &.{
-        "[[ ## next_thought ## ]]\nx\n\n[[ ## next_tool_name ## ]]\nadd\n\n[[ ## next_tool_args ## ]]\n{\"c\": 1}\n\n[[ ## completed ## ]]",
-        "[[ ## next_thought ## ]]\ny\n\n[[ ## next_tool_name ## ]]\nadd\n\n[[ ## next_tool_args ## ]]\n{\"a\": \"one\"}\n\n[[ ## completed ## ]]",
-        "[[ ## reasoning ## ]]\nr\n\n[[ ## answer ## ]]\nnone\n\n[[ ## completed ## ]]",
+        "<next_thought>\nx\n</next_thought>\n\n<tool_calls>\n{\"tool_calls\": [{\"name\": \"add\", \"args\": {\"c\": 1}}]}\n</tool_calls>",
+        "<next_thought>\ny\n</next_thought>\n\n<tool_calls>\n{\"tool_calls\": [{\"name\": \"add\", \"args\": {\"a\": \"one\"}}]}\n</tool_calls>",
+        "<next_thought>\nSubmit the answer.\n</next_thought>\n\n<tool_calls>\n{\"tool_calls\": [{\"name\": \"submit\", \"args\": {\"answer\": \"none\"}}]}\n</tool_calls>",
     } };
     const ctx: dszig.Context = .{ .arena = arena, .lm = scripted.lm() };
     const agent: dszig.ReAct(AgentQA, &.{add_tool}) = .{ .max_iters = 2 };
     var inputs: Record = .empty;
     try inputs.put(arena, "question", .{ .string = "?" });
     const prediction = try agent.run(ctx, &inputs);
-    try testing.expectEqualStrings("Execution error in add: InvalidArguments", prediction.trajectory.get("observation_0").?.string);
-    try testing.expectEqualStrings("Execution error in add: InvalidArguments", prediction.trajectory.get("observation_1").?.string);
+    try testing.expectEqual(@as(usize, 3), scripted.index);
+    try testing.expectEqual(@as(usize, 3), prediction.history.messages.len);
+    for (prediction.history.messages[0..2]) |event| {
+        const calls = try dszig.react.ToolCalls.fromValue(arena, event.get("tool_calls").?);
+        try testing.expectEqual(@as(usize, 1), calls.tool_calls.len);
+        try testing.expectEqualStrings("add", calls.tool_calls[0].name);
+        const results = calls.tool_call_results.?.tool_call_results;
+        try testing.expectEqual(@as(usize, 1), results.len);
+        try testing.expectEqualStrings(calls.tool_calls[0].id.?, results[0].call_id.?);
+        try testing.expectEqualStrings("add", results[0].name);
+        try testing.expect(results[0].is_error);
+        try testing.expectEqualStrings("Execution error in add: InvalidArguments", results[0].value.string);
+    }
+    try testing.expectEqual(dszig.react.TerminationReason.forced_submit, prediction.termination_reason);
     try testing.expectEqualStrings("none", prediction.outputs.get("answer").?.string);
+    try testing.expectEqualStrings("none", prediction.history.messages[2].get("answer").?.string);
 }
 
 test "normalize_text and dspy.majority match DSPy" {
@@ -315,15 +365,15 @@ const SimbaMock = struct {
     calls: std.ArrayList(Call) = .empty,
 
     const advice = "Answer with an ISO date.";
-    const feedback = "[[ ## discussion ## ]]\nThe worse run guessed.\n\n[[ ## module_advice ## ]]\n{\"generate.predict\": \"" ++
-        advice ++ "\"}\n\n[[ ## completed ## ]]";
-    const Call = struct { rollout: ?u32, temperature: ?f64, digest: [64]u8 };
+    const feedback = "<discussion>\nThe worse run guessed.\n</discussion>\n\n<module_advice>\n<generate.predict>\n" ++
+        advice ++ "\n</generate.predict>\n</module_advice>";
+    const Call = struct { rollout: ?Value, temperature: ?f64, digest: [64]u8 };
 
     fn lm(self: *SimbaMock) dszig.LM {
         return .{ .ptr = self, .vtable = &.{ .complete = complete } };
     }
 
-    fn complete(ptr: *anyopaque, arena: Allocator, request: dszig.lm.Request) dszig.lm.Error![]const []const u8 {
+    fn complete(ptr: *anyopaque, arena: Allocator, request: dszig.lm.Request) dszig.lm.Error![]const dszig.lm.Completion {
         const self: *SimbaMock = @ptrCast(@alignCast(ptr));
         var list: std.json.Array = .init(arena);
         for (request.messages) |m| {
@@ -337,25 +387,28 @@ const SimbaMock = struct {
         var hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(aw.written(), &hash, .{});
         try self.calls.append(self.arena, .{
-            .rollout = request.options.rollout_id,
+            .rollout = if (request.options.rollout_id) |rollout| try dszig.value.cloneValue(self.arena, rollout) else null,
             .temperature = request.options.temperature,
             .digest = std.fmt.bytesToHex(hash, .lower),
         });
         const system = request.messages[0].content;
         const user = request.messages[request.messages.len - 1].content;
-        const out = try arena.alloc([]const u8, 1);
+        const out = try arena.alloc(dszig.lm.Completion, 1);
         if (std.mem.indexOf(u8, system, "module_advice") != null) {
-            out[0] = feedback;
+            out[0] = .{ .text = feedback };
             return out;
         }
-        const marker = "[[ ## question ## ]]\n";
+        const marker = "<question>\n";
         const start = (std.mem.indexOf(u8, user, marker) orelse return error.LMFailure) + marker.len;
-        const end = std.mem.indexOfPos(u8, user, start, "\n\n") orelse user.len;
+        const end = std.mem.indexOfPos(u8, user, start, "\n</question>") orelse return error.LMFailure;
         const q = user[start..end];
         var good = std.mem.indexOf(u8, system, advice) != null or (request.messages.len > 2 and q.len % 3 == 0);
-        if (request.options.rollout_id) |r| good = good or (q.len + r) % 2 == 0;
+        if (request.options.rollout_id) |r| {
+            if (r != .integer) return error.LMFailure;
+            good = good or q.len % 2 == @as(usize, @intCast(@mod(r.integer, 2)));
+        }
         const answer = if (good) self.golds.get(q) orelse return error.LMFailure else "unknown";
-        out[0] = try std.fmt.allocPrint(arena, "[[ ## reasoning ## ]]\nr\n\n[[ ## answer ## ]]\n{s}\n\n[[ ## completed ## ]]", .{answer});
+        out[0] = .{ .text = try std.fmt.allocPrint(arena, "<plan>\nr\n</plan>\n\n<answer>\n{s}\n</answer>", .{answer}) };
         return out;
     }
 };
@@ -379,7 +432,7 @@ test "SIMBA program, scores and every request match DSPy" {
     try testing.expectEqual(calls.len, mock.calls.items.len);
     for (calls, mock.calls.items) |w, got| {
         const items = w.array.items;
-        if (items[0] == .null) try testing.expect(got.rollout == null) else try testing.expectEqual(items[0].integer, @as(i64, got.rollout.?));
+        try testing.expectEqualStrings(try compact(arena, items[0]), try compact(arena, got.rollout orelse .null));
         try testing.expectEqual(items[1].float, got.temperature.?);
         try testing.expectEqualStrings(items[2].string, &got.digest);
     }
@@ -430,11 +483,7 @@ test "nested Pydantic-style fields format, parse and validate like DSPy" {
         const adapter: dszig.Adapter = if (std.mem.eql(u8, case.object.get("adapter").?.string, "chat")) .chat else .json;
         const messages = try adapter.format(arena, view, &.{}, &inputs);
         const want_messages = case.object.get("messages").?.array.items;
-        try testing.expectEqual(want_messages.len, messages.len);
-        for (want_messages, messages) |w, got| {
-            try testing.expectEqualStrings(w.object.get("role").?.string, got.role.name());
-            try testing.expectEqualStrings(w.object.get("content").?.string, got.content);
-        }
+        try expectMessages(arena, want_messages, messages);
     }
     const parsed = try dszig.Adapter.chat.parse(arena, view, want.object.get("completion").?.string);
     try testing.expectEqualStrings(try compact(arena, want.object.get("outputs").?), try compact(arena, .{ .object = parsed }));
@@ -477,11 +526,7 @@ test "dict[str, T] fields format, parse and validate like DSPy" {
         const adapter: dszig.Adapter = if (std.mem.eql(u8, case.object.get("adapter").?.string, "chat")) .chat else .json;
         const messages = try adapter.format(arena, view, &.{}, &inputs);
         const want_messages = case.object.get("messages").?.array.items;
-        try testing.expectEqual(want_messages.len, messages.len);
-        for (want_messages, messages) |w, got| {
-            try testing.expectEqualStrings(w.object.get("role").?.string, got.role.name());
-            try testing.expectEqualStrings(w.object.get("content").?.string, got.content);
-        }
+        try expectMessages(arena, want_messages, messages);
     }
     const parsed = try dszig.Adapter.chat.parse(arena, view, want.object.get("dict_completion").?.string);
     try testing.expectEqualStrings(try compact(arena, want.object.get("dict_outputs").?), try compact(arena, .{ .object = parsed }));
@@ -490,6 +535,116 @@ test "dict[str, T] fields format, parse and validate like DSPy" {
     try testing.expectEqual(@as(i64, 9), typed.homes.get("bo").?.zip_code);
     try testing.expectEqual(@as(i64, 2), typed.deep.get("k").?.get("z").?);
     try testing.expectEqual(@as(usize, 0), typed.groups.get("y").?.len);
+}
+
+const XmlNullable = dszig.Signature(struct {
+    pub const instructions = "Return nullable values without conflating null and empty text.";
+    pub const Input = struct { question: []const u8 };
+    pub const Output = struct { text: ?[]const u8, number: ?i64, empty: []const u8 };
+});
+
+const XmlNestedOptional = dszig.Signature(struct {
+    pub const instructions = "Return optional people and dictionary values.";
+    pub const Input = struct { question: []const u8 };
+    pub const Output = struct {
+        person: ?Person,
+        people: []const ?Person,
+        codes: dszig.Dict(?i64),
+    };
+});
+
+fn xmlNativeRoundTrip(arena: Allocator, name: []const u8, outputs: *const Record) !void {
+    inline for (.{
+        .{ "primitive", Typed },
+        .{ "nullable", XmlNullable },
+        .{ "nested_optional", XmlNestedOptional },
+        .{ "extract", Extract },
+        .{ "tally", Tally },
+    }) |schema| {
+        if (std.mem.eql(u8, name, schema[0])) {
+            const Sig = schema[1];
+            const typed = try dszig.value.fromRecord(arena, Sig.Output, outputs);
+            const roundtrip = try dszig.value.toRecord(arena, Sig.Output, typed);
+            try testing.expectEqualStrings(try compact(arena, .{ .object = outputs.* }), try compact(arena, .{ .object = roundtrip }));
+            return;
+        }
+    }
+    if (!std.mem.eql(u8, name, "literal_union")) return error.MissingXmlSchema;
+}
+
+fn xmlFixtureView(arena: Allocator, schemas: *const Record, name: []const u8) !dszig.adapter.View {
+    inline for (.{
+        .{ "primitive", Typed },
+        .{ "nullable", XmlNullable },
+        .{ "nested_optional", XmlNestedOptional },
+        .{ "extract", Extract },
+        .{ "tally", Tally },
+    }) |schema| {
+        if (std.mem.eql(u8, name, schema[0])) {
+            const predictor: dszig.Predict(schema[1]) = .{};
+            return predictor.state.view(arena);
+        }
+    }
+    if (!std.mem.eql(u8, name, "literal_union")) return error.MissingXmlSchema;
+
+    // Arbitrary Python unions use the existing schema-backed adapter API;
+    // no native Zig union signature or compatibility alias is invented.
+    const schema = schemas.get(name).?.object;
+    const metadata = schema.get("field_metadata").?.object.get("value").?.object;
+    const fields = try arena.alloc(dszig.signature.Field, 2);
+    fields[0] = Typed.output_fields_list[3];
+    fields[1] = .{
+        .name = "value",
+        .kind = .json,
+        .type_name = metadata.get("annotation_name").?.string,
+        .desc = metadata.get("description").?.string,
+        .prefix = metadata.get("prefix").?.string,
+        .schema = try compact(arena, metadata.get("json_schema").?),
+    };
+    return .{
+        .instructions = schema.get("instructions").?.string,
+        .inputs = AgentQA.input_fields_list,
+        .outputs = fields,
+    };
+}
+
+fn checkXmlParse(arena: Allocator, view: dszig.adapter.View, case: *const Record) !void {
+    const completion = case.get("completion").?.string;
+    if (case.get("error")) |expected_error| {
+        try testing.expectEqualStrings("AdapterParseError", expected_error.string);
+        try testing.expectError(error.AdapterParse, dszig.Adapter.xml.parse(arena, view, completion));
+        return;
+    }
+    const parsed = try dszig.Adapter.xml.parse(arena, view, completion);
+    try testing.expectEqualStrings(try compact(arena, case.get("outputs").?), try compact(arena, .{ .object = parsed }));
+    try xmlNativeRoundTrip(arena, case.get("schema").?.string, &parsed);
+}
+
+test "all independently generated XML formats and parse outcomes match DSPy 3.5" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const fixture = (try std.json.parseFromSliceLeaky(Value, arena, xml_cases, .{})).object;
+    try testing.expectEqualStrings("3.5.0", fixture.get("dspy").?.string);
+    const schemas = fixture.get("schemas").?.object;
+    const formats = fixture.get("format_cases").?.array.items;
+    try testing.expectEqual(@as(usize, 6), formats.len);
+    for (formats) |case| {
+        const row = case.object;
+        const view = try xmlFixtureView(arena, &schemas, row.get("schema").?.string);
+        const inputs = row.get("inputs").?.object;
+        const messages = try dszig.Adapter.xml.format(arena, view, &.{}, &inputs);
+        const expected = row.get("messages").?.array.items;
+        try expectMessages(arena, expected, messages);
+        try checkXmlParse(arena, view, &row);
+    }
+    const parses = fixture.get("parse_cases").?.array.items;
+    try testing.expect(parses.len > 0);
+    for (parses) |case| {
+        const row = case.object;
+        const view = try xmlFixtureView(arena, &schemas, row.get("schema").?.string);
+        try checkXmlParse(arena, view, &row);
+    }
 }
 
 /// tools/dspy_reference/gen_gepa.py's MockLM: task answers are right when the
@@ -508,7 +663,7 @@ const GepaMock = struct {
         return .{ .ptr = self, .vtable = &.{ .complete = complete } };
     }
 
-    fn complete(ptr: *anyopaque, arena: Allocator, request: dszig.lm.Request) dszig.lm.Error![]const []const u8 {
+    fn complete(ptr: *anyopaque, arena: Allocator, request: dszig.lm.Request) dszig.lm.Error![]const dszig.lm.Completion {
         const self: *GepaMock = @ptrCast(@alignCast(ptr));
         var list: std.json.Array = .init(arena);
         for (request.messages) |m| {
@@ -522,36 +677,36 @@ const GepaMock = struct {
         var hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(aw.written(), &hash, .{});
         try self.calls.append(self.arena, .{
-            .rollout = request.options.rollout_id,
+            .rollout = if (request.options.rollout_id) |rollout| try dszig.value.cloneValue(self.arena, rollout) else null,
             .temperature = request.options.temperature,
             .digest = std.fmt.bytesToHex(hash, .lower),
         });
         const system = request.messages[0].content;
         const user = request.messages[request.messages.len - 1].content;
-        const out = try arena.alloc([]const u8, 1);
+        const out = try arena.alloc(dszig.lm.Completion, 1);
         const reflection = std.mem.indexOf(u8, system, "examples_with_feedback") != null;
         if (reflection and std.mem.indexOf(u8, user, "Restate the question.") != null) {
-            out[0] = "{\"new_instruction\": \"Restate the question. " ++ keep_advice ++ "\"}";
+            out[0] = .{ .text = "{\"new_instruction\": \"Restate the question. " ++ keep_advice ++ "\"}" };
             return out;
         }
         if (reflection) {
-            out[0] = try std.fmt.allocPrint(arena, "{{\"new_instruction\": \"  {s}\\n\"}}", .{proposals[self.reflections % proposals.len]});
+            out[0] = .{ .text = try std.fmt.allocPrint(arena, "{{\"new_instruction\": \"  {s}\\n\"}}", .{proposals[self.reflections % proposals.len]}) };
             self.reflections += 1;
             return out;
         }
-        const marker = "[[ ## question ## ]]\n";
+        const marker = "<question>\n";
         const start = (std.mem.indexOf(u8, user, marker) orelse return error.LMFailure) + marker.len;
-        const end = std.mem.indexOfPos(u8, user, start, "\n\n") orelse user.len;
+        const end = std.mem.indexOfPos(u8, user, start, "\n</question>") orelse return error.LMFailure;
         const q = user[start..end];
         if (std.mem.indexOf(u8, system, "`restated`") != null) {
             const keep = if (std.mem.indexOf(u8, system, keep_advice) != null) q.len % 5 != 0 else q.len % 2 == 1;
-            out[0] = try std.fmt.allocPrint(arena, "[[ ## restated ## ]]\n{s}{s}\n\n[[ ## completed ## ]]", .{ q, if (keep) "" else " Please." });
+            out[0] = .{ .text = try std.fmt.allocPrint(arena, "<restated>\n{s}{s}\n</restated>", .{ q, if (keep) "" else " Please." }) };
             return out;
         }
         const gold = self.golds.get(q);
         const good = (std.mem.indexOf(u8, system, advice) != null or q.len % 3 == 0) and gold != null;
         const answer = if (good) gold.? else "unknown";
-        out[0] = try std.fmt.allocPrint(arena, "[[ ## reasoning ## ]]\nr\n\n[[ ## answer ## ]]\n{s}\n\n[[ ## completed ## ]]", .{answer});
+        out[0] = .{ .text = try std.fmt.allocPrint(arena, "<plan>\nr\n</plan>\n\n<answer>\n{s}\n</answer>", .{answer}) };
         return out;
     }
 };
@@ -618,7 +773,7 @@ fn checkGepa(comptime P: type, case: []const u8, budget: usize) !void {
     try testing.expectEqual(calls.len, mock.calls.items.len);
     for (calls, mock.calls.items) |w, got| {
         const items = w.array.items;
-        try testing.expect(items[0] == .null and got.rollout == null);
+        try testing.expectEqualStrings(try compact(arena, items[0]), try compact(arena, got.rollout orelse .null));
         try testing.expectEqual(items[1].float, got.temperature.?);
         try testing.expectEqualStrings(items[2].string, &got.digest);
     }

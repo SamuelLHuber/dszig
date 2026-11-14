@@ -13,6 +13,8 @@ const Writer = std.Io.Writer;
 pub const Style = enum {
     /// `json.dumps(v, ensure_ascii=False)`.
     compact,
+    /// Native tool arguments use separators "," and ":".
+    minified,
     /// `json.dumps(v, indent=2, ensure_ascii=False)` and `orjson` OPT_INDENT_2.
     indent2,
 };
@@ -53,7 +55,7 @@ fn writeJsonDepth(w: *Writer, v: Value, style: Style, depth: u32) Error!void {
                 try writeSeparator(w, style, depth + 1, first);
                 first = false;
                 try writeJsonString(w, entry.key_ptr.*);
-                try w.writeAll(": ");
+                try w.writeAll(if (style == .minified) ":" else ": ");
                 try writeJsonDepth(w, entry.value_ptr.*, style, depth + 1);
             }
             try writeClose(w, style, depth, '}');
@@ -64,6 +66,7 @@ fn writeJsonDepth(w: *Writer, v: Value, style: Style, depth: u32) Error!void {
 fn writeSeparator(w: *Writer, style: Style, depth: u32, first: bool) Writer.Error!void {
     switch (style) {
         .compact => if (!first) try w.writeAll(", "),
+        .minified => if (!first) try w.writeByte(','),
         .indent2 => {
             if (!first) try w.writeByte(',');
             try w.writeByte('\n');

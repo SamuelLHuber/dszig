@@ -29,6 +29,10 @@ pub fn main(init: std.process.Init) !void {
     for (history.requests.items[0].messages) |m| {
         try w.print("--- {s} ---\n{s}\n", .{ m.role.name(), m.content });
     }
-    try w.print("=== reasoning: {s}\n=== answer: {s}\n=== trace steps: {d}\n", .{ output.reasoning, output.answer, trace.steps.items.len });
+    try w.print("=== reasoning: {s}\n=== answer: {s}\n=== trace steps: {d}\n", .{
+        if (output.reasoning) |reasoning| reasoning.content else "(none)",
+        output.answer,
+        trace.steps.items.len,
+    });
     try w.flush();
 }

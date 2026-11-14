@@ -9,7 +9,6 @@ const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 
 const predict = @import("predict.zig");
-const pyjson = @import("pyjson.zig");
 const pyrandom = @import("pyrandom.zig");
 const unicode = @import("unicode.zig");
 const value = @import("value.zig");
@@ -69,21 +68,23 @@ fn isArticle(run: []const u21) bool {
 /// `dspy.majority(completions, field=field)`: the index of the first
 /// completion whose normalized `field` is the most common normalized value
 /// (ties go to the value seen first; empty normalizations are ignored
-/// unless every one is empty). Non-string values compare by their JSON.
-pub fn majority(arena: Allocator, completions: []const Record, field: []const u8) Allocator.Error!usize {
+/// unless every one is empty). Non-string scalars keep Python equality.
+pub const Error = Allocator.Error || error{ UnhashableVote, MissingVoteField };
+
+pub fn majority(arena: Allocator, completions: []const Record, field: []const u8) Error!usize {
     assert(completions.len > 0);
-    const keys = try arena.alloc(?[]const u8, completions.len);
-    for (completions, keys) |*c, *k| k.* = try normalizedKey(arena, c.get(field) orelse .null);
+    const keys = try arena.alloc(Value, completions.len);
+    for (completions, keys) |*c, *k| k.* = try normalizedKey(arena, c.get(field) orelse return error.MissingVoteField);
     var any_kept = false;
-    for (keys) |k| any_kept = any_kept or k != null;
+    for (keys) |k| any_kept = any_kept or k != .null;
     var best: ?usize = null;
     var best_count: usize = 0;
     for (keys, 0..) |k, i| {
-        if (any_kept and k == null) continue;
+        if (any_kept and k == .null) continue;
         if (firstIndex(keys[0..i], k, any_kept) != null) continue;
         var count: usize = 0;
         for (keys) |other| {
-            if (eqlKey(k, other)) count += 1;
+            if (value.pyEqual(k, other)) count += 1;
         }
         if (count > best_count) {
             best = i;
@@ -93,28 +94,39 @@ pub fn majority(arena: Allocator, completions: []const Record, field: []const u8
     return best.?;
 }
 
-fn firstIndex(keys: []const ?[]const u8, k: ?[]const u8, skip_null: bool) ?usize {
+fn firstIndex(keys: []const Value, k: Value, skip_null: bool) ?usize {
     for (keys, 0..) |other, i| {
-        if (skip_null and other == null) continue;
-        if (eqlKey(k, other)) return i;
+        if (skip_null and other == .null) continue;
+        if (value.pyEqual(k, other)) return i;
     }
     return null;
 }
 
-fn eqlKey(a: ?[]const u8, b: ?[]const u8) bool {
-    if (a == null or b == null) return a == null and b == null;
-    return std.mem.eql(u8, a.?, b.?);
+/// `default_normalize`: text normalization only applies to strings.
+fn normalizedKey(arena: Allocator, v: Value) Error!Value {
+    return switch (v) {
+        .string => |s| blk: {
+            const n = try normalizeText(arena, s);
+            break :blk if (n.len == 0) .null else .{ .string = n };
+        },
+        .array, .object => error.UnhashableVote,
+        else => v,
+    };
 }
 
-/// `default_normalize`: `normalize_text(s) or None`.
-fn normalizedKey(arena: Allocator, v: Value) Allocator.Error!?[]const u8 {
-    if (v == .string) {
-        const n = try normalizeText(arena, v.string);
-        return if (n.len == 0) null else n;
-    }
-    var aw: std.Io.Writer.Allocating = .init(arena);
-    pyjson.writeJson(&aw.writer, v, .compact) catch return error.OutOfMemory;
-    return aw.written();
+test "majority distinguishes text from numbers and groups Python numeric equals" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var records: [3]Record = @splat(.empty);
+    try records[0].put(arena, "answer", .{ .string = "1" });
+    try records[1].put(arena, "answer", .{ .integer = 1 });
+    try records[2].put(arena, "answer", .{ .bool = true });
+    try std.testing.expectEqual(@as(usize, 1), try majority(arena, &records, "answer"));
+    try records[0].put(arena, "answer", .{ .integer = 9_007_199_254_740_993 });
+    try records[1].put(arena, "answer", .{ .integer = 9_007_199_254_740_992 });
+    try records[2].put(arena, "answer", .{ .float = 9_007_199_254_740_992.0 });
+    try std.testing.expectEqual(@as(usize, 1), try majority(arena, &records, "answer"));
 }
 
 pub fn Ensemble(comptime P: type, comptime n: usize) type {
@@ -134,7 +146,7 @@ pub fn Ensemble(comptime P: type, comptime n: usize) type {
         compiled: bool = false,
 
         /// `reduce_fn=dspy.majority`.
-        pub fn forward(self: *const Self, ctx: Context, input: Input) predict.Error!Output {
+        pub fn forward(self: *const Self, ctx: Context, input: Input) (predict.Error || Error)!Output {
             const outputs = try self.forwardAll(ctx, input);
             const records = try ctx.arena.alloc(Record, outputs.len);
             for (outputs, records) |o, *r| r.* = try value.toRecord(ctx.arena, Output, o);

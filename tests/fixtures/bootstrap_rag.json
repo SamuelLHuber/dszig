@@ -44,7 +44,7 @@
         },
         {
           "prefix": "Reasoning:",
-          "description": "${reasoning}"
+          "description": "A short plan for solving the task."
         },
         {
           "prefix": "Answer:",
@@ -57,7 +57,7 @@
   "metadata": {
     "dependency_versions": {
       "python": "3.11",
-      "dspy": "3.4.1",
+      "dspy": "3.5.0",
       "cloudpickle": "3.1"
     }
   }

@@ -1,7 +1,8 @@
-//! Replays the transcript of real gpt-4o-mini calls recorded by DSPy 3.4.1
-//! (tools/dspy_reference/live.py) through DSZig. Every request DSZig sends
-//! must byte-match a recorded DSPy request, every recorded call must be
-//! consumed, and outputs, scores and the compiled artifact must equal DSPy's.
+//! Replays the full deterministic suite recorded independently by DSPy 3.5.0
+//! (tools/dspy_reference/gen_suite_replay.py). This is mock-provider parity,
+//! not live-model evidence. Every request must byte-match DSPy's recording,
+//! every call must be consumed, and outputs, scores and artifacts must agree.
+//! Historical real-model recordings remain unchanged under fixtures/live/.
 
 const std = @import("std");
 const dszig = @import("dszig");
@@ -9,7 +10,7 @@ const suite = @import("live_suite");
 const testing = std.testing;
 const Value = std.json.Value;
 
-const transcript_json = @embedFile("fixtures/live/dspy_gpt-4o-mini.json");
+const transcript_json = @embedFile("fixtures/dspy_3_5_0_mock_suite.json");
 
 fn compact(arena: std.mem.Allocator, v: Value) ![]const u8 {
     var aw: std.Io.Writer.Allocating = .init(arena);
@@ -17,15 +18,27 @@ fn compact(arena: std.mem.Allocator, v: Value) ![]const u8 {
     return aw.written();
 }
 
-test "DSZig reproduces DSPy's real gpt-4o-mini run from its transcript" {
+test "DSZig reproduces DSPy 3.5.0's independently recorded deterministic suite" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const transcript = try std.json.parseFromSliceLeaky(Value, arena, transcript_json, .{});
+    try testing.expectEqualStrings("3.5.0", transcript.object.get("target_dspy").?.string);
+    try testing.expectEqualStrings("dspy 3.5.0 deterministic mock", transcript.object.get("runtime").?.string);
+    const supports_reasoning = transcript.object.get("supports_reasoning").?.bool;
     const calls = try suite.parseCalls(arena, transcript);
-    const used = try arena.alloc(bool, calls.len);
+    // Current-version parity may not use ReplayLM's historical options bypass.
+    for (calls) |call| try testing.expect(call.options != null);
+    const used = try arena.alloc(bool, dszig.lm.ReplayLM.completionCount(calls));
     @memset(used, false);
-    var replay: dszig.lm.ReplayLM = .{ .calls = calls, .used = used };
+    var replay: dszig.lm.ReplayLM = .{
+        .calls = calls,
+        .used = used,
+        .supports_reasoning = supports_reasoning,
+        .supports_response_format = transcript.object.get("supports_response_format").?.bool,
+        .supports_response_schema = transcript.object.get("supports_response_schema").?.bool,
+        .supports_function_calling = transcript.object.get("supports_function_calling").?.bool,
+    };
 
     const result = try suite.run(arena, testing.allocator, replay.lm());
     try testing.expectEqual(@as(usize, 0), replay.misses);
@@ -40,7 +53,7 @@ test "DSZig reproduces DSPy's real gpt-4o-mini run from its transcript" {
             try testing.expectEqualStrings(try compact(arena, outputs), try compact(arena, .{ .object = got.outputs.? }));
         }
     }
-    const mine_json = try suite.writeTranscript(arena, "dszig", "replay", calls, result);
+    const mine_json = try suite.writeTranscript(arena, "dszig", "replay", replay.lm(), calls, result);
     const mine_root = try std.json.parseFromSliceLeaky(std.json.Value, arena, mine_json, .{});
     inline for (suite.pipeline_names) |name| {
         const want = transcript.object.get(name).?.object;

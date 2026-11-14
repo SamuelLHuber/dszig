@@ -1,5 +1,5 @@
 """Records the categorical suggestions of Optuna's TPESampler(seed, multivariate=True),
-driven the way DSPy 3.4.1's MIPROv2 drives it: a default all-zero trial is added
+driven the way DSPy 3.5.0's MIPROv2 drives it: a default all-zero trial is added
 first, then study.optimize suggests one index per parameter in insertion order.
 Objective values are a deterministic function of the choices (with ties, like
 MIPROv2's rounded scores). Usage: gen_optuna.py OUT_DIR"""

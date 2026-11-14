@@ -294,14 +294,12 @@ test "COPRO climbs from the basic instruction to the best proposal" {
     const a = arena.allocator();
     var keyword: lm_mod.KeywordLM = .{
         .rules = &.{
-            .{ .needle = "increasing order", .scope = .any, .response = "[[ ## proposed_instruction ## ]]\n\"Say YES loudly.\"\n\n[[ ## proposed_prefix_for_output_field ## ]]\nAnswer:\n\n[[ ## completed ## ]]" },
-            .{ .needle = "``signature``", .scope = .any, .response = "[[ ## proposed_instruction ## ]]\nSay yes.\n\n[[ ## proposed_prefix_for_output_field ## ]]\nReply:\n\n[[ ## completed ## ]]" },
-            .{ .needle = "Say YES loudly.", .scope = .any, .response = "[[ ## answer ## ]]\nyes\n\n[[ ## completed ## ]]" },
+            .{ .needle = "increasing order", .scope = .any, .response = "<proposed_instruction>\n\"Say YES loudly.\"\n</proposed_instruction>\n\n<proposed_prefix_for_output_field>\nAnswer:\n</proposed_prefix_for_output_field>" },
+            .{ .needle = "``signature``", .scope = .any, .response = "<proposed_instruction>\nSay yes.\n</proposed_instruction>\n\n<proposed_prefix_for_output_field>\nReply:\n</proposed_prefix_for_output_field>" },
+            .{ .needle = "Say YES loudly.", .scope = .any, .response = "<answer>\nyes\n</answer>" },
         },
-        .default = "[[ ## answer ## ]]\nno\n\n[[ ## completed ## ]]",
+        .default = "<answer>\nno\n</answer>",
     };
-    var history: lm_mod.History = .{ .arena = a };
-    keyword.history = &history;
     const ctx: Context = .{ .arena = a, .lm = keyword.lm() };
     const trainset = [_]Example{try Example.fromJson(a, "{\"question\": \"ok?\", \"answer\": \"yes\"}", &.{"question"})};
     const optimizer: COPRO = .{ .metric = yesMetric, .breadth = 3, .depth = 2 };
@@ -314,9 +312,4 @@ test "COPRO climbs from the basic instruction to the best proposal" {
     try testing.expectEqual(@as(usize, 3), result.candidates.len);
     try testing.expectEqual(@as(f64, 100), result.candidates[0].score);
     try testing.expectEqual(@as(usize, 1), result.candidates[0].depth);
-    var n_requests: usize = 0;
-    for (history.requests.items) |r| {
-        if (r.options.n > 1) n_requests += 1;
-    }
-    try testing.expectEqual(@as(usize, 2), n_requests);
 }

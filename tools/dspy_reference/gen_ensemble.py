@@ -1,4 +1,4 @@
-"""Golden fixture for dspy.majority and normalize_text (DSPy 3.4.1).
+"""Golden fixture for dspy.majority and normalize_text (DSPy 3.5.0).
 
 Usage: uv run gen_ensemble.py [out_dir]  (default: ../../tests/fixtures)"""
 

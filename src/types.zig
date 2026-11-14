@@ -104,8 +104,14 @@ fn render(comptime entries: []const Entry) []const u8 {
                 sorted[j - 1] = t;
             }
         }
+        return renderOrdered(&sorted);
+    }
+}
+
+fn renderOrdered(comptime entries: []const Entry) []const u8 {
+    comptime {
         var s: []const u8 = "{";
-        for (sorted, 0..) |e, i| s = s ++ (if (i > 0) ", " else "") ++ "\"" ++ e.key ++ "\": " ++ e.val;
+        for (entries, 0..) |e, i| s = s ++ (if (i > 0) ", " else "") ++ "\"" ++ e.key ++ "\": " ++ e.val;
         return s ++ "}";
     }
 }
@@ -156,7 +162,7 @@ fn hasDefault(comptime S: type, comptime i: usize) bool {
     return @typeInfo(S).@"struct".field_attrs[i].default_value_ptr != null;
 }
 
-fn modelEntries(comptime S: type) []const Entry {
+fn modelEntries(comptime S: type, comptime ordered_properties: bool) []const Entry {
     comptime {
         const info = @typeInfo(S).@"struct";
         var props: [info.field_names.len]Entry = undefined;
@@ -179,7 +185,7 @@ fn modelEntries(comptime S: type) []const Entry {
         const final = props;
         return &.{
             .{ .key = "type", .val = quote("object") },
-            .{ .key = "properties", .val = render(&final) },
+            .{ .key = "properties", .val = if (ordered_properties) renderOrdered(&final) else render(&final) },
             .{ .key = "required", .val = required ++ "]" },
             .{ .key = "title", .val = quote(modelName(S)) },
         };
@@ -209,17 +215,26 @@ fn collectDefs(comptime T: type, comptime seen: []const type) []const type {
 
 /// `json.dumps(_get_json_schema(T))`.
 pub fn schema(comptime T: type) []const u8 {
+    return schemaImpl(T, false);
+}
+
+/// XML and native schemas preserve the model's field declaration order.
+pub fn schemaXml(comptime T: type) []const u8 {
+    return schemaImpl(T, true);
+}
+
+fn schemaImpl(comptime T: type, comptime ordered_properties: bool) []const u8 {
     comptime {
         @setEvalBranchQuota(1_000_000);
         const is_model = isModel(T);
         const all = collectDefs(T, &.{});
         const defs = if (is_model) all[1..] else all;
-        var top: []const Entry = if (is_model) modelEntries(T) else entriesOf(T);
+        var top: []const Entry = if (is_model) modelEntries(T, ordered_properties) else entriesOf(T);
         if (defs.len > 0) {
             var d: [defs.len]Entry = undefined;
             for (defs, 0..) |D, i| {
                 for (defs[0..i]) |E| if (std.mem.eql(u8, modelName(D), modelName(E))) @compileError("dszig: two models named " ++ modelName(D));
-                d[i] = .{ .key = modelName(D), .val = render(modelEntries(D)) };
+                d[i] = .{ .key = modelName(D), .val = render(modelEntries(D, ordered_properties)) };
             }
             const final = d;
             top = top ++ &[_]Entry{.{ .key = "$defs", .val = render(&final) }};

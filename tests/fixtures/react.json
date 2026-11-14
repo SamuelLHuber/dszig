@@ -2,131 +2,817 @@
   {
     "name": "react_tools",
     "max_iters": 5,
+    "tools": [
+      "search",
+      "add"
+    ],
     "calls": [
       {
         "messages": [
           {
             "role": "system",
-            "content": "Your input fields are:\n1. `question` (str): \n2. `trajectory` (str):\nYour output fields are:\n1. `next_thought` (str): \n2. `next_tool_name` (Literal['search', 'add', 'finish']): \n3. `next_tool_args` (dict[str, Any]):\nAll interactions will be structured in the following way, with the appropriate values filled in.\n\n[[ ## question ## ]]\n{question}\n\n[[ ## trajectory ## ]]\n{trajectory}\n\n[[ ## next_thought ## ]]\n{next_thought}\n\n[[ ## next_tool_name ## ]]\n{next_tool_name}        # note: the value you produce must exactly match (no extra characters) one of: search; add; finish\n\n[[ ## next_tool_args ## ]]\n{next_tool_args}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"additionalProperties\": true}\n\n[[ ## completed ## ]]\nIn adhering to this structure, your objective is: \n        Given the fields `question`, produce the fields `answer`.\n        \n        You are an Agent. In each episode, you will be given the fields `question` as input. And you can see your past trajectory so far.\n        Your goal is to use one or more of the supplied tools to collect any necessary information for producing `answer`.\n        \n        To do this, you will interleave next_thought, next_tool_name, and next_tool_args in each turn, and also when finishing the task.\n        After each tool call, you receive a resulting observation, which gets appended to your trajectory.\n        \n        When writing next_thought, you may reason about the current situation and plan for future steps.\n        When selecting the next_tool_name and its next_tool_args, the tool must be one of:\n        \n        (1) search, whose description is <desc>Search the corpus.      Returns passages.</desc>. It takes arguments {'query': {'type': 'string'}}.\n        (2) add. It takes arguments {'a': {'type': 'integer'}, 'b': {'type': 'integer', 'default': 2}}.\n        (3) finish, whose description is <desc>Marks the task as complete. That is, signals that all information for producing the outputs, i.e. `answer`, are now available to be extracted.</desc>. It takes arguments {}.\n        When providing `next_tool_args`, the value inside the field must be in JSON format"
+            "content": "Your input fields are:\n1. `question` (Union[str, NoneType]): \n2. `history` (History): \n3. `tools` (list[Tool]): \n4. `turn_budget` (str): Your current turn and how many turns remain before you must submit.\nYour output fields are:\n1. `next_thought` (str): \n2. `tool_calls` (ToolCalls): \n    Type description of ToolCalls: Tool calls must be a JSON object with `tool_calls`, a list of calls. Each call must include `name` and `args`. Example: {\"tool_calls\": [{\"name\": \"search\", \"args\": {\"query\": \"cats\"}}]}\nOutput format (replace placeholders):\n<next_thought>\n{next_thought}\n</next_thought>\n\n<tool_calls>\n{tool_calls}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"$defs\": {\"ToolCall\": {\"type\": \"object\", \"properties\": {\"args\": {\"type\": \"object\", \"additionalProperties\": true, \"title\": \"Args\"}, \"name\": {\"type\": \"string\", \"title\": \"Name\"}}, \"required\": [\"name\", \"args\"], \"title\": \"ToolCall\"}}, \"properties\": {\"tool_calls\": {\"type\": \"array\", \"items\": {\"$ref\": \"#/$defs/ToolCall\"}, \"title\": \"Tool Calls\"}}, \"required\": [\"tool_calls\"], \"title\": \"ToolCalls\"}\n</tool_calls>\nIn adhering to this structure, your objective is: \n        Given the fields `question`, produce the fields `answer`.\n        You are an Agent. Use the supplied tools to produce `answer` from `question`.\n        Call tools when more information is needed.\n        When the final answer is ready, call `submit` with `answer`.\n        The available tools are: `search`, `add`, `submit`."
           },
           {
             "role": "user",
-            "content": "[[ ## question ## ]]\nWhen did Apollo 11 land?\n\n[[ ## trajectory ## ]]\n\n\nRespond with the corresponding output fields, starting with the field `[[ ## next_thought ## ]]`, then `[[ ## next_tool_name ## ]]` (must be formatted as a valid Python Literal['search', 'add', 'finish']), then `[[ ## next_tool_args ## ]]` (must be formatted as a valid Python dict[str, Any]), and then ending with the marker for `[[ ## completed ## ]]`."
+            "content": "<question>\nWhen did Apollo 11 land?\n</question>\n\n<tools>\n[\"search, whose description is <desc>Search the corpus.      Returns passages.</desc>. It takes arguments {'query': {'type': 'string'}}.\", \"add. It takes arguments {'a': {'type': 'integer'}, 'b': {'type': 'integer', 'default': 2}}.\", \"submit, whose description is <desc>Submit the final outputs for the task.</desc>. It takes arguments {'answer': {'type': 'string', 'description': '${answer}'}}.\"]\n</tools>\n\n<turn_budget>\nTurn 1 of 5 (4 more after this one).\n</turn_budget>\n\nOutput format (replace placeholders):\n<next_thought>\n{next_thought}\n</next_thought>\n\n<tool_calls>\n{tool_calls}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"$defs\": {\"ToolCall\": {\"type\": \"object\", \"properties\": {\"args\": {\"type\": \"object\", \"additionalProperties\": true, \"title\": \"Args\"}, \"name\": {\"type\": \"string\", \"title\": \"Name\"}}, \"required\": [\"name\", \"args\"], \"title\": \"ToolCall\"}}, \"properties\": {\"tool_calls\": {\"type\": \"array\", \"items\": {\"$ref\": \"#/$defs/ToolCall\"}, \"title\": \"Tool Calls\"}}, \"required\": [\"tool_calls\"], \"title\": \"ToolCalls\"}\n</tool_calls>\n\nUse this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping."
           }
         ],
-        "completion": "[[ ## next_thought ## ]]\nSearch first\n\n[[ ## next_tool_name ## ]]\nsearch\n\n[[ ## next_tool_args ## ]]\n{\"query\": \"moon landing\"}"
+        "completion": "<next_thought>\nSearch first\n</next_thought>\n\n<tool_calls>\n{\"tool_calls\": [{\"name\": \"search\", \"args\": {\"query\": \"moon landing\"}}]}\n</tool_calls>"
       },
       {
         "messages": [
           {
             "role": "system",
-            "content": "Your input fields are:\n1. `question` (str): \n2. `trajectory` (str):\nYour output fields are:\n1. `next_thought` (str): \n2. `next_tool_name` (Literal['search', 'add', 'finish']): \n3. `next_tool_args` (dict[str, Any]):\nAll interactions will be structured in the following way, with the appropriate values filled in.\n\n[[ ## question ## ]]\n{question}\n\n[[ ## trajectory ## ]]\n{trajectory}\n\n[[ ## next_thought ## ]]\n{next_thought}\n\n[[ ## next_tool_name ## ]]\n{next_tool_name}        # note: the value you produce must exactly match (no extra characters) one of: search; add; finish\n\n[[ ## next_tool_args ## ]]\n{next_tool_args}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"additionalProperties\": true}\n\n[[ ## completed ## ]]\nIn adhering to this structure, your objective is: \n        Given the fields `question`, produce the fields `answer`.\n        \n        You are an Agent. In each episode, you will be given the fields `question` as input. And you can see your past trajectory so far.\n        Your goal is to use one or more of the supplied tools to collect any necessary information for producing `answer`.\n        \n        To do this, you will interleave next_thought, next_tool_name, and next_tool_args in each turn, and also when finishing the task.\n        After each tool call, you receive a resulting observation, which gets appended to your trajectory.\n        \n        When writing next_thought, you may reason about the current situation and plan for future steps.\n        When selecting the next_tool_name and its next_tool_args, the tool must be one of:\n        \n        (1) search, whose description is <desc>Search the corpus.      Returns passages.</desc>. It takes arguments {'query': {'type': 'string'}}.\n        (2) add. It takes arguments {'a': {'type': 'integer'}, 'b': {'type': 'integer', 'default': 2}}.\n        (3) finish, whose description is <desc>Marks the task as complete. That is, signals that all information for producing the outputs, i.e. `answer`, are now available to be extracted.</desc>. It takes arguments {}.\n        When providing `next_tool_args`, the value inside the field must be in JSON format"
+            "content": "Your input fields are:\n1. `question` (Union[str, NoneType]): \n2. `history` (History): \n3. `tools` (list[Tool]): \n4. `turn_budget` (str): Your current turn and how many turns remain before you must submit.\nYour output fields are:\n1. `next_thought` (str): \n2. `tool_calls` (ToolCalls): \n    Type description of ToolCalls: Tool calls must be a JSON object with `tool_calls`, a list of calls. Each call must include `name` and `args`. Example: {\"tool_calls\": [{\"name\": \"search\", \"args\": {\"query\": \"cats\"}}]}\nOutput format (replace placeholders):\n<next_thought>\n{next_thought}\n</next_thought>\n\n<tool_calls>\n{tool_calls}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"$defs\": {\"ToolCall\": {\"type\": \"object\", \"properties\": {\"args\": {\"type\": \"object\", \"additionalProperties\": true, \"title\": \"Args\"}, \"name\": {\"type\": \"string\", \"title\": \"Name\"}}, \"required\": [\"name\", \"args\"], \"title\": \"ToolCall\"}}, \"properties\": {\"tool_calls\": {\"type\": \"array\", \"items\": {\"$ref\": \"#/$defs/ToolCall\"}, \"title\": \"Tool Calls\"}}, \"required\": [\"tool_calls\"], \"title\": \"ToolCalls\"}\n</tool_calls>\nIn adhering to this structure, your objective is: \n        Given the fields `question`, produce the fields `answer`.\n        You are an Agent. Use the supplied tools to produce `answer` from `question`.\n        Call tools when more information is needed.\n        When the final answer is ready, call `submit` with `answer`.\n        The available tools are: `search`, `add`, `submit`."
           },
           {
             "role": "user",
-            "content": "[[ ## question ## ]]\nWhen did Apollo 11 land?\n\n[[ ## trajectory ## ]]\n[[ ## thought_0 ## ]]\nSearch first\n\n[[ ## tool_name_0 ## ]]\nsearch\n\n[[ ## tool_args_0 ## ]]\n{\"query\": \"moon landing\"}\n\n[[ ## observation_0 ## ]]\n[1] «Apollo 11 landed on the Moon in 1969.»\n[2] «««\n    multi\n    line «x»\n»»»\n\nRespond with the corresponding output fields, starting with the field `[[ ## next_thought ## ]]`, then `[[ ## next_tool_name ## ]]` (must be formatted as a valid Python Literal['search', 'add', 'finish']), then `[[ ## next_tool_args ## ]]` (must be formatted as a valid Python dict[str, Any]), and then ending with the marker for `[[ ## completed ## ]]`."
+            "content": "<question>\nWhen did Apollo 11 land?\n</question>\n\n<turn_budget>\nTurn 1 of 5 (4 more after this one).\n</turn_budget>\n\nOutput format (replace placeholders):\n<next_thought>\n{next_thought}\n</next_thought>\n\n<tool_calls>\n{tool_calls}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"$defs\": {\"ToolCall\": {\"type\": \"object\", \"properties\": {\"args\": {\"type\": \"object\", \"additionalProperties\": true, \"title\": \"Args\"}, \"name\": {\"type\": \"string\", \"title\": \"Name\"}}, \"required\": [\"name\", \"args\"], \"title\": \"ToolCall\"}}, \"properties\": {\"tool_calls\": {\"type\": \"array\", \"items\": {\"$ref\": \"#/$defs/ToolCall\"}, \"title\": \"Tool Calls\"}}, \"required\": [\"tool_calls\"], \"title\": \"ToolCalls\"}\n</tool_calls>\n\nUse this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping."
+          },
+          {
+            "role": "assistant",
+            "content": "<next_thought>\nSearch first\n</next_thought>",
+            "tool_calls": [
+              {
+                "id": "call_0_0",
+                "type": "function",
+                "function": {
+                  "name": "search",
+                  "arguments": "{\"query\":\"moon landing\"}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_0_0",
+            "content": "[\"Apollo 11 landed on the Moon in 1969.\", \"multi\\nline «x»\"]"
+          },
+          {
+            "role": "user",
+            "content": "<tools>\n[\"search, whose description is <desc>Search the corpus.      Returns passages.</desc>. It takes arguments {'query': {'type': 'string'}}.\", \"add. It takes arguments {'a': {'type': 'integer'}, 'b': {'type': 'integer', 'default': 2}}.\", \"submit, whose description is <desc>Submit the final outputs for the task.</desc>. It takes arguments {'answer': {'type': 'string', 'description': '${answer}'}}.\"]\n</tools>\n\n<turn_budget>\nTurn 2 of 5 (3 more after this one).\n</turn_budget>\n\nOutput format (replace placeholders):\n<next_thought>\n{next_thought}\n</next_thought>\n\n<tool_calls>\n{tool_calls}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"$defs\": {\"ToolCall\": {\"type\": \"object\", \"properties\": {\"args\": {\"type\": \"object\", \"additionalProperties\": true, \"title\": \"Args\"}, \"name\": {\"type\": \"string\", \"title\": \"Name\"}}, \"required\": [\"name\", \"args\"], \"title\": \"ToolCall\"}}, \"properties\": {\"tool_calls\": {\"type\": \"array\", \"items\": {\"$ref\": \"#/$defs/ToolCall\"}, \"title\": \"Tool Calls\"}}, \"required\": [\"tool_calls\"], \"title\": \"ToolCalls\"}\n</tool_calls>\n\nUse this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping."
           }
         ],
-        "completion": "[[ ## next_thought ## ]]\nAdd one\n\n[[ ## next_tool_name ## ]]\nadd\n\n[[ ## next_tool_args ## ]]\n{\"a\": 1969, \"b\": 1}"
+        "completion": "<next_thought>\nAdd one\n</next_thought>\n\n<tool_calls>\n{\"tool_calls\": [{\"name\": \"add\", \"args\": {\"a\": 1969, \"b\": 1}}]}\n</tool_calls>"
       },
       {
         "messages": [
           {
             "role": "system",
-            "content": "Your input fields are:\n1. `question` (str): \n2. `trajectory` (str):\nYour output fields are:\n1. `next_thought` (str): \n2. `next_tool_name` (Literal['search', 'add', 'finish']): \n3. `next_tool_args` (dict[str, Any]):\nAll interactions will be structured in the following way, with the appropriate values filled in.\n\n[[ ## question ## ]]\n{question}\n\n[[ ## trajectory ## ]]\n{trajectory}\n\n[[ ## next_thought ## ]]\n{next_thought}\n\n[[ ## next_tool_name ## ]]\n{next_tool_name}        # note: the value you produce must exactly match (no extra characters) one of: search; add; finish\n\n[[ ## next_tool_args ## ]]\n{next_tool_args}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"additionalProperties\": true}\n\n[[ ## completed ## ]]\nIn adhering to this structure, your objective is: \n        Given the fields `question`, produce the fields `answer`.\n        \n        You are an Agent. In each episode, you will be given the fields `question` as input. And you can see your past trajectory so far.\n        Your goal is to use one or more of the supplied tools to collect any necessary information for producing `answer`.\n        \n        To do this, you will interleave next_thought, next_tool_name, and next_tool_args in each turn, and also when finishing the task.\n        After each tool call, you receive a resulting observation, which gets appended to your trajectory.\n        \n        When writing next_thought, you may reason about the current situation and plan for future steps.\n        When selecting the next_tool_name and its next_tool_args, the tool must be one of:\n        \n        (1) search, whose description is <desc>Search the corpus.      Returns passages.</desc>. It takes arguments {'query': {'type': 'string'}}.\n        (2) add. It takes arguments {'a': {'type': 'integer'}, 'b': {'type': 'integer', 'default': 2}}.\n        (3) finish, whose description is <desc>Marks the task as complete. That is, signals that all information for producing the outputs, i.e. `answer`, are now available to be extracted.</desc>. It takes arguments {}.\n        When providing `next_tool_args`, the value inside the field must be in JSON format"
+            "content": "Your input fields are:\n1. `question` (Union[str, NoneType]): \n2. `history` (History): \n3. `tools` (list[Tool]): \n4. `turn_budget` (str): Your current turn and how many turns remain before you must submit.\nYour output fields are:\n1. `next_thought` (str): \n2. `tool_calls` (ToolCalls): \n    Type description of ToolCalls: Tool calls must be a JSON object with `tool_calls`, a list of calls. Each call must include `name` and `args`. Example: {\"tool_calls\": [{\"name\": \"search\", \"args\": {\"query\": \"cats\"}}]}\nOutput format (replace placeholders):\n<next_thought>\n{next_thought}\n</next_thought>\n\n<tool_calls>\n{tool_calls}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"$defs\": {\"ToolCall\": {\"type\": \"object\", \"properties\": {\"args\": {\"type\": \"object\", \"additionalProperties\": true, \"title\": \"Args\"}, \"name\": {\"type\": \"string\", \"title\": \"Name\"}}, \"required\": [\"name\", \"args\"], \"title\": \"ToolCall\"}}, \"properties\": {\"tool_calls\": {\"type\": \"array\", \"items\": {\"$ref\": \"#/$defs/ToolCall\"}, \"title\": \"Tool Calls\"}}, \"required\": [\"tool_calls\"], \"title\": \"ToolCalls\"}\n</tool_calls>\nIn adhering to this structure, your objective is: \n        Given the fields `question`, produce the fields `answer`.\n        You are an Agent. Use the supplied tools to produce `answer` from `question`.\n        Call tools when more information is needed.\n        When the final answer is ready, call `submit` with `answer`.\n        The available tools are: `search`, `add`, `submit`."
           },
           {
             "role": "user",
-            "content": "[[ ## question ## ]]\nWhen did Apollo 11 land?\n\n[[ ## trajectory ## ]]\n[[ ## thought_0 ## ]]\nSearch first\n\n[[ ## tool_name_0 ## ]]\nsearch\n\n[[ ## tool_args_0 ## ]]\n{\"query\": \"moon landing\"}\n\n[[ ## observation_0 ## ]]\n[1] «Apollo 11 landed on the Moon in 1969.»\n[2] «««\n    multi\n    line «x»\n»»»\n\n[[ ## thought_1 ## ]]\nAdd one\n\n[[ ## tool_name_1 ## ]]\nadd\n\n[[ ## tool_args_1 ## ]]\n{\"a\": 1969, \"b\": 1}\n\n[[ ## observation_1 ## ]]\n1970\n\nRespond with the corresponding output fields, starting with the field `[[ ## next_thought ## ]]`, then `[[ ## next_tool_name ## ]]` (must be formatted as a valid Python Literal['search', 'add', 'finish']), then `[[ ## next_tool_args ## ]]` (must be formatted as a valid Python dict[str, Any]), and then ending with the marker for `[[ ## completed ## ]]`."
-          }
-        ],
-        "completion": "[[ ## next_thought ## ]]\nDone\n\n[[ ## next_tool_name ## ]]\nfinish\n\n[[ ## next_tool_args ## ]]\n{}"
-      },
-      {
-        "messages": [
+            "content": "<question>\nWhen did Apollo 11 land?\n</question>\n\n<turn_budget>\nTurn 1 of 5 (4 more after this one).\n</turn_budget>\n\nOutput format (replace placeholders):\n<next_thought>\n{next_thought}\n</next_thought>\n\n<tool_calls>\n{tool_calls}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"$defs\": {\"ToolCall\": {\"type\": \"object\", \"properties\": {\"args\": {\"type\": \"object\", \"additionalProperties\": true, \"title\": \"Args\"}, \"name\": {\"type\": \"string\", \"title\": \"Name\"}}, \"required\": [\"name\", \"args\"], \"title\": \"ToolCall\"}}, \"properties\": {\"tool_calls\": {\"type\": \"array\", \"items\": {\"$ref\": \"#/$defs/ToolCall\"}, \"title\": \"Tool Calls\"}}, \"required\": [\"tool_calls\"], \"title\": \"ToolCalls\"}\n</tool_calls>\n\nUse this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping."
+          },
           {
-            "role": "system",
-            "content": "Your input fields are:\n1. `question` (str): \n2. `trajectory` (str):\nYour output fields are:\n1. `reasoning` (str): \n2. `answer` (str):\nAll interactions will be structured in the following way, with the appropriate values filled in.\n\n[[ ## question ## ]]\n{question}\n\n[[ ## trajectory ## ]]\n{trajectory}\n\n[[ ## reasoning ## ]]\n{reasoning}\n\n[[ ## answer ## ]]\n{answer}\n\n[[ ## completed ## ]]\nIn adhering to this structure, your objective is: \n        Given the fields `question`, produce the fields `answer`."
+            "role": "assistant",
+            "content": "<next_thought>\nSearch first\n</next_thought>",
+            "tool_calls": [
+              {
+                "id": "call_0_0",
+                "type": "function",
+                "function": {
+                  "name": "search",
+                  "arguments": "{\"query\":\"moon landing\"}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_0_0",
+            "content": "[\"Apollo 11 landed on the Moon in 1969.\", \"multi\\nline «x»\"]"
           },
           {
             "role": "user",
-            "content": "[[ ## question ## ]]\nWhen did Apollo 11 land?\n\n[[ ## trajectory ## ]]\n[[ ## thought_0 ## ]]\nSearch first\n\n[[ ## tool_name_0 ## ]]\nsearch\n\n[[ ## tool_args_0 ## ]]\n{\"query\": \"moon landing\"}\n\n[[ ## observation_0 ## ]]\n[1] «Apollo 11 landed on the Moon in 1969.»\n[2] «««\n    multi\n    line «x»\n»»»\n\n[[ ## thought_1 ## ]]\nAdd one\n\n[[ ## tool_name_1 ## ]]\nadd\n\n[[ ## tool_args_1 ## ]]\n{\"a\": 1969, \"b\": 1}\n\n[[ ## observation_1 ## ]]\n1970\n\n[[ ## thought_2 ## ]]\nDone\n\n[[ ## tool_name_2 ## ]]\nfinish\n\n[[ ## tool_args_2 ## ]]\n{}\n\n[[ ## observation_2 ## ]]\nCompleted.\n\nRespond with the corresponding output fields, starting with the field `[[ ## reasoning ## ]]`, then `[[ ## answer ## ]]`, and then ending with the marker for `[[ ## completed ## ]]`."
+            "content": "<turn_budget>\nTurn 2 of 5 (3 more after this one).\n</turn_budget>\n\nOutput format (replace placeholders):\n<next_thought>\n{next_thought}\n</next_thought>\n\n<tool_calls>\n{tool_calls}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"$defs\": {\"ToolCall\": {\"type\": \"object\", \"properties\": {\"args\": {\"type\": \"object\", \"additionalProperties\": true, \"title\": \"Args\"}, \"name\": {\"type\": \"string\", \"title\": \"Name\"}}, \"required\": [\"name\", \"args\"], \"title\": \"ToolCall\"}}, \"properties\": {\"tool_calls\": {\"type\": \"array\", \"items\": {\"$ref\": \"#/$defs/ToolCall\"}, \"title\": \"Tool Calls\"}}, \"required\": [\"tool_calls\"], \"title\": \"ToolCalls\"}\n</tool_calls>\n\nUse this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping."
+          },
+          {
+            "role": "assistant",
+            "content": "<next_thought>\nAdd one\n</next_thought>",
+            "tool_calls": [
+              {
+                "id": "call_1_0",
+                "type": "function",
+                "function": {
+                  "name": "add",
+                  "arguments": "{\"a\":1969,\"b\":1}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_1_0",
+            "content": "1970"
+          },
+          {
+            "role": "user",
+            "content": "<tools>\n[\"search, whose description is <desc>Search the corpus.      Returns passages.</desc>. It takes arguments {'query': {'type': 'string'}}.\", \"add. It takes arguments {'a': {'type': 'integer'}, 'b': {'type': 'integer', 'default': 2}}.\", \"submit, whose description is <desc>Submit the final outputs for the task.</desc>. It takes arguments {'answer': {'type': 'string', 'description': '${answer}'}}.\"]\n</tools>\n\n<turn_budget>\nTurn 3 of 5 (2 more after this one).\n</turn_budget>\n\nOutput format (replace placeholders):\n<next_thought>\n{next_thought}\n</next_thought>\n\n<tool_calls>\n{tool_calls}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"$defs\": {\"ToolCall\": {\"type\": \"object\", \"properties\": {\"args\": {\"type\": \"object\", \"additionalProperties\": true, \"title\": \"Args\"}, \"name\": {\"type\": \"string\", \"title\": \"Name\"}}, \"required\": [\"name\", \"args\"], \"title\": \"ToolCall\"}}, \"properties\": {\"tool_calls\": {\"type\": \"array\", \"items\": {\"$ref\": \"#/$defs/ToolCall\"}, \"title\": \"Tool Calls\"}}, \"required\": [\"tool_calls\"], \"title\": \"ToolCalls\"}\n</tool_calls>\n\nUse this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping."
           }
         ],
-        "completion": "[[ ## reasoning ## ]]\nFound 1969\n\n[[ ## answer ## ]]\n1969"
+        "completion": "<next_thought>\nDone\n</next_thought>\n\n<tool_calls>\n{\"tool_calls\": [{\"name\": \"submit\", \"args\": {\"answer\": \"1969\"}}]}\n</tool_calls>"
       }
     ],
-    "trajectory": {
-      "thought_0": "Search first",
-      "tool_name_0": "search",
-      "tool_args_0": {
-        "query": "moon landing"
-      },
-      "observation_0": [
-        "Apollo 11 landed on the Moon in 1969.",
-        "multi\nline «x»"
-      ],
-      "thought_1": "Add one",
-      "tool_name_1": "add",
-      "tool_args_1": {
-        "a": 1969,
-        "b": 1
-      },
-      "observation_1": 1970,
-      "thought_2": "Done",
-      "tool_name_2": "finish",
-      "tool_args_2": {},
-      "observation_2": "Completed."
+    "history": {
+      "messages": [
+        {
+          "question": "When did Apollo 11 land?",
+          "turn_budget": "Turn 1 of 5 (4 more after this one).",
+          "next_thought": "Search first",
+          "tool_calls": {
+            "tool_calls": [
+              {
+                "id": "call_0_0",
+                "name": "search",
+                "args": {
+                  "query": "moon landing"
+                }
+              }
+            ],
+            "tool_call_results": {
+              "tool_call_results": [
+                {
+                  "call_id": "call_0_0",
+                  "name": "search",
+                  "value": [
+                    "Apollo 11 landed on the Moon in 1969.",
+                    "multi\nline «x»"
+                  ],
+                  "is_error": false
+                }
+              ]
+            }
+          }
+        },
+        {
+          "turn_budget": "Turn 2 of 5 (3 more after this one).",
+          "next_thought": "Add one",
+          "tool_calls": {
+            "tool_calls": [
+              {
+                "id": "call_1_0",
+                "name": "add",
+                "args": {
+                  "a": 1969,
+                  "b": 1
+                }
+              }
+            ],
+            "tool_call_results": {
+              "tool_call_results": [
+                {
+                  "call_id": "call_1_0",
+                  "name": "add",
+                  "value": 1970,
+                  "is_error": false
+                }
+              ]
+            }
+          }
+        },
+        {
+          "turn_budget": "Turn 3 of 5 (2 more after this one).",
+          "next_thought": "Done",
+          "tool_calls": {
+            "tool_calls": [
+              {
+                "id": "call_2_0",
+                "name": "submit",
+                "args": {
+                  "answer": "1969"
+                }
+              }
+            ],
+            "tool_call_results": {
+              "tool_call_results": [
+                {
+                  "call_id": "call_2_0",
+                  "name": "submit",
+                  "value": {
+                    "answer": "1969"
+                  },
+                  "is_error": false
+                }
+              ]
+            }
+          },
+          "answer": "1969"
+        }
+      ]
     },
+    "termination_reason": "submit",
     "outputs": {
-      "reasoning": "Found 1969",
       "answer": "1969"
     }
   },
   {
     "name": "react_max_iters",
     "max_iters": 1,
+    "tools": [
+      "search"
+    ],
     "calls": [
       {
         "messages": [
           {
             "role": "system",
-            "content": "Your input fields are:\n1. `question` (str): \n2. `trajectory` (str):\nYour output fields are:\n1. `next_thought` (str): \n2. `next_tool_name` (Literal['search', 'finish']): \n3. `next_tool_args` (dict[str, Any]):\nAll interactions will be structured in the following way, with the appropriate values filled in.\n\n[[ ## question ## ]]\n{question}\n\n[[ ## trajectory ## ]]\n{trajectory}\n\n[[ ## next_thought ## ]]\n{next_thought}\n\n[[ ## next_tool_name ## ]]\n{next_tool_name}        # note: the value you produce must exactly match (no extra characters) one of: search; finish\n\n[[ ## next_tool_args ## ]]\n{next_tool_args}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"additionalProperties\": true}\n\n[[ ## completed ## ]]\nIn adhering to this structure, your objective is: \n        Given the fields `question`, produce the fields `answer`.\n        \n        You are an Agent. In each episode, you will be given the fields `question` as input. And you can see your past trajectory so far.\n        Your goal is to use one or more of the supplied tools to collect any necessary information for producing `answer`.\n        \n        To do this, you will interleave next_thought, next_tool_name, and next_tool_args in each turn, and also when finishing the task.\n        After each tool call, you receive a resulting observation, which gets appended to your trajectory.\n        \n        When writing next_thought, you may reason about the current situation and plan for future steps.\n        When selecting the next_tool_name and its next_tool_args, the tool must be one of:\n        \n        (1) search, whose description is <desc>Search the corpus.      Returns passages.</desc>. It takes arguments {'query': {'type': 'string'}}.\n        (2) finish, whose description is <desc>Marks the task as complete. That is, signals that all information for producing the outputs, i.e. `answer`, are now available to be extracted.</desc>. It takes arguments {}.\n        When providing `next_tool_args`, the value inside the field must be in JSON format"
+            "content": "Your input fields are:\n1. `question` (Union[str, NoneType]): \n2. `history` (History): \n3. `tools` (list[Tool]): \n4. `turn_budget` (str): Your current turn and how many turns remain before you must submit.\nYour output fields are:\n1. `next_thought` (str): \n2. `tool_calls` (ToolCalls): \n    Type description of ToolCalls: Tool calls must be a JSON object with `tool_calls`, a list of calls. Each call must include `name` and `args`. Example: {\"tool_calls\": [{\"name\": \"search\", \"args\": {\"query\": \"cats\"}}]}\nOutput format (replace placeholders):\n<next_thought>\n{next_thought}\n</next_thought>\n\n<tool_calls>\n{tool_calls}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"$defs\": {\"ToolCall\": {\"type\": \"object\", \"properties\": {\"args\": {\"type\": \"object\", \"additionalProperties\": true, \"title\": \"Args\"}, \"name\": {\"type\": \"string\", \"title\": \"Name\"}}, \"required\": [\"name\", \"args\"], \"title\": \"ToolCall\"}}, \"properties\": {\"tool_calls\": {\"type\": \"array\", \"items\": {\"$ref\": \"#/$defs/ToolCall\"}, \"title\": \"Tool Calls\"}}, \"required\": [\"tool_calls\"], \"title\": \"ToolCalls\"}\n</tool_calls>\nIn adhering to this structure, your objective is: \n        Given the fields `question`, produce the fields `answer`.\n        You are an Agent. Use the supplied tools to produce `answer` from `question`.\n        Call tools when more information is needed.\n        When the final answer is ready, call `submit` with `answer`.\n        The available tools are: `search`, `submit`."
           },
           {
             "role": "user",
-            "content": "[[ ## question ## ]]\nWhen did Apollo 11 land?\n\n[[ ## trajectory ## ]]\n\n\nRespond with the corresponding output fields, starting with the field `[[ ## next_thought ## ]]`, then `[[ ## next_tool_name ## ]]` (must be formatted as a valid Python Literal['search', 'finish']), then `[[ ## next_tool_args ## ]]` (must be formatted as a valid Python dict[str, Any]), and then ending with the marker for `[[ ## completed ## ]]`."
+            "content": "<question>\nWhen did Apollo 11 land?\n</question>\n\n<tools>\n[\"search, whose description is <desc>Search the corpus.      Returns passages.</desc>. It takes arguments {'query': {'type': 'string'}}.\", \"submit, whose description is <desc>Submit the final outputs for the task.</desc>. It takes arguments {'answer': {'type': 'string', 'description': '${answer}'}}.\"]\n</tools>\n\n<turn_budget>\nTurn 1 of 1 (this is your last turn).\n</turn_budget>\n\nOutput format (replace placeholders):\n<next_thought>\n{next_thought}\n</next_thought>\n\n<tool_calls>\n{tool_calls}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"$defs\": {\"ToolCall\": {\"type\": \"object\", \"properties\": {\"args\": {\"type\": \"object\", \"additionalProperties\": true, \"title\": \"Args\"}, \"name\": {\"type\": \"string\", \"title\": \"Name\"}}, \"required\": [\"name\", \"args\"], \"title\": \"ToolCall\"}}, \"properties\": {\"tool_calls\": {\"type\": \"array\", \"items\": {\"$ref\": \"#/$defs/ToolCall\"}, \"title\": \"Tool Calls\"}}, \"required\": [\"tool_calls\"], \"title\": \"ToolCalls\"}\n</tool_calls>\n\nUse this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping."
           }
         ],
-        "completion": "[[ ## next_thought ## ]]\nSearch\n\n[[ ## next_tool_name ## ]]\nsearch\n\n[[ ## next_tool_args ## ]]\n{\"query\": \"moon\"}"
+        "completion": "<next_thought>\nSearch\n</next_thought>\n\n<tool_calls>\n{\"tool_calls\": [{\"name\": \"search\", \"args\": {\"query\": \"moon\"}}]}\n</tool_calls>"
       },
       {
         "messages": [
           {
             "role": "system",
-            "content": "Your input fields are:\n1. `question` (str): \n2. `trajectory` (str):\nYour output fields are:\n1. `reasoning` (str): \n2. `answer` (str):\nAll interactions will be structured in the following way, with the appropriate values filled in.\n\n[[ ## question ## ]]\n{question}\n\n[[ ## trajectory ## ]]\n{trajectory}\n\n[[ ## reasoning ## ]]\n{reasoning}\n\n[[ ## answer ## ]]\n{answer}\n\n[[ ## completed ## ]]\nIn adhering to this structure, your objective is: \n        Given the fields `question`, produce the fields `answer`."
+            "content": "Your input fields are:\n1. `question` (Union[str, NoneType]): \n2. `history` (History): \n3. `tools` (list[Tool]): \n4. `turn_budget` (str): Your current turn and how many turns remain before you must submit.\nYour output fields are:\n1. `next_thought` (str): \n2. `tool_calls` (ToolCalls): \n    Type description of ToolCalls: Tool calls must be a JSON object with `tool_calls`, a list of calls. Each call must include `name` and `args`. Example: {\"tool_calls\": [{\"name\": \"search\", \"args\": {\"query\": \"cats\"}}]}\nOutput format (replace placeholders):\n<next_thought>\n{next_thought}\n</next_thought>\n\n<tool_calls>\n{tool_calls}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"$defs\": {\"ToolCall\": {\"type\": \"object\", \"properties\": {\"args\": {\"type\": \"object\", \"additionalProperties\": true, \"title\": \"Args\"}, \"name\": {\"type\": \"string\", \"title\": \"Name\"}}, \"required\": [\"name\", \"args\"], \"title\": \"ToolCall\"}}, \"properties\": {\"tool_calls\": {\"type\": \"array\", \"items\": {\"$ref\": \"#/$defs/ToolCall\"}, \"title\": \"Tool Calls\"}}, \"required\": [\"tool_calls\"], \"title\": \"ToolCalls\"}\n</tool_calls>\nIn adhering to this structure, your objective is: \n        Given the fields `question`, produce the fields `answer`.\n        You are an Agent. Use the supplied tools to produce `answer` from `question`.\n        Call tools when more information is needed.\n        When the final answer is ready, call `submit` with `answer`.\n        The available tools are: `search`, `submit`."
           },
           {
             "role": "user",
-            "content": "[[ ## question ## ]]\nWhen did Apollo 11 land?\n\n[[ ## trajectory ## ]]\n[[ ## thought_0 ## ]]\nSearch\n\n[[ ## tool_name_0 ## ]]\nsearch\n\n[[ ## tool_args_0 ## ]]\n{\"query\": \"moon\"}\n\n[[ ## observation_0 ## ]]\n[1] «Apollo 11 landed on the Moon in 1969.»\n[2] «««\n    multi\n    line «x»\n»»»\n\nRespond with the corresponding output fields, starting with the field `[[ ## reasoning ## ]]`, then `[[ ## answer ## ]]`, and then ending with the marker for `[[ ## completed ## ]]`."
+            "content": "<question>\nWhen did Apollo 11 land?\n</question>\n\n<turn_budget>\nTurn 1 of 1 (this is your last turn).\n</turn_budget>\n\nOutput format (replace placeholders):\n<next_thought>\n{next_thought}\n</next_thought>\n\n<tool_calls>\n{tool_calls}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"$defs\": {\"ToolCall\": {\"type\": \"object\", \"properties\": {\"args\": {\"type\": \"object\", \"additionalProperties\": true, \"title\": \"Args\"}, \"name\": {\"type\": \"string\", \"title\": \"Name\"}}, \"required\": [\"name\", \"args\"], \"title\": \"ToolCall\"}}, \"properties\": {\"tool_calls\": {\"type\": \"array\", \"items\": {\"$ref\": \"#/$defs/ToolCall\"}, \"title\": \"Tool Calls\"}}, \"required\": [\"tool_calls\"], \"title\": \"ToolCalls\"}\n</tool_calls>\n\nUse this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping."
+          },
+          {
+            "role": "assistant",
+            "content": "<next_thought>\nSearch\n</next_thought>",
+            "tool_calls": [
+              {
+                "id": "call_0_0",
+                "type": "function",
+                "function": {
+                  "name": "search",
+                  "arguments": "{\"query\":\"moon\"}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_0_0",
+            "content": "[\"Apollo 11 landed on the Moon in 1969.\", \"multi\\nline «x»\"]"
+          },
+          {
+            "role": "user",
+            "content": "<tools>\n[\"search, whose description is <desc>Search the corpus.      Returns passages.</desc>. It takes arguments {'query': {'type': 'string'}}.\", \"submit, whose description is <desc>Submit the final outputs for the task.</desc>. It takes arguments {'answer': {'type': 'string', 'description': '${answer}'}}.\"]\n</tools>\n\n<turn_budget>\nNo turns remain. Call `submit` now with your final outputs.\n</turn_budget>\n\nOutput format (replace placeholders):\n<next_thought>\n{next_thought}\n</next_thought>\n\n<tool_calls>\n{tool_calls}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"$defs\": {\"ToolCall\": {\"type\": \"object\", \"properties\": {\"args\": {\"type\": \"object\", \"additionalProperties\": true, \"title\": \"Args\"}, \"name\": {\"type\": \"string\", \"title\": \"Name\"}}, \"required\": [\"name\", \"args\"], \"title\": \"ToolCall\"}}, \"properties\": {\"tool_calls\": {\"type\": \"array\", \"items\": {\"$ref\": \"#/$defs/ToolCall\"}, \"title\": \"Tool Calls\"}}, \"required\": [\"tool_calls\"], \"title\": \"ToolCalls\"}\n</tool_calls>\n\nUse this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping."
           }
         ],
-        "completion": "[[ ## reasoning ## ]]\nOut of steps\n\n[[ ## answer ## ]]\n1969"
+        "completion": "<next_thought>\nOut of steps\n</next_thought>\n\n<tool_calls>\n{\"tool_calls\": [{\"name\": \"search\", \"args\": {\"query\": \"ignored in forced submit\"}}, {\"name\": \"submit\", \"args\": {\"answer\": \"1969\"}}]}\n</tool_calls>"
       }
     ],
-    "trajectory": {
-      "thought_0": "Search",
-      "tool_name_0": "search",
-      "tool_args_0": {
-        "query": "moon"
-      },
-      "observation_0": [
-        "Apollo 11 landed on the Moon in 1969.",
-        "multi\nline «x»"
+    "history": {
+      "messages": [
+        {
+          "question": "When did Apollo 11 land?",
+          "turn_budget": "Turn 1 of 1 (this is your last turn).",
+          "next_thought": "Search",
+          "tool_calls": {
+            "tool_calls": [
+              {
+                "id": "call_0_0",
+                "name": "search",
+                "args": {
+                  "query": "moon"
+                }
+              }
+            ],
+            "tool_call_results": {
+              "tool_call_results": [
+                {
+                  "call_id": "call_0_0",
+                  "name": "search",
+                  "value": [
+                    "Apollo 11 landed on the Moon in 1969.",
+                    "multi\nline «x»"
+                  ],
+                  "is_error": false
+                }
+              ]
+            }
+          }
+        },
+        {
+          "turn_budget": "No turns remain. Call `submit` now with your final outputs.",
+          "next_thought": "Out of steps",
+          "tool_calls": {
+            "tool_calls": [
+              {
+                "id": "call_1_1",
+                "name": "submit",
+                "args": {
+                  "answer": "1969"
+                }
+              }
+            ],
+            "tool_call_results": {
+              "tool_call_results": [
+                {
+                  "call_id": "call_1_1",
+                  "name": "submit",
+                  "value": {
+                    "answer": "1969"
+                  },
+                  "is_error": false
+                }
+              ]
+            }
+          },
+          "answer": "1969"
+        }
       ]
     },
+    "termination_reason": "forced_submit",
     "outputs": {
-      "reasoning": "Out of steps",
+      "answer": "1969"
+    }
+  },
+  {
+    "name": "react_batched",
+    "max_iters": 3,
+    "tools": [
+      "search",
+      "add"
+    ],
+    "calls": [
+      {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Your input fields are:\n1. `question` (Union[str, NoneType]): \n2. `history` (History): \n3. `tools` (list[Tool]): \n4. `turn_budget` (str): Your current turn and how many turns remain before you must submit.\nYour output fields are:\n1. `next_thought` (str): \n2. `tool_calls` (ToolCalls): \n    Type description of ToolCalls: Tool calls must be a JSON object with `tool_calls`, a list of calls. Each call must include `name` and `args`. Example: {\"tool_calls\": [{\"name\": \"search\", \"args\": {\"query\": \"cats\"}}]}\nOutput format (replace placeholders):\n<next_thought>\n{next_thought}\n</next_thought>\n\n<tool_calls>\n{tool_calls}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"$defs\": {\"ToolCall\": {\"type\": \"object\", \"properties\": {\"args\": {\"type\": \"object\", \"additionalProperties\": true, \"title\": \"Args\"}, \"name\": {\"type\": \"string\", \"title\": \"Name\"}}, \"required\": [\"name\", \"args\"], \"title\": \"ToolCall\"}}, \"properties\": {\"tool_calls\": {\"type\": \"array\", \"items\": {\"$ref\": \"#/$defs/ToolCall\"}, \"title\": \"Tool Calls\"}}, \"required\": [\"tool_calls\"], \"title\": \"ToolCalls\"}\n</tool_calls>\nIn adhering to this structure, your objective is: \n        Given the fields `question`, produce the fields `answer`.\n        You are an Agent. Use the supplied tools to produce `answer` from `question`.\n        Call tools when more information is needed.\n        When the final answer is ready, call `submit` with `answer`.\n        The available tools are: `search`, `add`, `submit`."
+          },
+          {
+            "role": "user",
+            "content": "<question>\nWhen did Apollo 11 land?\n</question>\n\n<tools>\n[\"search, whose description is <desc>Search the corpus.      Returns passages.</desc>. It takes arguments {'query': {'type': 'string'}}.\", \"add. It takes arguments {'a': {'type': 'integer'}, 'b': {'type': 'integer', 'default': 2}}.\", \"submit, whose description is <desc>Submit the final outputs for the task.</desc>. It takes arguments {'answer': {'type': 'string', 'description': '${answer}'}}.\"]\n</tools>\n\n<turn_budget>\nTurn 1 of 3 (2 more after this one).\n</turn_budget>\n\nOutput format (replace placeholders):\n<next_thought>\n{next_thought}\n</next_thought>\n\n<tool_calls>\n{tool_calls}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"$defs\": {\"ToolCall\": {\"type\": \"object\", \"properties\": {\"args\": {\"type\": \"object\", \"additionalProperties\": true, \"title\": \"Args\"}, \"name\": {\"type\": \"string\", \"title\": \"Name\"}}, \"required\": [\"name\", \"args\"], \"title\": \"ToolCall\"}}, \"properties\": {\"tool_calls\": {\"type\": \"array\", \"items\": {\"$ref\": \"#/$defs/ToolCall\"}, \"title\": \"Tool Calls\"}}, \"required\": [\"tool_calls\"], \"title\": \"ToolCalls\"}\n</tool_calls>\n\nUse this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping."
+          }
+        ],
+        "completion": "<next_thought>\nSearch and calculate\n</next_thought>\n\n<tool_calls>\n{\"tool_calls\": [{\"name\": \"search\", \"args\": {\"query\": \"moon\"}, \"id\": \"search-id\"}, {\"name\": \"add\", \"args\": {\"a\": 1968, \"b\": 1}, \"id\": \"add-id\"}]}\n</tool_calls>"
+      },
+      {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Your input fields are:\n1. `question` (Union[str, NoneType]): \n2. `history` (History): \n3. `tools` (list[Tool]): \n4. `turn_budget` (str): Your current turn and how many turns remain before you must submit.\nYour output fields are:\n1. `next_thought` (str): \n2. `tool_calls` (ToolCalls): \n    Type description of ToolCalls: Tool calls must be a JSON object with `tool_calls`, a list of calls. Each call must include `name` and `args`. Example: {\"tool_calls\": [{\"name\": \"search\", \"args\": {\"query\": \"cats\"}}]}\nOutput format (replace placeholders):\n<next_thought>\n{next_thought}\n</next_thought>\n\n<tool_calls>\n{tool_calls}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"$defs\": {\"ToolCall\": {\"type\": \"object\", \"properties\": {\"args\": {\"type\": \"object\", \"additionalProperties\": true, \"title\": \"Args\"}, \"name\": {\"type\": \"string\", \"title\": \"Name\"}}, \"required\": [\"name\", \"args\"], \"title\": \"ToolCall\"}}, \"properties\": {\"tool_calls\": {\"type\": \"array\", \"items\": {\"$ref\": \"#/$defs/ToolCall\"}, \"title\": \"Tool Calls\"}}, \"required\": [\"tool_calls\"], \"title\": \"ToolCalls\"}\n</tool_calls>\nIn adhering to this structure, your objective is: \n        Given the fields `question`, produce the fields `answer`.\n        You are an Agent. Use the supplied tools to produce `answer` from `question`.\n        Call tools when more information is needed.\n        When the final answer is ready, call `submit` with `answer`.\n        The available tools are: `search`, `add`, `submit`."
+          },
+          {
+            "role": "user",
+            "content": "<question>\nWhen did Apollo 11 land?\n</question>\n\n<turn_budget>\nTurn 1 of 3 (2 more after this one).\n</turn_budget>\n\nOutput format (replace placeholders):\n<next_thought>\n{next_thought}\n</next_thought>\n\n<tool_calls>\n{tool_calls}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"$defs\": {\"ToolCall\": {\"type\": \"object\", \"properties\": {\"args\": {\"type\": \"object\", \"additionalProperties\": true, \"title\": \"Args\"}, \"name\": {\"type\": \"string\", \"title\": \"Name\"}}, \"required\": [\"name\", \"args\"], \"title\": \"ToolCall\"}}, \"properties\": {\"tool_calls\": {\"type\": \"array\", \"items\": {\"$ref\": \"#/$defs/ToolCall\"}, \"title\": \"Tool Calls\"}}, \"required\": [\"tool_calls\"], \"title\": \"ToolCalls\"}\n</tool_calls>\n\nUse this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping."
+          },
+          {
+            "role": "assistant",
+            "content": "<next_thought>\nSearch and calculate\n</next_thought>",
+            "tool_calls": [
+              {
+                "id": "search-id",
+                "type": "function",
+                "function": {
+                  "name": "search",
+                  "arguments": "{\"query\":\"moon\"}"
+                }
+              },
+              {
+                "id": "add-id",
+                "type": "function",
+                "function": {
+                  "name": "add",
+                  "arguments": "{\"a\":1968,\"b\":1}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "search-id",
+            "content": "[\"Apollo 11 landed on the Moon in 1969.\", \"multi\\nline «x»\"]"
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "add-id",
+            "content": "1969"
+          },
+          {
+            "role": "user",
+            "content": "<tools>\n[\"search, whose description is <desc>Search the corpus.      Returns passages.</desc>. It takes arguments {'query': {'type': 'string'}}.\", \"add. It takes arguments {'a': {'type': 'integer'}, 'b': {'type': 'integer', 'default': 2}}.\", \"submit, whose description is <desc>Submit the final outputs for the task.</desc>. It takes arguments {'answer': {'type': 'string', 'description': '${answer}'}}.\"]\n</tools>\n\n<turn_budget>\nTurn 2 of 3 (1 more after this one).\n</turn_budget>\n\nOutput format (replace placeholders):\n<next_thought>\n{next_thought}\n</next_thought>\n\n<tool_calls>\n{tool_calls}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"$defs\": {\"ToolCall\": {\"type\": \"object\", \"properties\": {\"args\": {\"type\": \"object\", \"additionalProperties\": true, \"title\": \"Args\"}, \"name\": {\"type\": \"string\", \"title\": \"Name\"}}, \"required\": [\"name\", \"args\"], \"title\": \"ToolCall\"}}, \"properties\": {\"tool_calls\": {\"type\": \"array\", \"items\": {\"$ref\": \"#/$defs/ToolCall\"}, \"title\": \"Tool Calls\"}}, \"required\": [\"tool_calls\"], \"title\": \"ToolCalls\"}\n</tool_calls>\n\nUse this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping."
+          }
+        ],
+        "completion": "<next_thought>\nDone\n</next_thought>\n\n<tool_calls>\n{\"tool_calls\": [{\"name\": \"submit\", \"args\": {\"answer\": \"1969\"}, \"id\": \"submit-id\"}]}\n</tool_calls>"
+      }
+    ],
+    "history": {
+      "messages": [
+        {
+          "question": "When did Apollo 11 land?",
+          "turn_budget": "Turn 1 of 3 (2 more after this one).",
+          "next_thought": "Search and calculate",
+          "tool_calls": {
+            "tool_calls": [
+              {
+                "id": "search-id",
+                "name": "search",
+                "args": {
+                  "query": "moon"
+                }
+              },
+              {
+                "id": "add-id",
+                "name": "add",
+                "args": {
+                  "a": 1968,
+                  "b": 1
+                }
+              }
+            ],
+            "tool_call_results": {
+              "tool_call_results": [
+                {
+                  "call_id": "search-id",
+                  "name": "search",
+                  "value": [
+                    "Apollo 11 landed on the Moon in 1969.",
+                    "multi\nline «x»"
+                  ],
+                  "is_error": false
+                },
+                {
+                  "call_id": "add-id",
+                  "name": "add",
+                  "value": 1969,
+                  "is_error": false
+                }
+              ]
+            }
+          }
+        },
+        {
+          "turn_budget": "Turn 2 of 3 (1 more after this one).",
+          "next_thought": "Done",
+          "tool_calls": {
+            "tool_calls": [
+              {
+                "id": "submit-id",
+                "name": "submit",
+                "args": {
+                  "answer": "1969"
+                }
+              }
+            ],
+            "tool_call_results": {
+              "tool_call_results": [
+                {
+                  "call_id": "submit-id",
+                  "name": "submit",
+                  "value": {
+                    "answer": "1969"
+                  },
+                  "is_error": false
+                }
+              ]
+            }
+          },
+          "answer": "1969"
+        }
+      ]
+    },
+    "termination_reason": "submit",
+    "outputs": {
+      "answer": "1969"
+    }
+  },
+  {
+    "name": "react_empty_tool_calls",
+    "max_iters": 3,
+    "tools": [
+      "search"
+    ],
+    "calls": [
+      {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Your input fields are:\n1. `question` (Union[str, NoneType]): \n2. `history` (History): \n3. `tools` (list[Tool]): \n4. `turn_budget` (str): Your current turn and how many turns remain before you must submit.\nYour output fields are:\n1. `next_thought` (str): \n2. `tool_calls` (ToolCalls): \n    Type description of ToolCalls: Tool calls must be a JSON object with `tool_calls`, a list of calls. Each call must include `name` and `args`. Example: {\"tool_calls\": [{\"name\": \"search\", \"args\": {\"query\": \"cats\"}}]}\nOutput format (replace placeholders):\n<next_thought>\n{next_thought}\n</next_thought>\n\n<tool_calls>\n{tool_calls}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"$defs\": {\"ToolCall\": {\"type\": \"object\", \"properties\": {\"args\": {\"type\": \"object\", \"additionalProperties\": true, \"title\": \"Args\"}, \"name\": {\"type\": \"string\", \"title\": \"Name\"}}, \"required\": [\"name\", \"args\"], \"title\": \"ToolCall\"}}, \"properties\": {\"tool_calls\": {\"type\": \"array\", \"items\": {\"$ref\": \"#/$defs/ToolCall\"}, \"title\": \"Tool Calls\"}}, \"required\": [\"tool_calls\"], \"title\": \"ToolCalls\"}\n</tool_calls>\nIn adhering to this structure, your objective is: \n        Given the fields `question`, produce the fields `answer`.\n        You are an Agent. Use the supplied tools to produce `answer` from `question`.\n        Call tools when more information is needed.\n        When the final answer is ready, call `submit` with `answer`.\n        The available tools are: `search`, `submit`."
+          },
+          {
+            "role": "user",
+            "content": "<question>\nWhen did Apollo 11 land?\n</question>\n\n<tools>\n[\"search, whose description is <desc>Search the corpus.      Returns passages.</desc>. It takes arguments {'query': {'type': 'string'}}.\", \"submit, whose description is <desc>Submit the final outputs for the task.</desc>. It takes arguments {'answer': {'type': 'string', 'description': '${answer}'}}.\"]\n</tools>\n\n<turn_budget>\nTurn 1 of 3 (2 more after this one).\n</turn_budget>\n\nOutput format (replace placeholders):\n<next_thought>\n{next_thought}\n</next_thought>\n\n<tool_calls>\n{tool_calls}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"$defs\": {\"ToolCall\": {\"type\": \"object\", \"properties\": {\"args\": {\"type\": \"object\", \"additionalProperties\": true, \"title\": \"Args\"}, \"name\": {\"type\": \"string\", \"title\": \"Name\"}}, \"required\": [\"name\", \"args\"], \"title\": \"ToolCall\"}}, \"properties\": {\"tool_calls\": {\"type\": \"array\", \"items\": {\"$ref\": \"#/$defs/ToolCall\"}, \"title\": \"Tool Calls\"}}, \"required\": [\"tool_calls\"], \"title\": \"ToolCalls\"}\n</tool_calls>\n\nUse this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping."
+          }
+        ],
+        "completion": "<next_thought>\nNo call\n</next_thought>\n\n<tool_calls>\n{\"tool_calls\": []}\n</tool_calls>"
+      },
+      {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Your input fields are:\n1. `question` (Union[str, NoneType]): \n2. `history` (History): \n3. `tools` (list[Tool]): \n4. `turn_budget` (str): Your current turn and how many turns remain before you must submit.\nYour output fields are:\n1. `next_thought` (str): \n2. `tool_calls` (ToolCalls): \n    Type description of ToolCalls: Tool calls must be a JSON object with `tool_calls`, a list of calls. Each call must include `name` and `args`. Example: {\"tool_calls\": [{\"name\": \"search\", \"args\": {\"query\": \"cats\"}}]}\nOutput format (replace placeholders):\n<next_thought>\n{next_thought}\n</next_thought>\n\n<tool_calls>\n{tool_calls}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"$defs\": {\"ToolCall\": {\"type\": \"object\", \"properties\": {\"args\": {\"type\": \"object\", \"additionalProperties\": true, \"title\": \"Args\"}, \"name\": {\"type\": \"string\", \"title\": \"Name\"}}, \"required\": [\"name\", \"args\"], \"title\": \"ToolCall\"}}, \"properties\": {\"tool_calls\": {\"type\": \"array\", \"items\": {\"$ref\": \"#/$defs/ToolCall\"}, \"title\": \"Tool Calls\"}}, \"required\": [\"tool_calls\"], \"title\": \"ToolCalls\"}\n</tool_calls>\nIn adhering to this structure, your objective is: \n        Given the fields `question`, produce the fields `answer`.\n        You are an Agent. Use the supplied tools to produce `answer` from `question`.\n        Call tools when more information is needed.\n        When the final answer is ready, call `submit` with `answer`.\n        The available tools are: `search`, `submit`."
+          },
+          {
+            "role": "user",
+            "content": "<question>\nWhen did Apollo 11 land?\n</question>\n\n<tools>\n[\"search, whose description is <desc>Search the corpus.      Returns passages.</desc>. It takes arguments {'query': {'type': 'string'}}.\", \"submit, whose description is <desc>Submit the final outputs for the task.</desc>. It takes arguments {'answer': {'type': 'string', 'description': '${answer}'}}.\"]\n</tools>\n\n<turn_budget>\nNo turns remain. Call `submit` now with your final outputs.\n</turn_budget>\n\nOutput format (replace placeholders):\n<next_thought>\n{next_thought}\n</next_thought>\n\n<tool_calls>\n{tool_calls}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"$defs\": {\"ToolCall\": {\"type\": \"object\", \"properties\": {\"args\": {\"type\": \"object\", \"additionalProperties\": true, \"title\": \"Args\"}, \"name\": {\"type\": \"string\", \"title\": \"Name\"}}, \"required\": [\"name\", \"args\"], \"title\": \"ToolCall\"}}, \"properties\": {\"tool_calls\": {\"type\": \"array\", \"items\": {\"$ref\": \"#/$defs/ToolCall\"}, \"title\": \"Tool Calls\"}}, \"required\": [\"tool_calls\"], \"title\": \"ToolCalls\"}\n</tool_calls>\n\nUse this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping."
+          }
+        ],
+        "completion": "<next_thought>\nSubmit now\n</next_thought>\n\n<tool_calls>\n{\"tool_calls\": [{\"name\": \"submit\", \"args\": {\"answer\": \"1969\"}}]}\n</tool_calls>"
+      }
+    ],
+    "history": {
+      "messages": [
+        {
+          "question": "When did Apollo 11 land?",
+          "turn_budget": "No turns remain. Call `submit` now with your final outputs.",
+          "next_thought": "Submit now",
+          "tool_calls": {
+            "tool_calls": [
+              {
+                "id": "call_3_0",
+                "name": "submit",
+                "args": {
+                  "answer": "1969"
+                }
+              }
+            ],
+            "tool_call_results": {
+              "tool_call_results": [
+                {
+                  "call_id": "call_3_0",
+                  "name": "submit",
+                  "value": {
+                    "answer": "1969"
+                  },
+                  "is_error": false
+                }
+              ]
+            }
+          },
+          "answer": "1969"
+        }
+      ]
+    },
+    "termination_reason": "forced_submit",
+    "outputs": {
+      "answer": "1969"
+    }
+  },
+  {
+    "name": "react_parse_error",
+    "max_iters": 3,
+    "tools": [
+      "search"
+    ],
+    "calls": [
+      {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Your input fields are:\n1. `question` (Union[str, NoneType]): \n2. `history` (History): \n3. `tools` (list[Tool]): \n4. `turn_budget` (str): Your current turn and how many turns remain before you must submit.\nYour output fields are:\n1. `next_thought` (str): \n2. `tool_calls` (ToolCalls): \n    Type description of ToolCalls: Tool calls must be a JSON object with `tool_calls`, a list of calls. Each call must include `name` and `args`. Example: {\"tool_calls\": [{\"name\": \"search\", \"args\": {\"query\": \"cats\"}}]}\nOutput format (replace placeholders):\n<next_thought>\n{next_thought}\n</next_thought>\n\n<tool_calls>\n{tool_calls}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"$defs\": {\"ToolCall\": {\"type\": \"object\", \"properties\": {\"args\": {\"type\": \"object\", \"additionalProperties\": true, \"title\": \"Args\"}, \"name\": {\"type\": \"string\", \"title\": \"Name\"}}, \"required\": [\"name\", \"args\"], \"title\": \"ToolCall\"}}, \"properties\": {\"tool_calls\": {\"type\": \"array\", \"items\": {\"$ref\": \"#/$defs/ToolCall\"}, \"title\": \"Tool Calls\"}}, \"required\": [\"tool_calls\"], \"title\": \"ToolCalls\"}\n</tool_calls>\nIn adhering to this structure, your objective is: \n        Given the fields `question`, produce the fields `answer`.\n        You are an Agent. Use the supplied tools to produce `answer` from `question`.\n        Call tools when more information is needed.\n        When the final answer is ready, call `submit` with `answer`.\n        The available tools are: `search`, `submit`."
+          },
+          {
+            "role": "user",
+            "content": "<question>\nWhen did Apollo 11 land?\n</question>\n\n<tools>\n[\"search, whose description is <desc>Search the corpus.      Returns passages.</desc>. It takes arguments {'query': {'type': 'string'}}.\", \"submit, whose description is <desc>Submit the final outputs for the task.</desc>. It takes arguments {'answer': {'type': 'string', 'description': '${answer}'}}.\"]\n</tools>\n\n<turn_budget>\nTurn 1 of 3 (2 more after this one).\n</turn_budget>\n\nOutput format (replace placeholders):\n<next_thought>\n{next_thought}\n</next_thought>\n\n<tool_calls>\n{tool_calls}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"$defs\": {\"ToolCall\": {\"type\": \"object\", \"properties\": {\"args\": {\"type\": \"object\", \"additionalProperties\": true, \"title\": \"Args\"}, \"name\": {\"type\": \"string\", \"title\": \"Name\"}}, \"required\": [\"name\", \"args\"], \"title\": \"ToolCall\"}}, \"properties\": {\"tool_calls\": {\"type\": \"array\", \"items\": {\"$ref\": \"#/$defs/ToolCall\"}, \"title\": \"Tool Calls\"}}, \"required\": [\"tool_calls\"], \"title\": \"ToolCalls\"}\n</tool_calls>\n\nUse this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping."
+          }
+        ],
+        "completion": "not XML"
+      },
+      {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Your input fields are:\n1. `question` (Union[str, NoneType]): \n2. `history` (History): \n3. `tools` (list[Tool]): \n4. `turn_budget` (str): Your current turn and how many turns remain before you must submit.\nYour output fields are:\n1. `next_thought` (str): \n2. `tool_calls` (ToolCalls): \n    Type description of ToolCalls: Tool calls must be a JSON object with `tool_calls`, a list of calls. Each call must include `name` and `args`. Example: {\"tool_calls\": [{\"name\": \"search\", \"args\": {\"query\": \"cats\"}}]}\nAll interactions will be structured in the following way, with the appropriate values filled in.\n\nInputs will have the following structure:\n\n[[ ## question ## ]]\n{question}\n\n[[ ## history ## ]]\n{history}\n\n[[ ## tools ## ]]\n{tools}\n\n[[ ## turn_budget ## ]]\n{turn_budget}\n\nOutputs will be a JSON object with the following fields.\n\n{\n  \"next_thought\": \"{next_thought}\",\n  \"tool_calls\": \"{tool_calls}        # note: the value you produce must adhere to the JSON schema: {\\\"type\\\": \\\"object\\\", \\\"$defs\\\": {\\\"ToolCall\\\": {\\\"type\\\": \\\"object\\\", \\\"properties\\\": {\\\"args\\\": {\\\"type\\\": \\\"object\\\", \\\"additionalProperties\\\": true, \\\"title\\\": \\\"Args\\\"}, \\\"name\\\": {\\\"type\\\": \\\"string\\\", \\\"title\\\": \\\"Name\\\"}}, \\\"required\\\": [\\\"name\\\", \\\"args\\\"], \\\"title\\\": \\\"ToolCall\\\"}}, \\\"properties\\\": {\\\"tool_calls\\\": {\\\"type\\\": \\\"array\\\", \\\"items\\\": {\\\"$ref\\\": \\\"#/$defs/ToolCall\\\"}, \\\"title\\\": \\\"Tool Calls\\\"}}, \\\"required\\\": [\\\"tool_calls\\\"], \\\"title\\\": \\\"ToolCalls\\\"}\"\n}\nIn adhering to this structure, your objective is: \n        Given the fields `question`, produce the fields `answer`.\n        You are an Agent. Use the supplied tools to produce `answer` from `question`.\n        Call tools when more information is needed.\n        When the final answer is ready, call `submit` with `answer`.\n        The available tools are: `search`, `submit`."
+          },
+          {
+            "role": "user",
+            "content": "[[ ## question ## ]]\nWhen did Apollo 11 land?\n\n[[ ## tools ## ]]\n[\"search, whose description is <desc>Search the corpus.      Returns passages.</desc>. It takes arguments {'query': {'type': 'string'}}.\", \"submit, whose description is <desc>Submit the final outputs for the task.</desc>. It takes arguments {'answer': {'type': 'string', 'description': '${answer}'}}.\"]\n\n[[ ## turn_budget ## ]]\nTurn 1 of 3 (2 more after this one).\n\nRespond with a JSON object in the following order of fields: `next_thought` (must be formatted as a valid Python str), then `tool_calls` (must be a JSON object like {\"tool_calls\": [{\"name\": \"...\", \"args\": {...}}]})."
+          }
+        ],
+        "completion": "not JSON"
+      },
+      {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Your input fields are:\n1. `question` (Union[str, NoneType]): \n2. `history` (History): \n3. `tools` (list[Tool]): \n4. `turn_budget` (str): Your current turn and how many turns remain before you must submit.\nYour output fields are:\n1. `next_thought` (str): \n2. `tool_calls` (ToolCalls): \n    Type description of ToolCalls: Tool calls must be a JSON object with `tool_calls`, a list of calls. Each call must include `name` and `args`. Example: {\"tool_calls\": [{\"name\": \"search\", \"args\": {\"query\": \"cats\"}}]}\nOutput format (replace placeholders):\n<next_thought>\n{next_thought}\n</next_thought>\n\n<tool_calls>\n{tool_calls}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"$defs\": {\"ToolCall\": {\"type\": \"object\", \"properties\": {\"args\": {\"type\": \"object\", \"additionalProperties\": true, \"title\": \"Args\"}, \"name\": {\"type\": \"string\", \"title\": \"Name\"}}, \"required\": [\"name\", \"args\"], \"title\": \"ToolCall\"}}, \"properties\": {\"tool_calls\": {\"type\": \"array\", \"items\": {\"$ref\": \"#/$defs/ToolCall\"}, \"title\": \"Tool Calls\"}}, \"required\": [\"tool_calls\"], \"title\": \"ToolCalls\"}\n</tool_calls>\nIn adhering to this structure, your objective is: \n        Given the fields `question`, produce the fields `answer`.\n        You are an Agent. Use the supplied tools to produce `answer` from `question`.\n        Call tools when more information is needed.\n        When the final answer is ready, call `submit` with `answer`.\n        The available tools are: `search`, `submit`."
+          },
+          {
+            "role": "user",
+            "content": "<question>\nWhen did Apollo 11 land?\n</question>\n\n<tools>\n[\"search, whose description is <desc>Search the corpus.      Returns passages.</desc>. It takes arguments {'query': {'type': 'string'}}.\", \"submit, whose description is <desc>Submit the final outputs for the task.</desc>. It takes arguments {'answer': {'type': 'string', 'description': '${answer}'}}.\"]\n</tools>\n\n<turn_budget>\nNo turns remain. Call `submit` now with your final outputs.\n</turn_budget>\n\nOutput format (replace placeholders):\n<next_thought>\n{next_thought}\n</next_thought>\n\n<tool_calls>\n{tool_calls}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"$defs\": {\"ToolCall\": {\"type\": \"object\", \"properties\": {\"args\": {\"type\": \"object\", \"additionalProperties\": true, \"title\": \"Args\"}, \"name\": {\"type\": \"string\", \"title\": \"Name\"}}, \"required\": [\"name\", \"args\"], \"title\": \"ToolCall\"}}, \"properties\": {\"tool_calls\": {\"type\": \"array\", \"items\": {\"$ref\": \"#/$defs/ToolCall\"}, \"title\": \"Tool Calls\"}}, \"required\": [\"tool_calls\"], \"title\": \"ToolCalls\"}\n</tool_calls>\n\nUse this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping."
+          }
+        ],
+        "completion": "<next_thought>\nRecover\n</next_thought>\n\n<tool_calls>\n{\"tool_calls\": [{\"name\": \"submit\", \"args\": {\"answer\": \"1969\"}}]}\n</tool_calls>"
+      }
+    ],
+    "history": {
+      "messages": [
+        {
+          "question": "When did Apollo 11 land?",
+          "turn_budget": "No turns remain. Call `submit` now with your final outputs.",
+          "next_thought": "Recover",
+          "tool_calls": {
+            "tool_calls": [
+              {
+                "id": "call_3_0",
+                "name": "submit",
+                "args": {
+                  "answer": "1969"
+                }
+              }
+            ],
+            "tool_call_results": {
+              "tool_call_results": [
+                {
+                  "call_id": "call_3_0",
+                  "name": "submit",
+                  "value": {
+                    "answer": "1969"
+                  },
+                  "is_error": false
+                }
+              ]
+            }
+          },
+          "answer": "1969"
+        }
+      ]
+    },
+    "termination_reason": "forced_submit",
+    "outputs": {
+      "answer": "1969"
+    }
+  },
+  {
+    "name": "react_unknown_tool",
+    "max_iters": 3,
+    "tools": [
+      "search"
+    ],
+    "calls": [
+      {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Your input fields are:\n1. `question` (Union[str, NoneType]): \n2. `history` (History): \n3. `tools` (list[Tool]): \n4. `turn_budget` (str): Your current turn and how many turns remain before you must submit.\nYour output fields are:\n1. `next_thought` (str): \n2. `tool_calls` (ToolCalls): \n    Type description of ToolCalls: Tool calls must be a JSON object with `tool_calls`, a list of calls. Each call must include `name` and `args`. Example: {\"tool_calls\": [{\"name\": \"search\", \"args\": {\"query\": \"cats\"}}]}\nOutput format (replace placeholders):\n<next_thought>\n{next_thought}\n</next_thought>\n\n<tool_calls>\n{tool_calls}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"$defs\": {\"ToolCall\": {\"type\": \"object\", \"properties\": {\"args\": {\"type\": \"object\", \"additionalProperties\": true, \"title\": \"Args\"}, \"name\": {\"type\": \"string\", \"title\": \"Name\"}}, \"required\": [\"name\", \"args\"], \"title\": \"ToolCall\"}}, \"properties\": {\"tool_calls\": {\"type\": \"array\", \"items\": {\"$ref\": \"#/$defs/ToolCall\"}, \"title\": \"Tool Calls\"}}, \"required\": [\"tool_calls\"], \"title\": \"ToolCalls\"}\n</tool_calls>\nIn adhering to this structure, your objective is: \n        Given the fields `question`, produce the fields `answer`.\n        You are an Agent. Use the supplied tools to produce `answer` from `question`.\n        Call tools when more information is needed.\n        When the final answer is ready, call `submit` with `answer`.\n        The available tools are: `search`, `submit`."
+          },
+          {
+            "role": "user",
+            "content": "<question>\nWhen did Apollo 11 land?\n</question>\n\n<tools>\n[\"search, whose description is <desc>Search the corpus.      Returns passages.</desc>. It takes arguments {'query': {'type': 'string'}}.\", \"submit, whose description is <desc>Submit the final outputs for the task.</desc>. It takes arguments {'answer': {'type': 'string', 'description': '${answer}'}}.\"]\n</tools>\n\n<turn_budget>\nTurn 1 of 3 (2 more after this one).\n</turn_budget>\n\nOutput format (replace placeholders):\n<next_thought>\n{next_thought}\n</next_thought>\n\n<tool_calls>\n{tool_calls}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"$defs\": {\"ToolCall\": {\"type\": \"object\", \"properties\": {\"args\": {\"type\": \"object\", \"additionalProperties\": true, \"title\": \"Args\"}, \"name\": {\"type\": \"string\", \"title\": \"Name\"}}, \"required\": [\"name\", \"args\"], \"title\": \"ToolCall\"}}, \"properties\": {\"tool_calls\": {\"type\": \"array\", \"items\": {\"$ref\": \"#/$defs/ToolCall\"}, \"title\": \"Tool Calls\"}}, \"required\": [\"tool_calls\"], \"title\": \"ToolCalls\"}\n</tool_calls>\n\nUse this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping."
+          }
+        ],
+        "completion": "<next_thought>\nUnknown\n</next_thought>\n\n<tool_calls>\n{\"tool_calls\": [{\"name\": \"missing\", \"args\": {}}]}\n</tool_calls>"
+      },
+      {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Your input fields are:\n1. `question` (Union[str, NoneType]): \n2. `history` (History): \n3. `tools` (list[Tool]): \n4. `turn_budget` (str): Your current turn and how many turns remain before you must submit.\nYour output fields are:\n1. `next_thought` (str): \n2. `tool_calls` (ToolCalls): \n    Type description of ToolCalls: Tool calls must be a JSON object with `tool_calls`, a list of calls. Each call must include `name` and `args`. Example: {\"tool_calls\": [{\"name\": \"search\", \"args\": {\"query\": \"cats\"}}]}\nOutput format (replace placeholders):\n<next_thought>\n{next_thought}\n</next_thought>\n\n<tool_calls>\n{tool_calls}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"$defs\": {\"ToolCall\": {\"type\": \"object\", \"properties\": {\"args\": {\"type\": \"object\", \"additionalProperties\": true, \"title\": \"Args\"}, \"name\": {\"type\": \"string\", \"title\": \"Name\"}}, \"required\": [\"name\", \"args\"], \"title\": \"ToolCall\"}}, \"properties\": {\"tool_calls\": {\"type\": \"array\", \"items\": {\"$ref\": \"#/$defs/ToolCall\"}, \"title\": \"Tool Calls\"}}, \"required\": [\"tool_calls\"], \"title\": \"ToolCalls\"}\n</tool_calls>\nIn adhering to this structure, your objective is: \n        Given the fields `question`, produce the fields `answer`.\n        You are an Agent. Use the supplied tools to produce `answer` from `question`.\n        Call tools when more information is needed.\n        When the final answer is ready, call `submit` with `answer`.\n        The available tools are: `search`, `submit`."
+          },
+          {
+            "role": "user",
+            "content": "<question>\nWhen did Apollo 11 land?\n</question>\n\n<turn_budget>\nTurn 1 of 3 (2 more after this one).\n</turn_budget>\n\nOutput format (replace placeholders):\n<next_thought>\n{next_thought}\n</next_thought>\n\n<tool_calls>\n{tool_calls}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"$defs\": {\"ToolCall\": {\"type\": \"object\", \"properties\": {\"args\": {\"type\": \"object\", \"additionalProperties\": true, \"title\": \"Args\"}, \"name\": {\"type\": \"string\", \"title\": \"Name\"}}, \"required\": [\"name\", \"args\"], \"title\": \"ToolCall\"}}, \"properties\": {\"tool_calls\": {\"type\": \"array\", \"items\": {\"$ref\": \"#/$defs/ToolCall\"}, \"title\": \"Tool Calls\"}}, \"required\": [\"tool_calls\"], \"title\": \"ToolCalls\"}\n</tool_calls>\n\nUse this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping."
+          },
+          {
+            "role": "assistant",
+            "content": "<next_thought>\nUnknown\n</next_thought>",
+            "tool_calls": [
+              {
+                "id": "call_0_0",
+                "type": "function",
+                "function": {
+                  "name": "missing",
+                  "arguments": "{}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_0_0",
+            "content": "[error] Unknown tool: missing"
+          },
+          {
+            "role": "user",
+            "content": "<tools>\n[\"search, whose description is <desc>Search the corpus.      Returns passages.</desc>. It takes arguments {'query': {'type': 'string'}}.\", \"submit, whose description is <desc>Submit the final outputs for the task.</desc>. It takes arguments {'answer': {'type': 'string', 'description': '${answer}'}}.\"]\n</tools>\n\n<turn_budget>\nTurn 2 of 3 (1 more after this one).\n</turn_budget>\n\nOutput format (replace placeholders):\n<next_thought>\n{next_thought}\n</next_thought>\n\n<tool_calls>\n{tool_calls}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"$defs\": {\"ToolCall\": {\"type\": \"object\", \"properties\": {\"args\": {\"type\": \"object\", \"additionalProperties\": true, \"title\": \"Args\"}, \"name\": {\"type\": \"string\", \"title\": \"Name\"}}, \"required\": [\"name\", \"args\"], \"title\": \"ToolCall\"}}, \"properties\": {\"tool_calls\": {\"type\": \"array\", \"items\": {\"$ref\": \"#/$defs/ToolCall\"}, \"title\": \"Tool Calls\"}}, \"required\": [\"tool_calls\"], \"title\": \"ToolCalls\"}\n</tool_calls>\n\nUse this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping."
+          }
+        ],
+        "completion": "<next_thought>\nDone\n</next_thought>\n\n<tool_calls>\n{\"tool_calls\": [{\"name\": \"submit\", \"args\": {\"answer\": \"1969\"}}]}\n</tool_calls>"
+      }
+    ],
+    "history": {
+      "messages": [
+        {
+          "question": "When did Apollo 11 land?",
+          "turn_budget": "Turn 1 of 3 (2 more after this one).",
+          "next_thought": "Unknown",
+          "tool_calls": {
+            "tool_calls": [
+              {
+                "id": "call_0_0",
+                "name": "missing",
+                "args": {}
+              }
+            ],
+            "tool_call_results": {
+              "tool_call_results": [
+                {
+                  "call_id": "call_0_0",
+                  "name": "missing",
+                  "value": "Unknown tool: missing",
+                  "is_error": true
+                }
+              ]
+            }
+          }
+        },
+        {
+          "turn_budget": "Turn 2 of 3 (1 more after this one).",
+          "next_thought": "Done",
+          "tool_calls": {
+            "tool_calls": [
+              {
+                "id": "call_1_0",
+                "name": "submit",
+                "args": {
+                  "answer": "1969"
+                }
+              }
+            ],
+            "tool_call_results": {
+              "tool_call_results": [
+                {
+                  "call_id": "call_1_0",
+                  "name": "submit",
+                  "value": {
+                    "answer": "1969"
+                  },
+                  "is_error": false
+                }
+              ]
+            }
+          },
+          "answer": "1969"
+        }
+      ]
+    },
+    "termination_reason": "submit",
+    "outputs": {
+      "answer": "1969"
+    }
+  },
+  {
+    "name": "react_zero_iters",
+    "max_iters": 0,
+    "tools": [
+      "search"
+    ],
+    "calls": [
+      {
+        "messages": [
+          {
+            "role": "system",
+            "content": "Your input fields are:\n1. `question` (Union[str, NoneType]): \n2. `history` (History): \n3. `tools` (list[Tool]): \n4. `turn_budget` (str): Your current turn and how many turns remain before you must submit.\nYour output fields are:\n1. `next_thought` (str): \n2. `tool_calls` (ToolCalls): \n    Type description of ToolCalls: Tool calls must be a JSON object with `tool_calls`, a list of calls. Each call must include `name` and `args`. Example: {\"tool_calls\": [{\"name\": \"search\", \"args\": {\"query\": \"cats\"}}]}\nOutput format (replace placeholders):\n<next_thought>\n{next_thought}\n</next_thought>\n\n<tool_calls>\n{tool_calls}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"$defs\": {\"ToolCall\": {\"type\": \"object\", \"properties\": {\"args\": {\"type\": \"object\", \"additionalProperties\": true, \"title\": \"Args\"}, \"name\": {\"type\": \"string\", \"title\": \"Name\"}}, \"required\": [\"name\", \"args\"], \"title\": \"ToolCall\"}}, \"properties\": {\"tool_calls\": {\"type\": \"array\", \"items\": {\"$ref\": \"#/$defs/ToolCall\"}, \"title\": \"Tool Calls\"}}, \"required\": [\"tool_calls\"], \"title\": \"ToolCalls\"}\n</tool_calls>\nIn adhering to this structure, your objective is: \n        Given the fields `question`, produce the fields `answer`.\n        You are an Agent. Use the supplied tools to produce `answer` from `question`.\n        Call tools when more information is needed.\n        When the final answer is ready, call `submit` with `answer`.\n        The available tools are: `search`, `submit`."
+          },
+          {
+            "role": "user",
+            "content": "<question>\nWhen did Apollo 11 land?\n</question>\n\n<tools>\n[\"search, whose description is <desc>Search the corpus.      Returns passages.</desc>. It takes arguments {'query': {'type': 'string'}}.\", \"submit, whose description is <desc>Submit the final outputs for the task.</desc>. It takes arguments {'answer': {'type': 'string', 'description': '${answer}'}}.\"]\n</tools>\n\n<turn_budget>\nNo turns remain. Call `submit` now with your final outputs.\n</turn_budget>\n\nOutput format (replace placeholders):\n<next_thought>\n{next_thought}\n</next_thought>\n\n<tool_calls>\n{tool_calls}        # note: the value you produce must adhere to the JSON schema: {\"type\": \"object\", \"$defs\": {\"ToolCall\": {\"type\": \"object\", \"properties\": {\"args\": {\"type\": \"object\", \"additionalProperties\": true, \"title\": \"Args\"}, \"name\": {\"type\": \"string\", \"title\": \"Name\"}}, \"required\": [\"name\", \"args\"], \"title\": \"ToolCall\"}}, \"properties\": {\"tool_calls\": {\"type\": \"array\", \"items\": {\"$ref\": \"#/$defs/ToolCall\"}, \"title\": \"Tool Calls\"}}, \"required\": [\"tool_calls\"], \"title\": \"ToolCalls\"}\n</tool_calls>\n\nUse this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping."
+          }
+        ],
+        "completion": "<next_thought>\nSubmit immediately\n</next_thought>\n\n<tool_calls>\n{\"tool_calls\": [{\"name\": \"submit\", \"args\": {\"answer\": \"1969\"}}]}\n</tool_calls>"
+      }
+    ],
+    "history": {
+      "messages": [
+        {
+          "question": "When did Apollo 11 land?",
+          "turn_budget": "No turns remain. Call `submit` now with your final outputs.",
+          "next_thought": "Submit immediately",
+          "tool_calls": {
+            "tool_calls": [
+              {
+                "id": "call_0_0",
+                "name": "submit",
+                "args": {
+                  "answer": "1969"
+                }
+              }
+            ],
+            "tool_call_results": {
+              "tool_call_results": [
+                {
+                  "call_id": "call_0_0",
+                  "name": "submit",
+                  "value": {
+                    "answer": "1969"
+                  },
+                  "is_error": false
+                }
+              ]
+            }
+          },
+          "answer": "1969"
+        }
+      ]
+    },
+    "termination_reason": "forced_submit",
+    "outputs": {
       "answer": "1969"
     }
   }

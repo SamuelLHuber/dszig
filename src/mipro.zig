@@ -587,7 +587,7 @@ pub const MIPROv2 = struct {
                 var tip: []const u8 = "";
                 if (options.tip_aware_proposer) tip = tips[rng.randbelow(tips.len)];
                 var ctx = prompt;
-                ctx.lm_options.rollout_id = @intCast(rng.randint(0, 1_000_000_000));
+                ctx.lm_options.rollout_id = .{ .integer = @intCast(rng.randint(0, 1_000_000_000)) };
                 ctx.lm_options.temperature = self.init_temperature;
                 const demos_text = if (options.fewshot_aware_proposer and demo_sets.len > 0)
                     try taskDemos(ctx.arena, state, demo_sets[pred_i], set_i, bootstrapped_fewshot_examples_in_context)

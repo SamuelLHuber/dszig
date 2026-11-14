@@ -14,7 +14,7 @@ const Record = value.Record;
 /// Dependency versions DSZig targets; written as DSPy writes them.
 pub const dependency_versions = [_][2][]const u8{
     .{ "python", "3.11" },
-    .{ "dspy", "3.4.1" },
+    .{ "dspy", "3.5.0" },
     .{ "cloudpickle", "3.1" },
 };
 

@@ -225,7 +225,10 @@ pub const SIMBA = struct {
         var instance_idx: usize = 0;
         const train_scores = try out.alloc(?f64, self.max_steps);
         @memset(train_scores, null);
-        const start_rollout = ctx.lm_options.rollout_id orelse 0;
+        const start_rollout: i64 = if (ctx.lm_options.rollout_id) |r|
+            if (r == .integer) r.integer else return error.InvalidRolloutId
+        else
+            0;
         var base = ctx;
         base.trace = null;
 
@@ -241,7 +244,7 @@ pub const SIMBA = struct {
             const runs = try out.alloc(Run, self.num_candidates * self.bsize);
             for (0..self.num_candidates) |model| {
                 var c = base;
-                c.lm_options.rollout_id = start_rollout + @as(u32, @intCast(model));
+                c.lm_options.rollout_id = .{ .integer = std.math.add(i64, start_rollout, @as(i64, @intCast(model))) catch return error.InvalidRolloutId };
                 if (model == 0 and self.teacher_settings != null) {
                     self.teacher_settings.?.apply(&c);
                 } else {
@@ -442,15 +445,22 @@ pub const SIMBA = struct {
         while (it.next()) |e| if (!example.isInput(e.key_ptr.*)) try labels.put(out, e.key_ptr.*, e.value_ptr.*);
 
         const better_outputs = good.prediction orelse return error.StrategyFailed;
+        const worse_outputs = bad.prediction orelse Record.empty;
+        const ProgramSignature = signature.Signature(struct {
+            pub const Input = struct {};
+            pub const Output = P.Output;
+        });
+        const better_feedback_outputs = try maskReasoningFields(out, ProgramSignature.output_fields_list, &better_outputs);
+        const worse_feedback_outputs = try maskReasoningFields(out, ProgramSignature.output_fields_list, &worse_outputs);
         var inputs: Record = .empty;
         try inputs.put(out, "program_code", .{ .string = options.program_code });
         try inputs.put(out, "modules_defn", .{ .string = try inspectModules(out, preds) });
         try inputs.put(out, "program_inputs", try dumps(out, .{ .object = try example.inputs(out) }));
         try inputs.put(out, "oracle_metadata", try dumps(out, .{ .object = labels }));
         try inputs.put(out, "better_program_trajectory", try dumps(out, try trajectory(out, good)));
-        try inputs.put(out, "better_program_outputs", try dumps(out, .{ .object = better_outputs }));
+        try inputs.put(out, "better_program_outputs", try dumps(out, .{ .object = better_feedback_outputs }));
         try inputs.put(out, "worse_program_trajectory", try dumps(out, try trajectory(out, bad)));
-        try inputs.put(out, "worse_program_outputs", try dumps(out, .{ .object = bad.prediction orelse .empty }));
+        try inputs.put(out, "worse_program_outputs", try dumps(out, .{ .object = worse_feedback_outputs }));
         try inputs.put(out, "worse_reward_value", try reward(out, bad.score));
         try inputs.put(out, "better_reward_value", try reward(out, good.score));
         try inputs.put(out, "worse_reward_info", .{ .string = "{}" });
@@ -507,11 +517,31 @@ fn trajectory(out: Allocator, run: anytype) Allocator.Error!Value {
         const name = nameOf(run.names, step.predictor) orelse continue;
         var item: Record = .empty;
         try item.put(out, "module_name", .{ .string = name });
-        try item.put(out, "inputs", .{ .object = step.inputs });
-        try item.put(out, "outputs", .{ .object = step.outputs });
+        const fields = step.predictor.fields;
+        try item.put(out, "inputs", .{ .object = try maskReasoningFields(out, fields[0..step.predictor.input_count], &step.inputs) });
+        try item.put(out, "outputs", .{ .object = try maskReasoningFields(out, fields[step.predictor.input_count..], &step.outputs) });
         try list.append(.{ .object = item });
     }
     return .{ .array = list };
+}
+
+/// SIMBA's `recursive_mask` sees typed Reasoning objects before DSPy's custom
+/// JSON serializer runs. Restore that distinction from field metadata without
+/// mutating the serialized prediction/trace or masking ordinary string fields.
+fn maskReasoningFields(out: Allocator, fields: []const signature.Field, record: *const Record) Allocator.Error!Record {
+    var masked = record.*;
+    var copied = false;
+    for (fields) |field| {
+        if (!field.native_reasoning) continue;
+        const item = record.get(field.name) orelse continue;
+        if (item == .null) continue;
+        if (!copied) {
+            masked = try record.clone(out);
+            copied = true;
+        }
+        masked.getPtr(field.name).?.* = .{ .string = "<non-serializable: Reasoning>" };
+    }
+    return masked;
 }
 
 /// `orjson.dumps(v, option=OPT_INDENT_2).decode()`.
@@ -593,6 +623,30 @@ fn roundHalfEven(x: f64) f64 {
     if (diff < 0.5) return floor;
     if (diff > 0.5) return floor + 1;
     return if (@mod(floor, 2) == 0) floor else floor + 1;
+}
+
+test "feedback masks typed Reasoning without masking ordinary strings or mutating traces" {
+    const Sig = signature.Signature(struct {
+        pub const Input = struct {};
+        pub const Output = struct {
+            analysis: ?signature.Reasoning,
+            reasoning: []const u8,
+            absent: ?signature.Reasoning,
+        };
+    });
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const out = arena.allocator();
+    const original = try value.toRecord(out, Sig.Output, .{
+        .analysis = .{ .content = "Actual reasoning." },
+        .reasoning = "An ordinary string.",
+        .absent = null,
+    });
+    const masked = try maskReasoningFields(out, Sig.output_fields_list, &original);
+    try std.testing.expectEqualStrings("<non-serializable: Reasoning>", masked.get("analysis").?.string);
+    try std.testing.expectEqualStrings("An ordinary string.", masked.get("reasoning").?.string);
+    try std.testing.expect(masked.get("absent").? == .null);
+    try std.testing.expectEqualStrings("Actual reasoning.", original.get("analysis").?.string);
 }
 
 test "roundHalfEven matches Python round" {

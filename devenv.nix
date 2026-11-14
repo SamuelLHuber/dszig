@@ -31,7 +31,7 @@ let
     else
       pkgs.zig_0_17;
   # The DSPy reference harness (tools/dspy_reference) needs CPython 3.11; uv
-  # installs DSPy 3.4.1 from uv.lock, which pins every package by sha256.
+  # installs DSPy 3.5.0 from uv.lock, which pins every package by sha256.
   python = pkgs.python311;
 in
 {
@@ -62,8 +62,11 @@ in
     # Re-record real-model transcripts (needs OPENAI_API_KEY; not run by CI).
     dz-live.exec = ''
       set -euo pipefail
-      (cd tools/dspy_reference && uv run --locked live.py)
-      zig build live -- tests/fixtures/live/dszig_gpt-4o-mini.json
+      (cd tools/dspy_reference && uv run --locked live.py \
+        ../../tests/fixtures/live/dspy_3.5.0.json "openai/''${DSZIG_LIVE_MODEL:-gpt-4o-mini}")
+      zig build replay -- tests/fixtures/live/dspy_3.5.0.json
+      zig build live -- tests/fixtures/live/dszig_3.5.0.json
+      (cd tools/dspy_reference && uv run --locked check_live.py ../../tests/fixtures/live/dszig_3.5.0.json)
       tools/dspy_reference/check.sh
     '';
     dz-check.exec = ''
@@ -84,7 +87,7 @@ in
     ''
     + ''
       echo "dszig: zig $(zig version), $(python3 --version), uv $(uv --version | cut -d' ' -f2)"
-      echo "  dz-test, dz-examples, dz-dspy (cross-check with DSPy 3.4.1), dz-check (what CI runs), dz-live (re-record real gpt-4o-mini transcripts)"
+      echo "  dz-test, dz-examples, dz-dspy (cross-check with DSPy 3.5.0), dz-check (what CI runs), dz-live (record current-model transcripts)"
     '';
 
   enterTest = ''

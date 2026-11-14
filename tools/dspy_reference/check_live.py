@@ -1,5 +1,5 @@
 """Replay a live transcript (recorded by DSPy's live.py or by DSZig's
-`zig build live`) through DSPy 3.4.1. Passes only if DSPy sends exactly the
+`zig build live`) through the locked DSPy runtime. Passes only if DSPy sends exactly the
 recorded requests, consumes every recorded call, and reproduces the recorded
 case outputs, scores and saved artifact byte for byte.
 
@@ -17,7 +17,11 @@ def main():
     path = sys.argv[1]
     with open(path, encoding="utf-8") as f:
         transcript = json.load(f)
-    lm = live_suite.ReplayLM(transcript["calls"])
+    if transcript.get("target_dspy") != live_suite.dspy.__version__:
+        sys.exit(f"transcript targets {transcript.get('target_dspy', transcript.get('runtime'))!r}, "
+                 f"not locked DSPy {live_suite.dspy.__version__}; historical evidence cannot be relabeled")
+    lm = live_suite.ReplayLM(transcript["calls"], supports_reasoning=transcript["supports_reasoning"],
+                            capabilities=transcript)
     result = live_suite.run_suite(lm)
     failures = []
     if lm.misses:
@@ -38,7 +42,7 @@ def main():
     scores = "; ".join(
         f"{p} {result[p]['baseline']}% -> {result[p]['optimized']}% ({len(result[p]['artifact'])}-byte artifact)" for p in PIPELINES
     )
-    print(f"ok: DSPy 3.4.1 replayed {len(lm.calls)} {transcript['runtime']} calls ({transcript['model']}) identically; {scores}")
+    print(f"ok: DSPy {live_suite.dspy.__version__} replayed {len(lm.calls)} {transcript['runtime']} calls ({transcript['model']}) identically; {scores}")
 
 
 if __name__ == "__main__":

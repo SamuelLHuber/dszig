@@ -54,20 +54,20 @@ pub fn trainset(arena: Allocator) ![]const dszig.Example {
     return out;
 }
 
-fn chat(comptime reasoning: []const u8, comptime answer: []const u8) []const u8 {
-    return "[[ ## reasoning ## ]]\n" ++ reasoning ++ "\n\n[[ ## answer ## ]]\n" ++ answer ++ "\n\n[[ ## completed ## ]]";
+fn xml(comptime reasoning: []const u8, comptime answer: []const u8) []const u8 {
+    return "<plan>\n" ++ reasoning ++ "\n</plan>\n\n<answer>\n" ++ answer ++ "\n</answer>";
 }
 
 pub const rules = [_]dszig.lm.KeywordLM.Rule{
-    .{ .needle = "What is the capital of France?", .response = chat("The context says Paris is the capital of France.", "Paris") },
-    .{ .needle = "What is the highest mountain?", .response = chat("Everest is the highest mountain.", "Mount Everest") },
-    .{ .needle = "What is the largest ocean?", .response = chat("The Pacific is the largest ocean.", "The Pacific") },
-    .{ .needle = "What is the capital of Germany?", .response = chat("Not sure.", "Munich") },
-    .{ .needle = "At what temperature does water boil?", .response = chat("Water boils at 100 degrees Celsius.", "100 degrees Celsius") },
+    .{ .needle = "What is the capital of France?", .response = xml("The context says Paris is the capital of France.", "Paris") },
+    .{ .needle = "What is the highest mountain?", .response = xml("Everest is the highest mountain.", "Mount Everest") },
+    .{ .needle = "What is the largest ocean?", .response = xml("The Pacific is the largest ocean.", "The Pacific") },
+    .{ .needle = "What is the capital of Germany?", .response = xml("Not sure.", "Munich") },
+    .{ .needle = "At what temperature does water boil?", .response = xml("Water boils at 100 degrees Celsius.", "100 degrees Celsius") },
 };
 
 pub fn keywordLM() dszig.lm.KeywordLM {
-    return .{ .rules = &rules, .default = chat("No idea.", "unknown") };
+    return .{ .rules = &rules, .default = xml("No idea.", "unknown") };
 }
 
 /// `example.answer.lower() in pred.answer.lower()`.
@@ -109,15 +109,15 @@ pub const MultiHop = struct {
 };
 
 fn hopReply(comptime query: []const u8) []const u8 {
-    return "[[ ## query ## ]]\n" ++ query ++ "\n\n[[ ## completed ## ]]";
+    return "<query>\n" ++ query ++ "\n</query>";
 }
 
 /// The second hop sees the Tokyo passage the first hop's query retrieved.
 pub const multihop_rules = [_]dszig.lm.KeywordLM.Rule{
-    .{ .needle = "\"Tokyo is the capital of Japan.\"]\n\n[[ ## question ## ]]", .response = hopReply("highest mountain Everest") },
-    .{ .needle = "`[[ ## query ## ]]`", .response = hopReply("Tokyo Japan capital") },
+    .{ .needle = "\"Tokyo is the capital of Japan.\"]\n</context>", .response = hopReply("highest mountain Everest") },
+    .{ .needle = "<query>", .response = hopReply("Tokyo Japan capital") },
 } ++ rules;
 
 pub fn multihopLM() dszig.lm.KeywordLM {
-    return .{ .rules = &multihop_rules, .default = chat("No idea.", "unknown") };
+    return .{ .rules = &multihop_rules, .default = xml("No idea.", "unknown") };
 }

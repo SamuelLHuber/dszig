@@ -1,294 +1,651 @@
-//! `dspy.ReAct` (DSPy 3.4.1): a tool-using agent over any signature. Each
-//! step `react` picks `next_thought`, `next_tool_name` and `next_tool_args`
-//! given the trajectory so far; the tool's result is appended as an
-//! observation until `finish` or `max_iters`. `extract`, a ChainOfThought
-//! over the inputs and the trajectory, then produces the outputs.
-//!
-//! Tools are comptime: their names form the `next_tool_name` Literal and
-//! their descriptions the instructions, exactly as DSPy prints `str(Tool)`.
-//! Not supported: trajectory truncation on context-window errors, async
-//! tools, Pydantic-typed tool arguments, and Python's traceback text in
-//! `Execution error in <tool>: ...` observations (DSZig gives the error name).
+//! DSPy 3.5 ReAct's text-tool path: one discoverable predictor, reusable
+//! structured History, batched tool calls/results, and a typed `submit` tool.
+//! Exhausted turns, malformed responses, and empty calls get one final submit
+//! attempt, not a separate extraction predictor. All tools remain native Zig
+//! callbacks. Async execution, JSON repair, context-window error classification,
+//! and Python traceback text are not supported.
 
 const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
-
+const Writer = std.Io.Writer;
+const Value = std.json.Value;
 const adapter = @import("adapter.zig");
 const predict = @import("predict.zig");
 const signature = @import("signature.zig");
 const value = @import("value.zig");
-
+const types = @import("types.zig");
+const tool_protocol = @import("tool.zig");
 const Context = predict.Context;
 const Field = signature.Field;
 const Record = value.Record;
-const Value = std.json.Value;
 
+pub const History = @import("history.zig").History;
+pub const ToolCall = tool_protocol.ToolCall;
+pub const ToolCalls = tool_protocol.ToolCalls;
+pub const ToolCallResult = tool_protocol.ToolCallResult;
+pub const ToolCallResults = tool_protocol.ToolCallResults;
 pub const ToolError = error{ OutOfMemory, ToolFailed, InvalidArguments };
+pub const Error = predict.Error || error{ ReActNoSubmit, ReActSubmitFailed, InvalidMaxIters };
+pub const TerminationReason = enum { submit, forced_submit };
+
+pub const RunOptions = struct {
+    /// Appended in place, including failed final submit events. New events use
+    /// Context.arena; clone the History before releasing that arena.
+    history: ?*History = null,
+    max_iters: ?usize = null,
+};
 
 pub const Arg = struct {
     name: []const u8,
-    /// JSON-schema `type` (`string`, `integer`, `number`, `boolean`, ...).
-    schema_type: []const u8,
-    /// Python repr of the default value, e.g. `2` or `'x'`.
+    /// Basic JSON-schema type, or `Any` for an unconstrained argument.
+    schema_type: []const u8 = "Any",
+    /// JSON or Python scalar repr of the callback's default. Rich defaults can
+    /// be supplied in schema instead. The callback supplies omitted defaults.
     default: ?[]const u8 = null,
     description: ?[]const u8 = null,
+    /// A complete schema and matching native validator, normally from typed().
+    schema: []const u8 = "",
+    validate: ?*const fn (Allocator, Value) types.Error!Value = null,
+
+    pub fn typed(comptime name: []const u8, comptime T: type) Arg {
+        return .{
+            .name = name,
+            .schema_type = schemaType(T),
+            .schema = typeSchema(T),
+            .validate = TypedValidator(T).run,
+        };
+    }
 };
 
 pub const Tool = struct {
     name: []const u8,
-    /// Empty means no description, like a function without a docstring.
     desc: []const u8 = "",
     args: []const Arg = &.{},
     func: *const fn (ctx: Context, args: *const Record) ToolError!Value,
+    has_kwargs: bool = false,
 
-    /// `str(dspy.Tool)`.
-    pub fn describe(comptime tool: Tool) []const u8 {
-        comptime {
-            const desc = if (tool.desc.len > 0) ", whose description is <desc>" ++ tool.desc ++ "</desc>." else ".";
-            return tool.name ++ replaceNewlines(desc) ++ " It takes arguments " ++ argsRepr(tool.args) ++ ".";
+    /// `str(dspy.Tool)`, including full typed argument schemas.
+    pub fn format(comptime self: Tool, arena: Allocator) adapter.Error![]const u8 {
+        return tool_protocol.formatToolValue(arena, try self.toValue(arena));
+    }
+
+    /// Shared typed metadata: rendered as Tool strings for text adapters, or
+    /// converted to FunctionTool parameters for a capable native LM.
+    pub fn toValue(comptime self: Tool, arena: Allocator) adapter.Error!Value {
+        var args: Record = .empty;
+        try args.ensureTotalCapacity(arena, self.args.len);
+        inline for (self.args) |arg| {
+            var schema: Record = .empty;
+            if (arg.schema.len > 0) {
+                const parsed = std.json.parseFromSliceLeaky(Value, arena, arg.schema, .{}) catch |err| return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    else => error.AdapterParse,
+                };
+                if (parsed != .object) return error.AdapterParse;
+                schema = parsed.object;
+            } else if (!std.mem.eql(u8, arg.schema_type, "Any")) {
+                try schema.put(arena, "type", .{ .string = arg.schema_type });
+            }
+            if (arg.default) |default| try schema.put(arena, "default", try parseDefault(arena, default));
+            if (arg.description) |description| try schema.put(arena, "description", .{ .string = description });
+            args.putAssumeCapacity(arg.name, .{ .object = schema });
         }
+        var out: Record = .empty;
+        try out.ensureTotalCapacity(arena, 3);
+        out.putAssumeCapacity("name", .{ .string = self.name });
+        out.putAssumeCapacity("desc", .{ .string = self.desc });
+        out.putAssumeCapacity("args", .{ .object = args });
+        return .{ .object = out };
     }
 };
-
-fn replaceNewlines(comptime s: []const u8) []const u8 {
-    comptime {
-        var out: []const u8 = "";
-        for (s) |c| out = out ++ if (c == '\n') "  " else &[_]u8{c};
-        return out;
-    }
-}
-
-/// Python `repr(dict)` of the tool's JSON schemas,
-/// e.g. `{'a': {'type': 'integer'}, 'b': {'type': 'integer', 'default': 2}}`.
-fn argsRepr(comptime args: []const Arg) []const u8 {
-    comptime {
-        var out: []const u8 = "{";
-        for (args, 0..) |arg, i| {
-            if (i > 0) out = out ++ ", ";
-            out = out ++ pyRepr(arg.name) ++ ": {'type': " ++ pyRepr(arg.schema_type);
-            if (arg.default) |d| out = out ++ ", 'default': " ++ d;
-            if (arg.description) |d| out = out ++ ", 'description': " ++ pyRepr(d);
-            out = out ++ "}";
-        }
-        return out ++ "}";
-    }
-}
-
-/// Python `repr(str)` for printable text.
-fn pyRepr(comptime s: []const u8) []const u8 {
-    comptime {
-        @setEvalBranchQuota(100_000);
-        const quote: u8 = if (std.mem.indexOfScalar(u8, s, '\'') != null and
-            std.mem.indexOfScalar(u8, s, '"') == null) '"' else '\'';
-        var out: []const u8 = &[_]u8{quote};
-        for (s) |c| {
-            out = out ++ switch (c) {
-                '\\' => "\\\\",
-                '\n' => "\\n",
-                '\r' => "\\r",
-                '\t' => "\\t",
-                else => blk: {
-                    if (c < 0x20 or c == 0x7f) @compileError("dszig: tool text has a control character");
-                    if (c == quote) break :blk &[_]u8{ '\\', c };
-                    break :blk &[_]u8{c};
-                },
-            };
-        }
-        return out ++ &[_]u8{quote};
-    }
-}
-
-fn backticked(comptime fields: []const Field) []const u8 {
-    comptime {
-        var out: []const u8 = "";
-        for (fields, 0..) |f, i| {
-            if (i > 0) out = out ++ ", ";
-            out = out ++ "`" ++ f.name ++ "`";
-        }
-        return out;
-    }
-}
-
-fn makeField(comptime name: []const u8, comptime kind: signature.Kind, comptime type_name: []const u8, comptime literals: []const []const u8) Field {
-    return .{
-        .name = name,
-        .kind = kind,
-        .type_name = type_name,
-        .desc = "${" ++ name ++ "}",
-        .prefix = signature.inferPrefix(name) ++ ":",
-        .literals = literals,
-    };
-}
-
-const trajectory_field = makeField("trajectory", .str, "str", &.{});
-
-fn finishResult(_: Context, _: *const Record) ToolError!Value {
-    return .{ .string = "Completed." };
-}
 
 pub fn ReAct(comptime Sig: type, comptime user_tools: []const Tool) type {
     return ReActIters(Sig, user_tools, 20);
 }
 
-/// `ReAct` whose `max_iters` defaults to `default_max_iters`.
 pub fn ReActIters(comptime Sig: type, comptime user_tools: []const Tool, comptime default_max_iters: usize) type {
     comptime assert(signature.isSignature(Sig));
     const n_in = Sig.input_fields_list.len;
-    const output_names = backticked(Sig.fields[n_in..]);
-    const tools = comptime blk: {
-        for (user_tools, 0..) |t, i| {
-            if (std.mem.eql(u8, t.name, "finish")) @compileError("dszig: ReAct reserves the tool name `finish`");
-            for (user_tools[0..i]) |u| {
-                if (std.mem.eql(u8, t.name, u.name)) @compileError("dszig: duplicate ReAct tool `" ++ t.name ++ "`");
+    comptime {
+        for (Sig.input_fields_list) |field| {
+            for ([_][]const u8{ "history", "tools", "turn_budget" }) |reserved| {
+                if (std.mem.eql(u8, field.name, reserved)) @compileError("dszig: ReAct reserves the input field `" ++ reserved ++ "`");
             }
         }
-        break :blk user_tools ++ [_]Tool{.{
-            .name = "finish",
-            .desc = "Marks the task as complete. That is, signals that all information for producing the outputs, i.e. " ++
-                output_names ++ ", are now available to be extracted.",
-            .func = finishResult,
-        }};
-    };
-    const tool_names = comptime blk: {
-        var names: [tools.len][]const u8 = undefined;
-        for (tools, 0..) |t, i| names[i] = t.name;
-        const final = names;
-        break :blk &final;
-    };
-    const literal_type = comptime blk: {
-        var s: []const u8 = "Literal[";
-        for (tool_names, 0..) |name, i| s = s ++ (if (i > 0) ", " else "") ++ pyRepr(name);
-        break :blk s ++ "]";
+        for (Sig.output_fields_list) |field| {
+            for ([_][]const u8{ "history", "termination_reason" }) |reserved| {
+                if (std.mem.eql(u8, field.name, reserved)) @compileError("dszig: ReAct reserves the output field `" ++ reserved ++ "`");
+            }
+        }
+    }
+    const tools = comptime blk: {
+        var unique: []const Tool = &.{};
+        for (user_tools, 0..) |tool, index| {
+            if (std.mem.eql(u8, tool.name, "submit")) @compileError("dszig: ReAct reserves the tool name `submit`");
+            for (tool.args) |arg| {
+                if (arg.schema.len > 0 and arg.validate == null) @compileError("dszig: a tool argument schema needs its native validator; use Arg.typed");
+            }
+            var seen = false;
+            for (user_tools[0..index]) |previous| {
+                if (std.mem.eql(u8, previous.name, tool.name)) seen = true;
+            }
+            if (seen) continue;
+            var selected = tool;
+            for (user_tools[index + 1 ..]) |later| {
+                if (std.mem.eql(u8, later.name, tool.name)) selected = later;
+            }
+            unique = unique ++ [_]Tool{selected};
+        }
+        break :blk unique ++ [_]Tool{submitTool(Sig)};
     };
     const instructions = comptime blk: {
-        var s: []const u8 = Sig.instructions ++ "\n\n" ++
-            "You are an Agent. In each episode, you will be given the fields " ++ backticked(Sig.fields[0..n_in]) ++
-            " as input. And you can see your past trajectory so far.\n" ++
-            "Your goal is to use one or more of the supplied tools to collect any necessary information for producing " ++
-            output_names ++ ".\n\n" ++
-            "To do this, you will interleave next_thought, next_tool_name, and next_tool_args in each turn, and also when finishing the task.\n" ++
-            "After each tool call, you receive a resulting observation, which gets appended to your trajectory.\n\n" ++
-            "When writing next_thought, you may reason about the current situation and plan for future steps.\n" ++
-            "When selecting the next_tool_name and its next_tool_args, the tool must be one of:\n";
-        for (tools, 0..) |t, i| s = s ++ std.fmt.comptimePrint("\n({d}) ", .{i + 1}) ++ t.describe();
-        break :blk s ++ "\nWhen providing `next_tool_args`, the value inside the field must be in JSON format";
+        var names: []const u8 = "";
+        for (tools, 0..) |tool, index| names = names ++ (if (index > 0) ", " else "") ++ "`" ++ tool.name ++ "`";
+        break :blk value.pyStrip(Sig.instructions ++ "\n" ++
+            "You are an Agent. Use the supplied tools to produce " ++ backticked(Sig.output_fields_list) ++ " from " ++ backticked(Sig.input_fields_list) ++ ".\n" ++
+            "Call tools when more information is needed.\n" ++
+            "When the final answer is ready, call `submit` with " ++ backticked(Sig.output_fields_list) ++ ".\n" ++
+            "The available tools are: " ++ names ++ ".");
     };
-    const CoT = Sig.PrependOutput("reasoning", []const u8);
+    const optional_inputs = comptime blk: {
+        var fields: [n_in]Field = undefined;
+        const input_types = @typeInfo(Sig.Input).@"struct".field_types;
+        for (Sig.input_fields_list, input_types, 0..) |field, T, index| {
+            const Optional = if (@typeInfo(T) == .optional) T else ?T;
+            fields[index] = field;
+            fields[index].kind = .json;
+            fields[index].type_name = types.pyName(Optional);
+            fields[index].schema = typeSchema(Optional);
+            fields[index].validate = TypedValidator(Optional).run;
+            fields[index].optional_str = types.isOptionalStr(Optional);
+            fields[index].nullable = true;
+        }
+        break :blk fields;
+    };
 
     return struct {
         const Self = @This();
         pub const Input = Sig.Input;
         pub const Output = Sig.Output;
-        pub const all_tools: []const Tool = tools;
+        pub const all_tools: []const Tool = &tools;
         pub const react_instructions = instructions;
-        pub const react_fields: []const Field = Sig.fields[0..n_in] ++ [_]Field{
-            trajectory_field,
-            makeField("next_thought", .str, "str", &.{}),
-            makeField("next_tool_name", .literal, literal_type, tool_names),
-            makeField("next_tool_args", .json_object, "dict[str, Any]", &.{}),
+        const react_field_array = optional_inputs ++ [_]Field{
+            .{ .name = "history", .kind = .json, .type_name = "History", .desc = "${history}", .prefix = "History:", .schema = History.schema, .validate = History.validate },
+            .{ .name = "tools", .kind = .json, .type_name = "list[Tool]", .desc = "${tools}", .prefix = "Tools:", .schema = "{\"type\": \"array\", \"items\": {\"type\": \"string\"}}", .xml_literal = true, .native_tools = true },
+            .{ .name = "turn_budget", .kind = .str, .type_name = "str", .desc = "Your current turn and how many turns remain before you must submit.", .prefix = "Turn Budget:" },
+            .{ .name = "next_thought", .kind = .str, .type_name = "str", .desc = "${next_thought}", .prefix = "Next Thought:", .native_reasoning = true },
+            .{ .name = "tool_calls", .kind = .json, .type_name = "ToolCalls", .desc = "${tool_calls}", .prefix = "Tool Calls:", .schema = ToolCalls.schema, .validate = ToolCalls.validate, .xml_literal = true, .native_tool_calls = true, .type_description = ToolCalls.description },
         };
-        pub const extract_fields: []const Field = CoT.fields[0..n_in] ++ [_]Field{trajectory_field} ++ CoT.fields[n_in..];
+        pub const react_fields: []const Field = &react_field_array;
 
-        react: predict.PredictFields(react_fields, n_in + 1, instructions) = .{},
-        extract: Extract = .{},
+        react: predict.PredictFields(react_fields, n_in + 3, instructions) = .{},
         max_iters: usize = default_max_iters,
         compiled: bool = false,
 
-        /// `dspy.ChainOfThought(fallback_signature)`; its predictor is
-        /// `extract.predict`, as in DSPy.
-        pub const Extract = struct {
-            predict: predict.PredictFields(extract_fields, n_in + 1, Sig.instructions) = .{},
-            compiled: bool = false,
-
-            pub fn forward(self: *const Extract, ctx: Context, inputs: *const Record) predict.Error!Record {
-                return self.predict.state.call(ctx, inputs);
-            }
-        };
-
-        /// `dspy.Prediction(trajectory=..., **extract)`.
         pub const Prediction = struct {
-            /// `thought_i`, `tool_name_i`, `tool_args_i`, `observation_i`.
-            trajectory: Record,
-            /// `reasoning` followed by the signature's outputs.
             outputs: Record,
+            history: History,
+            termination_reason: TerminationReason,
         };
 
-        pub fn forward(self: *const Self, ctx: Context, input: Input) predict.Error!Output {
+        pub fn forward(self: *const Self, ctx: Context, input: Input) Error!Output {
             const inputs = try value.toRecord(ctx.arena, Input, input);
             const prediction = try self.run(ctx, &inputs);
             return value.fromRecord(ctx.arena, Output, &prediction.outputs);
         }
 
-        pub fn run(self: *const Self, ctx: Context, inputs: *const Record) predict.Error!Prediction {
-            var trajectory: Record = .empty;
-            for (0..self.max_iters) |idx| {
-                const step_inputs = try withTrajectory(ctx.arena, inputs, &trajectory);
-                const pred = try self.react.state.call(ctx, &step_inputs);
-                const name = pred.get("next_tool_name").?.string;
-                const args = pred.get("next_tool_args").?;
-                assert(args == .object);
-                try trajectory.put(ctx.arena, try key(ctx.arena, "thought", idx), pred.get("next_thought").?);
-                try trajectory.put(ctx.arena, try key(ctx.arena, "tool_name", idx), .{ .string = name });
-                try trajectory.put(ctx.arena, try key(ctx.arena, "tool_args", idx), args);
-                try trajectory.put(ctx.arena, try key(ctx.arena, "observation", idx), try observe(ctx, name, &args.object));
-                if (std.mem.eql(u8, name, "finish")) break;
-            }
-            const final_inputs = try withTrajectory(ctx.arena, inputs, &trajectory);
-            const outputs = try self.extract.predict.state.call(ctx, &final_inputs);
-            return .{ .trajectory = trajectory, .outputs = outputs };
+        /// Dynamic inputs may include `history` and `max_iters`, just like DSPy.
+        pub fn run(self: *const Self, ctx: Context, inputs: *const Record) Error!Prediction {
+            return self.runWithOptions(ctx, inputs, .{});
         }
 
-        fn observe(ctx: Context, name: []const u8, args: *const Record) Allocator.Error!Value {
-            inline for (tools) |tool| {
-                if (std.mem.eql(u8, tool.name, name)) {
-                    const result = if (validArgs(tool, args)) tool.func(ctx, args) else error.InvalidArguments;
-                    return result catch |err| switch (err) {
-                        error.OutOfMemory => error.OutOfMemory,
-                        else => .{ .string = try std.fmt.allocPrint(ctx.arena, "Execution error in {s}: {s}", .{ name, @errorName(err) }) },
-                    };
+        pub fn runWithOptions(self: *const Self, ctx: Context, inputs: *const Record, options: RunOptions) Error!Prediction {
+            const max_iters = options.max_iters orelse try iterationLimit(inputs, self.max_iters);
+            var local_history: History = if (options.history == null) blk: {
+                const supplied = inputs.get("history") orelse break :blk .{};
+                if (supplied == .null) break :blk .{};
+                break :blk try History.fromValue(ctx.arena, supplied);
+            } else .{};
+            const history = options.history orelse &local_history;
+            var trace_history: TraceHistory = .{ .next_step = if (ctx.trace) |trace| trace.steps.items.len else 0 };
+            var events: std.ArrayList(Record) = .empty;
+            try events.appendSlice(ctx.arena, history.messages);
+            var pending: Record = .empty;
+            inline for (Sig.input_fields_list) |field| {
+                if (!std.mem.eql(u8, field.name, "max_iters")) {
+                    if (inputs.get(field.name)) |item| try pending.put(ctx.arena, field.name, item);
                 }
             }
-            unreachable; // `next_tool_name` parses only to a tool name.
+            const catalog = try toolCatalog(ctx.arena);
+            turns: for (0..max_iters) |turn_index| {
+                const turn_inputs = try withBudget(ctx.arena, &pending, try turnBudget(ctx.arena, turn_index, max_iters));
+                const step_inputs = try callInputs(ctx.arena, history.*, catalog, &turn_inputs);
+                const pred = self.react.state.call(ctx, &step_inputs) catch |err| switch (err) {
+                    error.AdapterParse => break :turns, // parse_error -> one final submit attempt.
+                    else => return err,
+                };
+                var calls = ToolCalls.fromValue(ctx.arena, pred.get("tool_calls") orelse .null) catch |err| switch (err) {
+                    error.ParseValue => break :turns,
+                    error.OutOfMemory => return error.OutOfMemory,
+                };
+                if (calls.tool_calls.len == 0) break :turns; // empty_tool_calls.
+                calls = try calls.ensureIds(ctx.arena, turn_index);
+                const execution = try execute(ctx, calls);
+                const event = try historyEvent(ctx.arena, &turn_inputs, &pred, calls, execution);
+                try appendEvent(ctx.arena, &events, history, event);
+                try trace_history.append(ctx, &self.react.state, &event);
+                pending = .empty;
+                if (execution.final_outputs) |outputs| return .{
+                    .outputs = outputs,
+                    .history = history.*,
+                    .termination_reason = .submit,
+                };
+            }
+            // max_iters, parse_error, and empty_tool_calls all use this path.
+            return self.forcedSubmit(ctx, history, &events, &pending, catalog, max_iters, &trace_history);
+        }
+
+        fn forcedSubmit(self: *const Self, ctx_in: Context, history: *History, events: *std.ArrayList(Record), pending: *const Record, catalog: Value, turn_index: usize, trace_history: *TraceHistory) Error!Prediction {
+            var ctx = ctx_in;
+            ctx.lm_options.reasoning_effort = null;
+            ctx.lm_options.reasoning_effort_present = true;
+            ctx.lm_options.tool_choice = .{ .function = "submit" };
+            const turn_inputs = try withBudget(ctx.arena, pending, "No turns remain. Call `submit` now with your final outputs.");
+            const step_inputs = try callInputs(ctx.arena, history.*, catalog, &turn_inputs);
+            const pred = try self.react.state.call(ctx, &step_inputs);
+            var calls = ToolCalls.fromValue(ctx.arena, pred.get("tool_calls") orelse .null) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.ParseValue => error.AdapterParse,
+            };
+            calls = try calls.ensureIds(ctx.arena, turn_index);
+            calls = try calls.named(ctx.arena, "submit");
+            if (calls.tool_calls.len == 0) return error.ReActNoSubmit;
+            const execution = try execute(ctx, calls);
+            const event = try historyEvent(ctx.arena, &turn_inputs, &pred, calls, execution);
+            try appendEvent(ctx.arena, events, history, event);
+            try trace_history.append(ctx, &self.react.state, &event);
+            return .{
+                .outputs = execution.final_outputs orelse return error.ReActSubmitFailed,
+                .history = history.*,
+                .termination_reason = .forced_submit,
+            };
+        }
+
+        fn toolCatalog(arena: Allocator) adapter.Error!Value {
+            var catalog: std.json.Array = .init(arena);
+            try catalog.ensureTotalCapacity(tools.len);
+            inline for (tools) |tool| catalog.appendAssumeCapacity(try tool.toValue(arena));
+            return .{ .array = catalog };
+        }
+
+        const Execution = struct { results: ToolCallResults, final_outputs: ?Record = null };
+
+        fn execute(ctx: Context, calls: ToolCalls) Allocator.Error!Execution {
+            const results = try ctx.arena.alloc(ToolCallResult, calls.tool_calls.len);
+            var final_outputs: ?Record = null;
+            for (calls.tool_calls, results) |call, *result| {
+                result.* = .{ .call_id = call.id, .name = call.name, .value = undefined };
+                const observed = try observe(ctx, call);
+                result.value = observed.value;
+                result.is_error = observed.is_error;
+                if (!observed.is_error and std.mem.eql(u8, call.name, "submit") and observed.value == .object) final_outputs = observed.value.object;
+            }
+            return .{ .results = .{ .tool_call_results = results }, .final_outputs = final_outputs };
+        }
+
+        const Observation = struct { value: Value, is_error: bool = false };
+
+        fn observe(ctx: Context, call: ToolCall) Allocator.Error!Observation {
+            inline for (tools) |tool| {
+                if (std.mem.eql(u8, tool.name, call.name)) {
+                    const result = blk: {
+                        const args = normalizeArgs(tool, ctx.arena, &call.args) catch |err| break :blk @as(ToolError!Value, err);
+                        break :blk tool.func(ctx, &args);
+                    };
+                    return .{ .value = result catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return .{
+                            .value = .{ .string = try std.fmt.allocPrint(ctx.arena, "Execution error in {s}: {s}", .{ call.name, @errorName(err) }) },
+                            .is_error = true,
+                        },
+                    } };
+                }
+            }
+            return .{ .value = .{ .string = try std.fmt.allocPrint(ctx.arena, "Unknown tool: {s}", .{call.name}) }, .is_error = true };
+        }
+
+        fn historyEvent(arena: Allocator, turn_inputs: *const Record, pred: *const Record, calls: ToolCalls, execution: Execution) Allocator.Error!Record {
+            var event = try turn_inputs.clone(arena);
+            if (pred.get("next_thought")) |thought| {
+                if (thought != .null) {
+                    // History's JSON serialization invokes Reasoning.format,
+                    // while predictor traces retain its {content} value.
+                    const recorded = if (thought == .object) thought.object.get("content") orelse thought else thought;
+                    try event.put(arena, "next_thought", recorded);
+                }
+            }
+            var recorded_calls = calls;
+            if (execution.results.tool_call_results.len > 0) recorded_calls.tool_call_results = execution.results;
+            try event.put(arena, "tool_calls", try recorded_calls.toValue(arena));
+            if (execution.final_outputs) |outputs| {
+                for (outputs.keys(), outputs.values()) |name, item| try event.put(arena, name, item);
+            }
+            return event;
         }
     };
 }
 
-/// `Tool._validate_and_parse_args`: every argument must be declared and of
-/// its schema's basic type.
-fn validArgs(comptime tool: Tool, args: *const Record) bool {
-    var it = args.iterator();
-    next: while (it.next()) |entry| {
+fn submitTool(comptime Sig: type) Tool {
+    const args = comptime blk: {
+        var out: [Sig.output_fields_list.len]Arg = undefined;
+        const output_types = @typeInfo(Sig.Output).@"struct".field_types;
+        for (Sig.output_fields_list, output_types, 0..) |field, T, index| {
+            out[index] = Arg.typed(field.name, T);
+            out[index].description = field.desc;
+        }
+        const final = out;
+        break :blk &final;
+    };
+    return .{
+        .name = "submit",
+        .desc = "Submit the final outputs for the task.",
+        .args = args,
+        .has_kwargs = true,
+        .func = struct {
+            fn call(ctx: Context, input: *const Record) ToolError!Value {
+                var outputs: Record = .empty;
+                try outputs.ensureTotalCapacity(ctx.arena, Sig.output_fields_list.len);
+                inline for (Sig.output_fields_list) |field| outputs.putAssumeCapacity(field.name, input.get(field.name) orelse return error.InvalidArguments);
+                return .{ .object = outputs };
+            }
+        }.call,
+    };
+}
+
+fn normalizeArgs(comptime tool: Tool, arena: Allocator, input: *const Record) ToolError!Record {
+    var out: Record = .empty;
+    try out.ensureTotalCapacity(arena, input.count());
+    next: for (input.keys(), input.values()) |name, item| {
         inline for (tool.args) |arg| {
-            if (std.mem.eql(u8, arg.name, entry.key_ptr.*)) {
-                if (!schemaAccepts(arg.schema_type, entry.value_ptr.*)) return false;
+            if (std.mem.eql(u8, arg.name, name)) {
+                if (!schemaAccepts(arg.schema_type, item)) return error.InvalidArguments;
+                const parsed = if (arg.validate) |validate| validate(arena, item) catch |err| return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    error.ParseValue => error.InvalidArguments,
+                } else try normalizeBasicArg(arg.schema_type, item);
+                out.putAssumeCapacity(name, parsed);
                 continue :next;
             }
         }
-        return false;
+        if (!tool.has_kwargs) return error.InvalidArguments;
+        out.putAssumeCapacity(name, item);
     }
-    return true;
-}
-
-fn schemaAccepts(comptime schema_type: []const u8, v: Value) bool {
-    if (comptime std.mem.eql(u8, schema_type, "string")) return v == .string;
-    if (comptime std.mem.eql(u8, schema_type, "integer")) return v == .integer;
-    if (comptime std.mem.eql(u8, schema_type, "number")) return v == .integer or v == .float;
-    if (comptime std.mem.eql(u8, schema_type, "boolean")) return v == .bool;
-    if (comptime std.mem.eql(u8, schema_type, "array")) return v == .array;
-    if (comptime std.mem.eql(u8, schema_type, "object")) return v == .object;
-    return true;
-}
-
-fn key(arena: Allocator, comptime kind: []const u8, idx: usize) Allocator.Error![]const u8 {
-    return std.fmt.allocPrint(arena, kind ++ "_{d}", .{idx});
-}
-
-/// The inputs plus `trajectory`, rendered like DSPy's `_format_trajectory`.
-fn withTrajectory(arena: Allocator, inputs: *const Record, trajectory: *const Record) predict.Error!Record {
-    const fields = try arena.alloc(Field, trajectory.count());
-    for (fields, trajectory.keys()) |*f, k| f.* = .{ .name = k, .kind = .str, .type_name = "str", .desc = "", .prefix = "" };
-    var out = try inputs.clone(arena);
-    try out.put(arena, "trajectory", .{ .string = try adapter.formatInputs(arena, fields, trajectory) });
+    inline for (tool.args) |arg| {
+        if (arg.default == null and !out.contains(arg.name)) {
+            const has_default = if (arg.schema.len > 0) blk: {
+                const schema = std.json.parseFromSliceLeaky(Value, arena, arg.schema, .{}) catch |err| return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    else => error.InvalidArguments,
+                };
+                break :blk schema == .object and schema.object.contains("default");
+            } else false;
+            if (!has_default) return error.InvalidArguments;
+        }
+    }
     return out;
+}
+
+fn normalizeBasicArg(schema_type: []const u8, item: Value) ToolError!Value {
+    if (std.mem.eql(u8, schema_type, "integer") and item == .float) {
+        if (item.float < -9223372036854775808.0 or item.float >= 9223372036854775808.0) return error.InvalidArguments;
+        return .{ .integer = @intFromFloat(item.float) };
+    }
+    if (std.mem.eql(u8, schema_type, "number") and item == .integer) return .{ .float = @floatFromInt(item.integer) };
+    return item;
+}
+
+fn schemaAccepts(schema_type: []const u8, item: Value) bool {
+    if (std.mem.eql(u8, schema_type, "string")) return item == .string;
+    if (std.mem.eql(u8, schema_type, "integer")) return item == .integer or (item == .float and std.math.isFinite(item.float) and item.float == @trunc(item.float));
+    if (std.mem.eql(u8, schema_type, "number")) return item == .integer or item == .float;
+    if (std.mem.eql(u8, schema_type, "boolean")) return item == .bool;
+    if (std.mem.eql(u8, schema_type, "array")) return item == .array;
+    if (std.mem.eql(u8, schema_type, "object")) return item == .object;
+    return true;
+}
+
+fn schemaType(comptime T: type) []const u8 {
+    if (T == []const u8) return "string";
+    if (T == bool) return "boolean";
+    if (T == Record or T == signature.StrDict or types.isDict(T)) return "object";
+    return switch (@typeInfo(T)) {
+        .int => "integer",
+        .float => "number",
+        .@"enum" => "string",
+        .pointer => "array",
+        .@"struct" => "object",
+        .optional => "Any",
+        else => @compileError("dszig: unsupported tool argument type " ++ @typeName(T)),
+    };
+}
+
+fn typeSchema(comptime T: type) []const u8 {
+    if (T == signature.StrDict) return types.schema(types.Dict([]const u8));
+    if (@typeInfo(T) == .optional and @typeInfo(T).optional.child == signature.StrDict) return types.schema(?types.Dict([]const u8));
+    return types.schema(T);
+}
+
+fn TypedValidator(comptime T: type) type {
+    return struct {
+        fn run(arena: Allocator, input: Value) types.Error!Value {
+            // Tool validates a schema only when its root has a `type` key.
+            // Optional roots use Pydantic's lax conversion, matching upstream.
+            if (@typeInfo(T) != .optional and !strictAccepts(T, input)) return error.ParseValue;
+            if (T == signature.StrDict) return input;
+            if (@typeInfo(T) == .optional and @typeInfo(T).optional.child == signature.StrDict) {
+                if (input != .null and !strictAccepts(signature.StrDict, input)) return error.ParseValue;
+                return input;
+            }
+            const parsed = try types.validate(T, arena, input);
+            if (!nativeFits(T, parsed)) return error.ParseValue;
+            return parsed;
+        }
+    };
+}
+
+fn strictAccepts(comptime T: type, input: Value) bool {
+    if (T == []const u8) return input == .string;
+    if (T == bool) return input == .bool;
+    if (T == Record) return input == .object;
+    if (T == signature.StrDict) {
+        if (input != .object) return false;
+        for (input.object.values()) |item| if (item != .string) return false;
+        return true;
+    }
+    if (comptime types.isDict(T)) {
+        if (input != .object) return false;
+        for (input.object.values()) |item| if (!strictAccepts(T.dszig_dict_value, item)) return false;
+        return true;
+    }
+    return switch (@typeInfo(T)) {
+        .int => schemaAccepts("integer", input),
+        .float => schemaAccepts("number", input),
+        .@"enum" => input == .string and std.meta.stringToEnum(T, input.string) != null,
+        .optional => |optional| input == .null or strictAccepts(optional.child, input),
+        .pointer => |pointer| blk: {
+            if (input != .array) break :blk false;
+            for (input.array.items) |item| if (!strictAccepts(pointer.child, item)) break :blk false;
+            break :blk true;
+        },
+        .@"struct" => |info| blk: {
+            if (input != .object) break :blk false;
+            inline for (info.field_names, info.field_types, 0..) |name, FT, index| {
+                if (input.object.get(name)) |item| {
+                    if (!strictAccepts(FT, item)) break :blk false;
+                } else if (info.field_attrs[index].default_value_ptr == null) break :blk false;
+            }
+            break :blk true;
+        },
+        else => @compileError("dszig: unsupported tool argument type " ++ @typeName(T)),
+    };
+}
+
+/// JSON schemas describe Python integers, whereas native callbacks/output
+/// structs can use narrower integer storage. Reject overflow before submission.
+fn nativeFits(comptime T: type, input: Value) bool {
+    if (T == []const u8 or T == bool or T == Record or T == signature.StrDict) return true;
+    if (comptime types.isDict(T)) {
+        for (input.object.values()) |item| if (!nativeFits(T.dszig_dict_value, item)) return false;
+        return true;
+    }
+    return switch (@typeInfo(T)) {
+        .int => std.math.cast(T, input.integer) != null,
+        .float, .@"enum" => true,
+        .optional => |optional| input == .null or nativeFits(optional.child, input),
+        .pointer => |pointer| blk: {
+            for (input.array.items) |item| if (!nativeFits(pointer.child, item)) break :blk false;
+            break :blk true;
+        },
+        .@"struct" => |info| blk: {
+            inline for (info.field_names, info.field_types) |name, FT| {
+                if (!nativeFits(FT, input.object.get(name).?)) break :blk false;
+            }
+            break :blk true;
+        },
+        else => @compileError("dszig: unsupported tool argument type " ++ @typeName(T)),
+    };
+}
+
+fn backticked(comptime fields: []const Field) []const u8 {
+    comptime {
+        var out: []const u8 = "";
+        for (fields, 0..) |field, index| out = out ++ (if (index > 0) ", " else "") ++ "`" ++ field.name ++ "`";
+        return out;
+    }
+}
+
+fn iterationLimit(inputs: *const Record, default: usize) Error!usize {
+    const supplied = inputs.get("max_iters") orelse return default;
+    if (supplied != .integer or supplied.integer < 0) return error.InvalidMaxIters;
+    return std.math.cast(usize, supplied.integer) orelse error.InvalidMaxIters;
+}
+
+fn turnBudget(arena: Allocator, turn_index: usize, max_iters: usize) Allocator.Error![]const u8 {
+    assert(turn_index < max_iters);
+    const turn = turn_index + 1;
+    const remaining = max_iters - turn;
+    return if (remaining == 0)
+        std.fmt.allocPrint(arena, "Turn {d} of {d} (this is your last turn).", .{ turn, max_iters })
+    else
+        std.fmt.allocPrint(arena, "Turn {d} of {d} ({d} more after this one).", .{ turn, max_iters, remaining });
+}
+
+fn withBudget(arena: Allocator, pending: *const Record, budget: []const u8) Allocator.Error!Record {
+    var out = try pending.clone(arena);
+    try out.put(arena, "turn_budget", .{ .string = budget });
+    return out;
+}
+
+fn callInputs(arena: Allocator, history: History, catalog: Value, turn_inputs: *const Record) Allocator.Error!Record {
+    var out: Record = .empty;
+    try out.ensureTotalCapacity(arena, turn_inputs.count() + 2);
+    out.putAssumeCapacity("history", try history.toValue(arena));
+    out.putAssumeCapacity("tools", catalog);
+    for (turn_inputs.keys(), turn_inputs.values()) |name, item| out.putAssumeCapacity(name, item);
+    return out;
+}
+
+/// DSPy traces retain the same mutable History object passed to every turn.
+/// Link only this run's matching predictor steps, and copy each appended event
+/// once into the trace arena rather than repeatedly cloning its whole prefix.
+const TraceHistory = struct {
+    next_step: usize,
+    shared: ?Value = null,
+
+    fn append(self: *TraceHistory, ctx: Context, predictor: *const predict.PredictState, event: *const Record) Allocator.Error!void {
+        const trace = ctx.trace orelse return;
+        assert(self.next_step <= trace.steps.items.len);
+        for (trace.steps.items[self.next_step..]) |*step| {
+            if (step.predictor != predictor) continue;
+            const history = step.inputs.getPtr("history") orelse continue;
+            if (self.shared == null) self.shared = history.*;
+            history.* = self.shared.?;
+        }
+        self.next_step = trace.steps.items.len;
+        if (self.shared) |*shared| {
+            assert(shared.* == .object);
+            const messages = shared.object.getPtr("messages").?;
+            assert(messages.* == .array);
+            try messages.array.append(.{ .object = try value.cloneRecord(trace.arena, event) });
+        }
+    }
+};
+
+fn appendEvent(arena: Allocator, events: *std.ArrayList(Record), history: *History, event: Record) Allocator.Error!void {
+    try events.append(arena, event);
+    history.messages = events.items;
+}
+
+fn writeText(w: *Writer, text: []const u8) Allocator.Error!void {
+    w.writeAll(text) catch return error.OutOfMemory;
+}
+
+fn parseDefault(arena: Allocator, text: []const u8) adapter.Error!Value {
+    if (std.json.parseFromSliceLeaky(Value, arena, text, .{})) |parsed| return parsed else |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+    }
+    if (std.mem.eql(u8, text, "None")) return .null;
+    if (std.mem.eql(u8, text, "True")) return .{ .bool = true };
+    if (std.mem.eql(u8, text, "False")) return .{ .bool = false };
+    if (text.len < 2 or (text[0] != '\'' and text[0] != '"') or text[0] != text[text.len - 1]) return error.AdapterParse;
+    var out: Writer.Allocating = .init(arena);
+    var index: usize = 1;
+    while (index < text.len - 1) : (index += 1) {
+        const c = text[index];
+        if (c != '\\') {
+            out.writer.writeByte(c) catch return error.OutOfMemory;
+            continue;
+        }
+        index += 1;
+        if (index >= text.len - 1) return error.AdapterParse;
+        const escaped = text[index];
+        switch (escaped) {
+            '\\', '\'', '"' => out.writer.writeByte(escaped) catch return error.OutOfMemory,
+            'n' => try writeText(&out.writer, "\n"),
+            'r' => try writeText(&out.writer, "\r"),
+            't' => try writeText(&out.writer, "\t"),
+            'b' => try writeText(&out.writer, "\x08"),
+            'f' => try writeText(&out.writer, "\x0c"),
+            'v' => try writeText(&out.writer, "\x0b"),
+            'a' => try writeText(&out.writer, "\x07"),
+            '\n' => {},
+            'x', 'u', 'U' => {
+                const digits: usize = switch (escaped) {
+                    'x' => 2,
+                    'u' => 4,
+                    else => 8,
+                };
+                if (text.len - 1 - index <= digits) return error.AdapterParse;
+                const codepoint = std.fmt.parseInt(u21, text[index + 1 ..][0..digits], 16) catch return error.AdapterParse;
+                var buffer: [4]u8 = undefined;
+                const len = std.unicode.utf8Encode(codepoint, &buffer) catch return error.AdapterParse;
+                try writeText(&out.writer, buffer[0..len]);
+                index += digits;
+            },
+            '0'...'7' => {
+                var codepoint: u21 = escaped - '0';
+                var count: usize = 1;
+                while (count < 3 and index + 1 < text.len - 1 and text[index + 1] >= '0' and text[index + 1] <= '7') : (count += 1) {
+                    index += 1;
+                    codepoint = codepoint * 8 + text[index] - '0';
+                }
+                var buffer: [4]u8 = undefined;
+                const len = std.unicode.utf8Encode(codepoint, &buffer) catch return error.AdapterParse;
+                try writeText(&out.writer, buffer[0..len]);
+            },
+            else => try writeText(&out.writer, &.{ '\\', escaped }),
+        }
+    }
+    return .{ .string = out.written() };
 }

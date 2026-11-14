@@ -17,6 +17,7 @@ const pyjson = @import("pyjson.zig");
 
 const LM = lm_mod.LM;
 const Request = lm_mod.Request;
+const Completion = lm_mod.Completion;
 
 pub const Key = [64]u8;
 
@@ -25,7 +26,7 @@ pub const CachedLM = struct {
     inner: LM,
     /// `memory_max_entries`.
     max_entries: usize = 1_000_000,
-    entries: std.AutoArrayHashMapUnmanaged(Key, []const []const u8) = .empty,
+    entries: std.AutoArrayHashMapUnmanaged(Key, []const Completion) = .empty,
     hits: usize = 0,
     misses: usize = 0,
 
@@ -36,10 +37,17 @@ pub const CachedLM = struct {
     }
 
     pub fn lm(self: *CachedLM) LM {
-        return .{ .ptr = self, .vtable = &.{ .complete = complete } };
+        return .{
+            .ptr = self,
+            .vtable = &.{ .complete = complete },
+            .supports_reasoning = self.inner.supports_reasoning,
+            .supports_response_format = self.inner.supports_response_format,
+            .supports_response_schema = self.inner.supports_response_schema,
+            .supports_function_calling = self.inner.supports_function_calling,
+        };
     }
 
-    fn complete(ptr: *anyopaque, arena: Allocator, request: Request) lm_mod.Error![]const []const u8 {
+    fn complete(ptr: *anyopaque, arena: Allocator, request: Request) lm_mod.Error![]const Completion {
         const self: *CachedLM = @ptrCast(@alignCast(ptr));
         const k = try key(arena, request);
         if (self.entries.fetchOrderedRemove(k)) |hit| {
@@ -49,12 +57,12 @@ pub const CachedLM = struct {
             return dupeCompletions(arena, hit.value);
         }
         self.misses += 1;
-        const completions = try self.inner.completeMany(arena, request);
+        const completions = try self.inner.completeResponses(arena, request);
         try self.insert(k, completions);
         return completions;
     }
 
-    fn insert(self: *CachedLM, k: Key, completions: []const []const u8) Allocator.Error!void {
+    fn insert(self: *CachedLM, k: Key, completions: []const Completion) Allocator.Error!void {
         assert(self.max_entries > 0);
         const owned = try dupeCompletions(self.gpa, completions);
         errdefer self.freeCompletions(owned);
@@ -66,12 +74,12 @@ pub const CachedLM = struct {
         self.entries.putAssumeCapacity(k, owned);
     }
 
-    fn freeCompletions(self: *CachedLM, completions: []const []const u8) void {
-        for (completions) |c| self.gpa.free(c);
+    fn freeCompletions(self: *CachedLM, completions: []const Completion) void {
+        for (completions) |c| lm_mod.freeCompletion(self.gpa, c);
         self.gpa.free(completions);
     }
 
-    /// `{"<key>": ["completion", ...], ...}`, least recently used first.
+    /// `{"<key>": [{"text": "...", "reasoning": null}, ...]}`, LRU first.
     pub fn dump(self: *const CachedLM, w: *Writer) pyjson.Error!void {
         try w.writeByte('{');
         for (self.entries.keys(), self.entries.values(), 0..) |k, completions, i| {
@@ -80,7 +88,7 @@ pub const CachedLM = struct {
             try w.writeAll(": [");
             for (completions, 0..) |c, j| {
                 if (j > 0) try w.writeAll(", ");
-                try pyjson.writeJsonString(w, c);
+                try std.json.Stringify.value(c, .{}, w);
             }
             try w.writeByte(']');
         }
@@ -101,10 +109,12 @@ pub const CachedLM = struct {
             if (entry.key_ptr.len != 64 or entry.value_ptr.* != .array) return error.InvalidCache;
             const items = entry.value_ptr.array.items;
             if (items.len == 0) return error.InvalidCache;
-            const completions = try scratch.allocator().alloc([]const u8, items.len);
+            const completions = try scratch.allocator().alloc(Completion, items.len);
             for (items, completions) |item, *c| {
-                if (item != .string) return error.InvalidCache;
-                c.* = item.string;
+                c.* = lm_mod.completionFromValue(scratch.allocator(), item) catch |err| return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    else => error.InvalidCache,
+                };
             }
             if (self.entries.contains(entry.key_ptr.*[0..64].*)) continue;
             try self.insert(entry.key_ptr.*[0..64].*, completions);
@@ -112,15 +122,15 @@ pub const CachedLM = struct {
     }
 };
 
-fn dupeCompletions(a: Allocator, completions: []const []const u8) Allocator.Error![]const []const u8 {
-    const out = try a.alloc([]const u8, completions.len);
+fn dupeCompletions(a: Allocator, completions: []const Completion) Allocator.Error![]const Completion {
+    const out = try a.alloc(Completion, completions.len);
     var done: usize = 0;
     errdefer {
-        for (out[0..done]) |c| a.free(c);
+        for (out[0..done]) |c| lm_mod.freeCompletion(a, c);
         a.free(out);
     }
     for (completions, out) |c, *o| {
-        o.* = try a.dupe(u8, c);
+        o.* = try lm_mod.cloneCompletion(a, c);
         done += 1;
     }
     return out;
@@ -136,19 +146,9 @@ pub fn key(arena: Allocator, request: Request) Allocator.Error!Key {
 }
 
 fn writeCanonical(w: *Writer, request: Request) Writer.Error!void {
-    const o = request.options;
-    try w.print("{{\"json_mode\": {}, \"messages\": [", .{o.json_mode});
-    for (request.messages, 0..) |m, i| {
-        if (i > 0) try w.writeAll(", ");
-        try w.writeAll("{\"content\": ");
-        try pyjson.writeJsonString(w, m.content);
-        try w.print(", \"role\": \"{s}\"}}", .{m.role.name()});
-    }
-    try w.print("], \"n\": {d}, \"rollout_id\": ", .{o.n});
-    if (o.rollout_id) |r| try w.print("{d}", .{r}) else try w.writeAll("null");
-    try w.writeAll(", \"temperature\": ");
-    if (o.temperature) |t| try pyjson.writeFloat(w, t, .json) else try w.writeAll("null");
-    try w.writeByte('}');
+    // Stream every typed field, including native tools and structured schemas.
+    // Cache hashes are local to DSZig and are not DSPy's diskcache format.
+    try std.json.Stringify.value(request, .{}, w);
 }
 
 const testing = std.testing;
@@ -166,7 +166,7 @@ test "CachedLM serves repeats from memory and keys on options" {
     try testing.expectEqualStrings("a", try lm.complete(arena, base));
     try testing.expectEqualStrings("a", try lm.complete(arena, base));
     var rollout = base;
-    rollout.options.rollout_id = 1;
+    rollout.options.rollout_id = .{ .integer = 1 };
     try testing.expectEqualStrings("b", try lm.complete(arena, rollout));
     try testing.expectEqualStrings("b", try lm.complete(arena, rollout));
     var hot = base;
@@ -179,8 +179,8 @@ test "CachedLM serves repeats from memory and keys on options" {
     try testing.expectEqualStrings("e", pair[1]);
     const again = try lm.completeMany(arena, many);
     try testing.expectEqualStrings("e", again[1]);
-    try testing.expectEqual(@as(usize, 3), cache.hits);
-    try testing.expectEqual(@as(usize, 4), cache.misses);
+    try testing.expectEqual(@as(usize, 4), cache.hits);
+    try testing.expectEqual(@as(usize, 5), cache.misses);
 }
 
 test "CachedLM evicts the least recently used entry and round-trips dump/load" {
@@ -212,6 +212,53 @@ test "CachedLM evicts the least recently used entry and round-trips dump/load" {
     try testing.expectError(error.InvalidCache, restored.load("{\"x\": []}"));
 }
 
+test "CachedLM preserves native summaries and calls across eviction-independent persistence" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Native = struct {
+        calls: usize = 0,
+
+        fn complete(ptr: *anyopaque, _: Allocator, _: Request) lm_mod.Error![]const Completion {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return &.{.{
+                .text = "",
+                .reasoning = "Search before answering.",
+                .tool_calls = &.{.{ .id = "call_1", .name = "search", .arguments = "{\"query\":\"Paris\"}" }},
+            }};
+        }
+    };
+    var native: Native = .{};
+    var cache: CachedLM = .{
+        .gpa = testing.allocator,
+        .inner = .{ .ptr = &native, .vtable = &.{ .complete = Native.complete }, .supports_function_calling = true },
+    };
+    defer cache.deinit();
+    const messages = [_]adapter.Message{.{ .role = .user, .content = "Find the capital." }};
+    const request: Request = .{ .messages = &messages, .options = .{ .reasoning_effort = "low" } };
+    _ = try cache.lm().completeResponses(arena, request);
+    const hit = (try cache.lm().completeResponses(arena, request))[0];
+    try testing.expectEqualStrings("Search before answering.", hit.reasoning.?);
+    try testing.expectEqualStrings("{\"query\":\"Paris\"}", hit.tool_calls[0].arguments);
+    try testing.expectEqual(@as(usize, 1), native.calls);
+
+    var writer: Writer.Allocating = .init(arena);
+    try cache.dump(&writer.writer);
+    var empty: lm_mod.ScriptedLM = .{ .responses = &.{} };
+    var restored: CachedLM = .{ .gpa = testing.allocator, .inner = empty.lm() };
+    defer restored.deinit();
+    try restored.load(writer.written());
+    const persisted = (try restored.lm().completeResponses(arena, request))[0];
+    try testing.expectEqualStrings("Search before answering.", persisted.reasoning.?);
+    try testing.expectEqualStrings("call_1", persisted.tool_calls[0].id);
+    try testing.expectEqualStrings("search", persisted.tool_calls[0].name);
+    try testing.expectEqualStrings("{\"query\":\"Paris\"}", persisted.tool_calls[0].arguments);
+    var changed = request;
+    changed.options.reasoning_effort = "high";
+    try testing.expectError(error.ScriptExhausted, restored.lm().completeResponses(arena, changed));
+}
+
 test "CachedLM survives every allocation failure" {
     const messages = [_]adapter.Message{.{ .role = .user, .content = "hi" }};
     try testing.checkAllAllocationFailures(testing.allocator, struct {
@@ -223,7 +270,7 @@ test "CachedLM survives every allocation failure" {
             defer cache.deinit();
             _ = try cache.lm().complete(arena_state.allocator(), .{ .messages = msgs });
             _ = try cache.lm().complete(arena_state.allocator(), .{ .messages = msgs });
-            try cache.load("{\"0000000000000000000000000000000000000000000000000000000000000000\": [\"z\"]}");
+            try cache.load("{\"0000000000000000000000000000000000000000000000000000000000000000\": [{\"text\": \"z\", \"reasoning\": \"native\", \"tool_calls\": []}]}");
         }
     }.run, .{&messages});
 }

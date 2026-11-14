@@ -1,4 +1,4 @@
-"""Write DSPy 3.4.1's `get_dspy_source_code(DateQA())`, the program code the
+"""Write DSPy 3.5.0's `get_dspy_source_code(DateQA())`, the program code the
 MIPROv2 program-aware proposer sends, and `inspect.getsource(DateQA)`, which
 SIMBA's rule writer sends; DSZig embeds both in examples/live_suite.zig.
 

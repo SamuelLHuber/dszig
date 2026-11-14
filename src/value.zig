@@ -29,6 +29,11 @@ pub fn pyStrip(s: []const u8) []const u8 {
 
 /// `format_field_value(field_info, value)`.
 pub fn formatFieldValue(w: *Writer, field: Field, v: Value) pyjson.Error!void {
+    if (field.native_reasoning and v == .object) {
+        if (v.object.get("content")) |content| {
+            if (content == .string) return w.writeAll(content.string);
+        }
+    }
     if (v == .array and field.kind == .str) return formatListBlobs(w, v.array.items);
     switch (v) {
         .array, .object => try pyjson.writeJson(w, v, .compact),
@@ -128,7 +133,7 @@ pub fn parseJsonValue(arena: Allocator, field: Field, v: Value) ParseError!Value
         },
         .json_object => if (v == .object) v else error.ParseValue,
         .str_dict => strDict(v),
-        .json => field.validate.?(arena, v),
+        .json => if (field.validate) |validate| validate(arena, v) else error.ParseValue,
     };
 }
 
@@ -151,7 +156,8 @@ fn parseNestedText(arena: Allocator, field: Field, text: []const u8) ParseError!
         else
             Value{ .string = text },
     };
-    return field.validate.?(arena, candidate);
+    const validate = field.validate orelse return error.ParseValue;
+    return validate(arena, candidate);
 }
 
 fn strDict(v: Value) ParseError!Value {
@@ -343,6 +349,9 @@ pub fn toRecord(arena: Allocator, comptime T: type, value: T) Allocator.Error!Re
 }
 
 pub fn toValue(arena: Allocator, comptime T: type, v: T) Allocator.Error!Value {
+    if (T == signature.Reasoning) return .{ .string = v.content };
+    if (T == @import("tool.zig").ToolCalls) return v.toValue(arena);
+    if (T == Value) return v;
     if (T == []const u8) return .{ .string = v };
     if (T == []const []const u8) {
         var array: std.json.Array = .init(arena);
@@ -387,6 +396,16 @@ pub fn fromRecord(arena: Allocator, comptime T: type, record: *const Record) Con
 }
 
 pub fn fromValue(arena: Allocator, comptime T: type, v: Value) ConvertError!T {
+    if (T == Value) return v;
+    if (T == @import("tool.zig").ToolCalls) return T.fromValue(arena, v) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.TypeMismatch,
+    };
+    if (T == signature.Reasoning) {
+        const content = if (v == .object) v.object.get("content") orelse return error.MissingField else v;
+        if (content != .string) return error.TypeMismatch;
+        return .{ .content = content.string };
+    }
     if (T == []const u8) return if (v == .string) v.string else error.TypeMismatch;
     if (T == []const []const u8) {
         if (v != .array) return error.TypeMismatch;
@@ -453,11 +472,19 @@ pub fn fromValue(arena: Allocator, comptime T: type, v: Value) ConvertError!T {
 /// Python `==` for JSON-loaded values (dict equality ignores key order;
 /// `1 == 1.0` and `True == 1` as in Python).
 pub fn pyEqual(a: Value, b: Value) bool {
-    const an = numeric(a);
-    const bn = numeric(b);
-    if (an != null and bn != null) return an.? == bn.?;
-    if (an != null or bn != null) return false;
+    if (a == .bool) return pyEqual(.{ .integer = if (a.bool) 1 else 0 }, b);
+    if (b == .bool) return pyEqual(a, .{ .integer = if (b.bool) 1 else 0 });
     return switch (a) {
+        .integer => |i| switch (b) {
+            .integer => |j| i == j,
+            .float => |f| floatEqualsInt(f, i),
+            else => false,
+        },
+        .float => |f| switch (b) {
+            .integer => |i| floatEqualsInt(f, i),
+            .float => |g| f == g,
+            else => false,
+        },
         .null => b == .null,
         .string => |s| b == .string and std.mem.eql(u8, s, b.string),
         .array => |x| blk: {
@@ -480,13 +507,10 @@ pub fn recordEqual(a: *const Record, b: *const Record) bool {
     return true;
 }
 
-fn numeric(v: Value) ?f64 {
-    return switch (v) {
-        .bool => |x| if (x) 1 else 0,
-        .integer => |i| @floatFromInt(i),
-        .float => |f| f,
-        else => null,
-    };
+fn floatEqualsInt(f: f64, i: i64) bool {
+    // Converting the integer to f64 first would merge distinct values above 2^53.
+    if (!std.math.isFinite(f) or f != @trunc(f) or f < -0x1p63 or f >= 0x1p63) return false;
+    return @as(i64, @intFromFloat(f)) == i;
 }
 
 /// Deep copy of a value into `arena` (strings included).
@@ -516,6 +540,15 @@ pub fn cloneRecord(arena: Allocator, r: *const Record) Allocator.Error!Record {
 }
 
 const testing = std.testing;
+
+test "Python numeric equality preserves integer precision" {
+    try testing.expect(!pyEqual(.{ .integer = 9_007_199_254_740_993 }, .{ .integer = 9_007_199_254_740_992 }));
+    try testing.expect(!pyEqual(.{ .integer = 9_007_199_254_740_993 }, .{ .float = 9_007_199_254_740_992.0 }));
+    try testing.expect(!pyEqual(.{ .integer = std.math.maxInt(i64) }, .{ .float = 9_223_372_036_854_775_808.0 }));
+    try testing.expect(pyEqual(.{ .integer = std.math.minInt(i64) }, .{ .float = -9_223_372_036_854_775_808.0 }));
+    try testing.expect(pyEqual(.{ .bool = true }, .{ .float = 1.0 }));
+    try testing.expect(!pyEqual(.{ .string = "1" }, .{ .integer = 1 }));
+}
 
 fn testField(kind: signature.Kind) Field {
     return .{ .name = "f", .kind = kind, .type_name = "", .desc = "", .prefix = "F:", .literals = &.{ "x", "y" } };

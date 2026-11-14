@@ -1,5 +1,5 @@
 """Golden fixture for nested field types (Pydantic models, list[T], Optional)
-in DSPy 3.4.1: ChatAdapter and JSONAdapter prompts plus one parsed answer.
+in DSPy 3.5.0: ChatAdapter and JSONAdapter prompts plus one parsed answer.
 
 Usage: uv run gen_nested.py [out_dir]  (default: ../../tests/fixtures)"""
 
@@ -10,6 +10,8 @@ from typing import Literal, Optional
 
 import dspy
 import pydantic
+
+import reference as ref
 
 
 class Address(pydantic.BaseModel):
@@ -75,13 +77,13 @@ def main():
     inputs = {"people": [ada], "note": None}
     cases = []
     for name, adapter in (("chat", dspy.ChatAdapter()), ("json", dspy.JSONAdapter())):
-        cases.append({"adapter": name, "messages": adapter.format(Extract, demos=[], inputs=inputs)})
+        cases.append({"adapter": name, "messages": ref.messages_for(adapter.format(Extract, demos=[], inputs=inputs))})
     parsed = dspy.ChatAdapter().parse(Extract, COMPLETION)
     outputs = {k: pydantic.TypeAdapter(type(v)).dump_python(v, mode="json") for k, v in parsed.items()}
     dict_inputs = {"counts": {"b": 2, "a": 1}, "inventory": Inventory(items={"x": 1}, where={"h": Address(city="Oslo", zip_code=5)})}
     dict_cases = []
     for name, adapter in (("chat", dspy.ChatAdapter()), ("json", dspy.JSONAdapter())):
-        dict_cases.append({"adapter": name, "messages": adapter.format(Tally, demos=[], inputs=dict_inputs)})
+        dict_cases.append({"adapter": name, "messages": ref.messages_for(adapter.format(Tally, demos=[], inputs=dict_inputs))})
     parsed = dspy.ChatAdapter().parse(Tally, DICT_COMPLETION)
     dict_outputs = {k: pydantic.TypeAdapter(Tally.output_fields[k].annotation).dump_python(v, mode="json") for k, v in parsed.items()}
     data = {

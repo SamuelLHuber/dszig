@@ -16,9 +16,9 @@ const LearningLM = struct {
         return .{ .ptr = self, .vtable = &.{ .complete = complete } };
     }
 
-    fn complete(_: *anyopaque, arena: Allocator, request: dszig.lm.Request) dszig.lm.Error![]const []const u8 {
-        const out = try arena.alloc([]const u8, 1);
-        out[0] = try reply(arena, request);
+    fn complete(_: *anyopaque, arena: Allocator, request: dszig.lm.Request) dszig.lm.Error![]const dszig.lm.Completion {
+        const out = try arena.alloc(dszig.lm.Completion, 1);
+        out[0] = .{ .text = try reply(arena, request) };
         return out;
     }
 
@@ -32,7 +32,7 @@ const LearningLM = struct {
         for (rag.train_rows, difficulty) |row, need| {
             if (std.mem.indexOf(u8, last, row[0]) == null) continue;
             const answer = if (demos >= need) row[1] else "unknown";
-            return std.fmt.allocPrint(arena, "[[ ## reasoning ## ]]\n{d} demos.\n\n[[ ## answer ## ]]\n{s}\n\n[[ ## completed ## ]]", .{ demos, answer });
+            return std.fmt.allocPrint(arena, "<plan>\n{d} demos.\n</plan>\n\n<answer>\n{s}\n</answer>", .{ demos, answer });
         }
         return error.LMFailure;
     }
@@ -77,6 +77,38 @@ test "teacher_settings runs bootstrapping under the teacher's LM" {
     try testing.expectEqual(@as(usize, 2), result.program.generate_answer.predict.state.demos.len);
 }
 
+test "BootstrapFewShot zero threshold accepts a zero score while null rejects it" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    const arena = out.allocator();
+    var keyword = rag.keywordLM();
+    const ctx: dszig.Context = .{ .arena = arena, .lm = keyword.lm(), .retriever = rag.corpus.retriever() };
+    // The real shared mock answers Germany with Munich, not the gold Berlin.
+    const trainset = (try rag.trainset(arena))[3..4];
+    var optimizer: dszig.BootstrapFewShot = .{
+        .metric = rag.keywordMetric,
+        .metric_threshold = 0.0,
+        .max_bootstrapped_demos = 1,
+        .max_labeled_demos = 0,
+    };
+    const accepted = try optimizer.compile(rag.RAG, arena, testing.allocator, ctx, .{}, null, trainset);
+    try testing.expect(accepted.program.compiled);
+    try testing.expectEqual(@as(usize, 1), accepted.report.bootstrapped);
+    try testing.expectEqual(@as(usize, 0), accepted.report.validation);
+    const demos = accepted.program.generate_answer.predict.state.demos;
+    try testing.expectEqual(@as(usize, 1), demos.len);
+    try testing.expectEqualStrings("Munich", demos[0].get("answer").?.string);
+    try testing.expectEqual(@as(f64, 0.0), rag.keywordMetric(arena, &trainset[0], &demos[0], null));
+    try testing.expectEqualStrings("Not sure.", demos[0].get("reasoning").?.string);
+
+    optimizer.metric_threshold = null;
+    const rejected = try optimizer.compile(rag.RAG, arena, testing.allocator, ctx, .{}, null, trainset);
+    try testing.expect(rejected.program.compiled);
+    try testing.expectEqual(@as(usize, 0), rejected.report.bootstrapped);
+    try testing.expectEqual(@as(usize, 1), rejected.report.validation);
+    try testing.expectEqual(@as(usize, 0), rejected.program.generate_answer.predict.state.demos.len);
+}
+
 test "Evaluate matches DSPy scores for the RAG fixture" {
     var out: std.heap.ArenaAllocator = .init(testing.allocator);
     defer out.deinit();
@@ -104,10 +136,12 @@ test "the same forward pass yields identical traces" {
         const ctx: dszig.Context = .{ .arena = arena, .lm = keyword.lm(), .retriever = rag.corpus.retriever(), .trace = trace };
         const output = try program.forward(ctx, .{ .question = "What is the capital of France?" });
         try testing.expectEqualStrings("Paris", output.answer);
+        try testing.expectEqualStrings("The context says Paris is the capital of France.", output.reasoning.?.content);
     }
     try testing.expectEqual(@as(usize, 1), traces[0].steps.items.len);
     try testing.expect(traces[0].eql(&traces[1]));
     try testing.expectEqualStrings("What is the capital of France?", traces[0].steps.items[0].inputs.get("question").?.string);
+    try testing.expectEqualStrings("The context says Paris is the capital of France.", traces[0].steps.items[0].outputs.get("reasoning").?.string);
 }
 
 test "compile is deterministic and does not mutate its inputs" {
@@ -164,7 +198,10 @@ test "optimize, evaluate and save run in fixed buffers" {
 }
 
 test "every allocation failure point is handled without leaks" {
-    try testing.checkAllAllocationFailures(testing.allocator, compileAndSave, .{});
+    // Disable address-dependent backing resize so every injected allocation
+    // site is deterministic while the complete optimizer/save path still runs.
+    var stable_backing = testing.FailingAllocator.init(testing.allocator, .{ .resize_fail_index = 0 });
+    try testing.checkAllAllocationFailures(stable_backing.allocator(), compileAndSave, .{});
 }
 
 fn compileAndSave(gpa: Allocator) !void {
@@ -216,4 +253,699 @@ test "random search stops at stop_at_score" {
     const result = try search.compile(rag.RAG, out.allocator(), testing.allocator, ctx, .{}, null, trainset, null);
     try testing.expectEqual(@as(usize, 1), result.candidates.len);
     try testing.expectEqual(@as(i64, -3), result.candidates[0].seed);
+}
+
+test "Chat Completions retain native reasoning without inventing absent summaries" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    const arena = out.allocator();
+    const json =
+        \\{"choices":[
+        \\  {"message":{"content":"first","reasoning_content":"Actual summary."}},
+        \\  {"message":{"content":"second"}},
+        \\  {"message":{"content":"third","reasoning_content":null}},
+        \\  {"message":{"content":"fourth","reasoning_content":""}}
+        \\]}
+    ;
+    const body = try arena.dupe(u8, json);
+    const completions = try dszig.lm.OpenAI.parseCompletions(arena, body);
+    // Provider response buffers are released after parsing.
+    @memset(body, 'x');
+    try testing.expectEqual(@as(usize, 4), completions.len);
+    try testing.expectEqualStrings("first", completions[0].text);
+    try testing.expectEqualStrings("Actual summary.", completions[0].reasoning.?);
+    try testing.expectEqualStrings("second", completions[1].text);
+    try testing.expect(completions[1].reasoning == null);
+    try testing.expectEqualStrings("third", completions[2].text);
+    try testing.expect(completions[2].reasoning == null);
+    try testing.expectEqualStrings("fourth", completions[3].text);
+    try testing.expectEqualStrings("", completions[3].reasoning.?);
+
+    for ([_][]const u8{
+        "{\"choices\":[]}",
+        "{\"choices\":[{\"message\":{\"content\":null}}]}",
+        "{\"choices\":[{\"message\":{\"content\":\"answer\",\"reasoning_content\":42}}]}",
+        "{\"choices\":[{\"message\":{\"content\":\"answer\",\"reasoning_content\":[]}}]}",
+    }) |invalid| {
+        try testing.expectError(error.LMFailure, dszig.lm.OpenAI.parseCompletions(arena, invalid));
+    }
+}
+
+test "Responses parse assistant output after reasoning and preserve real summary parts" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    const arena = out.allocator();
+    const json =
+        \\{"status":"completed","output":[
+        \\  {"type":"reasoning","summary":[
+        \\    {"type":"summary_text","text":"Locate the capital."},
+        \\    {"type":"summary_text","text":"Use the supplied fact."}
+        \\  ]},
+        \\  {"type":"web_search_call","status":"completed"},
+        \\  {"type":"message","role":"assistant","status":"completed","content":[
+        \\    {"type":"output_text","text":"<answer>\n"},
+        \\    {"type":"output_text","text":"Paris\n</answer>"}
+        \\  ]}
+        \\]}
+    ;
+    const body = try arena.dupe(u8, json);
+    const completion = try dszig.lm.OpenAI.parseResponsesResponse(arena, body);
+    @memset(body, 'x');
+    try testing.expectEqualStrings("<answer>\nParis\n</answer>", completion.text);
+    try testing.expectEqualStrings("Locate the capital.\nUse the supplied fact.", completion.reasoning.?);
+
+    const no_summary = try dszig.lm.OpenAI.parseResponsesResponse(arena,
+        \\{"status":"completed","output":[
+        \\  {"type":"reasoning","summary":[]},
+        \\  {"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}
+        \\]}
+    );
+    try testing.expectEqualStrings("answer", no_summary.text);
+    try testing.expect(no_summary.reasoning == null);
+
+    const empty_summary = try dszig.lm.OpenAI.parseResponsesResponse(arena,
+        \\{"status":"completed","output":[
+        \\  {"type":"reasoning","summary":[{"type":"summary_text","text":""}]},
+        \\  {"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}
+        \\]}
+    );
+    try testing.expectEqualStrings("", empty_summary.reasoning.?);
+}
+
+test "Responses refuse failed incomplete refused and answerless provider output" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    const arena = out.allocator();
+    for ([_][]const u8{
+        "{\"status\":\"failed\",\"output\":[]}",
+        "{\"status\":\"incomplete\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"partial\"}]}]}",
+        "{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"status\":\"incomplete\",\"content\":[{\"type\":\"output_text\",\"text\":\"partial\"}]}]}",
+        "{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"refusal\",\"refusal\":\"No.\"}]}]}",
+        "{\"status\":\"completed\",\"output\":[{\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Not an answer.\"}]}]}",
+        "{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"output_text\",\"text\":\"Not an assistant answer.\"}]}]}",
+        "{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"\"}]}]}",
+        "{\"status\":\"completed\",\"output\":[]}",
+    }) |invalid| {
+        try testing.expectError(error.LMFailure, dszig.lm.OpenAI.parseResponsesResponse(arena, invalid));
+    }
+}
+
+test "provider request bodies select reasoning JSON and completion-count contracts" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    const arena = out.allocator();
+    var provider: dszig.lm.OpenAI = .{
+        .client = undefined,
+        .base_url = "http://unused",
+        .model = "reasoning-model",
+        .api = .responses,
+        .max_tokens = 1024,
+        .supports_reasoning = true,
+        .supports_response_format = true,
+    };
+    const messages = [_]dszig.adapter.Message{
+        .{ .role = .system, .content = "Use the supplied fact." },
+        .{ .role = .user, .content = "Capital?" },
+    };
+    const request: dszig.lm.Request = .{
+        .messages = &messages,
+        .options = .{ .n = 3, .response_format = .json_object, .reasoning_effort = "low", .rollout_id = .{ .integer = 7 } },
+    };
+    const responses = (try std.json.parseFromSliceLeaky(std.json.Value, arena, try provider.requestBody(arena, request), .{})).object;
+    try testing.expectEqualStrings("reasoning-model", responses.get("model").?.string);
+    try testing.expectEqual(@as(i64, 1024), responses.get("max_output_tokens").?.integer);
+    try testing.expect(!responses.get("store").?.bool);
+    try testing.expect(!responses.contains("messages") and !responses.contains("n"));
+    try testing.expect(!responses.contains("rollout_id"));
+    const input = responses.get("input").?.array.items;
+    try testing.expectEqual(messages.len, input.len);
+    for (messages, input) |message, got| {
+        try testing.expectEqualStrings(message.role.name(), got.object.get("role").?.string);
+        try testing.expectEqualStrings(message.content, got.object.get("content").?.string);
+    }
+    const reasoning = responses.get("reasoning").?.object;
+    try testing.expectEqualStrings("low", reasoning.get("effort").?.string);
+    try testing.expectEqualStrings("auto", reasoning.get("summary").?.string);
+    try testing.expectEqualStrings("json_object", responses.get("text").?.object.get("format").?.object.get("type").?.string);
+    try testing.expect(provider.lm().supports_reasoning);
+
+    for ([_][]const u8{ "none", "off" }) |effort| {
+        var disabled = request;
+        disabled.options.reasoning_effort = effort;
+        const body = (try std.json.parseFromSliceLeaky(std.json.Value, arena, try provider.requestBody(arena, disabled), .{})).object;
+        try testing.expectEqualStrings("none", body.get("reasoning").?.object.get("effort").?.string);
+        try testing.expect(!body.get("reasoning").?.object.contains("summary"));
+    }
+
+    provider.api = .chat_completions;
+    const chat = (try std.json.parseFromSliceLeaky(std.json.Value, arena, try provider.requestBody(arena, request), .{})).object;
+    try testing.expectEqual(@as(i64, 3), chat.get("n").?.integer);
+    try testing.expectEqual(@as(i64, 1024), chat.get("max_tokens").?.integer);
+    try testing.expectEqualStrings("low", chat.get("reasoning_effort").?.string);
+    try testing.expectEqualStrings("json_object", chat.get("response_format").?.object.get("type").?.string);
+    try testing.expectEqual(messages.len, chat.get("messages").?.array.items.len);
+    try testing.expect(!chat.contains("input") and !chat.contains("store") and !chat.contains("rollout_id"));
+
+    const ordinary = (try std.json.parseFromSliceLeaky(std.json.Value, arena, try provider.requestBody(arena, .{ .messages = &messages }), .{})).object;
+    try testing.expect(!ordinary.contains("reasoning_effort"));
+    try testing.expect(!ordinary.contains("response_format") and !ordinary.contains("n"));
+}
+
+test "Chat replays assistant reasoning as text without dropping answers or native calls" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    const arena = out.allocator();
+    const native_calls = [_]dszig.lm.ToolCall{.{ .id = "call_thought", .name = "lookup", .arguments = "{ \"query\": \"Paris\" }" }};
+    const Case = struct {
+        reasoning: ?[]const u8,
+        content: []const u8,
+        expected: []const u8,
+        calls: []const dszig.lm.ToolCall = &.{},
+    };
+    const cases = [_]Case{
+        .{ .reasoning = "thought", .content = "answer", .expected = "thought\nanswer" },
+        .{ .reasoning = "thought", .content = "", .expected = "thought" },
+        .{ .reasoning = "", .content = "answer", .expected = "answer" },
+        .{ .reasoning = null, .content = "answer", .expected = "answer" },
+        .{ .reasoning = "thought", .content = "answer", .expected = "thought\nanswer", .calls = &native_calls },
+    };
+    const provider: dszig.lm.OpenAI = .{ .client = undefined, .base_url = "http://unused", .model = "m" };
+    for (cases) |case| {
+        const messages = [_]dszig.adapter.Message{.{
+            .role = .assistant,
+            .content = case.content,
+            .reasoning = case.reasoning,
+            .tool_calls = case.calls,
+        }};
+        const body = try provider.requestBody(arena, .{ .messages = &messages });
+        const root = try std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{});
+        const projected = root.object.get("messages").?.array.items;
+        try testing.expectEqual(@as(usize, 1), projected.len);
+        const message = projected[0].object;
+        try testing.expectEqualStrings("assistant", message.get("role").?.string);
+        try testing.expectEqualStrings(case.expected, message.get("content").?.string);
+        try testing.expect(!message.contains("reasoning") and !message.contains("reasoning_content"));
+        if (case.calls.len == 0) {
+            try testing.expect(!message.contains("tool_calls"));
+        } else {
+            const calls = message.get("tool_calls").?.array.items;
+            try testing.expectEqual(case.calls.len, calls.len);
+            for (case.calls, calls) |want, got| {
+                try testing.expectEqualStrings(want.id, got.object.get("id").?.string);
+                try testing.expectEqualStrings("function", got.object.get("type").?.string);
+                const function = got.object.get("function").?.object;
+                try testing.expectEqualStrings(want.name, function.get("name").?.string);
+                try testing.expectEqualStrings(want.arguments, function.get("arguments").?.string);
+            }
+        }
+    }
+}
+
+test "recording metadata roundtrip and replay preserve rich completions and exact requests" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    const arena = out.allocator();
+    const parameters = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+        \\{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}
+    , .{});
+    const output_schema = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+        \\{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}
+    , .{});
+    const tool_calls = [_]dszig.lm.ToolCall{.{ .id = "call_lookup", .name = "lookup", .arguments = "{ \"query\": \"Paris\" }" }};
+    var scripted: dszig.lm.ScriptedLM = .{
+        .responses = &.{ "", "{\"answer\":\"Berlin\"}" },
+        .reasonings = &.{ "Actual summary.", null },
+        .tool_calls = &.{ &tool_calls, &.{} },
+        .supports_reasoning = true,
+        .supports_response_format = true,
+        .supports_response_schema = true,
+        .supports_function_calling = true,
+    };
+    var recording: dszig.lm.RecordingLM = .{ .inner = scripted.lm(), .arena = arena };
+    const request: dszig.lm.Request = .{
+        .messages = &.{.{ .role = .user, .content = "question" }},
+        .tools = &.{.{ .name = "lookup", .description = "Look up a fact.", .parameters = parameters, .strict = true }},
+        .options = .{
+            .n = 2,
+            .temperature = 0.7,
+            .rollout_id = .{ .integer = 4 },
+            .reasoning_effort = "low",
+            .response_format = .{ .json_schema = .{ .name = "TaskOutput", .schema = output_schema } },
+            .tool_choice = .{ .function = "lookup" },
+            .parallel_tool_calls = false,
+        },
+    };
+    try testing.expect(recording.lm().supports_reasoning);
+    try testing.expect(recording.lm().supports_response_format);
+    try testing.expect(recording.lm().supports_response_schema);
+    try testing.expect(recording.lm().supports_function_calling);
+    const completed = try recording.lm().completeResponses(arena, request);
+    try testing.expectEqual(@as(usize, 2), completed.len);
+    try testing.expectEqualStrings("Actual summary.", completed[0].reasoning.?);
+    try testing.expect(completed[1].reasoning == null);
+    try testing.expectEqual(@as(usize, 1), completed[0].tool_calls.len);
+    try testing.expectEqualStrings("call_lookup", completed[0].tool_calls[0].id);
+    try testing.expectEqualStrings("lookup", completed[0].tool_calls[0].name);
+    try testing.expectEqualStrings(tool_calls[0].arguments, completed[0].tool_calls[0].arguments);
+    try testing.expectEqual(@as(usize, 0), completed[1].tool_calls.len);
+    try testing.expectEqual(@as(usize, 2), recording.calls.items.len);
+    try testing.expectEqual(@as(usize, 1), recording.calls.items[0].tools.len);
+    try testing.expectEqualStrings("lookup", recording.calls.items[0].tools[0].name);
+
+    var used = [_]bool{ false, false };
+    var replay: dszig.lm.ReplayLM = .{
+        .calls = recording.calls.items,
+        .used = &used,
+        .supports_reasoning = true,
+        .supports_response_format = true,
+        .supports_response_schema = true,
+        .supports_function_calling = true,
+    };
+    try testing.expect(replay.lm().supports_reasoning);
+    try testing.expect(replay.lm().supports_response_format);
+    try testing.expect(replay.lm().supports_response_schema);
+    try testing.expect(replay.lm().supports_function_calling);
+    var changed = request;
+    changed.options.reasoning_effort = "high";
+    try testing.expectError(error.LMFailure, replay.lm().completeResponses(arena, changed));
+    changed = request;
+    changed.options.response_format = .text;
+    try testing.expectError(error.LMFailure, replay.lm().completeResponses(arena, changed));
+    changed = request;
+    changed.options.tool_choice = .none;
+    try testing.expectError(error.LMFailure, replay.lm().completeResponses(arena, changed));
+    changed = request;
+    changed.options.parallel_tool_calls = true;
+    try testing.expectError(error.LMFailure, replay.lm().completeResponses(arena, changed));
+    changed = request;
+    changed.tools = &.{};
+    try testing.expectError(error.LMFailure, replay.lm().completeResponses(arena, changed));
+    try testing.expect(!used[0]);
+    const restored_request = try dszig.lm.requestFromValue(arena, try dszig.lm.requestValue(arena, request));
+    const replayed = try replay.lm().completeResponses(arena, restored_request);
+    try testing.expectEqual(@as(usize, 2), replayed.len);
+    for (completed, replayed) |want, got| {
+        const restored = try dszig.lm.completionFromValue(arena, try dszig.lm.completionValue(arena, want));
+        try testing.expectEqualStrings(restored.text, got.text);
+        if (restored.reasoning) |summary| try testing.expectEqualStrings(summary, got.reasoning.?) else try testing.expect(got.reasoning == null);
+        try testing.expectEqual(restored.tool_calls.len, got.tool_calls.len);
+        for (restored.tool_calls, got.tool_calls) |want_call, got_call| {
+            try testing.expectEqualStrings(want_call.id, got_call.id);
+            try testing.expectEqualStrings(want_call.name, got_call.name);
+            try testing.expectEqualStrings(want_call.arguments, got_call.arguments);
+        }
+    }
+    try testing.expect(used[0] and used[1]);
+    try testing.expectEqual(@as(usize, 5), replay.misses);
+}
+
+test "native function-only provider completions preserve identifiers and raw arguments" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    const arena = out.allocator();
+    const arguments = "{ \"query\": \"Paris\", \"limit\": 2 }";
+    const chat_body = try arena.dupe(u8,
+        \\{"choices":[{"message":{"content":null,"reasoning_content":"Look up the fact.","tool_calls":[
+        \\  {"id":"call_chat","type":"function","function":{"name":"lookup","arguments":"{ \"query\": \"Paris\", \"limit\": 2 }"}}
+        \\]}}]}
+    );
+    const chat = try dszig.lm.OpenAI.parseCompletions(arena, chat_body);
+    @memset(chat_body, 'x');
+    try testing.expectEqual(@as(usize, 1), chat.len);
+    try testing.expectEqualStrings("", chat[0].text);
+    try testing.expectEqualStrings("Look up the fact.", chat[0].reasoning.?);
+    try testing.expectEqual(@as(usize, 1), chat[0].tool_calls.len);
+    try testing.expectEqualStrings("call_chat", chat[0].tool_calls[0].id);
+    try testing.expectEqualStrings("lookup", chat[0].tool_calls[0].name);
+    try testing.expectEqualStrings(arguments, chat[0].tool_calls[0].arguments);
+
+    const responses_body = try arena.dupe(u8,
+        \\{"status":"completed","output":[
+        \\  {"type":"reasoning","summary":[{"type":"summary_text","text":"Look up the fact."}]},
+        \\  {"type":"function_call","id":"fc_item","call_id":"call_responses","status":"completed",
+        \\   "name":"lookup","arguments":"{ \"query\": \"Paris\", \"limit\": 2 }"}
+        \\]}
+    );
+    const responses = try dszig.lm.OpenAI.parseResponsesResponse(arena, responses_body);
+    @memset(responses_body, 'x');
+    try testing.expectEqualStrings("", responses.text);
+    try testing.expectEqualStrings("Look up the fact.", responses.reasoning.?);
+    try testing.expectEqual(@as(usize, 1), responses.tool_calls.len);
+    try testing.expectEqualStrings("call_responses", responses.tool_calls[0].id);
+    try testing.expectEqualStrings("lookup", responses.tool_calls[0].name);
+    try testing.expectEqualStrings(arguments, responses.tool_calls[0].arguments);
+}
+
+test "native schemas tools choices and tool results use each provider's actual wire format" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    const arena = out.allocator();
+    const parameters = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+        \\{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}
+    , .{});
+    const output_schema = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+        \\{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}
+    , .{});
+    const arguments = "{ \"query\": \"Paris\" }";
+    const calls = [_]dszig.lm.ToolCall{.{ .id = "call_lookup", .name = "lookup", .arguments = arguments }};
+    const messages = [_]dszig.adapter.Message{
+        .{ .role = .user, .content = "Capital?" },
+        .{ .role = .assistant, .content = "", .tool_calls = &calls },
+        .{ .role = .tool, .content = "Paris", .tool_call_id = "call_lookup" },
+    };
+    const tools = [_]dszig.lm.FunctionTool{.{
+        .name = "lookup",
+        .description = "Look up a fact.",
+        .parameters = parameters,
+        .strict = true,
+    }};
+    const request: dszig.lm.Request = .{
+        .messages = &messages,
+        .tools = &tools,
+        .options = .{
+            .response_format = .{ .json_schema = .{ .name = "TaskOutput", .schema = output_schema, .description = "Answer only.", .strict = true } },
+            .tool_choice = .{ .function = "lookup" },
+            .parallel_tool_calls = false,
+        },
+    };
+    var provider: dszig.lm.OpenAI = .{
+        .client = undefined,
+        .base_url = "http://unused",
+        .model = "native-model",
+        .supports_response_format = true,
+        .supports_response_schema = true,
+        .supports_function_calling = true,
+    };
+    try testing.expect(provider.lm().supports_response_format);
+    try testing.expect(provider.lm().supports_response_schema);
+    try testing.expect(provider.lm().supports_function_calling);
+
+    const chat = (try std.json.parseFromSliceLeaky(std.json.Value, arena, try provider.requestBody(arena, request), .{})).object;
+    const chat_tools = chat.get("tools").?.array.items;
+    try testing.expectEqual(@as(usize, 1), chat_tools.len);
+    try testing.expectEqualStrings("function", chat_tools[0].object.get("type").?.string);
+    const chat_function = chat_tools[0].object.get("function").?.object;
+    try testing.expectEqualStrings("lookup", chat_function.get("name").?.string);
+    try testing.expectEqualStrings("Look up a fact.", chat_function.get("description").?.string);
+    try testing.expect(chat_function.get("strict").?.bool);
+    try testing.expectEqualStrings(
+        try std.json.Stringify.valueAlloc(arena, parameters, .{}),
+        try std.json.Stringify.valueAlloc(arena, chat_function.get("parameters").?, .{}),
+    );
+    const chat_format = chat.get("response_format").?.object;
+    try testing.expectEqualStrings("json_schema", chat_format.get("type").?.string);
+    const chat_schema = chat_format.get("json_schema").?.object;
+    try testing.expectEqualStrings("TaskOutput", chat_schema.get("name").?.string);
+    try testing.expectEqualStrings("Answer only.", chat_schema.get("description").?.string);
+    try testing.expect(chat_schema.get("strict").?.bool);
+    try testing.expectEqualStrings(
+        try std.json.Stringify.valueAlloc(arena, output_schema, .{}),
+        try std.json.Stringify.valueAlloc(arena, chat_schema.get("schema").?, .{}),
+    );
+    try testing.expectEqualStrings("function", chat.get("tool_choice").?.object.get("type").?.string);
+    try testing.expectEqualStrings("lookup", chat.get("tool_choice").?.object.get("function").?.object.get("name").?.string);
+    try testing.expect(!chat.get("parallel_tool_calls").?.bool);
+    const chat_messages = chat.get("messages").?.array.items;
+    try testing.expectEqual(messages.len, chat_messages.len);
+    const chat_call = chat_messages[1].object.get("tool_calls").?.array.items[0].object;
+    try testing.expectEqualStrings("call_lookup", chat_call.get("id").?.string);
+    try testing.expectEqualStrings("lookup", chat_call.get("function").?.object.get("name").?.string);
+    try testing.expectEqualStrings(arguments, chat_call.get("function").?.object.get("arguments").?.string);
+    try testing.expectEqualStrings("tool", chat_messages[2].object.get("role").?.string);
+    try testing.expectEqualStrings("call_lookup", chat_messages[2].object.get("tool_call_id").?.string);
+    try testing.expectEqualStrings("Paris", chat_messages[2].object.get("content").?.string);
+
+    provider.api = .responses;
+    const responses = (try std.json.parseFromSliceLeaky(std.json.Value, arena, try provider.requestBody(arena, request), .{})).object;
+    const response_tools = responses.get("tools").?.array.items;
+    try testing.expectEqual(@as(usize, 1), response_tools.len);
+    try testing.expectEqualStrings("function", response_tools[0].object.get("type").?.string);
+    try testing.expectEqualStrings("lookup", response_tools[0].object.get("name").?.string);
+    try testing.expectEqualStrings("Look up a fact.", response_tools[0].object.get("description").?.string);
+    try testing.expect(response_tools[0].object.get("strict").?.bool);
+    try testing.expectEqualStrings(
+        try std.json.Stringify.valueAlloc(arena, parameters, .{}),
+        try std.json.Stringify.valueAlloc(arena, response_tools[0].object.get("parameters").?, .{}),
+    );
+    const response_format = responses.get("text").?.object.get("format").?.object;
+    try testing.expectEqualStrings("json_schema", response_format.get("type").?.string);
+    try testing.expectEqualStrings("TaskOutput", response_format.get("name").?.string);
+    try testing.expectEqualStrings("Answer only.", response_format.get("description").?.string);
+    try testing.expect(response_format.get("strict").?.bool);
+    try testing.expectEqualStrings(
+        try std.json.Stringify.valueAlloc(arena, output_schema, .{}),
+        try std.json.Stringify.valueAlloc(arena, response_format.get("schema").?, .{}),
+    );
+    try testing.expectEqualStrings("function", responses.get("tool_choice").?.object.get("type").?.string);
+    try testing.expectEqualStrings("lookup", responses.get("tool_choice").?.object.get("name").?.string);
+    try testing.expect(!responses.get("parallel_tool_calls").?.bool);
+    var call_count: usize = 0;
+    var result_count: usize = 0;
+    for (responses.get("input").?.array.items) |item| {
+        const kind = item.object.get("type") orelse continue;
+        if (std.mem.eql(u8, kind.string, "function_call")) {
+            call_count += 1;
+            try testing.expectEqualStrings("call_lookup", item.object.get("call_id").?.string);
+            try testing.expectEqualStrings("lookup", item.object.get("name").?.string);
+            try testing.expectEqualStrings(arguments, item.object.get("arguments").?.string);
+        } else if (std.mem.eql(u8, kind.string, "function_call_output")) {
+            result_count += 1;
+            try testing.expectEqualStrings("call_lookup", item.object.get("call_id").?.string);
+            try testing.expectEqualStrings("Paris", item.object.get("output").?.string);
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), call_count);
+    try testing.expectEqual(@as(usize, 1), result_count);
+}
+
+const SubmitDetails = struct { city: []const u8, zip_code: i64 };
+
+const StructuredSubmit = dszig.Signature(struct {
+    pub const Input = struct { question: []const u8 };
+    pub const Output = struct {
+        answer: []const u8,
+        details: SubmitDetails,
+        ids: []const i64,
+        note: ?[]const u8,
+        label: enum { pos, neg },
+        count: u8,
+    };
+});
+
+test "ReAct typed submit returns every nested list nullable enum and bounded output" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    const arena = out.allocator();
+    var scripted: dszig.lm.ScriptedLM = .{ .responses = &.{
+        \\<next_thought>
+        \\Submit the result.
+        \\</next_thought>
+        \\<tool_calls>
+        \\{"tool_calls":[{"name":"submit","args":{"answer":"Paris","details":{"city":"Paris","zip_code":9},"ids":[1,2],"note":null,"label":"pos","count":255}}]}
+        \\</tool_calls>
+    } };
+    const agent: dszig.ReAct(StructuredSubmit, &.{}) = .{ .max_iters = 1 };
+    const output = try agent.forward(.{ .arena = arena, .lm = scripted.lm() }, .{ .question = "Return the result." });
+    try testing.expectEqualStrings("Paris", output.answer);
+    try testing.expectEqualStrings("Paris", output.details.city);
+    try testing.expectEqual(@as(i64, 9), output.details.zip_code);
+    try testing.expectEqualSlices(i64, &.{ 1, 2 }, output.ids);
+    try testing.expect(output.note == null);
+    try testing.expect(output.label == .pos);
+    try testing.expectEqual(@as(u8, 255), output.count);
+    try testing.expectEqual(@as(usize, 1), scripted.index);
+}
+
+test "ReAct rejects malformed typed final values before returning any output" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    const arena = out.allocator();
+    const agent: dszig.ReAct(StructuredSubmit, &.{}) = .{ .max_iters = 0 };
+    const inputs = try dszig.value.toRecord(arena, StructuredSubmit.Input, .{ .question = "Return the result." });
+    for ([_][]const u8{
+        "{\"answer\":\"Paris\",\"details\":{\"city\":\"Paris\",\"zip_code\":9},\"ids\":[1,2],\"note\":null,\"label\":\"pos\",\"count\":256}",
+        "{\"answer\":\"Paris\",\"details\":{\"city\":\"Paris\",\"zip_code\":9},\"ids\":[1,2],\"note\":null,\"label\":\"pos\",\"count\":-1}",
+        "{\"answer\":\"Paris\",\"details\":{\"city\":\"Paris\",\"zip_code\":9},\"ids\":[1,2],\"note\":null,\"label\":\"pos\",\"count\":1.5}",
+        "{\"answer\":\"Paris\",\"details\":{\"city\":42,\"zip_code\":9},\"ids\":[1,2],\"note\":null,\"label\":\"pos\",\"count\":7}",
+        "{\"answer\":\"Paris\",\"details\":{\"city\":\"Paris\",\"zip_code\":9},\"ids\":\"not a list\",\"note\":null,\"label\":\"pos\",\"count\":7}",
+        "{\"answer\":\"Paris\",\"details\":{\"city\":\"Paris\",\"zip_code\":9},\"ids\":[1,2],\"note\":null,\"label\":\"other\",\"count\":7}",
+        "{\"answer\":\"Paris\",\"details\":{\"city\":\"Paris\",\"zip_code\":9},\"ids\":[1,2],\"note\":null,\"label\":\"pos\"}",
+    }) |args| {
+        const completion = try std.mem.concat(arena, u8, &.{
+            "<next_thought>\nSubmit the result.\n</next_thought>\n<tool_calls>\n{\"tool_calls\":[{\"name\":\"submit\",\"args\":",
+            args,
+            "}]}\n</tool_calls>",
+        });
+        var scripted: dszig.lm.ScriptedLM = .{ .responses = &.{completion} };
+        var history: dszig.History = .{};
+        try testing.expectError(error.ReActSubmitFailed, agent.runWithOptions(.{ .arena = arena, .lm = scripted.lm() }, &inputs, .{ .history = &history }));
+        try testing.expectEqual(@as(usize, 1), scripted.index);
+        try testing.expectEqual(@as(usize, 1), history.messages.len);
+        const calls = try dszig.react.ToolCalls.fromValue(arena, history.messages[0].get("tool_calls").?);
+        const results = calls.tool_call_results.?.tool_call_results;
+        try testing.expectEqual(@as(usize, 1), results.len);
+        try testing.expect(results[0].is_error);
+        try testing.expectEqualStrings("Execution error in submit: InvalidArguments", results[0].value.string);
+        try testing.expect(!history.messages[0].contains("answer"));
+    }
+}
+
+test "ReAct reuses structured History across calls without replacing prior events" {
+    const QA = dszig.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: []const u8 };
+    });
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    const arena = out.allocator();
+    var requests: dszig.lm.History = .{ .arena = arena };
+    var scripted: dszig.lm.ScriptedLM = .{ .responses = &.{
+        "<next_thought>\nFirst result.\n</next_thought>\n<tool_calls>\n{\"tool_calls\":[{\"id\":\"submit-paris\",\"name\":\"submit\",\"args\":{\"answer\":\"Paris\"}}]}\n</tool_calls>",
+        "<next_thought>\nSecond result.\n</next_thought>\n<tool_calls>\n{\"tool_calls\":[{\"id\":\"submit-berlin\",\"name\":\"submit\",\"args\":{\"answer\":\"Berlin\"}}]}\n</tool_calls>",
+    }, .history = &requests };
+    const ctx: dszig.Context = .{ .arena = arena, .lm = scripted.lm() };
+    const agent: dszig.ReAct(QA, &.{}) = .{ .max_iters = 1 };
+    var history: dszig.History = .{};
+    const first_inputs = try dszig.value.toRecord(arena, QA.Input, .{ .question = "First question?" });
+    const first = try agent.runWithOptions(ctx, &first_inputs, .{ .history = &history });
+    try testing.expectEqualStrings("Paris", first.outputs.get("answer").?.string);
+    try testing.expectEqual(dszig.react.TerminationReason.submit, first.termination_reason);
+    try testing.expectEqual(@as(usize, 1), history.messages.len);
+    const saved_first = try std.json.Stringify.valueAlloc(arena, std.json.Value{ .object = history.messages[0] }, .{});
+
+    const second_inputs = try dszig.value.toRecord(arena, QA.Input, .{ .question = "Second question?" });
+    const second = try agent.runWithOptions(ctx, &second_inputs, .{ .history = &history });
+    try testing.expectEqualStrings("Berlin", second.outputs.get("answer").?.string);
+    try testing.expectEqual(dszig.react.TerminationReason.submit, second.termination_reason);
+    try testing.expectEqual(@as(usize, 2), history.messages.len);
+    try testing.expectEqual(@as(usize, 1), first.history.messages.len);
+    try testing.expectEqualStrings(saved_first, try std.json.Stringify.valueAlloc(arena, std.json.Value{ .object = history.messages[0] }, .{}));
+    try testing.expectEqualStrings("First question?", history.messages[0].get("question").?.string);
+    try testing.expectEqualStrings("Second question?", history.messages[1].get("question").?.string);
+    try testing.expectEqualStrings("Paris", history.messages[0].get("answer").?.string);
+    try testing.expectEqualStrings("Berlin", history.messages[1].get("answer").?.string);
+    const first_calls = try dszig.react.ToolCalls.fromValue(arena, history.messages[0].get("tool_calls").?);
+    const second_calls = try dszig.react.ToolCalls.fromValue(arena, history.messages[1].get("tool_calls").?);
+    try testing.expectEqualStrings("submit-paris", first_calls.tool_calls[0].id.?);
+    try testing.expectEqualStrings("submit-berlin", second_calls.tool_calls[0].id.?);
+    try testing.expectEqual(@as(usize, 2), requests.requests.items.len);
+    try testing.expect(requests.requests.items[1].messages.len > requests.requests.items[0].messages.len);
+    var saw_first = false;
+    var saw_second = false;
+    var saw_first_answer = false;
+    for (requests.requests.items[1].messages) |message| {
+        saw_first = saw_first or std.mem.indexOf(u8, message.content, "First question?") != null;
+        saw_second = saw_second or std.mem.indexOf(u8, message.content, "Second question?") != null;
+        saw_first_answer = saw_first_answer or std.mem.indexOf(u8, message.content, "Paris") != null;
+    }
+    try testing.expect(saw_first and saw_second and saw_first_answer);
+}
+
+test "LM fans out actual n1 candidate requests and replay preserves strict rollout identity" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    const arena = out.allocator();
+    const messages = [_]dszig.adapter.Message{.{ .role = .user, .content = "Look up the facts." }};
+    const parameters = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"type\":\"object\"}", .{});
+    const tools = [_]dszig.lm.FunctionTool{.{ .name = "lookup", .parameters = parameters }};
+    const texts = [_][]const u8{ "first", "second", "third" };
+    const summaries = [_]?[]const u8{ "First summary.", null, "" };
+    const first_calls = [_]dszig.lm.ToolCall{.{ .id = "call_first", .name = "lookup", .arguments = "{ \"query\": \"first\" }" }};
+    const third_calls = [_]dszig.lm.ToolCall{.{ .id = "call_third", .name = "lookup", .arguments = "{\"query\":\"third\"}" }};
+    const native_calls = [_][]const dszig.lm.ToolCall{ &first_calls, &.{}, &third_calls };
+    const array_rollout = try std.json.parseFromSliceLeaky(std.json.Value, arena, "[\"session\",7]", .{});
+    const bases = [_]?std.json.Value{ null, .{ .integer = 4 }, .{ .string = "base-run" }, array_rollout };
+    for (bases) |base| {
+        var scripted: dszig.lm.ScriptedLM = .{
+            .responses = &texts,
+            .reasonings = &summaries,
+            .tool_calls = &native_calls,
+            .supports_reasoning = true,
+            .supports_function_calling = true,
+        };
+        var recording: dszig.lm.RecordingLM = .{ .inner = scripted.lm(), .arena = arena };
+        const request: dszig.lm.Request = .{
+            .messages = &messages,
+            .tools = &tools,
+            .options = .{ .n = 3, .temperature = 0.7, .reasoning_effort = "low", .rollout_id = base },
+        };
+        const generated = try recording.lm().completeResponses(arena, request);
+        try testing.expectEqual(@as(usize, 3), generated.len);
+        try testing.expectEqual(@as(usize, 3), scripted.index);
+        try testing.expectEqual(@as(usize, 3), recording.calls.items.len);
+        try testing.expectEqual(@as(usize, 3), dszig.lm.ReplayLM.completionCount(recording.calls.items));
+        for (recording.calls.items, 0..) |call, index| {
+            const options = call.options.?;
+            try testing.expectEqual(@as(u32, 1), options.n);
+            try testing.expectEqual(@as(f64, 0.7), options.temperature.?);
+            try testing.expectEqualStrings("low", options.reasoning_effort.?);
+            const rollout = options.rollout_id.?.array.items;
+            try testing.expectEqual(@as(usize, 3), rollout.len);
+            try testing.expectEqualStrings("dspy.adapter.candidate", rollout[0].string);
+            try testing.expectEqualStrings(
+                try std.json.Stringify.valueAlloc(arena, base orelse .null, .{}),
+                try std.json.Stringify.valueAlloc(arena, rollout[1], .{}),
+            );
+            try testing.expectEqual(@as(i64, @intCast(index)), rollout[2].integer);
+            try testing.expectEqual(@as(usize, 1), call.all().len);
+            try testing.expectEqualStrings(texts[index], call.completion);
+            try testing.expectEqualStrings(texts[index], generated[index].text);
+        }
+
+        var untagged_used = [_]bool{ false, false, false };
+        var untagged: dszig.lm.ReplayLM = .{ .calls = recording.calls.items, .used = &untagged_used };
+        var wrong_request = request;
+        wrong_request.options.n = 1;
+        try testing.expectError(error.LMFailure, untagged.lm().completeResponses(arena, wrong_request));
+        try testing.expectEqualSlices(bool, &.{ false, false, false }, &untagged_used);
+        try testing.expectEqual(@as(usize, 1), untagged.misses);
+
+        var used = [_]bool{ false, false, false };
+        var replay: dszig.lm.ReplayLM = .{
+            .calls = recording.calls.items,
+            .used = &used,
+            .supports_reasoning = true,
+            .supports_function_calling = true,
+        };
+        const completions = try replay.lm().completeResponses(arena, request);
+        try testing.expectEqual(@as(usize, 3), completions.len);
+        for (completions, 0..) |got, index| {
+            try testing.expectEqualStrings(texts[index], got.text);
+            if (summaries[index]) |summary| try testing.expectEqualStrings(summary, got.reasoning.?) else try testing.expect(got.reasoning == null);
+            try testing.expectEqual(native_calls[index].len, got.tool_calls.len);
+            for (native_calls[index], got.tool_calls) |want_call, got_call| {
+                try testing.expectEqualStrings(want_call.id, got_call.id);
+                try testing.expectEqualStrings(want_call.name, got_call.name);
+                try testing.expectEqualStrings(want_call.arguments, got_call.arguments);
+            }
+        }
+        try testing.expect(replay.exhausted());
+        try testing.expectError(error.LMFailure, replay.lm().completeResponses(arena, request));
+        try testing.expectEqual(@as(usize, 1), replay.misses);
+    }
+}
+
+test "native provider calls require real identifiers names and argument strings" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    const arena = out.allocator();
+    for ([_][]const u8{
+        "{\"choices\":[{\"message\":{\"content\":null,\"tool_calls\":[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]}}]}",
+        "{\"choices\":[{\"message\":{\"content\":null,\"tool_calls\":[{\"id\":\"call\",\"type\":\"function\",\"function\":{\"arguments\":\"{}\"}}]}}]}",
+        "{\"choices\":[{\"message\":{\"content\":null,\"tool_calls\":[{\"id\":\"call\",\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}]}}]}",
+        "{\"choices\":[{\"message\":{\"content\":null,\"tool_calls\":[{\"id\":\"call\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":{}}}]}}]}",
+        "{\"choices\":[{\"message\":{\"content\":null,\"tool_calls\":[{\"id\":\"\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]}}]}",
+    }) |invalid| {
+        try testing.expectError(error.LMFailure, dszig.lm.OpenAI.parseCompletions(arena, invalid));
+    }
+    for ([_][]const u8{
+        "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"name\":\"lookup\",\"arguments\":\"{}\"}]}",
+        "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"call\",\"arguments\":\"{}\"}]}",
+        "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"call\",\"name\":\"lookup\"}]}",
+        "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"call\",\"name\":\"lookup\",\"arguments\":{}}]}",
+        "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"\",\"name\":\"lookup\",\"arguments\":\"{}\"}]}",
+        "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"call\",\"name\":\"lookup\",\"arguments\":\"{}\",\"status\":\"incomplete\"}]}",
+    }) |invalid| {
+        try testing.expectError(error.LMFailure, dszig.lm.OpenAI.parseResponsesResponse(arena, invalid));
+    }
 }

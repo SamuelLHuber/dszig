@@ -1,7 +1,7 @@
 StringSignature(question -> reasoning, answer
     instructions='Answer the question with the date it asks for.'
     question = Field(annotation=str required=True json_schema_extra={'__dspy_field_type': 'input', 'prefix': 'Question:', 'desc': '${question}'})
-    reasoning = Field(annotation=str required=True json_schema_extra={'desc': '${reasoning}', '__dspy_field_type': 'output', 'prefix': 'Reasoning:'})
+    reasoning = Field(annotation=Reasoning required=True json_schema_extra={'desc': 'A short plan for solving the task.', '__dspy_field_type': 'output', 'prefix': 'Reasoning:', '__dspy_reasoning_fallback': 'plan'})
     answer = Field(annotation=str required=True json_schema_extra={'__dspy_field_type': 'output', 'prefix': 'Answer:', 'desc': '${answer}'})
 )
 

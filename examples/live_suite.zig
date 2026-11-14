@@ -1,7 +1,7 @@
-//! Live-validation suite: the same cases and RAG BootstrapFewShot pipeline
-//! as tools/dspy_reference/live_suite.py. `zig build live` runs it on a real
-//! OpenAI model and writes a transcript DSPy replays; tests/live_replay.zig
-//! replays DSPy's real-model transcript through it.
+//! DSPy 3.5.0 validation suite shared with tools/dspy_reference/live_suite.py.
+//! `zig build live` runs every adapter case and optimizer pipeline against a
+//! real model and writes a request/response transcript DSPy can replay.
+//! tests/live_replay.zig replays independently recorded DSPy 3.5.0 calls.
 
 const std = @import("std");
 const dszig = @import("dszig");
@@ -11,6 +11,7 @@ const Value = std.json.Value;
 const Record = dszig.value.Record;
 const Call = dszig.lm.ReplayLM.Call;
 
+pub const target_dspy = "3.5.0";
 pub const temperature = 0.0;
 
 pub const Typed = dszig.Signature(struct {
@@ -32,7 +33,7 @@ pub const Indented = dszig.Signature(struct {
 });
 
 pub const qa_demos =
-    \\[{"augmented": true, "context": ["a fact"], "question": "q1?", "reasoning": "r1", "answer": "a1"},
+    \\[{"augmented": true, "context": ["a fact"], "question": "q1?", "reasoning": {"content": "r1"}, "answer": "a1"},
     \\ {"question": "q2?", "answer": "a2"}]
 ;
 pub const qa_input: rag.QA.Input = .{
@@ -88,7 +89,7 @@ pub fn exactMetric(_: Allocator, example: *const dszig.Example, prediction: *con
     return if (std.mem.eql(u8, std.mem.trim(u8, got, " \t\r\n"), want)) 1 else 0;
 }
 
-pub const case_count = 5;
+pub const case_count = 8;
 
 pub const Case = struct {
     name: []const u8,
@@ -138,6 +139,9 @@ pub fn run(arena: Allocator, gpa: Allocator, lm: dszig.LM) !Result {
         try runCase(dszig.Predict(Typed), base, .chat, "typed_chat", typed_demos, typed_input),
         try runCase(dszig.Predict(Typed), base, .json, "typed_json", typed_demos, typed_input),
         try runCase(dszig.Predict(Indented), base, .chat, "indented_chat", "[]", .{ .text = "meh" }),
+        try runCase(dszig.ChainOfThought(rag.QA), base, base.adapter, "cot_qa_xml", qa_demos, qa_input),
+        try runCase(dszig.Predict(Typed), base, base.adapter, "typed_xml", typed_demos, typed_input),
+        try runCase(dszig.Predict(Indented), base, base.adapter, "indented_xml", "[]", .{ .text = "meh" }),
     };
 
     var ctx = base;
@@ -231,6 +235,7 @@ fn corpusSearch(ctx: dszig.Context, args: *const Record) dszig.react.ToolError!V
     return .{ .array = list };
 }
 
+/// Structured history and tool calls, ending in `submit(answer=...)`.
 /// `dspy.ReAct("question -> answer", tools=[corpus_search], max_iters=4)`.
 pub const RagAgent = dszig.react.ReActIters(AgentQA, &.{.{
     .name = "corpus_search",
@@ -344,53 +349,136 @@ fn parseRecords(arena: Allocator, json: []const u8) ![]const Record {
     return out;
 }
 
-/// Calls of a transcript (`{"calls": [{"messages", "completion"}, ...]}`).
+/// Reads 3.5.0 request/response transcripts without discarding native reasoning,
+/// function calls, or provider continuation state.
+/// Historical rows without request options retain `options = null`; they do not
+/// silently acquire the current default options.
 pub fn parseCalls(arena: Allocator, transcript: Value) ![]const Call {
     const items = transcript.object.get("calls").?.array.items;
     const calls = try arena.alloc(Call, items.len);
     for (items, calls) |item, *call| {
-        const raw = item.object.get("messages").?.array.items;
-        const messages = try arena.alloc(dszig.adapter.Message, raw.len);
-        for (raw, messages) |m, *dst| dst.* = .{
-            .role = std.meta.stringToEnum(dszig.adapter.Role, m.object.get("role").?.string) orelse return error.BadTranscript,
-            .content = m.object.get("content").?.string,
-        };
+        const message_values = item.object.get("messages").?.array.items;
+        const messages = try arena.alloc(dszig.adapter.Message, message_values.len);
+        for (message_values, messages) |m, *dst| dst.* = try dszig.lm.messageFromValue(arena, m);
         var completions: []const []const u8 = &.{};
         if (item.object.get("completions")) |all| {
             const list = try arena.alloc([]const u8, all.array.items.len);
             for (all.array.items, list) |c, *dst| dst.* = c.string;
             completions = list;
         }
+        var reasonings: []const ?[]const u8 = &.{};
+        if (item.object.get("reasonings")) |all| {
+            const list = try arena.alloc(?[]const u8, all.array.items.len);
+            for (all.array.items, list) |reasoning, *dst| dst.* = switch (reasoning) {
+                .null => null,
+                .string => |text| text,
+                else => return error.BadTranscript,
+            };
+            if (list.len != 0 and list.len != (if (completions.len > 0) completions.len else 1)) return error.BadTranscript;
+            reasonings = list;
+        }
+        var tool_calls: []const []const dszig.lm.ToolCall = &.{};
+        if (item.object.get("tool_calls")) |all| {
+            if (all != .array) return error.BadTranscript;
+            const list = try arena.alloc([]const dszig.lm.ToolCall, all.array.items.len);
+            for (all.array.items, list) |calls_value, *dst| dst.* = try dszig.inference.toolCallsFromValue(arena, calls_value);
+            if (list.len != 0 and list.len != (if (completions.len > 0) completions.len else 1)) return error.BadTranscript;
+            tool_calls = list;
+        }
+        var continuation: []const []const dszig.inference.Continuation = &.{};
+        if (item.object.get("continuation")) |all| {
+            if (all != .array) return error.BadTranscript;
+            const list = try arena.alloc([]const dszig.inference.Continuation, all.array.items.len);
+            for (all.array.items, list) |state, *dst| dst.* = try dszig.inference.continuationsFromValue(arena, state);
+            if (list.len != 0 and list.len != (if (completions.len > 0) completions.len else 1)) return error.BadTranscript;
+            continuation = list;
+        }
+        var provider_data: []const ?Value = &.{};
+        if (item.object.get("provider_data")) |all| {
+            if (all != .array) return error.BadTranscript;
+            const list = try arena.alloc(?Value, all.array.items.len);
+            for (all.array.items, list) |data, *dst| dst.* = switch (data) {
+                .null => null,
+                .object => data,
+                else => return error.BadTranscript,
+            };
+            if (list.len != 0 and list.len != (if (completions.len > 0) completions.len else 1)) return error.BadTranscript;
+            provider_data = list;
+        }
+        const options: ?dszig.lm.Options = if (item.object.get("options")) |raw|
+            if (raw == .null) null else try dszig.lm.optionsFromValue(arena, raw)
+        else
+            null;
+        const tools = if (item.object.get("tools")) |raw|
+            try dszig.inference.toolsFromValue(arena, raw)
+        else
+            &.{};
         call.* = .{
             .messages = messages,
             .completion = item.object.get("completion").?.string,
             .completions = completions,
+            .reasonings = reasonings,
+            .options = options,
+            .tools = tools,
+            .tool_calls = tool_calls,
+            .continuation = continuation,
+            .provider_data = provider_data,
         };
     }
     return calls;
 }
 
 /// Transcript JSON in the layout tools/dspy_reference/live.py writes.
-pub fn writeTranscript(arena: Allocator, runtime: []const u8, model: []const u8, calls: []const Call, result: Result) ![]const u8 {
+/// Capabilities are the actual LM's advertised native features.
+pub fn writeTranscript(arena: Allocator, runtime: []const u8, model: []const u8, lm: dszig.LM, calls: []const Call, result: Result) ![]const u8 {
     var call_values: std.json.Array = .init(arena);
     for (calls) |call| {
         var messages: std.json.Array = .init(arena);
-        for (call.messages) |m| {
-            var obj: std.json.ObjectMap = .empty;
-            try obj.put(arena, "role", .{ .string = m.role.name() });
-            try obj.put(arena, "content", .{ .string = m.content });
-            try messages.append(.{ .object = obj });
-        }
+        for (call.messages) |m| try messages.append(try dszig.lm.messageValue(arena, m));
         var obj: std.json.ObjectMap = .empty;
         try obj.put(arena, "messages", .{ .array = messages });
+        try obj.put(arena, "tools", try dszig.inference.toolsValue(arena, call.tools));
         try obj.put(arena, "completion", .{ .string = call.completion });
         if (call.completions.len > 0) {
             var all: std.json.Array = .init(arena);
             for (call.completions) |c| try all.append(.{ .string = c });
             try obj.put(arena, "completions", .{ .array = all });
         }
+        if (call.reasonings.len > 0) {
+            var all: std.json.Array = .init(arena);
+            for (call.reasonings) |reasoning| try all.append(if (reasoning) |text| .{ .string = text } else .null);
+            try obj.put(arena, "reasonings", .{ .array = all });
+        }
+        var native_calls: std.json.Array = .init(arena);
+        for (call.tool_calls) |calls_value| try native_calls.append(try dszig.inference.toolCallsValue(arena, calls_value));
+        try obj.put(arena, "tool_calls", .{ .array = native_calls });
+        var continuation: std.json.Array = .init(arena);
+        for (call.continuation) |state| try continuation.append(try dszig.inference.continuationsValue(arena, state));
+        try obj.put(arena, "continuation", .{ .array = continuation });
+        var provider_data: std.json.Array = .init(arena);
+        for (call.provider_data) |data| try provider_data.append(data orelse .null);
+        try obj.put(arena, "provider_data", .{ .array = provider_data });
+        if (call.options) |options| try obj.put(arena, "options", try dszig.lm.optionsValue(arena, options));
         try call_values.append(.{ .object = obj });
     }
+    var root: std.json.ObjectMap = .empty;
+    try root.put(arena, "runtime", .{ .string = runtime });
+    try root.put(arena, "target_dspy", .{ .string = target_dspy });
+    try root.put(arena, "model", .{ .string = model });
+    try root.put(arena, "supports_reasoning", .{ .bool = lm.supports_reasoning });
+    try root.put(arena, "supports_response_format", .{ .bool = lm.supports_response_format });
+    try root.put(arena, "supports_response_schema", .{ .bool = lm.supports_response_schema });
+    try root.put(arena, "supports_function_calling", .{ .bool = lm.supports_function_calling });
+    try root.put(arena, "calls", .{ .array = call_values });
+    try appendResult(arena, &root, result);
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    dszig.pyjson.writeJson(&aw.writer, .{ .object = root }, .indent2) catch return error.OutOfMemory;
+    try aw.writer.writeByte('\n');
+    return aw.written();
+}
+
+/// Shared result representation for transcript writing and CLI verification.
+fn appendResult(arena: Allocator, root: *std.json.ObjectMap, result: Result) Allocator.Error!void {
     var cases: std.json.Array = .init(arena);
     for (result.cases) |c| {
         var obj: std.json.ObjectMap = .empty;
@@ -399,10 +487,6 @@ pub fn writeTranscript(arena: Allocator, runtime: []const u8, model: []const u8,
         if (c.err) |e| try obj.put(arena, "error", .{ .string = @errorName(e) });
         try cases.append(.{ .object = obj });
     }
-    var root: std.json.ObjectMap = .empty;
-    try root.put(arena, "runtime", .{ .string = runtime });
-    try root.put(arena, "model", .{ .string = model });
-    try root.put(arena, "calls", .{ .array = call_values });
     try root.put(arena, "cases", .{ .array = cases });
     inline for (pipeline_names) |name| {
         const p = @field(result, name);
@@ -447,8 +531,70 @@ pub fn writeTranscript(arena: Allocator, runtime: []const u8, model: []const u8,
         try obj.put(arena, "train_scores", .{ .array = train_scores });
         try root.put(arena, name, .{ .object = obj });
     }
-    var aw: std.Io.Writer.Allocating = .init(arena);
-    dszig.pyjson.writeJson(&aw.writer, .{ .object = root }, .indent2) catch return error.OutOfMemory;
-    try aw.writer.writeByte('\n');
-    return aw.written();
+}
+
+pub const VerifyTranscriptError = error{
+    BadTranscript,
+    TargetVersionMismatch,
+    CaseCountMismatch,
+    CaseNameMismatch,
+    CaseOutputMismatch,
+    CaseErrorMismatch,
+    PipelineArtifactMismatch,
+    PipelineBaselineMismatch,
+    PipelineOptimizedMismatch,
+    PipelineCandidatesMismatch,
+    PipelineInstructionsMismatch,
+    PipelineTrialsMismatch,
+    PipelineScoresMismatch,
+    PipelineTrainScoresMismatch,
+} || Allocator.Error;
+
+/// Checks the complete suite result against a DSPy 3.5.0 transcript.
+/// Exception names are runtime-specific; their presence must agree.
+/// Request matching and consumption remain the ReplayLM caller's responsibility.
+pub fn verifyTranscript(arena: Allocator, expected: Value, result: Result) VerifyTranscriptError!void {
+    if (expected != .object) return error.BadTranscript;
+    const target = expected.object.get("target_dspy") orelse return error.BadTranscript;
+    if (target != .string or !std.mem.eql(u8, target.string, target_dspy)) return error.TargetVersionMismatch;
+    const expected_cases = expected.object.get("cases") orelse return error.BadTranscript;
+    if (expected_cases != .array) return error.BadTranscript;
+    if (expected_cases.array.items.len != result.cases.len) return error.CaseCountMismatch;
+
+    var actual: std.json.ObjectMap = .empty;
+    try appendResult(arena, &actual, result);
+    const actual_cases = actual.get("cases").?.array.items;
+    for (expected_cases.array.items, actual_cases) |want, got| {
+        if (want != .object) return error.BadTranscript;
+        const want_name = want.object.get("name") orelse return error.BadTranscript;
+        if (!dszig.value.pyEqual(want_name, got.object.get("name").?)) return error.CaseNameMismatch;
+        const want_outputs = want.object.get("outputs");
+        const got_outputs = got.object.get("outputs");
+        if ((want_outputs == null) != (got_outputs == null)) return error.CaseOutputMismatch;
+        if (want_outputs) |outputs| {
+            if (!dszig.value.pyEqual(outputs, got_outputs.?)) return error.CaseOutputMismatch;
+        }
+        if ((want.object.get("error") != null) != (got.object.get("error") != null)) return error.CaseErrorMismatch;
+    }
+
+    inline for (pipeline_names) |name| {
+        const want = expected.object.get(name) orelse return error.BadTranscript;
+        if (want != .object) return error.BadTranscript;
+        const got = actual.get(name).?.object;
+        const want_artifact = want.object.get("artifact") orelse return error.BadTranscript;
+        if (want_artifact != .string) return error.BadTranscript;
+        if (!std.mem.eql(u8, want_artifact.string, got.get("artifact").?.string)) return error.PipelineArtifactMismatch;
+        inline for (.{
+            .{ "baseline", error.PipelineBaselineMismatch },
+            .{ "optimized", error.PipelineOptimizedMismatch },
+            .{ "candidates", error.PipelineCandidatesMismatch },
+            .{ "instructions", error.PipelineInstructionsMismatch },
+            .{ "trials", error.PipelineTrialsMismatch },
+            .{ "scores", error.PipelineScoresMismatch },
+            .{ "train_scores", error.PipelineTrainScoresMismatch },
+        }) |field| {
+            const expected_field = want.object.get(field[0]) orelse return error.BadTranscript;
+            if (!dszig.value.pyEqual(expected_field, got.get(field[0]).?)) return field[1];
+        }
+    }
 }

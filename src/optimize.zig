@@ -8,7 +8,6 @@ const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 
 const predict = @import("predict.zig");
-const pickle = @import("pickle.zig");
 const pyrandom = @import("pyrandom.zig");
 const value = @import("value.zig");
 const Context = predict.Context;
@@ -259,7 +258,7 @@ pub const BootstrapFewShot = struct {
         self.teacher_settings.apply(&c);
         if (round_idx > 0) {
             c.lm_options.temperature = 1.0;
-            c.lm_options.rollout_id = @intCast(round_idx);
+            c.lm_options.rollout_id = .{ .integer = @intCast(round_idx) };
         }
 
         const cached = try arena.alloc([]const Record, teacher_preds.len);
@@ -282,8 +281,7 @@ pub const BootstrapFewShot = struct {
 
         if (self.metric) |metric| {
             const score = metric(arena, example, &prediction, &trace);
-            const threshold = self.metric_threshold orelse 0;
-            const success = if (threshold != 0) score >= threshold else score != 0;
+            const success = if (self.metric_threshold) |threshold| score >= threshold else score != 0;
             if (!success) return false;
         }
 
@@ -301,16 +299,25 @@ pub const BootstrapFewShot = struct {
             while (it_out.next()) |e| try demo.put(arena, e.key_ptr.*, e.value_ptr.*);
             try local[index].append(arena, demo);
         }
-        // Of several same-predictor traces, DSPy keeps the one picked by a
-        // `random.Random` seeded with the pickle hash of all of them.
-        for (local, name2traces) |demos, *traces| {
+        // DSPy 3.5 seeds by predictor position so tool-containing traces do
+        // not need to be picklable.
+        for (local, name2traces, teacher_preds) |demos, *traces, predictor| {
             if (demos.items.len == 0) continue;
-            const pick = if (demos.items.len == 1) 0 else try pickle.pickTrace(arena, demos.items);
+            const pick = try tracePick(arena, predictor.name, traces.items.len, demos.items.len);
             try traces.append(out, try value.cloneRecord(out, &demos.items[pick]));
         }
         return true;
     }
 };
+
+/// Select one multi-use predictor trace exactly as DSPy 3.5 does.
+pub fn tracePick(arena: Allocator, predictor_name: []const u8, prior_count: usize, count: usize) Allocator.Error!usize {
+    assert(count > 0);
+    if (count == 1) return 0;
+    const seed = try std.fmt.allocPrint(arena, "{s}:{d}", .{ predictor_name, prior_count });
+    var rng = pyrandom.Random.initStr(seed);
+    return if (rng.random() < 0.5) rng.randbelow(count - 1) else count - 1;
+}
 
 /// `dspy.BootstrapFewShotWithRandomSearch`: evaluates seeds -3 (no demos),
 /// -2 (LabeledFewShot), -1 (BootstrapFewShot) and 0.. (shuffled trainset,

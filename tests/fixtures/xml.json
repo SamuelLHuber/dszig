@@ -1,0 +1,1862 @@
+{
+  "dspy": "3.5.0",
+  "schemas": {
+    "primitive": {
+      "instructions": "Given the fields `text`, `tags`, produce the fields `flag`, `count`, `ratio`, `label`, `items`.",
+      "json_schema": {
+        "description": "Given the fields `text`, `tags`, produce the fields `flag`, `count`, `ratio`, `label`, `items`.",
+        "properties": {
+          "text": {
+            "__dspy_field_type": "input",
+            "desc": "${text}",
+            "prefix": "Text:",
+            "title": "Text",
+            "type": "string"
+          },
+          "tags": {
+            "__dspy_field_type": "input",
+            "desc": "free-form labels",
+            "items": {
+              "type": "string"
+            },
+            "prefix": "Tags:",
+            "title": "Tags",
+            "type": "array"
+          },
+          "flag": {
+            "__dspy_field_type": "output",
+            "desc": "${flag}",
+            "prefix": "Flag:",
+            "title": "Flag",
+            "type": "boolean"
+          },
+          "count": {
+            "__dspy_field_type": "output",
+            "desc": "${count}",
+            "prefix": "Count:",
+            "title": "Count",
+            "type": "integer"
+          },
+          "ratio": {
+            "__dspy_field_type": "output",
+            "desc": "between 0 and 1",
+            "prefix": "Ratio:",
+            "title": "Ratio",
+            "type": "number"
+          },
+          "label": {
+            "__dspy_field_type": "output",
+            "desc": "${label}",
+            "enum": [
+              "pos",
+              "neg"
+            ],
+            "prefix": "Label:",
+            "title": "Label",
+            "type": "string"
+          },
+          "items": {
+            "__dspy_field_type": "output",
+            "desc": "${items}",
+            "items": {
+              "type": "string"
+            },
+            "prefix": "Items:",
+            "title": "Items",
+            "type": "array"
+          }
+        },
+        "required": [
+          "text",
+          "tags",
+          "flag",
+          "count",
+          "ratio",
+          "label",
+          "items"
+        ],
+        "title": "Typed",
+        "type": "object"
+      },
+      "input_fields": [
+        "text",
+        "tags"
+      ],
+      "output_fields": [
+        "flag",
+        "count",
+        "ratio",
+        "label",
+        "items"
+      ],
+      "field_metadata": {
+        "text": {
+          "annotation_name": "str",
+          "description": "${text}",
+          "prefix": "Text:",
+          "json_schema": {
+            "type": "string"
+          }
+        },
+        "tags": {
+          "annotation_name": "list[str]",
+          "description": "free-form labels",
+          "prefix": "Tags:",
+          "json_schema": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "flag": {
+          "annotation_name": "bool",
+          "description": "${flag}",
+          "prefix": "Flag:",
+          "json_schema": {
+            "type": "boolean"
+          }
+        },
+        "count": {
+          "annotation_name": "int",
+          "description": "${count}",
+          "prefix": "Count:",
+          "json_schema": {
+            "type": "integer"
+          }
+        },
+        "ratio": {
+          "annotation_name": "float",
+          "description": "between 0 and 1",
+          "prefix": "Ratio:",
+          "json_schema": {
+            "type": "number"
+          }
+        },
+        "label": {
+          "annotation_name": "Literal['pos', 'neg']",
+          "description": "${label}",
+          "prefix": "Label:",
+          "json_schema": {
+            "enum": [
+              "pos",
+              "neg"
+            ],
+            "type": "string"
+          }
+        },
+        "items": {
+          "annotation_name": "list[str]",
+          "description": "${items}",
+          "prefix": "Items:",
+          "json_schema": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        }
+      }
+    },
+    "nullable": {
+      "instructions": "Return nullable values without conflating null and empty text.",
+      "json_schema": {
+        "description": "Return nullable values without conflating null and empty text.",
+        "properties": {
+          "question": {
+            "__dspy_field_type": "input",
+            "desc": "${question}",
+            "prefix": "Question:",
+            "title": "Question",
+            "type": "string"
+          },
+          "text": {
+            "__dspy_field_type": "output",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "desc": "${text}",
+            "prefix": "Text:",
+            "title": "Text"
+          },
+          "number": {
+            "__dspy_field_type": "output",
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "desc": "${number}",
+            "prefix": "Number:",
+            "title": "Number"
+          },
+          "empty": {
+            "__dspy_field_type": "output",
+            "desc": "${empty}",
+            "prefix": "Empty:",
+            "title": "Empty",
+            "type": "string"
+          }
+        },
+        "required": [
+          "question",
+          "text",
+          "number",
+          "empty"
+        ],
+        "title": "Nullable",
+        "type": "object"
+      },
+      "input_fields": [
+        "question"
+      ],
+      "output_fields": [
+        "text",
+        "number",
+        "empty"
+      ],
+      "field_metadata": {
+        "question": {
+          "annotation_name": "str",
+          "description": "${question}",
+          "prefix": "Question:",
+          "json_schema": {
+            "type": "string"
+          }
+        },
+        "text": {
+          "annotation_name": "Union[str, NoneType]",
+          "description": "${text}",
+          "prefix": "Text:",
+          "json_schema": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "number": {
+          "annotation_name": "Union[int, NoneType]",
+          "description": "${number}",
+          "prefix": "Number:",
+          "json_schema": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "empty": {
+          "annotation_name": "str",
+          "description": "${empty}",
+          "prefix": "Empty:",
+          "json_schema": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "nested_optional": {
+      "instructions": "Return optional people and dictionary values.",
+      "json_schema": {
+        "$defs": {
+          "Address": {
+            "properties": {
+              "city": {
+                "title": "City",
+                "type": "string"
+              },
+              "zip_code": {
+                "title": "Zip Code",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "city",
+              "zip_code"
+            ],
+            "title": "Address",
+            "type": "object"
+          },
+          "Person": {
+            "properties": {
+              "name": {
+                "title": "Name",
+                "type": "string"
+              },
+              "age": {
+                "title": "Age",
+                "type": "integer"
+              },
+              "tags": {
+                "items": {
+                  "type": "string"
+                },
+                "title": "Tags",
+                "type": "array"
+              },
+              "address": {
+                "$ref": "#/$defs/Address"
+              },
+              "role": {
+                "enum": [
+                  "admin",
+                  "user"
+                ],
+                "title": "Role",
+                "type": "string"
+              },
+              "score": {
+                "title": "Score",
+                "type": "number"
+              },
+              "nickname": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Nickname"
+              }
+            },
+            "required": [
+              "name",
+              "age",
+              "tags",
+              "address",
+              "role",
+              "score"
+            ],
+            "title": "Person",
+            "type": "object"
+          }
+        },
+        "description": "Return optional people and dictionary values.",
+        "properties": {
+          "question": {
+            "__dspy_field_type": "input",
+            "desc": "${question}",
+            "prefix": "Question:",
+            "title": "Question",
+            "type": "string"
+          },
+          "person": {
+            "__dspy_field_type": "output",
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Person"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "desc": "${person}",
+            "prefix": "Person:"
+          },
+          "people": {
+            "__dspy_field_type": "output",
+            "desc": "${people}",
+            "items": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Person"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "prefix": "People:",
+            "title": "People",
+            "type": "array"
+          },
+          "codes": {
+            "__dspy_field_type": "output",
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "desc": "${codes}",
+            "prefix": "Codes:",
+            "title": "Codes",
+            "type": "object"
+          }
+        },
+        "required": [
+          "question",
+          "person",
+          "people",
+          "codes"
+        ],
+        "title": "NestedOptional",
+        "type": "object"
+      },
+      "input_fields": [
+        "question"
+      ],
+      "output_fields": [
+        "person",
+        "people",
+        "codes"
+      ],
+      "field_metadata": {
+        "question": {
+          "annotation_name": "str",
+          "description": "${question}",
+          "prefix": "Question:",
+          "json_schema": {
+            "type": "string"
+          }
+        },
+        "person": {
+          "annotation_name": "Union[Person, NoneType]",
+          "description": "${person}",
+          "prefix": "Person:",
+          "json_schema": {
+            "$defs": {
+              "Address": {
+                "properties": {
+                  "city": {
+                    "title": "City",
+                    "type": "string"
+                  },
+                  "zip_code": {
+                    "title": "Zip Code",
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "city",
+                  "zip_code"
+                ],
+                "title": "Address",
+                "type": "object"
+              },
+              "Person": {
+                "properties": {
+                  "name": {
+                    "title": "Name",
+                    "type": "string"
+                  },
+                  "age": {
+                    "title": "Age",
+                    "type": "integer"
+                  },
+                  "tags": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "title": "Tags",
+                    "type": "array"
+                  },
+                  "address": {
+                    "$ref": "#/$defs/Address"
+                  },
+                  "role": {
+                    "enum": [
+                      "admin",
+                      "user"
+                    ],
+                    "title": "Role",
+                    "type": "string"
+                  },
+                  "score": {
+                    "title": "Score",
+                    "type": "number"
+                  },
+                  "nickname": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "default": null,
+                    "title": "Nickname"
+                  }
+                },
+                "required": [
+                  "name",
+                  "age",
+                  "tags",
+                  "address",
+                  "role",
+                  "score"
+                ],
+                "title": "Person",
+                "type": "object"
+              }
+            },
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Person"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "people": {
+          "annotation_name": "list[Union[Person, NoneType]]",
+          "description": "${people}",
+          "prefix": "People:",
+          "json_schema": {
+            "$defs": {
+              "Address": {
+                "properties": {
+                  "city": {
+                    "title": "City",
+                    "type": "string"
+                  },
+                  "zip_code": {
+                    "title": "Zip Code",
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "city",
+                  "zip_code"
+                ],
+                "title": "Address",
+                "type": "object"
+              },
+              "Person": {
+                "properties": {
+                  "name": {
+                    "title": "Name",
+                    "type": "string"
+                  },
+                  "age": {
+                    "title": "Age",
+                    "type": "integer"
+                  },
+                  "tags": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "title": "Tags",
+                    "type": "array"
+                  },
+                  "address": {
+                    "$ref": "#/$defs/Address"
+                  },
+                  "role": {
+                    "enum": [
+                      "admin",
+                      "user"
+                    ],
+                    "title": "Role",
+                    "type": "string"
+                  },
+                  "score": {
+                    "title": "Score",
+                    "type": "number"
+                  },
+                  "nickname": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "default": null,
+                    "title": "Nickname"
+                  }
+                },
+                "required": [
+                  "name",
+                  "age",
+                  "tags",
+                  "address",
+                  "role",
+                  "score"
+                ],
+                "title": "Person",
+                "type": "object"
+              }
+            },
+            "items": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Person"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": "array"
+          }
+        },
+        "codes": {
+          "annotation_name": "dict[str, Union[int, NoneType]]",
+          "description": "${codes}",
+          "prefix": "Codes:",
+          "json_schema": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": "object"
+          }
+        }
+      }
+    },
+    "extract": {
+      "instructions": "Extract people.",
+      "json_schema": {
+        "$defs": {
+          "Address": {
+            "properties": {
+              "city": {
+                "title": "City",
+                "type": "string"
+              },
+              "zip_code": {
+                "title": "Zip Code",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "city",
+              "zip_code"
+            ],
+            "title": "Address",
+            "type": "object"
+          },
+          "Person": {
+            "properties": {
+              "name": {
+                "title": "Name",
+                "type": "string"
+              },
+              "age": {
+                "title": "Age",
+                "type": "integer"
+              },
+              "tags": {
+                "items": {
+                  "type": "string"
+                },
+                "title": "Tags",
+                "type": "array"
+              },
+              "address": {
+                "$ref": "#/$defs/Address"
+              },
+              "role": {
+                "enum": [
+                  "admin",
+                  "user"
+                ],
+                "title": "Role",
+                "type": "string"
+              },
+              "score": {
+                "title": "Score",
+                "type": "number"
+              },
+              "nickname": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Nickname"
+              }
+            },
+            "required": [
+              "name",
+              "age",
+              "tags",
+              "address",
+              "role",
+              "score"
+            ],
+            "title": "Person",
+            "type": "object"
+          }
+        },
+        "description": "Extract people.",
+        "properties": {
+          "people": {
+            "__dspy_field_type": "input",
+            "desc": "${people}",
+            "items": {
+              "$ref": "#/$defs/Person"
+            },
+            "prefix": "People:",
+            "title": "People",
+            "type": "array"
+          },
+          "note": {
+            "__dspy_field_type": "input",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "desc": "${note}",
+            "prefix": "Note:",
+            "title": "Note"
+          },
+          "person": {
+            "$ref": "#/$defs/Person",
+            "__dspy_field_type": "output",
+            "desc": "${person}",
+            "prefix": "Person:"
+          },
+          "ids": {
+            "__dspy_field_type": "output",
+            "desc": "${ids}",
+            "items": {
+              "type": "integer"
+            },
+            "prefix": "Ids:",
+            "title": "Ids",
+            "type": "array"
+          },
+          "pairs": {
+            "__dspy_field_type": "output",
+            "desc": "${pairs}",
+            "items": {
+              "items": {
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "prefix": "Pairs:",
+            "title": "Pairs",
+            "type": "array"
+          },
+          "maybe": {
+            "__dspy_field_type": "output",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "desc": "${maybe}",
+            "prefix": "Maybe:",
+            "title": "Maybe"
+          },
+          "age": {
+            "__dspy_field_type": "output",
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "desc": "${age}",
+            "prefix": "Age:",
+            "title": "Age"
+          }
+        },
+        "required": [
+          "people",
+          "note",
+          "person",
+          "ids",
+          "pairs",
+          "maybe",
+          "age"
+        ],
+        "title": "Extract",
+        "type": "object"
+      },
+      "input_fields": [
+        "people",
+        "note"
+      ],
+      "output_fields": [
+        "person",
+        "ids",
+        "pairs",
+        "maybe",
+        "age"
+      ],
+      "field_metadata": {
+        "people": {
+          "annotation_name": "list[Person]",
+          "description": "${people}",
+          "prefix": "People:",
+          "json_schema": {
+            "$defs": {
+              "Address": {
+                "properties": {
+                  "city": {
+                    "title": "City",
+                    "type": "string"
+                  },
+                  "zip_code": {
+                    "title": "Zip Code",
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "city",
+                  "zip_code"
+                ],
+                "title": "Address",
+                "type": "object"
+              },
+              "Person": {
+                "properties": {
+                  "name": {
+                    "title": "Name",
+                    "type": "string"
+                  },
+                  "age": {
+                    "title": "Age",
+                    "type": "integer"
+                  },
+                  "tags": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "title": "Tags",
+                    "type": "array"
+                  },
+                  "address": {
+                    "$ref": "#/$defs/Address"
+                  },
+                  "role": {
+                    "enum": [
+                      "admin",
+                      "user"
+                    ],
+                    "title": "Role",
+                    "type": "string"
+                  },
+                  "score": {
+                    "title": "Score",
+                    "type": "number"
+                  },
+                  "nickname": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "default": null,
+                    "title": "Nickname"
+                  }
+                },
+                "required": [
+                  "name",
+                  "age",
+                  "tags",
+                  "address",
+                  "role",
+                  "score"
+                ],
+                "title": "Person",
+                "type": "object"
+              }
+            },
+            "items": {
+              "$ref": "#/$defs/Person"
+            },
+            "type": "array"
+          }
+        },
+        "note": {
+          "annotation_name": "Union[str, NoneType]",
+          "description": "${note}",
+          "prefix": "Note:",
+          "json_schema": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "person": {
+          "annotation_name": "Person",
+          "description": "${person}",
+          "prefix": "Person:",
+          "json_schema": {
+            "$defs": {
+              "Address": {
+                "properties": {
+                  "city": {
+                    "title": "City",
+                    "type": "string"
+                  },
+                  "zip_code": {
+                    "title": "Zip Code",
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "city",
+                  "zip_code"
+                ],
+                "title": "Address",
+                "type": "object"
+              }
+            },
+            "properties": {
+              "name": {
+                "title": "Name",
+                "type": "string"
+              },
+              "age": {
+                "title": "Age",
+                "type": "integer"
+              },
+              "tags": {
+                "items": {
+                  "type": "string"
+                },
+                "title": "Tags",
+                "type": "array"
+              },
+              "address": {
+                "$ref": "#/$defs/Address"
+              },
+              "role": {
+                "enum": [
+                  "admin",
+                  "user"
+                ],
+                "title": "Role",
+                "type": "string"
+              },
+              "score": {
+                "title": "Score",
+                "type": "number"
+              },
+              "nickname": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Nickname"
+              }
+            },
+            "required": [
+              "name",
+              "age",
+              "tags",
+              "address",
+              "role",
+              "score"
+            ],
+            "title": "Person",
+            "type": "object"
+          }
+        },
+        "ids": {
+          "annotation_name": "list[int]",
+          "description": "${ids}",
+          "prefix": "Ids:",
+          "json_schema": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "pairs": {
+          "annotation_name": "list[list[int]]",
+          "description": "${pairs}",
+          "prefix": "Pairs:",
+          "json_schema": {
+            "items": {
+              "items": {
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "type": "array"
+          }
+        },
+        "maybe": {
+          "annotation_name": "Union[str, NoneType]",
+          "description": "${maybe}",
+          "prefix": "Maybe:",
+          "json_schema": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "age": {
+          "annotation_name": "Union[int, NoneType]",
+          "description": "${age}",
+          "prefix": "Age:",
+          "json_schema": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      }
+    },
+    "tally": {
+      "instructions": "Tally things.",
+      "json_schema": {
+        "$defs": {
+          "Address": {
+            "properties": {
+              "city": {
+                "title": "City",
+                "type": "string"
+              },
+              "zip_code": {
+                "title": "Zip Code",
+                "type": "integer"
+              }
+            },
+            "required": [
+              "city",
+              "zip_code"
+            ],
+            "title": "Address",
+            "type": "object"
+          },
+          "Inventory": {
+            "properties": {
+              "items": {
+                "additionalProperties": {
+                  "type": "integer"
+                },
+                "title": "Items",
+                "type": "object"
+              },
+              "where": {
+                "additionalProperties": {
+                  "$ref": "#/$defs/Address"
+                },
+                "title": "Where",
+                "type": "object"
+              }
+            },
+            "required": [
+              "items",
+              "where"
+            ],
+            "title": "Inventory",
+            "type": "object"
+          }
+        },
+        "description": "Tally things.",
+        "properties": {
+          "counts": {
+            "__dspy_field_type": "input",
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "desc": "${counts}",
+            "prefix": "Counts:",
+            "title": "Counts",
+            "type": "object"
+          },
+          "inventory": {
+            "$ref": "#/$defs/Inventory",
+            "__dspy_field_type": "input",
+            "desc": "${inventory}",
+            "prefix": "Inventory:"
+          },
+          "scores": {
+            "__dspy_field_type": "output",
+            "additionalProperties": {
+              "type": "number"
+            },
+            "desc": "${scores}",
+            "prefix": "Scores:",
+            "title": "Scores",
+            "type": "object"
+          },
+          "groups": {
+            "__dspy_field_type": "output",
+            "additionalProperties": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "desc": "${groups}",
+            "prefix": "Groups:",
+            "title": "Groups",
+            "type": "object"
+          },
+          "homes": {
+            "__dspy_field_type": "output",
+            "additionalProperties": {
+              "$ref": "#/$defs/Address"
+            },
+            "desc": "${homes}",
+            "prefix": "Homes:",
+            "title": "Homes",
+            "type": "object"
+          },
+          "deep": {
+            "__dspy_field_type": "output",
+            "additionalProperties": {
+              "additionalProperties": {
+                "type": "integer"
+              },
+              "type": "object"
+            },
+            "desc": "${deep}",
+            "prefix": "Deep:",
+            "title": "Deep",
+            "type": "object"
+          }
+        },
+        "required": [
+          "counts",
+          "inventory",
+          "scores",
+          "groups",
+          "homes",
+          "deep"
+        ],
+        "title": "Tally",
+        "type": "object"
+      },
+      "input_fields": [
+        "counts",
+        "inventory"
+      ],
+      "output_fields": [
+        "scores",
+        "groups",
+        "homes",
+        "deep"
+      ],
+      "field_metadata": {
+        "counts": {
+          "annotation_name": "dict[str, int]",
+          "description": "${counts}",
+          "prefix": "Counts:",
+          "json_schema": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object"
+          }
+        },
+        "inventory": {
+          "annotation_name": "Inventory",
+          "description": "${inventory}",
+          "prefix": "Inventory:",
+          "json_schema": {
+            "$defs": {
+              "Address": {
+                "properties": {
+                  "city": {
+                    "title": "City",
+                    "type": "string"
+                  },
+                  "zip_code": {
+                    "title": "Zip Code",
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "city",
+                  "zip_code"
+                ],
+                "title": "Address",
+                "type": "object"
+              }
+            },
+            "properties": {
+              "items": {
+                "additionalProperties": {
+                  "type": "integer"
+                },
+                "title": "Items",
+                "type": "object"
+              },
+              "where": {
+                "additionalProperties": {
+                  "$ref": "#/$defs/Address"
+                },
+                "title": "Where",
+                "type": "object"
+              }
+            },
+            "required": [
+              "items",
+              "where"
+            ],
+            "title": "Inventory",
+            "type": "object"
+          }
+        },
+        "scores": {
+          "annotation_name": "dict[str, float]",
+          "description": "${scores}",
+          "prefix": "Scores:",
+          "json_schema": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "type": "object"
+          }
+        },
+        "groups": {
+          "annotation_name": "dict[str, list[str]]",
+          "description": "${groups}",
+          "prefix": "Groups:",
+          "json_schema": {
+            "additionalProperties": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "type": "object"
+          }
+        },
+        "homes": {
+          "annotation_name": "dict[str, Address]",
+          "description": "${homes}",
+          "prefix": "Homes:",
+          "json_schema": {
+            "$defs": {
+              "Address": {
+                "properties": {
+                  "city": {
+                    "title": "City",
+                    "type": "string"
+                  },
+                  "zip_code": {
+                    "title": "Zip Code",
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "city",
+                  "zip_code"
+                ],
+                "title": "Address",
+                "type": "object"
+              }
+            },
+            "additionalProperties": {
+              "$ref": "#/$defs/Address"
+            },
+            "type": "object"
+          }
+        },
+        "deep": {
+          "annotation_name": "dict[str, dict[str, int]]",
+          "description": "${deep}",
+          "prefix": "Deep:",
+          "json_schema": {
+            "additionalProperties": {
+              "additionalProperties": {
+                "type": "integer"
+              },
+              "type": "object"
+            },
+            "type": "object"
+          }
+        }
+      }
+    },
+    "literal_union": {
+      "instructions": "Classify and return either a count or literal text.",
+      "json_schema": {
+        "description": "Classify and return either a count or literal text.",
+        "properties": {
+          "question": {
+            "__dspy_field_type": "input",
+            "desc": "${question}",
+            "prefix": "Question:",
+            "title": "Question",
+            "type": "string"
+          },
+          "label": {
+            "__dspy_field_type": "output",
+            "desc": "${label}",
+            "enum": [
+              "pos",
+              "neg"
+            ],
+            "prefix": "Label:",
+            "title": "Label",
+            "type": "string"
+          },
+          "value": {
+            "__dspy_field_type": "output",
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "desc": "${value}",
+            "prefix": "Value:",
+            "title": "Value"
+          }
+        },
+        "required": [
+          "question",
+          "label",
+          "value"
+        ],
+        "title": "LiteralUnion",
+        "type": "object"
+      },
+      "input_fields": [
+        "question"
+      ],
+      "output_fields": [
+        "label",
+        "value"
+      ],
+      "field_metadata": {
+        "question": {
+          "annotation_name": "str",
+          "description": "${question}",
+          "prefix": "Question:",
+          "json_schema": {
+            "type": "string"
+          }
+        },
+        "label": {
+          "annotation_name": "Literal['pos', 'neg']",
+          "description": "${label}",
+          "prefix": "Label:",
+          "json_schema": {
+            "enum": [
+              "pos",
+              "neg"
+            ],
+            "type": "string"
+          }
+        },
+        "value": {
+          "annotation_name": "Union[int, str]",
+          "description": "${value}",
+          "prefix": "Value:",
+          "json_schema": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          }
+        }
+      }
+    }
+  },
+  "format_cases": [
+    {
+      "name": "primitive",
+      "schema": "primitive",
+      "completion": "<flag>\nTrue\n</flag>\n<count>\n42\n</count>\n<ratio>\n0.25\n</ratio>\n<label>\npos\n</label>\n<items>\n<item>\none\n</item>\n<item>\ntwo\n</item>\n</items>",
+      "outputs": {
+        "flag": true,
+        "count": 42,
+        "ratio": 0.25,
+        "label": "pos",
+        "items": [
+          "one",
+          "two"
+        ]
+      },
+      "inputs": {
+        "text": "great movie",
+        "tags": [
+          "review",
+          "film"
+        ]
+      },
+      "messages": [
+        {
+          "role": "system",
+          "content": "Your input fields are:\n1. `text` (str): \n2. `tags` (list[str]): free-form labels\nYour output fields are:\n1. `flag` (bool): \n2. `count` (int): \n3. `ratio` (float): between 0 and 1\n4. `label` (Literal['pos', 'neg']): \n5. `items` (list[str]):\nOutput format (replace placeholders):\n<flag>\n{flag}\n</flag>\n\n<count>\n{count}\n</count>\n\n<ratio>\n{ratio}\n</ratio>\n\n<label>\n{label}        # note: the value you produce must exactly match (no extra characters) one of: pos; neg\n</label>\n\n<items>\n<item>\n...\n</item>\n</items>\nIn adhering to this structure, your objective is: \n        Given the fields `text`, `tags`, produce the fields `flag`, `count`, `ratio`, `label`, `items`."
+        },
+        {
+          "role": "user",
+          "content": "<text>\ngreat movie\n</text>\n\n<tags>\n[\"review\", \"film\"]\n</tags>\n\nOutput format (replace placeholders):\n<flag>\n{flag}\n</flag>\n\n<count>\n{count}\n</count>\n\n<ratio>\n{ratio}\n</ratio>\n\n<label>\n{label}        # note: the value you produce must exactly match (no extra characters) one of: pos; neg\n</label>\n\n<items>\n<item>\n...\n</item>\n</items>\n\nUse this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping."
+        }
+      ]
+    },
+    {
+      "name": "nullable",
+      "schema": "nullable",
+      "completion": "<text />\n<number />\n<empty></empty>",
+      "outputs": {
+        "text": null,
+        "number": null,
+        "empty": ""
+      },
+      "inputs": {
+        "question": "null or empty?"
+      },
+      "messages": [
+        {
+          "role": "system",
+          "content": "Your input fields are:\n1. `question` (str):\nYour output fields are:\n1. `text` (Union[str, NoneType]): \n2. `number` (Union[int, NoneType]): \n3. `empty` (str):\nOutput format (replace placeholders):\n<text>\n{text}\n</text>\n\n<number>\n{number}\n</number>\n\n<empty>\n{empty}\n</empty>\nIn adhering to this structure, your objective is: \n        Return nullable values without conflating null and empty text."
+        },
+        {
+          "role": "user",
+          "content": "<question>\nnull or empty?\n</question>\n\nOutput format (replace placeholders):\n<text>\n{text}\n</text>\n\n<number>\n{number}\n</number>\n\n<empty>\n{empty}\n</empty>\n\nUse this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping. For null, self-close the field's own tag. For an empty string, use an opening and closing tag with no content."
+        }
+      ]
+    },
+    {
+      "name": "nested_optional",
+      "schema": "nested_optional",
+      "completion": "<person />\n<people>\n<item />\n<item>\n<name>\nBo\n</name>\n<age>\n2\n</age>\n<tags />\n<address>\n<city>\nX\n</city>\n<zip_code>\n9\n</zip_code>\n</address>\n<role>\nuser\n</role>\n<score>\n1\n</score>\n<nickname />\n</item>\n</people>\n<codes>\n<entry key=\"a&amp;b\" />\n<x>\n7\n</x>\n</codes>",
+      "error": "AdapterParseError",
+      "inputs": {
+        "question": "optional people"
+      },
+      "messages": [
+        {
+          "role": "system",
+          "content": "Your input fields are:\n1. `question` (str):\nYour output fields are:\n1. `person` (Union[Person, NoneType]): \n2. `people` (list[Union[Person, NoneType]]): \n3. `codes` (dict[str, Union[int, NoneType]]):\nOutput format (replace placeholders):\n<person>\n<name>\n...\n</name>\n<age>\n...\n</age>\n<tags>\n<item>\n...\n</item>\n</tags>\n<address>\n<city>\n...\n</city>\n<zip_code>\n...\n</zip_code>\n</address>\n<role>\none of: admin; user\n</role>\n<score>\n...\n</score>\n<nickname>\n...\n</nickname>\n</person>\n\n<people>\n<item>\n<name>\n...\n</name>\n<age>\n...\n</age>\n<tags>\n<item>\n...\n</item>\n</tags>\n<address>\n<city>\n...\n</city>\n<zip_code>\n...\n</zip_code>\n</address>\n<role>\none of: admin; user\n</role>\n<score>\n...\n</score>\n<nickname>\n...\n</nickname>\n</item>\n</people>\n\n<codes>\n<entry key=\"example key\">\n...\n</entry>\n</codes>\nIn adhering to this structure, your objective is: \n        Return optional people and dictionary values."
+        },
+        {
+          "role": "user",
+          "content": "<question>\noptional people\n</question>\n\nOutput format (replace placeholders):\n<person>\n<name>\n...\n</name>\n<age>\n...\n</age>\n<tags>\n<item>\n...\n</item>\n</tags>\n<address>\n<city>\n...\n</city>\n<zip_code>\n...\n</zip_code>\n</address>\n<role>\none of: admin; user\n</role>\n<score>\n...\n</score>\n<nickname>\n...\n</nickname>\n</person>\n\n<people>\n<item>\n<name>\n...\n</name>\n<age>\n...\n</age>\n<tags>\n<item>\n...\n</item>\n</tags>\n<address>\n<city>\n...\n</city>\n<zip_code>\n...\n</zip_code>\n</address>\n<role>\none of: admin; user\n</role>\n<score>\n...\n</score>\n<nickname>\n...\n</nickname>\n</item>\n</people>\n\n<codes>\n<entry key=\"example key\">\n...\n</entry>\n</codes>\n\nUse this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping. For null, self-close the field's own tag. For an empty string, use an opening and closing tag with no content. Dictionary keys: <entry key=\"...\">; escape key attributes only."
+        }
+      ]
+    },
+    {
+      "name": "extract",
+      "schema": "extract",
+      "completion": "<person>\n<name>\nBo\n</name>\n<age>\n2\n</age>\n<tags />\n<address>\n<city>\nX\n</city>\n<zip_code>\n9\n</zip_code>\n</address>\n<role>\nuser\n</role>\n<score>\n1\n</score>\n<nickname />\n</person>\n<ids>\n<item>\n1\n</item>\n<item>\n2\n</item>\n</ids>\n<pairs>\n<item>\n<item>\n1\n</item>\n</item>\n<item />\n</pairs>\n<maybe />\n<age />",
+      "outputs": {
+        "person": {
+          "name": "Bo",
+          "age": 2,
+          "tags": [],
+          "address": {
+            "city": "X",
+            "zip_code": 9
+          },
+          "role": "user",
+          "score": 1.0,
+          "nickname": null
+        },
+        "ids": [
+          1,
+          2
+        ],
+        "pairs": [
+          [
+            1
+          ],
+          []
+        ],
+        "maybe": null,
+        "age": null
+      },
+      "inputs": {
+        "people": [
+          {
+            "name": "Ada",
+            "age": 36,
+            "tags": [
+              "math"
+            ],
+            "address": {
+              "city": "London",
+              "zip_code": 1
+            },
+            "role": "admin",
+            "score": 0.5,
+            "nickname": null
+          }
+        ],
+        "note": null
+      },
+      "messages": [
+        {
+          "role": "system",
+          "content": "Your input fields are:\n1. `people` (list[Person]): \n2. `note` (Union[str, NoneType]):\nYour output fields are:\n1. `person` (Person): \n2. `ids` (list[int]): \n3. `pairs` (list[list[int]]): \n4. `maybe` (Union[str, NoneType]): \n5. `age` (Union[int, NoneType]):\nOutput format (replace placeholders):\n<person>\n<name>\n...\n</name>\n<age>\n...\n</age>\n<tags>\n<item>\n...\n</item>\n</tags>\n<address>\n<city>\n...\n</city>\n<zip_code>\n...\n</zip_code>\n</address>\n<role>\none of: admin; user\n</role>\n<score>\n...\n</score>\n<nickname>\n...\n</nickname>\n</person>\n\n<ids>\n<item>\n...\n</item>\n</ids>\n\n<pairs>\n<item>\n<item>\n...\n</item>\n</item>\n</pairs>\n\n<maybe>\n{maybe}\n</maybe>\n\n<age>\n{age}\n</age>\nIn adhering to this structure, your objective is: \n        Extract people."
+        },
+        {
+          "role": "user",
+          "content": "<people>\n[{\"name\": \"Ada\", \"age\": 36, \"tags\": [\"math\"], \"address\": {\"city\": \"London\", \"zip_code\": 1}, \"role\": \"admin\", \"score\": 0.5, \"nickname\": null}]\n</people>\n\n<note>\nNone\n</note>\n\nOutput format (replace placeholders):\n<person>\n<name>\n...\n</name>\n<age>\n...\n</age>\n<tags>\n<item>\n...\n</item>\n</tags>\n<address>\n<city>\n...\n</city>\n<zip_code>\n...\n</zip_code>\n</address>\n<role>\none of: admin; user\n</role>\n<score>\n...\n</score>\n<nickname>\n...\n</nickname>\n</person>\n\n<ids>\n<item>\n...\n</item>\n</ids>\n\n<pairs>\n<item>\n<item>\n...\n</item>\n</item>\n</pairs>\n\n<maybe>\n{maybe}\n</maybe>\n\n<age>\n{age}\n</age>\n\nUse this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping. For null, self-close the field's own tag. For an empty string, use an opening and closing tag with no content."
+        }
+      ]
+    },
+    {
+      "name": "tally",
+      "schema": "tally",
+      "completion": "<scores>\n<entry key=\"a&amp;&quot;b\">\n2.5\n</entry>\n</scores>\n<groups>\n<x>\n<item>\np\n</item>\n</x>\n<y />\n</groups>\n<homes>\n<bo>\n<city>\nX\n</city>\n<zip_code>\n9\n</zip_code>\n</bo>\n</homes>\n<deep>\n<k>\n<z>\n2\n</z>\n</k>\n</deep>",
+      "outputs": {
+        "scores": {
+          "a&\"b": 2.5
+        },
+        "groups": {
+          "x": [
+            "p"
+          ],
+          "y": []
+        },
+        "homes": {
+          "bo": {
+            "city": "X",
+            "zip_code": 9
+          }
+        },
+        "deep": {
+          "k": {
+            "z": 2
+          }
+        }
+      },
+      "inputs": {
+        "counts": {
+          "b": 2,
+          "a": 1
+        },
+        "inventory": {
+          "items": {
+            "x": 1
+          },
+          "where": {
+            "h": {
+              "city": "Oslo",
+              "zip_code": 5
+            }
+          }
+        }
+      },
+      "messages": [
+        {
+          "role": "system",
+          "content": "Your input fields are:\n1. `counts` (dict[str, int]): \n2. `inventory` (Inventory):\nYour output fields are:\n1. `scores` (dict[str, float]): \n2. `groups` (dict[str, list[str]]): \n3. `homes` (dict[str, Address]): \n4. `deep` (dict[str, dict[str, int]]):\nOutput format (replace placeholders):\n<scores>\n<entry key=\"example key\">\n...\n</entry>\n</scores>\n\n<groups>\n<entry key=\"example key\">\n<item>\n...\n</item>\n</entry>\n</groups>\n\n<homes>\n<entry key=\"example key\">\n<city>\n...\n</city>\n<zip_code>\n...\n</zip_code>\n</entry>\n</homes>\n\n<deep>\n<entry key=\"example key\">\n<entry key=\"example key\">\n...\n</entry>\n</entry>\n</deep>\nIn adhering to this structure, your objective is: \n        Tally things."
+        },
+        {
+          "role": "user",
+          "content": "<counts>\n{\"b\": 2, \"a\": 1}\n</counts>\n\n<inventory>\n{\"items\": {\"x\": 1}, \"where\": {\"h\": {\"city\": \"Oslo\", \"zip_code\": 5}}}\n</inventory>\n\nOutput format (replace placeholders):\n<scores>\n<entry key=\"example key\">\n...\n</entry>\n</scores>\n\n<groups>\n<entry key=\"example key\">\n<item>\n...\n</item>\n</entry>\n</groups>\n\n<homes>\n<entry key=\"example key\">\n<city>\n...\n</city>\n<zip_code>\n...\n</zip_code>\n</entry>\n</homes>\n\n<deep>\n<entry key=\"example key\">\n<entry key=\"example key\">\n...\n</entry>\n</entry>\n</deep>\n\nUse this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping. Dictionary keys: <entry key=\"...\">; escape key attributes only."
+        }
+      ]
+    },
+    {
+      "name": "literal_union",
+      "schema": "literal_union",
+      "completion": "<label>\npos\n</label>\n<value>\n42\n</value>",
+      "outputs": {
+        "label": "pos",
+        "value": 42
+      },
+      "inputs": {
+        "question": "classify"
+      },
+      "messages": [
+        {
+          "role": "system",
+          "content": "Your input fields are:\n1. `question` (str):\nYour output fields are:\n1. `label` (Literal['pos', 'neg']): \n2. `value` (Union[int, str]):\nOutput format (replace placeholders):\n<label>\n{label}        # note: the value you produce must exactly match (no extra characters) one of: pos; neg\n</label>\n\n<value>\n{value}\n</value>\nIn adhering to this structure, your objective is: \n        Classify and return either a count or literal text."
+        },
+        {
+          "role": "user",
+          "content": "<question>\nclassify\n</question>\n\nOutput format (replace placeholders):\n<label>\n{label}        # note: the value you produce must exactly match (no extra characters) one of: pos; neg\n</label>\n\n<value>\n{value}\n</value>\n\nUse this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping."
+        }
+      ]
+    }
+  ],
+  "parse_cases": [
+    {
+      "name": "primitive",
+      "schema": "primitive",
+      "completion": "<flag>\nTrue\n</flag>\n<count>\n42\n</count>\n<ratio>\n0.25\n</ratio>\n<label>\npos\n</label>\n<items>\n<item>\none\n</item>\n<item>\ntwo\n</item>\n</items>",
+      "outputs": {
+        "flag": true,
+        "count": 42,
+        "ratio": 0.25,
+        "label": "pos",
+        "items": [
+          "one",
+          "two"
+        ]
+      }
+    },
+    {
+      "name": "null_self_close",
+      "schema": "nullable",
+      "completion": "<text />\n<number />\n<empty></empty>",
+      "outputs": {
+        "text": null,
+        "number": null,
+        "empty": ""
+      }
+    },
+    {
+      "name": "empty_not_null",
+      "schema": "nullable",
+      "completion": "<text></text>\n<number />\n<empty></empty>",
+      "outputs": {
+        "text": "",
+        "number": null,
+        "empty": ""
+      }
+    },
+    {
+      "name": "nullable_missing",
+      "schema": "nullable",
+      "completion": "<empty>\nx\n</empty>",
+      "outputs": {
+        "text": null,
+        "number": null,
+        "empty": "x"
+      }
+    },
+    {
+      "name": "missing_required",
+      "schema": "nullable",
+      "completion": "<text />\n<number />",
+      "error": "AdapterParseError"
+    },
+    {
+      "name": "unknown_field",
+      "schema": "nullable",
+      "completion": "<text />\n<number />\n<empty></empty>\n<unknown>\nx\n</unknown>",
+      "error": "AdapterParseError"
+    },
+    {
+      "name": "repeated_scalar",
+      "schema": "nullable",
+      "completion": "<text />\n<number />\n<empty></empty>\n<empty>\nx\n</empty>",
+      "error": "AdapterParseError"
+    },
+    {
+      "name": "literal_inner_close",
+      "schema": "nullable",
+      "completion": "<text>\na\n</text> literal\nb\n</text>\n<number />\n<empty></empty>",
+      "outputs": {
+        "text": "a\n</text> literal\nb",
+        "number": null,
+        "empty": ""
+      }
+    },
+    {
+      "name": "fenced",
+      "schema": "nullable",
+      "completion": "```xml\n<text />\n<number />\n<empty></empty>\n```",
+      "outputs": {
+        "text": null,
+        "number": null,
+        "empty": ""
+      }
+    },
+    {
+      "name": "leading_thought",
+      "schema": "nullable",
+      "completion": "<think>private</think>\n<text />\n<number />\n<empty></empty>",
+      "outputs": {
+        "text": null,
+        "number": null,
+        "empty": ""
+      }
+    },
+    {
+      "name": "unclosed_thought",
+      "schema": "nullable",
+      "completion": "<think>private\n<text />\n<number />\n<empty></empty>",
+      "error": "AdapterParseError"
+    },
+    {
+      "name": "multiline_close_then_prose",
+      "schema": "nullable",
+      "completion": "<text>\nvalue</text> prose\n<number />\n<empty></empty>",
+      "error": "AdapterParseError"
+    },
+    {
+      "name": "root_entry_key",
+      "schema": "nullable",
+      "completion": "<entry key=\"text\">x</entry>\n<number />\n<empty></empty>",
+      "error": "AdapterParseError"
+    },
+    {
+      "name": "nested_optional",
+      "schema": "nested_optional",
+      "completion": "<person />\n<people>\n<item />\n<item>\n<name>\nBo\n</name>\n<age>\n2\n</age>\n<tags />\n<address>\n<city>\nX\n</city>\n<zip_code>\n9\n</zip_code>\n</address>\n<role>\nuser\n</role>\n<score>\n1\n</score>\n<nickname />\n</item>\n</people>\n<codes>\n<entry key=\"a&amp;b\" />\n<x>\n7\n</x>\n</codes>",
+      "error": "AdapterParseError"
+    },
+    {
+      "name": "extract",
+      "schema": "extract",
+      "completion": "<person>\n<name>\nBo\n</name>\n<age>\n2\n</age>\n<tags />\n<address>\n<city>\nX\n</city>\n<zip_code>\n9\n</zip_code>\n</address>\n<role>\nuser\n</role>\n<score>\n1\n</score>\n<nickname />\n</person>\n<ids>\n<item>\n1\n</item>\n<item>\n2\n</item>\n</ids>\n<pairs>\n<item>\n<item>\n1\n</item>\n</item>\n<item />\n</pairs>\n<maybe />\n<age />",
+      "outputs": {
+        "person": {
+          "name": "Bo",
+          "age": 2,
+          "tags": [],
+          "address": {
+            "city": "X",
+            "zip_code": 9
+          },
+          "role": "user",
+          "score": 1.0,
+          "nickname": null
+        },
+        "ids": [
+          1,
+          2
+        ],
+        "pairs": [
+          [
+            1
+          ],
+          []
+        ],
+        "maybe": null,
+        "age": null
+      }
+    },
+    {
+      "name": "repeated_array_wrapper",
+      "schema": "extract",
+      "completion": "<person>\n<name>\nBo\n</name>\n<age>\n2\n</age>\n<tags />\n<address>\n<city>\nX\n</city>\n<zip_code>\n9\n</zip_code>\n</address>\n<role>\nuser\n</role>\n<score>\n1\n</score>\n<nickname />\n</person>\n<ids>\n1\n</ids>\n<ids>\n2\n</ids>\n<pairs>\n<item>\n<item>\n1\n</item>\n</item>\n<item />\n</pairs>\n<maybe />\n<age />",
+      "outputs": {
+        "person": {
+          "name": "Bo",
+          "age": 2,
+          "tags": [],
+          "address": {
+            "city": "X",
+            "zip_code": 9
+          },
+          "role": "user",
+          "score": 1.0,
+          "nickname": null
+        },
+        "ids": [
+          1,
+          2
+        ],
+        "pairs": [
+          [
+            1
+          ],
+          []
+        ],
+        "maybe": null,
+        "age": null
+      }
+    },
+    {
+      "name": "dictionary_escaped_key",
+      "schema": "tally",
+      "completion": "<scores>\n<entry key=\"a&amp;&quot;b\">\n2.5\n</entry>\n</scores>\n<groups>\n<x>\n<item>\np\n</item>\n</x>\n<y />\n</groups>\n<homes>\n<bo>\n<city>\nX\n</city>\n<zip_code>\n9\n</zip_code>\n</bo>\n</homes>\n<deep>\n<k>\n<z>\n2\n</z>\n</k>\n</deep>",
+      "outputs": {
+        "scores": {
+          "a&\"b": 2.5
+        },
+        "groups": {
+          "x": [
+            "p"
+          ],
+          "y": []
+        },
+        "homes": {
+          "bo": {
+            "city": "X",
+            "zip_code": 9
+          }
+        },
+        "deep": {
+          "k": {
+            "z": 2
+          }
+        }
+      }
+    },
+    {
+      "name": "literal_valid",
+      "schema": "literal_union",
+      "completion": "<label>\nneg\n</label>\n<value>\nhello\n</value>",
+      "outputs": {
+        "label": "neg",
+        "value": "hello"
+      }
+    },
+    {
+      "name": "literal_invalid",
+      "schema": "literal_union",
+      "completion": "<label>\nother\n</label>\n<value>\n42\n</value>",
+      "error": "AdapterParseError"
+    }
+  ]
+}

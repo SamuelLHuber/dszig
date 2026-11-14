@@ -21,7 +21,7 @@ pub const Random = struct {
     /// below 2^32 (CPython seeds with the 32-bit words of `abs(seed)`).
     pub fn init(seed: u32) Random {
         var r: Random = .{ .mt = undefined, .index = state_len };
-        r.initByArray(&.{seed});
+        r.initBySeed(ArraySeed{ .words = &.{seed}, .len = 1 });
         return r;
     }
 
@@ -35,15 +35,41 @@ pub const Random = struct {
         r.index = state_len;
     }
 
-    fn initByArray(r: *Random, key: []const u32) void {
+    const ArraySeed = struct {
+        words: []const u32,
+        len: usize,
+
+        fn word(self: @This(), index: usize) u32 {
+            return self.words[index];
+        }
+    };
+
+    const StringSeed = struct {
+        text: []const u8,
+        digest: []const u8,
+        len: usize,
+
+        fn word(self: @This(), index: usize) u32 {
+            const end = self.text.len + self.digest.len - index * 4;
+            const start = end -| 4;
+            var out: u32 = 0;
+            for (start..end) |position| {
+                const byte = if (position < self.text.len) self.text[position] else self.digest[position - self.text.len];
+                out = (out << 8) | byte;
+            }
+            return out;
+        }
+    };
+
+    fn initBySeed(r: *Random, key: anytype) void {
         assert(key.len > 0);
         r.initGenrand(19650218);
         var i: u32 = 1;
-        var j: u32 = 0;
+        var j: usize = 0;
         var k: usize = @max(state_len, key.len);
         while (k > 0) : (k -= 1) {
             const prev = r.mt[i - 1];
-            r.mt[i] = (r.mt[i] ^ ((prev ^ (prev >> 30)) *% 1664525)) +% key[j] +% j;
+            r.mt[i] = (r.mt[i] ^ ((prev ^ (prev >> 30)) *% 1664525)) +% key.word(j) +% @as(u32, @truncate(j));
             i += 1;
             j += 1;
             if (i >= state_len) {
@@ -105,27 +131,17 @@ pub const Random = struct {
         return x;
     }
 
-    /// `random.Random(s)` for a `str` seed of 1..64 UTF-8 bytes: CPython's
-    /// version-2 seeding uses `int.from_bytes(s + sha512(s).digest())`.
+    /// `random.Random(s)` for a UTF-8 string seed. Read the little-endian
+    /// limbs of `int.from_bytes(s + sha512(s).digest())` without copying the
+    /// string or allocating a bigint, including predictor names over 64 bytes.
     pub fn initStr(s: []const u8) Random {
-        assert(s.len > 0 and s.len <= 64);
-        var bytes: [128]u8 = undefined;
-        @memcpy(bytes[0..s.len], s);
-        std.crypto.hash.sha2.Sha512.hash(s, bytes[s.len..][0..64], .{});
-        const big = bytes[0 .. s.len + 64];
-        var key: [32]u32 = undefined;
-        var n: usize = 0;
-        var end = big.len;
-        while (end > 0) : (n += 1) {
-            const start = end -| 4;
-            var word: u32 = 0;
-            for (big[start..end]) |b| word = (word << 8) | b;
-            key[n] = word;
-            end = start;
-        }
-        while (n > 1 and key[n - 1] == 0) n -= 1;
+        assert(s.len <= std.math.maxInt(usize) - 67);
+        var digest: [64]u8 = undefined;
+        std.crypto.hash.sha2.Sha512.hash(s, &digest, .{});
+        var key: StringSeed = .{ .text = s, .digest = &digest, .len = (s.len + digest.len + 3) / 4 };
+        while (key.len > 1 and key.word(key.len - 1) == 0) key.len -= 1;
         var r: Random = .{ .mt = undefined, .index = state_len };
-        r.initByArray(key[0..n]);
+        r.initBySeed(key);
         return r;
     }
 
