@@ -9,7 +9,7 @@ const Writer = std.Io.Writer;
 
 const adapter = @import("adapter.zig");
 const pyjson = @import("pyjson.zig");
-const TimedIo = @import("timed_io.zig");
+const http = @import("http.zig");
 pub const inference = @import("inference.zig");
 const Message = adapter.Message;
 pub const FunctionTool = inference.FunctionTool;
@@ -631,12 +631,6 @@ pub const History = struct {
     }
 };
 
-/// Request-arena-owned headers are prepared anew before each network attempt.
-pub const HeaderProvider = struct {
-    context: *anyopaque,
-    prepare: *const fn (*anyopaque, Allocator, []const std.http.Header) anyerror![]const std.http.Header,
-};
-
 /// OpenAI-compatible Chat Completions and Responses clients on `std.http`.
 pub const OpenAI = struct {
     client: *std.http.Client,
@@ -663,7 +657,7 @@ pub const OpenAI = struct {
     /// DNS/TCP limit; null inherits timeout_ns.
     connect_timeout_ns: ?u64 = null,
     /// Authentication providers are refreshed on every attempt, not per call.
-    header_provider: ?HeaderProvider = null,
+    header_provider: ?http.HeaderProvider = null,
 
     pub const Api = enum { chat_completions, responses };
 
@@ -986,148 +980,27 @@ pub const OpenAI = struct {
         return out;
     }
 
-    const HttpResponse = struct { status: std.http.Status, body: []u8 };
-
-    /// Uses the same std.http request flow as Client.fetch, with a body limit
-    /// applied during transfer rather than after an unbounded allocation.
-    fn fetch(self: *OpenAI, url: []const u8, auth: ?[]const u8, body: []const u8, headers: []const std.http.Header) !HttpResponse {
-        var selected_headers: std.http.Client.Request.Headers = .{
-            .content_type = .{ .override = "application/json" },
-            .authorization = if (auth) |token| .{ .override = token } else .default,
-        };
-        for (headers) |header| {
-            if (std.ascii.eqlIgnoreCase(header.name, "content-type")) {
-                selected_headers.content_type = .omit;
-            } else if (std.ascii.eqlIgnoreCase(header.name, "authorization")) {
-                selected_headers.authorization = .omit;
-            } else if (std.ascii.eqlIgnoreCase(header.name, "host")) {
-                selected_headers.host = .omit;
-            } else if (std.ascii.eqlIgnoreCase(header.name, "user-agent")) {
-                selected_headers.user_agent = .omit;
-            } else if (std.ascii.eqlIgnoreCase(header.name, "accept-encoding")) {
-                selected_headers.accept_encoding = .omit;
-            } else if (std.ascii.eqlIgnoreCase(header.name, "connection")) {
-                selected_headers.connection = .omit;
-            }
-        }
-        var request = try self.client.request(.POST, try std.Uri.parse(url), .{
-            .redirect_behavior = .unhandled,
-            .extra_headers = headers,
-            .headers = selected_headers,
-        });
-        defer request.deinit();
-        return self.transferRequest(&request, body) catch |err| {
-            // HTTP Reader/Writer erase the underlying cancellation into
-            // ReadFailed/WriteFailed. Recover it before deciding to retry.
-            if (request.connection) |connection| {
-                if (connection.stream_reader.err) |read_error| {
-                    if (read_error == error.Canceled) return error.Canceled;
-                }
-                if (connection.stream_writer.err) |write_error| {
-                    if (write_error == error.Canceled) return error.Canceled;
-                }
-            }
-            return err;
-        };
-    }
-
-    fn transferRequest(self: *OpenAI, request: *std.http.Client.Request, body: []const u8) !HttpResponse {
-        request.transfer_encoding = .{ .content_length = body.len };
-        var payload = try request.sendBodyUnflushed(&.{});
-        try payload.writer.writeAll(body);
-        try payload.end();
-        try request.connection.?.flush();
-        var response = try request.receiveHead(&.{});
-        const status = response.head.status;
-        const decompress_buffer: []u8 = switch (response.head.content_encoding) {
-            .identity => &.{},
-            .zstd => try self.client.allocator.alloc(u8, std.compress.zstd.default_window_len),
-            .deflate, .gzip => try self.client.allocator.alloc(u8, std.compress.flate.max_window_len),
-            .compress => return error.UnsupportedCompressionMethod,
-        };
-        defer self.client.allocator.free(decompress_buffer);
-        var transfer_buffer: [64]u8 = undefined;
-        var decompress: std.http.Decompress = undefined;
-        const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
-        const response_body = try reader.allocRemaining(self.client.allocator, .limited(self.max_response_bytes));
-        return .{ .status = status, .body = response_body };
-    }
-
-    fn fetchWithRetries(self: *OpenAI, arena: Allocator, url: []const u8, auth: ?[]const u8, body: []const u8, headers: []const std.http.Header) anyerror!HttpResponse {
-        if (self.timeout_ns == null and self.connect_timeout_ns == null)
-            return self.fetchRetried(arena, url, auth, body, headers, null);
-        var timed: TimedIo = .{
-            .inner = self.client.io,
+    fn fetchWithRetries(self: *OpenAI, arena: Allocator, url: []const u8, auth: ?[]const u8, body: []const u8, headers: []const std.http.Header) anyerror!http.Response {
+        const transport: http.Transport = .{
+            .client = self.client,
+            .max_response_bytes = self.max_response_bytes,
+            .max_retries = self.max_retries,
+            .retry_base_ms = self.retry_base_ms,
             .timeout_ns = self.timeout_ns,
-            .connect_timeout_ns = self.connect_timeout_ns orelse self.timeout_ns,
+            .connect_timeout_ns = self.connect_timeout_ns,
+            .header_provider = self.header_provider,
+            .success = .ok,
+            .failure_error = error.LMFailure,
+            .response_limit_error = error.LMFailure,
         };
-        // Connections retain their Io. Never install a stack adapter into a
-        // shared client or reuse those connections after the adapter dies.
-        var isolated: std.http.Client = .{
-            .allocator = self.client.allocator,
-            .io = timed.io(),
-            .tls_buffer_size = self.client.tls_buffer_size,
-            .ssl_key_log = self.client.ssl_key_log,
-            .read_buffer_size = self.client.read_buffer_size,
-            .write_buffer_size = self.client.write_buffer_size,
-            .http_proxy = self.client.http_proxy,
-            .https_proxy = self.client.https_proxy,
-        };
-        defer isolated.deinit();
-        if (!std.http.Client.disable_tls) {
-            try self.client.ca_bundle_lock.lockShared(self.client.io);
-            defer self.client.ca_bundle_lock.unlockShared(self.client.io);
-            isolated.now = self.client.now;
-            if (self.client.now != null) {
-                // Bundle keys are DER offsets. Copy both backing bytes and
-                // index with a context pointing to the independently owned copy.
-                try isolated.ca_bundle.bytes.appendSlice(isolated.allocator, self.client.ca_bundle.bytes.items);
-                try isolated.ca_bundle.map.ensureTotalCapacityContext(isolated.allocator, self.client.ca_bundle.map.count(), .{ .cb = &isolated.ca_bundle });
-                var entries = self.client.ca_bundle.map.iterator();
-                while (entries.next()) |entry| {
-                    isolated.ca_bundle.map.putAssumeCapacityContext(entry.key_ptr.*, entry.value_ptr.*, .{ .cb = &isolated.ca_bundle });
-                }
-            }
-        }
-        var scoped = self.*;
-        scoped.client = &isolated;
-        return scoped.fetchRetried(arena, url, auth, body, headers, &timed);
-    }
-
-    fn fetchRetried(self: *OpenAI, arena: Allocator, url: []const u8, auth: ?[]const u8, body: []const u8, headers: []const std.http.Header, timed: ?*TimedIo) anyerror!HttpResponse {
-        var attempt: u8 = 0;
-        while (true) : (attempt += 1) {
-            const prepared = if (self.header_provider) |provider|
-                try provider.prepare(provider.context, arena, headers)
-            else
-                headers;
-            if (timed) |timer| timer.resetFailure();
-            var last_error: anyerror = error.LMFailure;
-            const response: ?HttpResponse = self.fetch(url, auth, body, prepared) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.StreamTooLong => return error.LMFailure,
-                else => failed: {
-                    const cause = if (timed) |timer| timer.failure() else null;
-                    if (cause) |failure| {
-                        if (failure == error.Canceled) return error.Canceled;
-                    } else if (err == error.Canceled) return error.Canceled;
-                    last_error = cause orelse error.LMFailure;
-                    break :failed null;
-                },
-            };
-            const status: ?std.http.Status = if (response) |r| r.status else null;
-            if (status == .ok) return response.?;
-            if (response) |r| self.client.allocator.free(r.body);
-            if (!retryable(status) or attempt >= self.max_retries) return last_error;
-            const delay_ms = @as(i64, self.retry_base_ms) << @as(u6, @intCast(@min(attempt, 31)));
-            try std.Io.sleep(self.client.io, .fromMilliseconds(delay_ms), .awake);
-        }
-    }
-
-    /// Transport failures (null), rate limits and server errors.
-    pub fn retryable(status: ?std.http.Status) bool {
-        const s = status orelse return true;
-        return s == .too_many_requests or @backingInt(s) >= 500;
+        return transport.send(arena, .{
+            .url = url,
+            .method = .POST,
+            .body = body,
+            .content_type = "application/json",
+            .authorization = auth,
+            .headers = headers,
+        });
     }
 
     fn parseJson(arena: Allocator, body: []const u8) Error!std.json.Value {
@@ -1349,11 +1222,6 @@ test "keyword LM scopes and OpenAI wire format" {
     try testing.expectEqualStrings("b", many[1]);
     const body_n = try client.requestBody(arena.allocator(), .{ .messages = &msgs, .options = .{ .n = 3 } });
     try testing.expect(std.mem.endsWith(u8, body_n, "\"n\": 3}"));
-    try testing.expect(OpenAI.retryable(null));
-    try testing.expect(OpenAI.retryable(.too_many_requests));
-    try testing.expect(OpenAI.retryable(.service_unavailable));
-    try testing.expect(!OpenAI.retryable(.unauthorized));
-    try testing.expect(!OpenAI.retryable(.bad_request));
 }
 
 test "replay LM matches recorded requests exactly and reports misses" {

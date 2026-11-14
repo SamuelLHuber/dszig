@@ -113,7 +113,7 @@ retain the actual continuation and raw provider response independently.
 | Instruction optimization | `InferRules`; `MIPROv2`, its program-aware proposer and an Optuna 4.5.0 TPE port; `COPRO`; `SIMBA`; supported instance-frontier `GEPA` paths against gepa 0.1.4 |
 | Agents and tools | `ReAct`, comptime `Tool`, `History`, `ToolCalls`, tool results, native declarations and text tool calls, typed submit, retained history |
 | Voting | `Ensemble`, `ensemble.majority`, Unicode text normalization; exact Python numeric equality, NaN object identity and source-order fallback behavior |
-| LM boundary | `LM`, native `lm.OpenAI` Chat Completions/Responses, scripted/keyword LMs, recording/replay wrappers and typed native protocol metadata |
+| LM boundary | `LM`, native `lm.OpenAI` Chat Completions/Responses, shared bounded `http.Transport`, scripted/keyword LMs, recording/replay wrappers and typed native protocol metadata |
 | Cache | `CachedLM`, per-candidate/request identity, LRU eviction, rich-response JSON dump/load; failed calls are not cached |
 | State | `state.save`, `saveAlloc`, `load`, with DSPy 3.5.0 dependency metadata and program JSON artifact comparisons |
 
@@ -331,7 +331,7 @@ scores, saved artifact bytes, instruction candidates, trial logs, candidate
 scores and SIMBA train scores. It is **mock-provider behavioral evidence**, not
 proof of real-model performance or complete DSPy equivalence.
 
-Local verification on 2026-11-14 passed **238/238 tests**
+Local verification on 2026-11-14 passed **239/239 tests**
 in both Debug and ReleaseSafe. The actual replay executable consumed the entire
 fixture and matched every adapter case and pipeline. The independent real-DSPy
 reference gate also passed. These results establish only the coverage described
@@ -348,6 +348,12 @@ async worker budget and cancellation without duplicate attempts. A private-CA
 HTTPS check covered untimed and timed clients followed by a fresh untimed TLS
 handshake, proving the caller's trust remained usable. An exhaustive native
 representation digest matched actual pinned CPython `repr` for all 1,112,064 Unicode scalar values.
+The shared HTTP transport was also exercised with an actual bodiless gzip GET,
+raw non-success status inspection, per-retry header refresh and override,
+unchanged callback errors, response-size rejection, an inactivity timeout and
+the actual live CLI against a scripted localhost provider. Generation retains
+its existing HTTP-200-only success policy; status-inspecting consumers use the
+same bounded transfer and timeout implementation without generation retries.
 These are protocol and formatting checks, not homelab or real-model evidence.
 
 The independent optimizer source probes can also be run directly:
