@@ -271,6 +271,8 @@ def persistence_cases(root):
                 np.lib.format.write_array(stream, vectors, version=version, allow_pickle=False)
             result[name] = saved_observation(path)
 
+    result.update(fortran_header_cases(root / "fortran-header"))
+
     # load replaces an existing instance without invoking its new embedder.
     backend = TextBackend()
     with managed(Embeddings(["east"], backend.embedder)) as loaded:
@@ -331,6 +333,34 @@ def persistence_cases(root):
         else:
             with managed(candidate):
                 raise AssertionError(f"Missing file accepted: {name}")
+    return result
+
+
+def fortran_header_cases(root):
+    # Hand-written headers claim fortran_order=True. DSPy's real np.load/np.save
+    # canonicalize degenerate shapes (one row or column) and rank one to False.
+    root.mkdir(parents=True, exist_ok=True)
+    result = {}
+    for name, shape in (("degenerate-row", (1, 3)), ("degenerate-column", (3, 1)),
+                        ("nondegenerate-matrix", (2, 3)), ("scalar", ()),
+                        ("vector", (3,)), ("empty-rows", (0, 3)),
+                        ("empty-columns", (3, 0)), ("unit-matrix", (1, 1))):
+        path = root / name
+        path.mkdir(parents=True, exist_ok=True)
+        data = np.arange(int(np.prod(shape)), dtype="<f4").reshape(shape, order="F")
+        stream = io.BytesIO()
+        np.lib.format.write_array_header_1_0(stream, {"descr": "<f4", "fortran_order": True,
+                                                      "shape": shape})
+        stream.write(data.tobytes(order="F"))
+        (path / "corpus_embeddings.npy").write_bytes(stream.getvalue())
+        (path / "config.json").write_text(json.dumps(
+            {"k": 5, "normalize": False, "corpus": [f"{name}-{i}" for i in range(shape[0] if shape else 1)],
+             "has_faiss_index": False}))
+        with managed(EmbeddingsWithScores.from_saved(str(path), TextBackend().embedder)) as loaded:
+            loaded.save(str(path / "resaved"))
+        result[name] = {"input_hex": stream.getvalue().hex(),
+                        "saved_hex": (path / "resaved" / "corpus_embeddings.npy").read_bytes().hex(),
+                        "array": array(np.load(path / "corpus_embeddings.npy", allow_pickle=False))}
     return result
 
 

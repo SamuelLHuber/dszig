@@ -216,6 +216,12 @@ representation while retaining its model validation.
 A native executable also exercised a typed Code prediction, fenced output,
 language-specialized instance preservation through the base validator,
 raw-string traces and saved-demo restoration.
+Further native checks matched 12 actual XML predictions across direct, optional,
+dictionary and nested-list Code annotations, including exact input/output
+structure formatting. Five composed/decomposed Unicode and control-character
+schema prompts also matched exactly. Provider schemas reject unequal colliding
+definitions rather than silently aliasing them; equivalent definitions share
+the same source-matching schema.
 
 `Embeddings` and `EmbeddingsWithScores` embed the corpus once, normalize float32
 vectors when requested and expose explicit batched queries. Their signed `k`
@@ -230,6 +236,10 @@ An actual native executable loaded six independently generated Python saves
 without recomputing the corpus and matched their retrieval results. Real DSPy
 then loaded both normalized and raw native saves and reproduced the same indices,
 passages, float64 scores and query-only embedding calls.
+Eight further load/save round trips matched actual NumPy output bytes, including
+scalar, vector, empty and degenerate Fortran headers. Saves canonicalize arrays
+that are also C-contiguous to `fortran_order: False`, preserving nondegenerate
+Fortran storage.
 
 `MultiChainComparison(Sig, M)` accepts exactly `M` ordered completion records
 and the original typed inputs. It constructs the student-attempt fields and
@@ -304,7 +314,7 @@ scores, saved artifact bytes, instruction candidates, trial logs, candidate
 scores and SIMBA train scores. It is **mock-provider behavioral evidence**, not
 proof of real-model performance or complete DSPy equivalence.
 
-Local verification on 2026-11-14 passed **231/231 tests**
+Local verification on 2026-11-14 passed **235/235 tests**
 in both Debug and ReleaseSafe. The actual replay executable consumed the entire
 fixture and matched every adapter case and pipeline. The independent real-DSPy
 reference gate also passed. These results establish only the coverage described
@@ -410,8 +420,10 @@ The following prevent a claim that DSZig can do everything DSPy can:
   Completions object model, dynamic signature syntax, arbitrary Pydantic custom
   models/validators, custom Type hierarchy, generic callbacks,
   settings singleton, usage accounting, asyncify/syncify or streamify equivalents.
-- **Type and parsing boundaries:** Code's generated schema-definition name
-  collisions fail closed. Tagged unions beyond optional types and some
+- **Type and parsing boundaries:** Unequal response-schema definitions with
+  colliding names fail closed; equivalent definitions can share a name.
+  Python's identity-dependent automatic renaming is not reproduced. Tagged
+  unions beyond optional types and some
   Pydantic model defaults are not native signature types. JSON repair is not
   implemented; strict JSON and the existing limited Python-literal parser are
   not equivalent to `json_repair` for malformed output. XML golden cases that

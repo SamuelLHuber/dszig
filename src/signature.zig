@@ -66,7 +66,7 @@ pub const Field = struct {
     type_description_name: []const u8 = "",
     /// Code is text on the wire but keeps its own model validator and schema.
     code_type: bool = false,
-    /// Direct, optional, list, or dictionary Code annotations use literal XML.
+    /// Direct or nested Code annotations enable custom-type text parsing.
     code_annotation: bool = false,
     /// Custom class names can differ from Pydantic's safe definition keys.
     schema_definition_name: []const u8 = "",
@@ -197,6 +197,17 @@ pub fn isSignature(comptime T: type) bool {
     return @typeInfo(T) == .@"struct" and @hasDecl(T, "is_dszig_signature");
 }
 
+/// XMLAdapter unwraps only the outer Optional and inspects only an immediate
+/// list item. Recursive custom-type discovery is a separate description rule.
+fn codeXmlLiteral(comptime T: type) bool {
+    const annotation = if (@typeInfo(T) == .optional) @typeInfo(T).optional.child else T;
+    if (code.isCode(annotation)) return true;
+    return switch (@typeInfo(annotation)) {
+        .pointer => |p| p.size == .slice and code.isCode(p.child),
+        else => false,
+    };
+}
+
 fn fieldsOf(comptime T: type, comptime role: []const u8, comptime descriptions: []const Description) [fieldCount(T, role)]Field {
     comptime {
         const info = @typeInfo(T).@"struct";
@@ -218,7 +229,7 @@ fn fieldsOf(comptime T: type, comptime role: []const u8, comptime descriptions: 
                 .reasoning_type = FT == Reasoning or FT == ?Reasoning,
                 // DSPy adapts direct Reasoning annotations, not Optional unions.
                 .native_reasoning = FT == Reasoning,
-                .xml_literal = FT == History or FT == ToolCalls or FT == ?Reasoning or code.annotationType(FT) != null,
+                .xml_literal = FT == History or FT == ToolCalls or FT == ?Reasoning or codeXmlLiteral(FT),
                 .native_tool_calls = FT == ToolCalls,
                 .type_description = if (code.annotationType(FT)) |C| C.description else if (FT == ToolCalls) ToolCalls.description else "",
                 .type_description_name = if (code.annotationType(FT)) |C| C.model_name else "",

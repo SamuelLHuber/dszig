@@ -281,6 +281,154 @@ test "Code optional and collection adapters keep null empty and invalid values d
     try testing.expectError(error.AdapterParse, adapter.Adapter.xml.parse(arena, list_view, "<snippets>[{\"code\":7}]</snippets>"));
 }
 
+test "Code XML literal selection stops at the immediate list item" {
+    const adapter = @import("adapter.zig");
+    const signature = @import("signature.zig");
+    const types = @import("types.zig");
+    const value = @import("value.zig");
+    const Snippet = CodeWithLanguage("JAVA");
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    inline for (.{
+        .{ Snippet, "\"run();\"", "<result>\nrun();\n</result>" },
+        .{ ?Snippet, "\"run();\"", "<result>\nrun();\n</result>" },
+        .{ []const Snippet, "[\"run();\"]", "<result>\n[\"run();\"]\n</result>" },
+        .{ ?[]const Snippet, "[\"run();\"]", "<result>\n[\"run();\"]\n</result>" },
+        .{ types.Dict(Snippet), "{\"main\":\"run();\",\"a b\":\"run();\"}", "<result>\n<main>\nrun();\n</main>\n<entry key=\"a b\">\nrun();\n</entry>\n</result>" },
+        .{ []const []const Snippet, "[[\"run();\"]]", "<result>\n<item>\n<item>\nrun();\n</item>\n</item>\n</result>" },
+        .{ []const ?Snippet, "[\"run();\",null]", "<result>\n<item>\nrun();\n</item>\n<item />\n</result>" },
+        .{ []const types.Dict(Snippet), "[{\"main\":\"run();\"}]", "<result>\n<item>\n<main>\nrun();\n</main>\n</item>\n</result>" },
+        .{ ?types.Dict(Snippet), "{\"main\":\"run();\"}", "<result>\n<main>\nrun();\n</main>\n</result>" },
+        .{ []const Snippet, "[]", "<result>\n[]\n</result>" },
+        .{ ?[]const Snippet, "null", "<result />" },
+        .{ types.Dict(Snippet), "{}", "<result>\n\n</result>" },
+    }) |case| {
+        const Sig = signature.Signature(struct {
+            pub const Input = struct {};
+            pub const Output = struct { result: case[0] };
+        });
+        const view: adapter.View = .{ .instructions = "", .inputs = Sig.input_fields_list, .outputs = Sig.output_fields_list };
+        const expected = try std.json.parseFromSliceLeaky(Value, arena, case[1], .{});
+        const typed = try value.fromValue(arena, case[0], expected);
+        const outputs = try value.toRecord(arena, Sig.Output, .{ .result = typed });
+        const text = try adapter.formatAssistantPartial(.xml, arena, view, &outputs);
+        try testing.expectEqualStrings(case[2], text);
+        const parsed = try adapter.Adapter.xml.parse(arena, view, text);
+        try testing.expect(value.pyEqual(expected, parsed.get("result").?));
+        const restored = try value.fromRecord(arena, Sig.Output, &parsed);
+        try testing.expect(value.pyEqual(expected, try value.toValue(arena, case[0], restored.result)));
+    }
+    inline for (.{
+        .{
+            types.Dict(Snippet),
+            "{\"main\":\"run();\",\"a b\":\"run();\"}",
+            "<source>\n{\"main\": \"run();\", \"a b\": \"run();\"}\n</source>",
+            "<result>\n<entry key=\"example key\">\n<code>\n...\n</code>\n</entry>\n</result>",
+        },
+        .{
+            []const []const Snippet,
+            "[[\"run();\"]]",
+            "<source>\n[[\"run();\"]]\n</source>",
+            "<result>\n<item>\n<item>\n<code>\n...\n</code>\n</item>\n</item>\n</result>",
+        },
+        .{
+            []const ?Snippet,
+            "[\"run();\",null]",
+            "<source>\n[\"run();\", null]\n</source>",
+            "<result>\n<item>\n<code>\n...\n</code>\n</item>\n</result>",
+        },
+    }) |case| {
+        const Sig = signature.Signature(struct {
+            pub const Input = struct { source: case[0] };
+            pub const Output = struct { result: case[0] };
+        });
+        const view: adapter.View = .{ .instructions = "", .inputs = Sig.input_fields_list, .outputs = Sig.output_fields_list };
+        const input = try std.json.parseFromSliceLeaky(Value, arena, case[1], .{});
+        const typed = try value.fromValue(arena, case[0], input);
+        const inputs = try value.toRecord(arena, Sig.Input, .{ .source = typed });
+        try testing.expectEqualStrings(case[2], try adapter.formatUser(.xml, arena, view, &inputs, false));
+        try testing.expectEqualStrings(
+            "Output format (replace placeholders):\n" ++ case[3],
+            try adapter.XmlAdapter.fieldStructure(arena, Sig.output_fields_list),
+        );
+    }
+}
+
+test "Code provider definition collisions fail closed and equivalent models share" {
+    const adapter = @import("adapter.zig");
+    const signature = @import("signature.zig");
+    const Cpp = CodeWithLanguage("C++");
+    const Other = struct {
+        pub const model_name = "Code_C__";
+        count: i64,
+    };
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    inline for (.{
+        .{ Cpp, Other },
+        .{ Other, Cpp },
+        .{ []const Cpp, []const Other },
+        .{ []const Other, []const Cpp },
+        .{ []const Cpp, Other },
+        .{ Other, []const Cpp },
+        .{ Cpp, []const Other },
+        .{ []const Other, Cpp },
+        .{ Cpp, CodeWithLanguage("C##") },
+        .{ CodeWithLanguage("C##"), Cpp },
+        .{ []const Cpp, []const CodeWithLanguage("C##") },
+        .{ []const CodeWithLanguage("C##"), []const Cpp },
+    }) |case| {
+        const Sig = signature.Signature(struct {
+            pub const Input = struct {};
+            pub const Output = struct { code: case[0], model: case[1] };
+        });
+        const view: adapter.View = .{ .instructions = "", .inputs = Sig.input_fields_list, .outputs = Sig.output_fields_list };
+        try testing.expectError(error.AdapterParse, adapter.responseFormat(arena, view, true));
+        try testing.expect((try adapter.responseFormat(arena, view, false)) == .json_object);
+    }
+    const Shared = signature.Signature(struct {
+        pub const Input = struct {};
+        pub const Output = struct { first: Cpp, second: Cpp, snippets: []const Cpp, optional: ?Cpp };
+    });
+    const response = try adapter.responseFormat(arena, .{ .instructions = "", .inputs = Shared.input_fields_list, .outputs = Shared.output_fields_list }, true);
+    const root = response.json_schema.schema.object;
+    try testing.expectEqual(@as(usize, 1), root.get("$defs").?.object.count());
+    const properties = root.get("properties").?.object;
+    try testing.expectEqualStrings("#/$defs/Code_C__", properties.get("first").?.object.get("$ref").?.string);
+    try testing.expectEqualStrings("#/$defs/Code_C__", properties.get("second").?.object.get("$ref").?.string);
+    try testing.expectEqualStrings("#/$defs/Code_C__", properties.get("snippets").?.object.get("items").?.object.get("$ref").?.string);
+    try testing.expectEqualStrings("#/$defs/Code_C__", properties.get("optional").?.object.get("anyOf").?.array.items[0].object.get("$ref").?.string);
+}
+
+test "Code textual prompt schemas preserve Unicode and required JSON escaping" {
+    const adapter = @import("adapter.zig");
+    const signature = @import("signature.zig");
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    inline for (.{
+        .{ "Café", "Code_Caf_", "Code_Café" },
+        .{ "Cafe\u{0301}", "Code_Cafe_", "Code_Cafe\u{0301}" },
+        .{ "Café\x08\x0c\n\r\t\x1f", "Code_Caf_______", "Code_Café\\b\\f\\n\\r\\t\\u001f" },
+        .{ "q\"uote\\\n\x01", "Code_q_uote___", "Code_q\\\"uote\\\\\\n\\u0001" },
+        .{ "é😀\x7f\u{2028}", "Code_____", "Code_é😀\x7f\u{2028}" },
+    }) |case| {
+        const Sig = signature.Signature(struct {
+            pub const Input = struct {};
+            pub const Output = struct { result: []const CodeWithLanguage(case[0]) };
+        });
+        var text: std.Io.Writer.Allocating = .init(arena);
+        try adapter.translateFieldType(&text.writer, Sig.output_fields_list[0], false);
+        try testing.expectEqualStrings(
+            "{result}        # note: the value you produce must adhere to the JSON schema: " ++
+                "{\"type\": \"array\", \"$defs\": {\"" ++ case[1] ++ "\": {\"type\": \"object\", \"properties\": {\"code\": {\"type\": \"string\", \"title\": \"Code\"}}, \"required\": [\"code\"], \"title\": \"" ++ case[2] ++ "\"}}, \"items\": {\"$ref\": \"#/$defs/" ++ case[1] ++ "\"}}",
+            text.written(),
+        );
+    }
+}
+
 test "Code provider schemas preserve model validation despite raw-string serialization" {
     const adapter = @import("adapter.zig");
     const signature = @import("signature.zig");

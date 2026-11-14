@@ -525,7 +525,7 @@ fn readNpy(arena: Allocator, bytes: []align(@alignOf(f32)) u8) !Npy {
         .matrix = .{ .values = values, .rows = rows, .columns = columns },
         .rank = header.rank,
         .byte_order = byte_order,
-        .fortran_order = header.fortran_order,
+        .fortran_order = transpose,
     };
 }
 
@@ -538,10 +538,13 @@ fn writeNpy(file: std.Io.File, io: std.Io, matrix: Matrix, rank: ArrayRank, byte
         .vector => try std.fmt.bufPrint(&shape_buffer, "({d},)", .{matrix.rows}),
         .matrix => try std.fmt.bufPrint(&shape_buffer, "({d}, {d})", .{ matrix.rows, matrix.columns }),
     };
+    // NumPy writes fortran_order only when the array is F- but not C-contiguous,
+    // i.e. a matrix with more than one row and column.
+    const transpose = rank == .matrix and fortran_order and matrix.rows > 1 and matrix.columns > 1;
     var header_buffer: [256]u8 = undefined;
     const dictionary = try std.fmt.bufPrint(&header_buffer, "{{'descr': '{c}f4', 'fortran_order': {s}, 'shape': {s}, }}", .{
         @as(u8, if (byte_order == .little) '<' else '>'),
-        if (fortran_order) "True" else "False",
+        if (transpose) "True" else "False",
         shape,
     });
     const header_length = std.mem.alignForward(usize, 10 + dictionary.len + 1, 64) - 10;
@@ -551,7 +554,6 @@ fn writeNpy(file: std.Io.File, io: std.Io, matrix: Matrix, rank: ArrayRank, byte
     std.mem.writeInt(u16, prefix[8..10], @intCast(header_length), .little);
     try file.writeStreamingAll(io, &prefix);
     try file.writeStreamingAll(io, header_buffer[0..header_length]);
-    const transpose = rank == .matrix and fortran_order and matrix.rows > 1 and matrix.columns > 1;
     if (!transpose and byte_order == native_endian) {
         try file.writeStreamingAll(io, std.mem.sliceAsBytes(matrix.values));
         return;
@@ -1021,6 +1023,56 @@ test "Embeddings save writes independently produced NumPy NPY bytes" {
     try testing.expect(!config.object.get("normalize").?.bool);
     try testing.expect(!config.object.get("has_faiss_index").?.bool);
     try testing.expectEqualStrings("second", config.object.get("corpus").?.array.items[1].string);
+}
+
+test "Embeddings saves degenerate NumPy Fortran headers canonically" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var temporary = testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporary.dir.realPathFileAlloc(testing.io, ".", arena);
+    // Inputs are genuine NumPy 1.x files with fortran_order=True; outputs are DSPy's np.save results.
+    const cases = [_]struct { input: []const u8, expected: []const u8, rows: usize, columns: usize, names: []const []const u8 }{
+        .{
+            .input = "934e554d5059010076007b276465736372273a20273c6634272c2027666f727472616e5f6f72646572273a20547275652c20277368617065273a2028312c2033292c207d20202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020200a000000000000803f00000040",
+            .expected = "934e554d5059010076007b276465736372273a20273c6634272c2027666f727472616e5f6f72646572273a2046616c73652c20277368617065273a2028312c2033292c207d202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020200a000000000000803f00000040",
+            .rows = 1,
+            .columns = 3,
+            .names = &.{"degenerate-row-0"},
+        },
+        .{
+            .input = "934e554d5059010076007b276465736372273a20273c6634272c2027666f727472616e5f6f72646572273a20547275652c20277368617065273a2028332c2031292c207d20202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020200a000000000000803f00000040",
+            .expected = "934e554d5059010076007b276465736372273a20273c6634272c2027666f727472616e5f6f72646572273a2046616c73652c20277368617065273a2028332c2031292c207d202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020202020200a000000000000803f00000040",
+            .rows = 3,
+            .columns = 1,
+            .names = &.{ "degenerate-column-0", "degenerate-column-1", "degenerate-column-2" },
+        },
+    };
+    for (cases) |case| {
+        var input_buffer: [256]u8 = undefined;
+        var expected_buffer: [256]u8 = undefined;
+        const input = try std.fmt.hexToBytes(&input_buffer, case.input);
+        const expected = try std.fmt.hexToBytes(&expected_buffer, case.expected);
+        const values = [_]f32{ 0, 1, 2 };
+        var backend: TestBackend = .{
+            .arena = arena,
+            .corpus = .{ .values = &values, .rows = case.rows, .columns = case.columns },
+            .query = .{ .values = &.{ 1, 1, 1 }, .rows = 1, .columns = 3 },
+        };
+        var model = backend.model();
+        defer model.deinit();
+        var retriever = try EmbeddingsWithScores.init(testing.allocator, case.names, &model, .{ .normalize = false, .k = -1 });
+        defer retriever.deinit();
+        try retriever.save(testing.io, path);
+        try temporary.dir.writeFile(testing.io, .{ .sub_path = "corpus_embeddings.npy", .data = input });
+        var loaded = try EmbeddingsWithScores.fromSaved(testing.allocator, testing.io, path, &model);
+        defer loaded.deinit();
+        try testing.expectEqualSlices(f32, &values, loaded.corpus_embeddings.values);
+        try loaded.save(testing.io, path);
+        const saved = try temporary.dir.readFileAlloc(testing.io, "corpus_embeddings.npy", arena, .unlimited);
+        try testing.expectEqualSlices(u8, expected, saved);
+    }
 }
 
 test "Embeddings loads genuine NumPy versions and endian Fortran arrays without recomputing" {

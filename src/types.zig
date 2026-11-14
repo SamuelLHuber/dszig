@@ -119,10 +119,10 @@ fn renderOrdered(comptime entries: []const Entry) []const u8 {
 
 fn quote(comptime s: []const u8) []const u8 {
     comptime {
+        if (!std.unicode.utf8ValidateSlice(s)) @compileError("dszig: schema text must be valid UTF-8");
         var out: []const u8 = "\"";
-        var iterator = (std.unicode.Utf8View.init(s) catch @compileError("dszig: schema text must be valid UTF-8")).iterator();
-        while (iterator.nextCodepoint()) |cp| {
-            out = out ++ switch (cp) {
+        for (s) |byte| {
+            out = out ++ switch (byte) {
                 '"' => "\\\"",
                 '\\' => "\\\\",
                 '\n' => "\\n",
@@ -130,11 +130,7 @@ fn quote(comptime s: []const u8) []const u8 {
                 '\t' => "\\t",
                 0x08 => "\\b",
                 0x0c => "\\f",
-                else => if (cp < 0x20 or cp >= 0x7f) blk: {
-                    if (cp <= 0xffff) break :blk std.fmt.comptimePrint("\\u{x:0>4}", .{cp});
-                    const scalar = cp - 0x10000;
-                    break :blk std.fmt.comptimePrint("\\u{x:0>4}\\u{x:0>4}", .{ 0xd800 + (scalar >> 10), 0xdc00 + (scalar & 0x3ff) });
-                } else &[_]u8{@intCast(cp)},
+                else => if (byte < 0x20) std.fmt.comptimePrint("\\u{x:0>4}", .{byte}) else &[_]u8{byte},
             };
         }
         return out ++ "\"";

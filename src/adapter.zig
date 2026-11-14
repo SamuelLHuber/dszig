@@ -278,7 +278,7 @@ pub fn responseFormat(arena: Allocator, view: View, supports_schema: bool) Error
         if (schema.object.get("$defs")) |defs| {
             if (defs == .object) {
                 var it = defs.object.iterator();
-                while (it.next()) |entry| try definitions.put(arena, entry.key_ptr.*, entry.value_ptr.*);
+                while (it.next()) |entry| try putDefinition(arena, &definitions, entry.key_ptr.*, entry.value_ptr.*);
             }
             _ = schema.object.orderedRemove("$defs");
         }
@@ -288,7 +288,7 @@ pub fn responseFormat(arena: Allocator, view: View, supports_schema: bool) Error
             model_title != null and model_title.? == .string)
         {
             const name = if (field.schema_definition_name.len > 0) field.schema_definition_name else model_title.?.string;
-            try definitions.put(arena, name, schema);
+            try putDefinition(arena, &definitions, name, schema);
             var reference: Record = .empty;
             try reference.put(arena, "$ref", .{ .string = try std.fmt.allocPrint(arena, "#/$defs/{s}", .{name}) });
             schema = .{ .object = reference };
@@ -307,6 +307,17 @@ pub fn responseFormat(arena: Allocator, view: View, supports_schema: bool) Error
     var schema: Value = .{ .object = root };
     try enforceRequired(arena, &schema, 0);
     return .{ .json_schema = .{ .name = "DSPyProgramOutputs", .schema = schema } };
+}
+
+/// Python class/module identities are not available for Pydantic's collision
+/// renaming. Never make distinct models alias the same provider definition.
+fn putDefinition(arena: Allocator, definitions: *Record, name: []const u8, schema: Value) Error!void {
+    const entry = try definitions.getOrPut(arena, name);
+    if (entry.found_existing) {
+        if (!value.pyEqual(entry.value_ptr.*, schema)) return error.AdapterParse;
+    } else {
+        entry.value_ptr.* = schema;
+    }
 }
 
 fn needsFieldTitle(schema: Value) bool {

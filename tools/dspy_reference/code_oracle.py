@@ -24,6 +24,7 @@ from dspy.adapters.utils import (
     get_field_description_string,
     parse_value,
     serialize_for_json,
+    translate_field_type,
 )
 
 
@@ -171,6 +172,57 @@ def main():
             "predict": {"output": predicted.toDict(), "result_class": type(predicted.result).__name__,
                         "requests": model.calls},
         }
+    xml = dspy.XMLAdapter()
+    xml_shapes = []
+    for name, annotation, result in [
+        ("direct", Java, specialized),
+        ("optional", Java | None, specialized),
+        ("list", list[Java], [specialized]),
+        ("optional_list", list[Java] | None, [specialized]),
+        ("dict", dict[str, Java], {"main": specialized, "a b": specialized}),
+        ("nested_list", list[list[Java]], [[specialized]]),
+        ("list_optional", list[Java | None], [specialized, None]),
+        ("list_dict", list[dict[str, Java]], [{"main": specialized}]),
+        ("optional_dict", dict[str, Java] | None, {"main": specialized}),
+        ("empty_list", list[Java], []),
+        ("null_list", list[Java] | None, None),
+        ("empty_dict", dict[str, Java], {}),
+    ]:
+        shape = dspy.Signature({
+            "source": (annotation, dspy.InputField()),
+            "result": (annotation, dspy.OutputField()),
+        })
+        text = xml.format_assistant_message_content(shape, {"result": result})
+        xml_shapes.append({
+            "name": name, "annotation": get_annotation_name(annotation),
+            "uses_nested_xml": xml._uses_nested_xml(annotation), "assistant": text,
+            "input": xml.format_user_message_content(shape, {"source": result}),
+            "structure": xml.format_field_structure(shape),
+            "round_trip": attempt(lambda shape=shape, text=text: xml.parse(shape, text)),
+        })
+    prompt_schemas = []
+    for language in ("Café", "Cafe\u0301", "Café\b\f\n\r\t\x1f",
+                     'q"uote\\\n\x01', "é😀\x7f\u2028"):
+        shape = dspy.Signature({"result": (list[dspy.Code[language]], dspy.OutputField())})
+        prompt_schemas.append({
+            "language": language,
+            "translation": translate_field_type("result", shape.output_fields["result"]),
+        })
+    collision_model = pydantic.create_model("Code_C__", count=(int, ...))
+    cpp = dspy.Code["C++"]
+    schema_collisions = {}
+    for name, annotations in [
+        ("direct", (cpp, collision_model)),
+        ("nested", (list[cpp], list[collision_model])),
+        ("code_languages_direct", (cpp, dspy.Code["C##"])),
+        ("code_languages_nested", (list[cpp], list[dspy.Code["C##"]])),
+        ("equivalent", (cpp, dspy.Code["C++"])),
+    ]:
+        shape = dspy.Signature({
+            f"result{index}": (annotation, dspy.OutputField())
+            for index, annotation in enumerate(annotations)
+        })
+        schema_collisions[name] = _get_structured_outputs_response_format(shape).model_json_schema()
     output = {
         "versions": {"python": platform.python_version(), "dspy": importlib.metadata.version("dspy"),
                      "pydantic": pydantic.__version__, "unicode": unicodedata.unidata_version},
@@ -226,6 +278,9 @@ def main():
         "adapters": adapters,
         "provider_schemas": {"direct": _get_structured_outputs_response_format(Direct).model_json_schema(),
                              "nested": _get_structured_outputs_response_format(Nested).model_json_schema()},
+        "xml_code_shapes": xml_shapes,
+        "unicode_prompt_schemas": prompt_schemas,
+        "schema_collisions": schema_collisions,
     }
     print(json.dumps(output, ensure_ascii=False, indent=2, default=normalized))
 
