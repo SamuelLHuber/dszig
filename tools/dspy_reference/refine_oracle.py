@@ -98,6 +98,14 @@ def small_score(inputs, prediction):
     return -1e-5
 
 
+def large_score(inputs, prediction):
+    return float(2**200 if prediction.answer == "7" else 2**201)
+
+
+def negative_large_score(inputs, prediction):
+    return -float(2**200)
+
+
 class FailingPair(Pair):
     def forward(self, question):
         raise ValueError("native-parity-program-failure")
@@ -167,7 +175,13 @@ def main():
         run("zero-failure-budget-is-default", n=4, failing=True, fail_count=0),
         run("negative-failure-budget", n=3, failing=True, fail_count=-1),
         run("feedback-float-small", threshold=1e-5, reward=small_score),
+        run("integer-threshold-above-float", n=2, threshold=2**200 + 1, reward=large_score),
+        run("negative-integer-threshold", n=2, threshold=-(2**200 + 1), reward=negative_large_score),
     ]
+    assert rows[-2]["outcomes"] == [{"answer": "8"}]
+    assert rows[-1]["outcomes"] == [{"answer": "7"}]
+    feedback = next(call for call in rows[-2]["calls"] if call["kind"] == "feedback")
+    assert feedback["inputs"]["target_threshold"] == '"<non-serializable: int>"'
     masks = {
         "reasoning": recursive_mask({"nested": [dspy.Reasoning(content="reason")]}),
         "code": recursive_mask({"nested": [dspy.Code(code="x = 1")]}),

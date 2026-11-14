@@ -1,4 +1,4 @@
-"""Run actual DSPy Refine(ReAct) and retain its feedback trajectory."""
+"""Run actual DSPy Refine(ReAct), retaining outputs, feedback and LM prompts."""
 
 import contextlib
 import io
@@ -15,9 +15,12 @@ class RecordingLM(ref.ReferenceLM):
     def __init__(self, capture):
         super().__init__(model="mock/refine-react", temperature=0.25,
                          rollout_id=7, max_tokens=1000, cache=False)
-        self.capture, self.feedback = capture, []
+        self.capture, self.feedback, self.calls = capture, [], []
 
     def complete(self, request):
+        self.calls.append({"messages": ref.messages_for(request),
+                           "temperature": request.config.temperature,
+                           "rollout_id": ref.rollout_id(self)})
         if "advice" in self.capture.local.signature.output_fields:
             self.feedback.append(dict(self.capture.local.inputs))
             text = '<discussion>Improve.</discussion><advice>{}</advice>'
@@ -48,6 +51,7 @@ def main():
     assert prediction.answer == "8"
     print(json.dumps({"dspy_version": dspy.__version__,
                       "prediction": prediction.toDict(), "feedback": lm.feedback,
+                      "calls": lm.calls,
                       "trace": [{"inputs": serialize_for_json(inputs), "outputs": outputs.toDict()}
                                 for _, inputs, outputs in trace]}, indent=2))
 

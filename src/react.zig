@@ -166,10 +166,18 @@ pub fn ReActIters(comptime Sig: type, comptime user_tools: []const Tool, comptim
         break :blk fields;
     };
 
+    const FinalOutput = comptime blk: {
+        const info = @typeInfo(Sig.Output).@"struct";
+        const names = info.field_names[0..info.field_names.len].* ++ [_][:0]const u8{ "history", "termination_reason" };
+        const field_types = info.field_types[0..info.field_types.len].* ++ [_]type{ History, TerminationReason };
+        const attrs = info.field_attrs[0..info.field_attrs.len].* ++ [_]@TypeOf(info.field_attrs[0]){ .{}, .{} };
+        break :blk @Struct(.auto, null, &names, &field_types, &attrs);
+    };
+
     return struct {
         const Self = @This();
         pub const Input = Sig.Input;
-        pub const Output = Sig.Output;
+        pub const Output = FinalOutput;
         pub const all_tools: []const Tool = &tools;
         pub const react_instructions = instructions;
         const react_field_array = optional_inputs ++ [_]Field{
@@ -194,7 +202,12 @@ pub fn ReActIters(comptime Sig: type, comptime user_tools: []const Tool, comptim
         pub fn forward(self: *const Self, ctx: Context, input: Input) Error!Output {
             const inputs = try value.toRecord(ctx.arena, Input, input);
             const prediction = try self.run(ctx, &inputs);
-            return value.fromRecord(ctx.arena, Output, &prediction.outputs);
+            const submitted = try value.fromRecord(ctx.arena, Sig.Output, &prediction.outputs);
+            var output: Output = undefined;
+            inline for (Sig.output_fields_list) |field| @field(output, field.name) = @field(submitted, field.name);
+            output.history = prediction.history;
+            output.termination_reason = prediction.termination_reason;
+            return output;
         }
 
         /// Dynamic inputs may include `history` and `max_iters`, just like DSPy.
@@ -613,6 +626,32 @@ fn appendEvent(arena: Allocator, events: *std.ArrayList(Record), history: *Histo
 
 fn writeText(w: *Writer, text: []const u8) Allocator.Error!void {
     w.writeAll(text) catch return error.OutOfMemory;
+}
+
+test "ReAct forward retains final history and termination metadata" {
+    const testing = std.testing;
+    const Sig = signature.Signature(struct {
+        pub const Input = struct {};
+        pub const Output = struct { answer: []const u8 };
+    });
+    inline for (.{ false, true }) |forced| {
+        var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer memory.deinit();
+        const arena = memory.allocator();
+        const submit = "{\"next_thought\":\"done\",\"tool_calls\":{\"tool_calls\":[{\"name\":\"submit\",\"args\":{\"answer\":\"retained\"}}]}}";
+        var script: @import("lm.zig").ScriptedLM = .{ .responses = if (forced)
+            &.{ "{\"next_thought\":\"retry\",\"tool_calls\":{\"tool_calls\":[]}}", submit }
+        else
+            &.{submit} };
+        const agent: ReActIters(Sig, &.{}, 1) = .{};
+        const output = try agent.forward(.{ .arena = arena, .lm = script.lm(), .adapter = .json, .json_fallback = false }, .{});
+        const record = try value.toRecord(arena, @TypeOf(output), output);
+        try testing.expectEqualStrings("retained", record.get("answer").?.string);
+        try testing.expect(record.contains("history"));
+        try testing.expectEqualStrings(if (forced) "forced_submit" else "submit", record.get("termination_reason").?.string);
+        const event = record.get("history").?.object.get("messages").?.array.items[0].object;
+        try testing.expectEqualStrings("retained", event.get("answer").?.string);
+    }
 }
 
 test "ReAct submit validates Code models but retains custom string results" {

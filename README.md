@@ -202,10 +202,20 @@ program trace. A native executable matched **14 actual DSPy cases and all
 outputs, outer traces and persistent failure budgets. Coverage includes distinct versus shared
 signature classes, missing/empty advice, null thresholds, NaN/infinite rewards,
 and small-decimal feedback serialization.
-A reproduced Refine/ReAct regression also verifies that feedback masks History,
-Tool and ToolCalls objects while retaining the original structured traces.
-An actual native executable matched the source feedback trajectory byte-for-byte
-and selected the same improved answer.
+Thresholds are nullable `std.json.Value` scalars: `.integer = 100` and
+`.float = 100` intentionally generate different feedback strings. Exact integer
+thresholds beyond machine widths use `.number_string`; reward comparisons do
+not round them to a floating-point threshold. Feedback retains DSPy's
+`<non-serializable: int>` masking beyond orjson's integer range.
+
+Typed `ReAct.forward` returns the signature's outputs plus `History` and
+`termination_reason`, including forced-submit results. A reproduced Refine/ReAct
+regression verifies that feedback masks History, Tool and ToolCalls objects
+while retaining the original structured traces. An actual native executable
+matched DSPy's complete final prediction, all nine feedback inputs and all three
+prompts, rollout IDs and temperatures exactly.
+The same executable also matched actual DSPy selections for positive and negative
+`2**200 + 1` thresholds and the resulting large-integer feedback mask.
 
 `Code` defaults to Python; `CodeWithLanguage("JAVA")` keeps the supplied language
 in its description and lowercases only the Markdown fence. Validation extracts
@@ -314,7 +324,7 @@ scores, saved artifact bytes, instruction candidates, trial logs, candidate
 scores and SIMBA train scores. It is **mock-provider behavioral evidence**, not
 proof of real-model performance or complete DSPy equivalence.
 
-Local verification on 2026-11-14 passed **235/235 tests**
+Local verification on 2026-11-14 passed **237/237 tests**
 in both Debug and ReleaseSafe. The actual replay executable consumed the entire
 fixture and matched every adapter case and pipeline. The independent real-DSPy
 reference gate also passed. These results establish only the coverage described

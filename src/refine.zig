@@ -63,7 +63,7 @@ pub fn Refine(comptime P: type) type {
         pub const Options = struct {
             n: isize,
             reward_fn: Reward,
-            threshold: ?f64,
+            threshold: ?Value,
             fail_count: ?i128 = null,
             module_code: []const u8,
             reward_code: []const u8,
@@ -72,7 +72,7 @@ pub fn Refine(comptime P: type) type {
         module: P,
         n: isize,
         reward_fn: Reward,
-        threshold: ?f64,
+        threshold: ?Value,
         fail_count: i128,
         module_code: []const u8,
         reward_code: []const u8,
@@ -154,7 +154,7 @@ pub fn Refine(comptime P: type) type {
             const reward = try self.reward_fn(reward_context, input, &output);
             if (reward > best.reward) best.* = .{ .output = output, .steps = steps, .reward = reward };
             if (self.threshold) |threshold| {
-                if (reward >= threshold) return true;
+                if (threshold != .null and try value.floatAtLeast(reward, threshold)) return true;
             }
             if (index + 1 == @as(usize, @intCast(self.n))) return true;
             // Preserve an already-selected best and prior advice if feedback
@@ -195,7 +195,9 @@ pub fn Refine(comptime P: type) type {
             try inputs.put(arena, "program_trajectory", try dumps(arena, .{ .array = trajectory }));
             try inputs.put(arena, "program_outputs", try dumps(arena, .{ .object = try predictionRecord(arena, Prediction, output.*) }));
             try inputs.put(arena, "reward_code", .{ .string = self.reward_code });
-            try inputs.put(arena, "target_threshold", try dumps(arena, if (self.threshold) |threshold| .{ .float = threshold } else .null));
+            const threshold = self.threshold orelse .null;
+            const masked_threshold = (try feedback.masker(Value).?(arena, threshold)) orelse threshold;
+            try inputs.put(arena, "target_threshold", try dumps(arena, masked_threshold));
             try inputs.put(arena, "reward_value", try dumps(arena, .{ .float = reward }));
             try inputs.put(arena, "module_names", try dumps(arena, .{ .array = module_names }));
             const adviser = try arena.create(predict.Predict(OfferFeedback));
@@ -367,7 +369,7 @@ test "Refine maps actual signature classes with last-name precedence and retains
         var refined = Refine(TestPair(separate)).init(.{}, .{
             .n = 3,
             .reward_fn = testScore,
-            .threshold = 100,
+            .threshold = .{ .float = 100 },
             .module_code = "class Pair(dspy.Module): ...",
             .reward_code = "def score(inputs, prediction): return float(prediction.answer)",
         });
@@ -405,13 +407,23 @@ test "Refine masks ReAct custom objects in feedback without changing stored trac
     var trace: Trace = .{ .arena = arena };
     var refined = Refine(Agent).init(.{}, .{
         .n = 2,
-        .reward_fn = testScore,
-        .threshold = 100,
+        .reward_fn = struct {
+            fn score(_: Context, _: *const Agent.Input, output: *const Agent.Output) anyerror!f64 {
+                return std.fmt.parseFloat(f64, output.answer);
+            }
+        }.score,
+        .threshold = .{ .integer = 100 },
         .module_code = "dspy.ReAct(QA, tools=[])",
         .reward_code = "def score(inputs, prediction): return float(prediction.answer)",
     });
     const result = (try refined.forward(.{ .arena = arena, .lm = lm.lm(), .trace = &trace }, .{ .question = "q" })).?;
     try testing.expectEqualStrings("8", result.answer);
+    try testing.expectEqualStrings("100", trace.steps.items[0].inputs.get("target_threshold").?.string);
+    const program_outputs = try std.json.parseFromSliceLeaky(Value, arena, trace.steps.items[0].inputs.get("program_outputs").?.string, .{});
+    try testing.expectEqualStrings("<non-serializable: History>", program_outputs.object.get("history").?.string);
+    try testing.expectEqualStrings("submit", program_outputs.object.get("termination_reason").?.string);
+    try testing.expectEqual(@import("react.zig").TerminationReason.submit, result.termination_reason);
+    try testing.expectEqualStrings("8", result.history.messages[0].get("answer").?.string);
     const trajectory = try std.json.parseFromSliceLeaky(Value, arena, trace.steps.items[0].inputs.get("program_trajectory").?.string, .{});
     const step = trajectory.array.items[0].object;
     const inputs = step.get("inputs").?.object;
@@ -423,6 +435,42 @@ test "Refine masks ReAct custom objects in feedback without changing stored trac
     try testing.expectEqualStrings("ready", outputs.get("next_thought").?.string);
     try testing.expect(trace.steps.items[1].inputs.get("history").? == .object);
     try testing.expect(trace.steps.items[1].outputs.get("tool_calls").? == .object);
+}
+
+test "Refine retains exact integer thresholds beyond binary64 and binary128 precision" {
+    inline for (.{ false, true }) |negative| {
+        var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer memory.deinit();
+        const arena = memory.allocator();
+        var lm: lm_mod.ScriptedLM = .{ .responses = &.{
+            "<answer>7</answer>",
+            "<discussion>Continue.</discussion><advice>{}</advice>",
+            "<answer>8</answer>",
+        } };
+        var trace: Trace = .{ .arena = arena };
+        var refined = Refine(predict.Predict(TestSignature)).init(.{}, .{
+            .n = 2,
+            .reward_fn = struct {
+                fn score(_: Context, _: *const TestSignature.Input, output: *const TestSignature.Output) anyerror!f64 {
+                    return if (std.mem.eql(u8, output.answer, "7"))
+                        (if (negative) -0x1p200 else 0x1p200)
+                    else
+                        0x1p201;
+                }
+            }.score,
+            .threshold = .{ .number_string = if (negative)
+                "-1606938044258990275541962092341162602522202993782792835301377"
+            else
+                "1606938044258990275541962092341162602522202993782792835301377" },
+            .module_code = "Predict(QA)",
+            .reward_code = "large_score",
+        });
+        const result = (try refined.forward(.{ .arena = arena, .lm = lm.lm(), .trace = &trace }, .{ .question = "q" })).?;
+        try testing.expectEqualStrings(if (negative) "7" else "8", result.answer);
+        if (!negative) {
+            try testing.expectEqualStrings("\"<non-serializable: int>\"", trace.steps.items[0].inputs.get("target_threshold").?.string);
+        }
+    }
 }
 
 fn nanScore(_: Context, _: *const TestSignature.Input, _: *const TestSignature.Output) anyerror!f64 {
@@ -470,7 +518,7 @@ test "Refine failure budgets persist and zero means the constructor attempt coun
     var refined = Refine(FailingProgram).init(.{}, .{
         .n = 4,
         .reward_fn = testScore,
-        .threshold = 100,
+        .threshold = .{ .float = 100 },
         .fail_count = 0,
         .module_code = "FailingPair",
         .reward_code = "score",
@@ -496,7 +544,7 @@ test "Refine feedback failure keeps the selected result without leaking failed a
     var refined = Refine(predict.Predict(TestSignature)).init(.{}, .{
         .n = 2,
         .reward_fn = testScore,
-        .threshold = 100,
+        .threshold = .{ .float = 100 },
         .module_code = "Predict(QA)",
         .reward_code = "score",
     });

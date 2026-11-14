@@ -588,24 +588,51 @@ fn integerStringEqualsValue(text: []const u8, v: Value) bool {
     const other = switch (v) {
         .number_string => |s| s,
         .integer => |i| std.fmt.bufPrint(&buffer, "{d}", .{i}) catch unreachable,
-        .float => |f| blk: {
-            if (!std.math.isFinite(f) or f != @trunc(f)) return false;
-            // LLVM cannot lower f64-to-arbitrary-width integer casts on every
-            // target. Reconstruct the exact integral magnitude from binary64.
-            const bits: u64 = @bitCast(@abs(f));
-            const exponent: u11 = @intCast(bits >> 52);
-            var magnitude: u1024 = if (exponent == 0) 0 else (bits & 0x000f_ffff_ffff_ffff) | 0x0010_0000_0000_0000;
-            if (magnitude != 0) {
-                if (exponent >= 1075)
-                    magnitude <<= @intCast(exponent - 1075)
-                else
-                    magnitude >>= @intCast(1075 - exponent);
-            }
-            break :blk std.fmt.bufPrint(&buffer, "{s}{d}", .{ if (f < 0) "-" else "", magnitude }) catch unreachable;
-        },
+        .float => |f| integralFloatText(f, &buffer) orelse return false,
         else => return false,
     };
     return a.eql(IntegerText.parse(other) orelse return false);
+}
+
+fn integralFloatText(f: f64, buffer: *[310]u8) ?[]const u8 {
+    if (!std.math.isFinite(f) or f != @trunc(f)) return null;
+    // Reconstruct binary64's exact integer without unsupported wide casts.
+    const bits: u64 = @bitCast(@abs(f));
+    const exponent: u11 = @intCast(bits >> 52);
+    var magnitude: u1024 = if (exponent == 0) 0 else (bits & 0x000f_ffff_ffff_ffff) | 0x0010_0000_0000_0000;
+    if (magnitude != 0) {
+        if (exponent >= 1075)
+            magnitude <<= @intCast(exponent - 1075)
+        else
+            magnitude >>= @intCast(1075 - exponent);
+    }
+    return std.fmt.bufPrint(buffer, "{s}{d}", .{ if (f < 0) "-" else "", magnitude }) catch unreachable;
+}
+
+/// Python float >= numeric scalar, retaining arbitrary integer boundaries.
+pub fn floatAtLeast(f: f64, threshold: Value) error{InvalidNumber}!bool {
+    return switch (threshold) {
+        .float => |g| f >= g,
+        .integer => |i| @as(f128, f) >= @as(f128, @floatFromInt(i)),
+        .bool => |b| f >= @as(f64, @floatFromInt(@intFromBool(b))),
+        .number_string => |text| blk: {
+            const integer = IntegerText.parse(text) orelse {
+                const g = std.fmt.parseFloat(f64, text) catch return error.InvalidNumber;
+                break :blk f >= g;
+            };
+            if (std.math.isNan(f)) break :blk false;
+            if (std.math.isInf(f)) break :blk f > 0;
+            var buffer: [310]u8 = undefined;
+            const floor = IntegerText.parse(integralFloatText(@floor(f), &buffer).?).?;
+            if (floor.negative != integer.negative) break :blk !floor.negative;
+            const magnitude_order = if (floor.digits.len == integer.digits.len)
+                std.mem.order(u8, floor.digits, integer.digits)
+            else
+                std.math.order(floor.digits.len, integer.digits.len);
+            break :blk if (floor.negative) magnitude_order != .gt else magnitude_order != .lt;
+        },
+        else => error.InvalidNumber,
+    };
 }
 
 fn floatEqualsInt(f: f64, i: i64) bool {
