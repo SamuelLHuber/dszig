@@ -187,9 +187,25 @@ fn validateNetloc(netloc: []const u8) error{InvalidMimePath}!void {
     var iterator = (std.unicode.Utf8View.init(netloc) catch return error.InvalidMimePath).iterator();
     while (iterator.nextCodepoint()) |cp| {
         switch (cp) {
-            0x2047, 0x2048, 0x2049, 0x2100, 0x2101, 0x2105, 0x2106,
-            0x2a74, 0xfe13, 0xfe16, 0xfe55, 0xfe56, 0xfe5f, 0xfe6b,
-            0xff03, 0xff0f, 0xff1a, 0xff1f, 0xff20,
+            0x2047,
+            0x2048,
+            0x2049,
+            0x2100,
+            0x2101,
+            0x2105,
+            0x2106,
+            0x2a74,
+            0xfe13,
+            0xfe16,
+            0xfe55,
+            0xfe56,
+            0xfe5f,
+            0xfe6b,
+            0xff03,
+            0xff0f,
+            0xff1a,
+            0xff1f,
+            0xff20,
             => return error.InvalidMimePath,
             else => {},
         }

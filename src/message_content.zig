@@ -8,7 +8,7 @@ const Value = @import("runtime_value.zig").Value;
 
 pub const start_marker = "<<CUSTOM-TYPE-START-IDENTIFIER>>";
 pub const end_marker = "<<CUSTOM-TYPE-END-IDENTIFIER>>";
-pub const Error = Allocator.Error || error{InvalidContent, JsonTooDeep};
+pub const Error = Allocator.Error || error{ InvalidContent, JsonTooDeep };
 
 pub const Content = union(enum) {
     text: []const u8,

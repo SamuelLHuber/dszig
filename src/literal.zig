@@ -25,8 +25,7 @@ fn repr(comptime v: Value, comptime as_str: bool) []const u8 {
         };
         var buffer: [size]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&buffer);
-        if (as_str) @import("pyjson.zig").writeStr(&writer, v) catch @compileError("dszig: invalid Literal value") else
-            @import("pyjson.zig").writeRepr(&writer, v, 0) catch @compileError("dszig: invalid Literal value");
+        if (as_str) @import("pyjson.zig").writeStr(&writer, v) catch @compileError("dszig: invalid Literal value") else @import("pyjson.zig").writeRepr(&writer, v, 0) catch @compileError("dszig: invalid Literal value");
         const result = buffer[0..writer.buffered().len].*;
         return &result;
     }
@@ -173,7 +172,12 @@ pub fn parseValues(arena: Allocator, allowed: []const Value, input: Value) runti
     const stripped: Value = .{ .string = text };
     for (allowed) |v| if (value.pyEqual(v, stripped)) return stripped;
     const candidate = try value.parseText(arena, .{
-        .name = "literal", .kind = .json, .type_name = "Literal", .desc = "", .prefix = "", .validate = identity,
+        .name = "literal",
+        .kind = .json,
+        .type_name = "Literal",
+        .desc = "",
+        .prefix = "",
+        .validate = identity,
     }, text);
     return validateValues(allowed, candidate);
 }
@@ -251,7 +255,9 @@ test "Nested XML Literal validates numeric equality after leaf parsing" {
     });
     const adapter = @import("adapter.zig");
     const outputs = try adapter.Adapter.xml.parse(a, .{
-        .instructions = "", .inputs = Sig.input_fields_list, .outputs = Sig.output_fields_list,
+        .instructions = "",
+        .inputs = Sig.input_fields_list,
+        .outputs = Sig.output_fields_list,
     }, "<choices><item>1.0</item><item>true</item><item>ready</item><item>null</item></choices><optional>null</optional>");
     const typed = try value.fromRecord(a, Sig.Output, &outputs);
     try std.testing.expectEqual(@as(usize, 4), typed.choices.len);
