@@ -163,6 +163,12 @@ pub fn ReActIters(comptime Sig: type, comptime user_tools: []const Tool, comptim
             fields[index].refine_mask = @import("feedback.zig").masker(Optional);
             fields[index].optional_str = types.isOptionalStr(Optional);
             fields[index].nullable = true;
+            fields[index].code_type = false;
+            fields[index].dspy_type = false;
+            fields[index].enum_parse = null;
+            fields[index].native_reasoning = false;
+            fields[index].schema_definition_name = "";
+            fields[index].xml_literal = field.xml_literal or Optional == ?signature.Reasoning;
         }
         break :blk fields;
     };
@@ -182,11 +188,11 @@ pub fn ReActIters(comptime Sig: type, comptime user_tools: []const Tool, comptim
         pub const all_tools: []const Tool = &tools;
         pub const react_instructions = instructions;
         const react_field_array = optional_inputs ++ [_]Field{
-            .{ .name = "history", .kind = .json, .type_name = "History", .desc = "${history}", .prefix = "History:", .schema = History.schema, .validate = History.validate, .refine_mask = @import("feedback.zig").masker(History), .python_str = @import("python_str.zig").renderer(History) },
+            .{ .name = "history", .kind = .json, .type_name = "History", .desc = "${history}", .prefix = "History:", .schema = History.schema, .validate = History.validate, .dspy_type = true, .refine_mask = @import("feedback.zig").masker(History), .python_str = @import("python_str.zig").renderer(History) },
             .{ .name = "tools", .kind = .json, .type_name = "list[Tool]", .desc = "${tools}", .prefix = "Tools:", .schema = "{\"type\": \"array\", \"items\": {\"type\": \"string\"}}", .xml_literal = true, .native_tools = true, .refine_mask = @import("feedback.zig").masker([]const Tool), .python_str = @import("python_str.zig").toolsRender },
             .{ .name = "turn_budget", .kind = .str, .type_name = "str", .desc = "Your current turn and how many turns remain before you must submit.", .prefix = "Turn Budget:" },
-            .{ .name = "next_thought", .kind = .str, .type_name = "str", .desc = "${next_thought}", .prefix = "Next Thought:", .reasoning_type = true, .native_reasoning = true },
-            .{ .name = "tool_calls", .kind = .json, .type_name = "ToolCalls", .desc = "${tool_calls}", .prefix = "Tool Calls:", .schema = ToolCalls.schema, .validate = ToolCalls.validate, .xml_literal = true, .native_tool_calls = true, .type_description = ToolCalls.description, .refine_mask = @import("feedback.zig").masker(ToolCalls), .python_str = @import("python_str.zig").renderer(ToolCalls) },
+            .{ .name = "next_thought", .kind = .str, .type_name = "str", .desc = "${next_thought}", .prefix = "Next Thought:", .reasoning_type = true, .native_reasoning = true, .dspy_type = true, .refine_mask = @import("feedback.zig").masker(signature.Reasoning), .python_str = @import("python_str.zig").renderer(signature.Reasoning) },
+            .{ .name = "tool_calls", .kind = .json, .type_name = "ToolCalls", .desc = "${tool_calls}", .prefix = "Tool Calls:", .schema = ToolCalls.schema, .validate = ToolCalls.validate, .dspy_type = true, .xml_literal = true, .native_tool_calls = true, .type_description = ToolCalls.description, .refine_mask = @import("feedback.zig").masker(ToolCalls), .python_str = @import("python_str.zig").renderer(ToolCalls) },
         };
         pub const react_fields: []const Field = &react_field_array;
 
@@ -492,6 +498,16 @@ fn TypedValidator(comptime T: type) type {
 }
 
 fn strictAccepts(comptime T: type, input: Value) bool {
+    if (T == Value) return true;
+    if (T == @import("integer.zig").Integer) return schemaAccepts("integer", input);
+    if (comptime @import("enum.zig").isEnum(T)) {
+        if (T.dszig_enum_json_type) |kind| {
+            if (!schemaAccepts(kind, input)) return false;
+            for (T.dszig_enum_values) |member| if (value.pyEqual(member, input)) return true;
+            return false;
+        }
+        return true;
+    }
     if (comptime @import("code.zig").isCode(T) or T == signature.Reasoning or
         T == @import("file.zig").File or T == @import("bounding_box.zig").BoundingBox)
     {
@@ -537,6 +553,12 @@ fn strictAccepts(comptime T: type, input: Value) bool {
 /// JSON schemas describe Python integers, whereas native callbacks/output
 /// structs can use narrower integer storage. Reject overflow before submission.
 fn nativeFits(comptime T: type, input: Value) bool {
+    if (T == Value) return true;
+    if (T == @import("integer.zig").Integer) return true;
+    if (comptime @import("enum.zig").isEnum(T)) {
+        _ = T.fromValue(input) catch return false;
+        return true;
+    }
     if (comptime @import("code.zig").isCode(T) or T == signature.Reasoning or
         T == @import("file.zig").File or T == @import("bounding_box.zig").BoundingBox)
     {

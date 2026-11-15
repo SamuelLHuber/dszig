@@ -19,6 +19,8 @@ const std = @import("std");
 const nested = @import("types.zig");
 const History = @import("history.zig").History;
 const ToolCalls = @import("tool.zig").ToolCalls;
+const BoundingBox = @import("bounding_box.zig").BoundingBox;
+const File = @import("file.zig").File;
 const code = @import("code.zig");
 const python_str = @import("python_str.zig");
 const assert = std.debug.assert;
@@ -66,8 +68,10 @@ pub const Field = struct {
     type_description_name: []const u8 = "",
     /// Code is text on the wire but keeps its own model validator and schema.
     code_type: bool = false,
-    /// Direct or nested Code annotations enable custom-type text parsing.
-    code_annotation: bool = false,
+    /// Only a direct DSPy Type annotation retries validation against raw text.
+    dspy_type: bool = false,
+    /// DSPy resolves a direct Enum before string repair or TypeAdapter.
+    enum_parse: ?*const fn (std.mem.Allocator, @import("runtime_value.zig").Value) nested.Error!@import("runtime_value.zig").Value = null,
     /// Custom class names can differ from Pydantic's safe definition keys.
     schema_definition_name: []const u8 = "",
     /// `desc` as stored by DSPy: user text, or `${name}` when none given.
@@ -203,8 +207,6 @@ pub fn isSignature(comptime T: type) bool {
 /// list item. Recursive custom-type discovery is a separate description rule.
 fn customXmlLiteral(comptime T: type) bool {
     const annotation = if (@typeInfo(T) == .optional) @typeInfo(T).optional.child else T;
-    const BoundingBox = @import("bounding_box.zig").BoundingBox;
-    const File = @import("file.zig").File;
     if (code.isCode(annotation) or annotation == BoundingBox or annotation == File) return true;
     return switch (@typeInfo(annotation)) {
         .pointer => |p| p.size == .slice and (code.isCode(p.child) or p.child == BoundingBox or p.child == File),
@@ -239,7 +241,8 @@ fn fieldsOf(comptime T: type, comptime role: []const u8, comptime descriptions: 
                 .type_description = if (code.annotationType(FT)) |C| C.description else if (FT == ToolCalls) ToolCalls.description else "",
                 .type_description_name = if (code.annotationType(FT)) |C| C.model_name else "",
                 .code_type = code.isCode(FT),
-                .code_annotation = code.annotationType(FT) != null,
+                .dspy_type = code.isCode(FT) or FT == Reasoning or FT == BoundingBox or FT == File or FT == History or FT == ToolCalls,
+                .enum_parse = if (@import("enum.zig").isEnum(FT)) FT.parseValue else null,
                 .schema_definition_name = if (code.isCode(FT)) FT.schema_name else "",
                 .nullable = @typeInfo(FT) == .optional,
                 .default_value = if (info.field_attrs[i].default_value_ptr) |raw| defaultProvider(FT, raw) else null,
@@ -271,6 +274,7 @@ pub fn kindOf(comptime T: type, comptime name: []const u8) Kind {
     if (T == []const u8 or T == Reasoning or code.isCode(T)) return .str;
     if (T == []const []const u8) return .str_list;
     if (T == bool) return .boolean;
+    if (T == @import("integer.zig").Integer) return .int;
     if (T == @import("runtime_value.zig").ObjectMap) return .json_object;
     if (T == StrDict) return .str_dict;
     if (nested.isNested(T)) return .json;

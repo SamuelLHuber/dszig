@@ -32,15 +32,24 @@ pub const File = struct {
 
     /// Construct a fresh File from an optional positional source and keyword
     /// fields. Unlike validation, copying a File omits its null fields before
-    /// merging keywords, and an entirely empty copy is invalid. No storage is
-    /// allocated: the validated strings borrow their input storage.
-    pub fn init(source: ?Value, keywords: Value) Error!File {
+    /// merging keywords, and an entirely empty copy is invalid. Strings borrow
+    /// their storage; raw Python bytes allocate a data URI in arena.
+    pub fn init(arena: Allocator, source: ?Value, keywords: Value) (Error || Allocator.Error)!File {
         if (keywords != .object) return error.InvalidFile;
         var values: [3]Value = @splat(.null);
         var present: [3]bool = @splat(false);
+        var encoded_data: ?[]const u8 = null;
+        errdefer if (encoded_data) |data| arena.free(data);
         if (source) |input| switch (input) {
             .custom => |custom| {
-                const file = custom.get(File) orelse return error.InvalidFile;
+                const file = if (custom.get(File)) |file| file.* else bytes_file: {
+                    const inspect = custom.vtable.python orelse return error.InvalidFile;
+                    const view = inspect(custom.ptr);
+                    if (view != .bytes) return error.InvalidFile;
+                    const file = try fromBytes(arena, view.bytes, .{});
+                    encoded_data = file.file_data;
+                    break :bytes_file file;
+                };
                 inline for (field_names, 0..) |name, index| {
                     if (@field(file, name)) |text| {
                         values[index] = .{ .string = text };
@@ -89,9 +98,16 @@ pub const File = struct {
     /// Borrow the input's UTF-8 strings, after Pydantic-compatible stripping.
     /// A positional string must start with data: BEFORE field stripping. An
     /// object needs a recognized key, but its nullable values need not describe
-    /// usable media. Neither form touches the filesystem.
-    pub fn fromValue(input: Value) Error!File {
-        if (input == .custom) return (input.custom.get(File) orelse return error.InvalidFile).*;
+    /// usable media. Actual Python bytes allocate an encoded data URI in arena.
+    /// No form touches the filesystem.
+    pub fn fromValue(arena: Allocator, input: Value) (Error || Allocator.Error)!File {
+        if (input == .custom) {
+            if (input.custom.get(File)) |file| return file.*;
+            const inspect = input.custom.vtable.python orelse return error.InvalidFile;
+            const view = inspect(input.custom.ptr);
+            if (view != .bytes) return error.InvalidFile;
+            return fromBytes(arena, view.bytes, .{});
+        }
         if (input == .string) {
             if (!std.mem.startsWith(u8, input.string, "data:")) return error.InvalidFile;
             return .{ .file_data = try field(.{ .string = input.string }) };
@@ -220,7 +236,7 @@ pub const File = struct {
         return runtimeFile(ptr).toValue(arena);
     }
 
-    fn serializedRuntimeValue(arena: Allocator, ptr: *const anyopaque) runtime.CustomError!Value {
+    fn serializedRuntimeValue(arena: Allocator, ptr: *const anyopaque, _: u32) runtime.CustomError!Value {
         return .{ .string = runtimeFile(ptr).serialize(arena) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.ParseValue,
@@ -234,7 +250,7 @@ pub const File = struct {
         };
     }
 
-    fn writeRuntimeRepr(writer: *Writer, ptr: *const anyopaque) runtime.CustomWriteError!void {
+    fn writeRuntimeRepr(writer: *Writer, ptr: *const anyopaque, _: u32) runtime.CustomWriteError!void {
         try runtimeFile(ptr).writeRepr(writer);
     }
 
@@ -398,7 +414,7 @@ fn field(input: Value) File.Error!?[]const u8 {
         .null => null,
         .string => |text| blk: {
             if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidFile;
-            break :blk strip(text, true);
+            break :blk unicode.strip(text, true);
         },
         else => error.InvalidFile,
     };
@@ -413,32 +429,6 @@ fn uriSize(mime_len: usize, bytes_len: usize) Allocator.Error!usize {
     const encoded_len = std.math.mul(usize, groups, 4) catch return error.OutOfMemory;
     const prefix_len = std.math.add(usize, mime_len, 13) catch return error.OutOfMemory;
     return std.math.add(usize, prefix_len, encoded_len) catch error.OutOfMemory;
-}
-
-/// Rust/Pydantic White_Space excludes U+001C..U+001F; CPython str.strip and
-/// str.split include them. Both paths share the existing Unicode table.
-fn isSpace(cp: u21, pydantic: bool) bool {
-    return unicode.isSpace(cp) and !(pydantic and cp >= 0x1c and cp <= 0x1f);
-}
-
-fn strip(text: []const u8, pydantic: bool) []const u8 {
-    var start: usize = 0;
-    var end = text.len;
-    while (start < end) {
-        const len = std.unicode.utf8ByteSequenceLength(text[start]) catch break;
-        if (len > end - start) break;
-        const cp = std.unicode.utf8Decode(text[start..][0..len]) catch break;
-        if (!isSpace(cp, pydantic)) break;
-        start += len;
-    }
-    while (end > start) {
-        var first = end - 1;
-        while (first > start and text[first] & 0xc0 == 0x80) first -= 1;
-        const cp = std.unicode.utf8Decode(text[first..end]) catch break;
-        if (!isSpace(cp, pydantic)) break;
-        end = first;
-    }
-    return text[start..end];
 }
 
 fn codepointCount(text: []const u8) usize {
@@ -458,7 +448,7 @@ pub fn validateBase64(raw: []const u8) File.Error!void {
     if (std.mem.startsWith(u8, payload, "data:")) {
         if (std.mem.indexOf(u8, payload, ";base64,")) |index| payload = payload[index + 8 ..];
     }
-    const stripped = strip(payload, false);
+    const stripped = unicode.strip(payload, false);
     const normalize = stripped.len != payload.len or std.mem.indexOfAny(u8, stripped, " \n\r\t\x0b\x0c") != null;
     var count: usize = 0;
     var padding: usize = 0;
@@ -571,9 +561,9 @@ test "File construction distinguishes nullable instance copies from validation a
     const arena = scratch.allocator();
     const empty: Value = .{ .object = .empty };
     const nullable = try (File{}).toRuntime(arena);
-    try std.testing.expectError(error.InvalidFile, File.init(nullable, empty));
+    try std.testing.expectError(error.InvalidFile, File.init(arena, nullable, empty));
     const nullable_fields = try (File{}).toValue(arena);
-    const from_fields = try File.init(null, nullable_fields);
+    const from_fields = try File.init(arena, null, nullable_fields);
     try std.testing.expectEqual(@as(?[]const u8, null), from_fields.file_data);
     try std.testing.expectEqual(@as(?[]const u8, null), from_fields.file_id);
     try std.testing.expectEqual(@as(?[]const u8, null), from_fields.filename);
@@ -582,7 +572,7 @@ test "File construction distinguishes nullable instance copies from validation a
     const instance = try original.toRuntime(arena);
     var keywords: runtime.ObjectMap = .empty;
     try keywords.put(arena, "filename", .{ .string = " additional.txt " });
-    const named = try File.init(instance, .{ .object = keywords });
+    const named = try File.init(arena, instance, .{ .object = keywords });
     try std.testing.expectEqualStrings("file-copy", named.file_id.?);
     try std.testing.expectEqualStrings("additional.txt", named.filename.?);
     try std.testing.expectEqual(@as(?[]const u8, null), original.filename);
@@ -592,10 +582,10 @@ test "File construction distinguishes nullable instance copies from validation a
     // A dictionary retains explicit null keys, so its filename collides;
     // an actual instance omits that null field before merging keywords.
     const dictionary = try original.toValue(arena);
-    try std.testing.expectError(error.InvalidFile, File.init(dictionary, .{ .object = keywords }));
+    try std.testing.expectError(error.InvalidFile, File.init(arena, dictionary, .{ .object = keywords }));
     try keywords.put(arena, "file_id", .{ .string = "replacement" });
-    try std.testing.expectError(error.InvalidFile, File.init(instance, .{ .object = keywords }));
-    try std.testing.expectError(error.InvalidFile, File.init(null, empty));
+    try std.testing.expectError(error.InvalidFile, File.init(arena, instance, .{ .object = keywords }));
+    try std.testing.expectError(error.InvalidFile, File.init(arena, null, empty));
 }
 
 test "File validation preserves actual instances and lookalikes do not acquire identity" {
@@ -668,7 +658,7 @@ test "all-null File constructs but rejects when formatted" {
     defer scratch.deinit();
     const arena = scratch.allocator();
     const parsed = try std.json.parseFromSliceLeaky(Value, arena, "{\"file_data\":null,\"file_id\":null,\"filename\":null}", .{});
-    const invalid = try File.fromValue(parsed);
+    const invalid = try File.fromValue(arena, parsed);
     try std.testing.expect(invalid.file_data == null and invalid.file_id == null and invalid.filename == null);
     const runtime_value = try invalid.toRuntime(arena);
     try std.testing.expectEqualStrings(

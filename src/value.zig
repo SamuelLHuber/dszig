@@ -21,11 +21,11 @@ pub const Record = ObjectMap;
 
 pub const ParseError = error{ParseValue} || Allocator.Error;
 
-/// Python `str.strip()` whitespace (ASCII subset).
+/// ASCII Python whitespace for byte-oriented token grammars.
 pub const py_whitespace = " \t\n\r\x0b\x0c\x1c\x1d\x1e\x1f";
 
 pub fn pyStrip(s: []const u8) []const u8 {
-    return std.mem.trim(u8, s, py_whitespace);
+    return @import("unicode.zig").strip(s, false);
 }
 
 /// `format_field_value(field_info, value)`.
@@ -78,216 +78,196 @@ fn formatBlob(w: *Writer, v: Value) pyjson.Error!void {
 
 /// `parse_value(value, annotation)` for a value taken from a chat section.
 pub fn parseText(arena: Allocator, field: Field, text: []const u8) ParseError!Value {
-    if (field.code_type) {
-        const validate = field.validate orelse return error.ParseValue;
-        const candidate = try parseNestedCandidate(arena, text, true);
-        return validate(arena, candidate) catch |err| switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            // DSPy retries a direct custom Type against the original string,
-            // but does not apply this fallback to Optional/list/dict unions.
-            error.ParseValue => validate(arena, .{ .string = text }),
-        };
+    if (field.enum_parse) |parse| return parse(arena, .{ .string = text });
+    if (field.kind == .str and !field.reasoning_type and !field.code_type)
+        return .{ .string = text };
+    if (field.optional_str) return .{ .string = text };
+    var source = text;
+    if (field.kind == .literal) {
+        if (literalMatch(field, source)) return .{ .string = source };
+        source = literalText(source);
+        if (literalMatch(field, source)) return .{ .string = source };
     }
-    return switch (field.kind) {
-        .str => .{ .string = text },
-        .literal => parseLiteralText(field, text),
-        .boolean => parseBoolText(text),
-        .int => blk: {
-            const token = pyStrip(text);
-            // Ordinary JSON integers need neither repair nor parser scratch.
-            if (isJsonNumber(token) and std.json.isNumberFormattedLikeAnInteger(token)) {
-                if (std.fmt.parseInt(i64, token, 10)) |integer| {
-                    break :blk Value{ .integer = integer };
-                } else |_| {}
-            }
-            const candidate = @import("json_repair.zig").loads(arena, text) catch |err| return switch (err) {
-                error.OutOfMemory => error.OutOfMemory,
-                else => error.ParseValue,
-            };
-            break :blk parseInteger(candidate);
-        },
-        .float => parseFloatText(text),
-        .str_list => parseStrListText(arena, text),
-        .json_object => parseObjectText(arena, text),
-        .str_dict => strDict(try parseObjectText(arena, text)),
-        .json => parseNestedText(arena, field, text),
+    if (field.kind == .int) {
+        const token = pyStrip(source);
+        if (isJsonNumber(token) and std.json.isNumberFormattedLikeAnInteger(token)) {
+            if (std.fmt.parseInt(i64, token, 10)) |integer|
+                return .{ .integer = integer }
+            else |_| {}
+        }
+    }
+    const candidate = try parseCandidate(arena, source);
+    return validateCandidate(arena, field, candidate) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.ParseValue => if (field.dspy_type or field.code_type or
+            (field.reasoning_type and field.kind == .str))
+            validateCandidate(arena, field, .{ .string = source })
+        else
+            error.ParseValue,
     };
 }
 
-/// `parse_value(value, annotation)` for a value taken from a JSON object.
+/// `parse_value(value, annotation)` preserves the original Python type until
+/// the annotation's validator chooses a conversion.
 pub fn parseJsonValue(arena: Allocator, field: Field, v: Value) ParseError!Value {
-    if (field.code_type) {
-        if (v == .string) return parseText(arena, field, v.string);
-        const validate = field.validate orelse return error.ParseValue;
-        return validate(arena, v);
-    }
-    if (field.reasoning_type and field.kind == .str) return types.validate(signature.Reasoning, arena, v);
-    if (field.kind == .str) {
+    if (field.enum_parse) |parse| return parse(arena, v);
+    if (field.kind == .str and !field.reasoning_type and !field.code_type) {
         if (v == .string) return v;
-        var aw: Writer.Allocating = .init(arena);
-        pyjson.writeStr(&aw.writer, v) catch |err| return switch (err) {
+        var out: Writer.Allocating = .init(arena);
+        pyjson.writeStr(&out.writer, v) catch |err| return switch (err) {
             error.WriteFailed => error.OutOfMemory,
             error.JsonTooDeep, error.ParseValue => error.ParseValue,
         };
-        return .{ .string = aw.written() };
+        return .{ .string = out.written() };
+    }
+    if (field.kind == .literal) {
+        for (field.literals) |allowed| if (pyEqual(v, .{ .string = allowed })) return v;
     }
     if (v == .string) return parseText(arena, field, v.string);
+    return validateCandidate(arena, field, v);
+}
+
+fn validateCandidate(arena: Allocator, field: Field, v: Value) ParseError!Value {
+    if (field.code_type) return (field.validate orelse return error.ParseValue)(arena, v);
+    if (field.reasoning_type and field.kind == .str) return types.validate(signature.Reasoning, arena, v);
     return switch (field.kind) {
         .str => unreachable,
-        .literal => error.ParseValue,
-        .boolean => switch (v) {
-            .bool => v,
-            .integer => |i| if (i == 0 or i == 1) Value{ .bool = i == 1 } else error.ParseValue,
-            else => error.ParseValue,
-        },
-        .int => parseInteger(v),
-        .float => switch (v) {
-            .float => v,
-            .integer => |i| Value{ .float = @floatFromInt(i) },
-            .number_string => |s| parseFloatText(s),
-            else => error.ParseValue,
-        },
-        .str_list => switch (v) {
-            .array => |a| blk: {
-                for (a.items) |item| if (item != .string) break :blk error.ParseValue;
-                break :blk v;
-            },
-            else => error.ParseValue,
-        },
-        .json_object => if (v == .object) v else error.ParseValue,
-        .str_dict => strDict(v),
-        .json => if (field.validate) |validate| validate(arena, v) else error.ParseValue,
+        .literal => if (v == .string and literalMatch(field, v.string)) v else error.ParseValue,
+        .boolean => types.validate(bool, arena, v),
+        .int => coerceInteger(arena, v),
+        .float => types.validate(f64, arena, v),
+        .str_list => types.validate([]const []const u8, arena, v),
+        .json_object => types.validate(ObjectMap, arena, v),
+        .str_dict => types.validate(signature.Dict([]const u8), arena, v),
+        .json => (field.validate orelse return error.ParseValue)(arena, v),
     };
 }
 
-/// `dict[str, Any]` from text: a JSON object (DSPy also repairs malformed
-/// JSON with `json_repair`, which DSZig does not).
-/// `parse_value(text, annotation)` for a nested type: `Optional[str]` keeps
-/// the text; otherwise JSON (DSPy also repairs malformed JSON), then a Python
-/// literal, then the text itself, validated against the type.
-fn parseNestedText(arena: Allocator, field: Field, text: []const u8) ParseError!Value {
-    if (field.optional_str) return .{ .string = text };
-    const candidate = try parseNestedCandidate(arena, text, field.code_annotation);
-    const validate = field.validate orelse return error.ParseValue;
-    return validate(arena, candidate);
-}
-
-fn parseNestedCandidate(arena: Allocator, text: []const u8, code_annotation: bool) ParseError!Value {
-    const t = pyStrip(text);
-    return std.json.parseFromSliceLeaky(Value, arena, t, .{}) catch |err| switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        else => blk: {
-            if (code_annotation) {
-                const filtered = code.Code.init(text).code;
-                if (filtered.ptr != text.ptr or filtered.len != text.len) {
-                    if (std.json.parseFromSliceLeaky(Value, arena, filtered, .{})) |candidate| {
-                        break :blk candidate;
-                    } else |parse_err| if (parse_err == error.OutOfMemory) return error.OutOfMemory;
-                }
-            }
-            break :blk if (std.mem.eql(u8, t, "None"))
-                Value.null
-            else if (std.mem.eql(u8, t, "True"))
-                Value{ .bool = true }
-            else if (std.mem.eql(u8, t, "False"))
-                Value{ .bool = false }
-            else
-                Value{ .string = text };
-        },
-    };
-}
-
-fn strDict(v: Value) ParseError!Value {
-    if (v != .object) return error.ParseValue;
-    for (v.object.values()) |item| if (item != .string) return error.ParseValue;
-    return v;
-}
-
-fn parseObjectText(arena: Allocator, text: []const u8) ParseError!Value {
-    const v = std.json.parseFromSliceLeaky(Value, arena, pyStrip(text), .{}) catch |err| return switch (err) {
+fn parseCandidate(arena: Allocator, source: []const u8) ParseError!Value {
+    const candidate = @import("json_repair.zig").loads(arena, source) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.ParseValue,
     };
-    if (v != .object) return error.ParseValue;
-    return v;
+    if (candidate == .string and candidate.string.len == 0 and source.len != 0) {
+        return @import("python_literal.zig").parse(arena, source) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.JsonTooDeep, error.LiteralEvaluation => error.ParseValue,
+            error.ParseValue, error.IntegerTooLong => .{ .string = source },
+        };
+    }
+    return candidate;
 }
 
-fn parseLiteralText(field: Field, text: []const u8) ParseError!Value {
-    if (literalMatch(field, text)) |s| return .{ .string = s };
-    var v = pyStrip(text);
-    const wrappers = [_][]const u8{ "Literal[", "str[" };
-    for (wrappers) |wrapper| {
-        if (std.mem.startsWith(u8, v, wrapper) and std.mem.endsWith(u8, v, "]")) {
-            v = v[std.mem.indexOfScalar(u8, v, '[').? + 1 .. v.len - 1];
+fn literalText(text: []const u8) []const u8 {
+    var result = pyStrip(text);
+    for ([_][]const u8{ "Literal[", "str[" }) |prefix| {
+        if (std.mem.startsWith(u8, result, prefix) and std.mem.endsWith(u8, result, "]")) {
+            result = result[prefix.len .. result.len - 1];
             break;
         }
     }
-    if (v.len > 1 and v[0] == v[v.len - 1] and (v[0] == '"' or v[0] == '\'')) v = v[1 .. v.len - 1];
-    if (literalMatch(field, v)) |s| return .{ .string = s };
-    return error.ParseValue;
+    if (result.len > 1 and result[0] == result[result.len - 1] and
+        (result[0] == '"' or result[0] == '\''))
+        result = result[1 .. result.len - 1];
+    return result;
 }
 
-fn literalMatch(field: Field, text: []const u8) ?[]const u8 {
-    for (field.literals) |allowed| {
-        if (std.mem.eql(u8, allowed, text)) return allowed;
-    }
-    return null;
+fn literalMatch(field: Field, text: []const u8) bool {
+    for (field.literals) |allowed| if (std.mem.eql(u8, allowed, text)) return true;
+    return false;
 }
 
-/// pydantic lax `bool` from str plus JSON `true`/`false`/`0`/`1`.
-fn parseBoolText(text: []const u8) ParseError!Value {
-    const truthy = [_][]const u8{ "1", "on", "t", "true", "y", "yes" };
-    const falsy = [_][]const u8{ "0", "off", "f", "false", "n", "no" };
-    const trimmed = pyStrip(text);
-    for ([_][]const u8{ text, trimmed }, 0..) |candidate, pass| {
-        // json_repair normalises surrounding whitespace only for JSON tokens.
-        if (pass == 1 and !(std.mem.eql(u8, trimmed, "true") or std.mem.eql(u8, trimmed, "false") or
-            std.mem.eql(u8, trimmed, "0") or std.mem.eql(u8, trimmed, "1"))) break;
-        if (candidate.len > 8) continue;
-        var lower_buf: [8]u8 = undefined;
-        const lower = std.ascii.lowerString(&lower_buf, candidate);
-        for (truthy) |t| if (std.mem.eql(u8, lower, t)) return .{ .bool = true };
-        for (falsy) |f| if (std.mem.eql(u8, lower, f)) return .{ .bool = false };
-    }
-    return error.ParseValue;
-}
-
-/// Normalize an integer scalar without narrowing exact decimal JSON numbers.
-/// Text is borrowed, like parseText; the typed decoder enforces the Zig width.
+/// Allocation-free exact numeric normalization. Pydantic string/bytes coercion
+/// is separate because removing separators may require owned storage.
 pub fn parseInteger(v: Value) error{ParseValue}!Value {
     return switch (v) {
         .integer => v,
         .bool => |b| .{ .integer = @intFromBool(b) },
-        .string, .number_string => |s| parseIntText(s),
+        .string, .number_string => |s| blk: {
+            if (!isJsonNumber(s) or !std.json.isNumberFormattedLikeAnInteger(s)) break :blk error.ParseValue;
+            break :blk Value.parseFromNumberSlice(s);
+        },
         .float => |f| floatToInt(f),
         else => error.ParseValue,
     };
 }
 
-fn parseIntText(text: []const u8) error{ParseValue}!Value {
-    const t = pyStrip(text);
-    if (!isJsonNumber(t)) return error.ParseValue;
-    if (std.json.isNumberFormattedLikeAnInteger(t)) return Value.parseFromNumberSlice(t);
-    const f = std.fmt.parseFloat(f64, t) catch return error.ParseValue;
-    return floatToInt(f);
+/// Pydantic's lax integer strings allow signs, zero prefixes, underscores and
+/// a zero-only fractional suffix, but not exponent strings or non-ASCII digits.
+pub fn coerceInteger(arena: Allocator, input: Value) ParseError!Value {
+    var v = input;
+    if (v == .custom) {
+        if (v.custom.vtable.enumeration) |inspect| return inspect(v.custom.ptr).value;
+    }
+    if (v == .custom) {
+        const view = if (v.custom.vtable.python) |inspect| inspect(v.custom.ptr) else return error.ParseValue;
+        v = switch (view) {
+            .bytes => |data| .{ .string = data },
+            else => return error.ParseValue,
+        };
+    }
+    if (v != .string) return parseInteger(v);
+    const source = @import("unicode.zig").strip(v.string, true);
+    if (source.len == 0) return error.ParseValue;
+    var start: usize = 0;
+    const negative = source[0] == '-';
+    if (source[0] == '+' or negative) start = 1;
+    var end = start;
+    var digits: usize = 0;
+    var separated = false;
+    while (end < source.len and source[end] != '.') : (end += 1) {
+        if (source[end] == '_') {
+            if (end == start or end + 1 == source.len or
+                !std.ascii.isDigit(source[end - 1]) or !std.ascii.isDigit(source[end + 1]))
+                return error.ParseValue;
+            separated = true;
+        } else if (std.ascii.isDigit(source[end])) {
+            digits += 1;
+        } else return error.ParseValue;
+    }
+    if (digits == 0 or digits > 4300) return error.ParseValue;
+    if (end != source.len) {
+        if (end + 1 == source.len) return error.ParseValue;
+        for (source[end + 1 ..], 0..) |byte, offset| {
+            if (byte == '_') {
+                const index = end + 1 + offset;
+                if (offset == 0 or index + 1 == source.len or source[index - 1] != '0' or source[index + 1] != '0')
+                    return error.ParseValue;
+            } else if (byte != '0') return error.ParseValue;
+        }
+    }
+    var first = start;
+    while (first < end and (source[first] == '0' or source[first] == '_')) first += 1;
+    if (first == end) return .{ .integer = 0 };
+    if (std.fmt.parseInt(i64, source[0..end], 10)) |integer|
+        return .{ .integer = integer }
+    else |_| {}
+    const magnitude = source[first..end];
+    if (!separated) {
+        if (!negative) return Value.parseFromNumberSlice(magnitude);
+        if (first == start) return Value.parseFromNumberSlice(source[0..end]);
+    }
+    const count = std.mem.count(u8, magnitude, "_");
+    const canonical = try arena.alloc(u8, @intFromBool(negative) + magnitude.len - count);
+    var index: usize = 0;
+    if (negative) {
+        canonical[0] = '-';
+        index = 1;
+    }
+    for (magnitude) |byte| if (byte != '_') {
+        canonical[index] = byte;
+        index += 1;
+    };
+    return Value.parseFromNumberSlice(canonical);
 }
 
 fn floatToInt(f: f64) error{ParseValue}!Value {
     if (!std.math.isFinite(f) or @trunc(f) != f) return error.ParseValue;
-    // Pydantic's lax float-to-int conversion excludes both i64 endpoints.
-    // Integer tokens take the exact path above and are not limited to i64.
     if (f <= -0x1p63 or f >= 0x1p63) return error.ParseValue;
     return .{ .integer = @intFromFloat(f) };
 }
 
-fn parseFloatText(text: []const u8) ParseError!Value {
-    const t = pyStrip(text);
-    if (!isJsonNumber(t)) return error.ParseValue;
-    const f = std.fmt.parseFloat(f64, t) catch return error.ParseValue;
-    return .{ .float = f };
-}
-
-/// JSON number grammar: -?(0|[1-9]\d*)(\.\d+)?([eE][+-]?\d+)?
+/// JSON number grammar: -?(0|[1-9]\\d*)(\\.\\d+)?([eE][+-]?\\d+)?
 fn isJsonNumber(s: []const u8) bool {
     var i: usize = 0;
     if (i < s.len and s[i] == '-') i += 1;
@@ -313,76 +293,6 @@ fn isJsonNumber(s: []const u8) bool {
     return i == s.len;
 }
 
-/// `list[str]` from a JSON array or a Python literal list of quoted strings.
-fn parseStrListText(arena: Allocator, text: []const u8) ParseError!Value {
-    const t = pyStrip(text);
-    if (std.json.parseFromSliceLeaky(Value, arena, t, .{})) |v| {
-        if (v != .array) return error.ParseValue;
-        for (v.array.items) |item| if (item != .string) return error.ParseValue;
-        return v;
-    } else |_| {}
-    return parsePyStrList(arena, t);
-}
-
-fn parsePyStrList(arena: Allocator, s: []const u8) ParseError!Value {
-    var array: @import("runtime_value.zig").Array = .init(arena);
-    var i: usize = 0;
-    if (i >= s.len or s[i] != '[') return error.ParseValue;
-    i += 1;
-    while (true) {
-        i = skipSpaces(s, i);
-        if (i >= s.len) return error.ParseValue;
-        if (s[i] == ']') {
-            i += 1;
-            break;
-        }
-        const quote = s[i];
-        if (quote != '\'' and quote != '"') return error.ParseValue;
-        i += 1;
-        var out: std.ArrayList(u8) = .empty;
-        while (true) {
-            if (i >= s.len) return error.ParseValue;
-            const c = s[i];
-            i += 1;
-            if (c == quote) break;
-            if (c == '\n') return error.ParseValue;
-            if (c != '\\') {
-                try out.append(arena, c);
-                continue;
-            }
-            if (i >= s.len) return error.ParseValue;
-            const e = s[i];
-            i += 1;
-            const decoded: u8 = switch (e) {
-                'n' => '\n',
-                't' => '\t',
-                'r' => '\r',
-                '\\', '\'', '"' => e,
-                else => return error.ParseValue,
-            };
-            try out.append(arena, decoded);
-        }
-        try array.append(.{ .string = out.items });
-        i = skipSpaces(s, i);
-        if (i >= s.len) return error.ParseValue;
-        if (s[i] == ',') {
-            i += 1;
-            continue;
-        }
-        if (s[i] != ']') return error.ParseValue;
-        i += 1;
-        break;
-    }
-    if (skipSpaces(s, i) != s.len) return error.ParseValue;
-    return .{ .array = array };
-}
-
-fn skipSpaces(s: []const u8, start: usize) usize {
-    var i = start;
-    while (i < s.len and std.mem.indexOfScalar(u8, py_whitespace, s[i]) != null) i += 1;
-    return i;
-}
-
 // ---------------------------------------------------------------------------
 // Typed <-> dynamic bridge.
 
@@ -400,7 +310,7 @@ pub fn toRecord(arena: Allocator, comptime T: type, value: T) Allocator.Error!Re
 }
 
 pub fn toValue(arena: Allocator, comptime T: type, v: T) Allocator.Error!Value {
-    if (comptime code.isCode(T)) return v.toRuntime(arena);
+    if (comptime code.isCode(T) or @import("enum.zig").isEnum(T) or T == @import("integer.zig").Integer) return v.toRuntime(arena);
     if (T == @import("file.zig").File or T == @import("bounding_box.zig").BoundingBox or T == signature.Reasoning)
         return v.toRuntime(arena);
     if (T == @import("tool.zig").ToolCalls) return v.toValue(arena);
@@ -454,8 +364,13 @@ pub fn fromRecord(arena: Allocator, comptime T: type, record: *const Record) Con
 pub fn fromValue(arena: Allocator, comptime T: type, v: Value) ConvertError!T {
     if (comptime code.isCode(T)) return T.fromValue(v) catch error.TypeMismatch;
     if (T == @import("bounding_box.zig").BoundingBox) return T.fromValue(v) catch error.TypeMismatch;
-    if (T == @import("file.zig").File) return T.fromValue(v) catch error.TypeMismatch;
+    if (T == @import("file.zig").File) return T.fromValue(arena, v) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.TypeMismatch,
+    };
     if (T == Value) return v;
+    if (T == @import("integer.zig").Integer) return T.fromValue(v);
+    if (comptime @import("enum.zig").isEnum(T)) return T.fromValue(v) catch error.TypeMismatch;
     if (T == @import("tool.zig").ToolCalls) return T.fromValue(arena, v) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.TypeMismatch,
@@ -474,7 +389,8 @@ pub fn fromValue(arena: Allocator, comptime T: type, v: Value) ConvertError!T {
     if (T == bool) return if (v == .bool) v.bool else error.TypeMismatch;
     if (T == @import("runtime_value.zig").ObjectMap) return if (v == .object) v.object else error.TypeMismatch;
     if (T == signature.StrDict) {
-        _ = strDict(v) catch return error.TypeMismatch;
+        if (v != .object) return error.TypeMismatch;
+        for (v.object.values()) |item| if (item != .string) return error.TypeMismatch;
         return .{ .map = v.object };
     }
     if (comptime types.isDict(T)) {
@@ -529,7 +445,10 @@ pub fn fromValue(arena: Allocator, comptime T: type, v: Value) ConvertError!T {
 /// Python `==` for JSON-loaded values (dict equality ignores key order;
 /// `1 == 1.0` and `True == 1` as in Python).
 pub fn pyEqual(a: Value, b: Value) bool {
-    if (std.meta.activeTag(a) != std.meta.activeTag(b)) {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b) or
+        (a == .custom and b == .custom and
+            !std.mem.eql(u8, a.custom.vtable.type_name, b.custom.vtable.type_name)))
+    {
         if (a == .custom) {
             if (a.custom.vtable.eql_value) |equal| return equal(a.custom.ptr, b);
         }
@@ -662,17 +581,63 @@ fn floatEqualsInt(f: f64, i: i64) bool {
 /// `serialize_for_json`: only actual custom objects become their serialized
 /// values. Ordinary dictionaries with identical keys stay dictionaries.
 pub fn serializedValue(arena: Allocator, input: Value) ParseError!Value {
-    return (try serializeDepth(arena, input, 0)).value;
+    const result = serializeDepth(arena, input, 0) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.ParseValue => error.ParseValue,
+        error.PythonSerializeFallback => blk: {
+            var out: Writer.Allocating = .init(arena);
+            pyjson.writeStr(&out.writer, input) catch |write_err| return switch (write_err) {
+                error.WriteFailed => error.OutOfMemory,
+                error.JsonTooDeep, error.ParseValue => error.ParseValue,
+            };
+            break :blk .{ .string = out.written() };
+        },
+    };
+    return result.value;
 }
 
+/// Strict JSON-mode projection for nested custom serializers. Only the public
+/// top-level boundary may replace the whole original value after a fallback.
+pub fn serializedValueDepth(arena: Allocator, input: Value, depth: u32) @import("runtime_value.zig").SerializationError!Value {
+    return (try serializeDepth(arena, input, depth)).value;
+}
+
+test "DSPy JSON mode keeps a root nonfinite float but projects nested floats to null" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try serializedValue(a, .{ .float = std.math.inf(f64) });
+    try std.testing.expect(root == .float and std.math.isPositiveInf(root.float));
+    var items: @import("runtime_value.zig").Array = .init(a);
+    try items.append(.{ .float = std.math.inf(f64) });
+    try items.append(.{ .float = std.math.nan(f64) });
+    try items.append(.{ .float = 2.5 });
+    const nested = try serializedValue(a, .{ .array = items });
+    try std.testing.expect(nested.array.items[0] == .null);
+    try std.testing.expect(nested.array.items[1] == .null);
+    try std.testing.expectEqual(@as(f64, 2.5), nested.array.items[2].float);
+}
 const Serialized = struct { value: Value, changed: bool };
 
-fn serializeDepth(arena: Allocator, input: Value, depth: u32) ParseError!Serialized {
+fn serializeDepth(arena: Allocator, input: Value, depth: u32) @import("runtime_value.zig").SerializationError!Serialized {
     if (depth >= pyjson.max_depth) return error.ParseValue;
     return switch (input) {
-        .custom => |custom| .{
-            .value = (try serializeDepth(arena, try custom.serialize(arena), depth + 1)).value,
-            .changed = true,
+        .float => |f| if (depth > 0 and !std.math.isFinite(f))
+            .{ .value = .null, .changed = true }
+        else
+            .{ .value = input, .changed = false },
+        .custom => |custom| blk: {
+            if (custom.vtable.python) |inspect| {
+                if (inspect(custom.ptr) == .ellipsis)
+                    break :blk if (depth == 0)
+                        .{ .value = input, .changed = false }
+                    else
+                        .{ .value = .{ .string = "Ellipsis" }, .changed = true };
+            }
+            break :blk .{
+                .value = try custom.vtable.serialized(arena, custom.ptr, depth),
+                .changed = true,
+            };
         },
         .array => |array| blk: {
             var out: ?@import("runtime_value.zig").Array = null;

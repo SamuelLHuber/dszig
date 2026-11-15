@@ -63,6 +63,7 @@ pub const Reasoning = struct {
         // nested containers still JSON-encode that same serialized content.
         .is_type = true,
         .bool_value = runtimeTruthy,
+        .iterate = iterateRuntime,
         .raw_value = rawRuntimeValue,
         .serialized = serializedRuntimeValue,
         .write_str = writeRuntimeStr,
@@ -83,11 +84,24 @@ pub const Reasoning = struct {
         return runtimeReasoning(ptr).content.len != 0;
     }
 
+    fn iterateRuntime(allocator: Allocator, ptr: *const anyopaque) runtime.CustomError![]Value {
+        const content = runtimeReasoning(ptr).content;
+        const view = std.unicode.Wtf8View.init(content) catch return error.ParseValue;
+        var count: usize = 0;
+        for (content) |byte| {
+            if (byte & 0xc0 != 0x80) count += 1;
+        }
+        const result = try allocator.alloc(Value, count);
+        var iterator = view.iterator();
+        for (result) |*slot| slot.* = .{ .string = iterator.nextCodepointSlice().? };
+        return result;
+    }
+
     fn rawRuntimeValue(allocator: Allocator, ptr: *const anyopaque) Allocator.Error!Value {
         return runtimeReasoning(ptr).toValue(allocator);
     }
 
-    fn serializedRuntimeValue(_: Allocator, ptr: *const anyopaque) runtime.CustomError!Value {
+    fn serializedRuntimeValue(_: Allocator, ptr: *const anyopaque, _: u32) runtime.CustomError!Value {
         return .{ .string = runtimeReasoning(ptr).format() };
     }
 
@@ -95,7 +109,7 @@ pub const Reasoning = struct {
         try writer.writeAll(runtimeReasoning(ptr).content);
     }
 
-    fn writeRuntimeRepr(writer: *Writer, ptr: *const anyopaque) runtime.CustomWriteError!void {
+    fn writeRuntimeRepr(writer: *Writer, ptr: *const anyopaque, _: u32) runtime.CustomWriteError!void {
         try runtimeReasoning(ptr).writeRepr(writer);
     }
 

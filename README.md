@@ -164,8 +164,39 @@ fields. A native consumer matched **141 actual DSPy JSONAdapter calls** across
 string, required-pair and integer outputs, including malformed objects, comments,
 multiple objects, nonobject roots, exact large integers, nonfinite numbers and
 lone surrogates. Integer string fields use repair before conversion and accept
-Pydantic's boolean-to-integer coercion. This does not establish every shared
-`parse_value` annotation or Python `ast.literal_eval` fallback.
+Pydantic's boolean-to-integer coercion.
+
+A separate native consumer matched **5,166 actual DSPy `parse_value` calls**
+across 21 annotations, preserving model/builtin kinds, ordered dictionaries,
+exact integers and binary64 bits. Its original 4,920-case baseline improved from
+4,012 matches, 624 differences and 284 missing inputs to 4,920 matches with none
+missing. The additional 246 cases exercise `Any`. These finite observations do
+not establish every annotation or input.
+
+Plain Python Enum classes use `Enum` / `EnumWithIdentity`, not Zig enums (which
+represent string Literals). Their members retain canonical alias and class
+identity through runtime values and owning clones. A native consumer matched
+**3,064 actual DSPy/Pydantic comparisons**, including separate same-name classes,
+value-before-name resolution, scalar validation, schemas, serialization and
+typed Predict outputs through Chat, JSON and XML. `Integer` is width-independent
+storage for an int annotation's actual validated result: Pydantic's lax Enum
+path can return a noninteger member value without revalidating it. Native
+fixed-width integer types still impose their explicit representational limits.
+
+The zero-dependency `python_literal` parser implements the supported CPython
+3.11 literal grammar without execution, and `python_value` retains genuine
+bytes, tuples, sets, frozensets, complex values, Ellipsis and arbitrary-key
+dictionaries rather than replacing them with JSON lookalikes. Native comparison
+against **175,826 actual `ast.literal_eval` calls** matched 175,820 and differed
+on six near-recursion-limit cases. Python's cutoff depends on its caller frame
+depth; the native AST-depth ceiling is deterministic. This is a real parity
+limit, not a passing check. Generic Python execution is still unsupported.
+
+After this cutover, the pinned Debug and ReleaseSafe gates each passed all
+324 tests and 28 build steps, including actual RAG/bootstrap executions. Native
+687-request replay and the pinned Python fixture/artifact/replay gate also
+passed. These gates do not erase the literal-recursion and NaN-identity
+differences, or replace authenticated inference proof.
 
 Pinned native parser consumers matched **42 Responses and 4 Chat actual DSPy
 3.5 localhost HTTP observations**, comparing visible text, reasoning and tool
@@ -217,14 +248,16 @@ strings; generic container copies do not reproduce Python's memoized alias graph
 `File` has three nullable UTF-8 fields: `file_data`, `file_id` and `filename`.
 Its constructors are explicit:
 
-- `File.init(source, keywords)` constructs a fresh typed File without allocating.
+- `File.init(arena, source, keywords)` constructs a fresh typed File.
   `source` is an optional runtime value; `keywords` is an ordinary object.
+  Strings are borrowed; actual Python bytes allocate a base64 data URI in the arena.
   Positional File instances omit null fields before keyword merging, unlike
   dictionaries, which retain explicit null keys. Overlapping fields are
   rejected. Copying an all-null instance with no keywords fails construction,
   whereas validating that same instance preserves it.
-- `File.fromValue(input)` accepts a data-URI string, an object with recognized
-  File fields, or an actual runtime File. It borrows validated/stripped strings;
+- `File.fromValue(arena, input)` accepts a data-URI string, an object with recognized
+  File fields, an actual runtime File, or actual Python bytes. Bytes allocate a
+  base64 data URI; other inputs borrow validated/stripped strings;
   it does not read paths or fetch URLs. Unknown object fields and invalid field
   types are rejected. Runtime class validation preserves an existing File box,
   whereas explicitly converting a raw object to a typed File constructs a File.
@@ -766,7 +799,16 @@ The following prevent a claim that DSZig can do everything DSPy can:
   colliding names fail closed; equivalent definitions can share a name.
   Python's identity-dependent automatic renaming is not reproduced. Tagged
   unions beyond optional types and some
-  Pydantic model defaults are not native signature types. JSON repair covers the
+  Pydantic model defaults are not native signature types. Enum factories are
+  comptime class definitions, not arbitrary runtime class creation or Enum
+  mixins. Python literal lexical nesting is bounded at 200; its separate native
+  AST-depth ceiling is 3,000, not Python's caller-stack-dependent recursion
+  budget. Generic runtime values still cannot preserve shared NaN float-object
+  identity or arbitrary mutable alias/cycle graphs. A builtin observation smoke
+  matched 405 checks but differed on two same-NaN container-equality cases;
+  those failures are not counted as parity. Native ownership clones preserve a
+  set's stored iteration snapshot, not CPython deepcopy's reconstruction order.
+  JSON repair covers the
   pinned default parser and correlated Chat/Responses tool arguments, not every
   upstream option or every adapter parsing path. Its nesting bound is 512 and
   Python exception classes/messages are not reconstructed (for example, some

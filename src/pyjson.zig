@@ -28,6 +28,13 @@ pub fn writeJsonAscii(w: *Writer, v: Value) Error!void {
     try writeJsonDepth(w, v, .compact, 0, true);
 }
 
+test "Python repr treats a WTF8 surrogate as one nonprintable code point" {
+    var buffer: [32]u8 = undefined;
+    var writer: Writer = .fixed(&buffer);
+    try writeReprString(&writer, "a\xed\xa0\x80b");
+    try std.testing.expectEqualStrings("'a\\ud800b'", writer.buffered());
+}
+
 test "ASCII JSON preserves lone surrogates and escapes surrogate keys as strings" {
     const cases = [_][2][]const u8{
         .{ "\xed\xa0\x80", "\"\\ud800\"" },
@@ -53,25 +60,62 @@ test "ASCII JSON preserves lone surrogates and escapes surrogate keys as strings
     try std.testing.expectError(error.ParseValue, writeJsonAscii(&writer, .{ .string = "\xff" }));
 }
 
-fn writeJsonDepth(w: *Writer, v: Value, style: Style, depth: u32, comptime ascii: bool) Error!void {
+pub fn writeJsonDepth(w: *Writer, v: Value, style: Style, depth: u32, comptime ascii: bool) Error!void {
+    return writeJsonOptions(w, v, style, depth, ascii, false);
+}
+
+/// Stream a nested Pydantic JSON-mode value without allocating a projected
+/// container. Unlike plain json.dumps, nonfinite float leaves become null.
+pub fn writeJsonProjection(w: *Writer, v: Value, style: Style, depth: u32) Error!void {
+    return writeJsonOptions(w, v, style, depth, false, true);
+}
+
+fn writeJsonOptions(w: *Writer, v: Value, style: Style, depth: u32, comptime ascii: bool, comptime projection: bool) Error!void {
     if (depth >= max_depth) return error.JsonTooDeep;
     switch (v) {
         .null => try w.writeAll("null"),
         .bool => |b| try w.writeAll(if (b) "true" else "false"),
         .integer => |i| try w.print("{d}", .{i}),
-        .float => |f| try writeFloat(w, f, if (style == .orjson_indent2) .orjson else .json),
-        .number_string => |s| try w.writeAll(s),
-        .string => |s| if (ascii) try writeJsonAsciiString(w, s) else try writeJsonString(w, s),
-        .custom => |custom| if (ascii) return error.ParseValue else try custom.writeSerializedJson(w, style, depth),
-        .array => |a| {
-            if (a.items.len == 0) return w.writeAll("[]");
-            try w.writeByte('[');
-            for (a.items, 0..) |item, i| {
-                try writeSeparator(w, style, depth + 1, i == 0);
-                try writeJsonDepth(w, item, style, depth + 1, ascii);
+        .float => |f| if (projection and !std.math.isFinite(f))
+            try w.writeAll("null")
+        else
+            try writeFloat(w, f, if (style == .orjson_indent2) .orjson else .json),
+        .number_string => |s| {
+            try checkIntegerRepr(s);
+            if (style == .orjson_indent2 and std.json.isNumberFormattedLikeAnInteger(s)) {
+                if (s.len > 0 and s[0] == '-') {
+                    _ = std.fmt.parseInt(i64, s, 10) catch return error.ParseValue;
+                } else {
+                    _ = std.fmt.parseInt(u64, s, 10) catch return error.ParseValue;
+                }
             }
-            try writeClose(w, style, depth, ']');
+            try w.writeAll(s);
         },
+        .string => |s| {
+            if (style == .orjson_indent2 and !std.unicode.utf8ValidateSlice(s)) return error.ParseValue;
+            if (ascii) try writeJsonAsciiString(w, s) else try writeJsonString(w, s);
+        },
+        .custom => |custom| {
+            if (ascii) {
+                const inspect = custom.vtable.python orelse return error.ParseValue;
+                return switch (inspect(custom.ptr)) {
+                    .tuple => |items| writeJsonArray(w, items, style, depth, true, false),
+                    .dictionary => |entries| writePlainDictionary(w, entries, style, depth),
+                    else => error.ParseValue,
+                };
+            }
+            if (style == .orjson_indent2) {
+                if (custom.vtable.enumeration) |inspect|
+                    return writeJsonOptions(w, inspect(custom.ptr).value, style, depth + 1, false, false);
+                if (custom.vtable.python) |inspect| {
+                    const view = inspect(custom.ptr);
+                    if (view == .tuple) return writeJsonArray(w, view.tuple, style, depth, false, false);
+                }
+                return error.ParseValue;
+            }
+            try custom.writeSerializedJson(w, style, depth);
+        },
+        .array => |a| try writeJsonArray(w, a.items, style, depth, ascii, projection),
         .object => |o| {
             if (o.count() == 0) return w.writeAll("{}");
             try w.writeByte('{');
@@ -80,13 +124,50 @@ fn writeJsonDepth(w: *Writer, v: Value, style: Style, depth: u32, comptime ascii
             while (it.next()) |entry| {
                 try writeSeparator(w, style, depth + 1, first);
                 first = false;
+                if (style == .orjson_indent2 and !std.unicode.utf8ValidateSlice(entry.key_ptr.*)) return error.ParseValue;
                 if (ascii) try writeJsonAsciiString(w, entry.key_ptr.*) else try writeJsonString(w, entry.key_ptr.*);
                 try w.writeAll(if (style == .minified) ":" else ": ");
-                try writeJsonDepth(w, entry.value_ptr.*, style, depth + 1, ascii);
+                try writeJsonOptions(w, entry.value_ptr.*, style, depth + 1, ascii, projection);
             }
             try writeClose(w, style, depth, '}');
         },
     }
+}
+
+fn writeJsonArray(w: *Writer, items: []const Value, style: Style, depth: u32, comptime ascii: bool, comptime projection: bool) Error!void {
+    if (items.len == 0) return w.writeAll("[]");
+    try w.writeByte('[');
+    for (items, 0..) |item, index| {
+        try writeSeparator(w, style, depth + 1, index == 0);
+        try writeJsonOptions(w, item, style, depth + 1, ascii, projection);
+    }
+    try writeClose(w, style, depth, ']');
+}
+
+fn writePlainDictionary(w: *Writer, entries: []const @import("runtime_value.zig").PythonEntry, style: Style, depth: u32) Error!void {
+    if (entries.len == 0) return w.writeAll("{}");
+    try w.writeByte('{');
+    for (entries, 0..) |entry, index| {
+        try writeSeparator(w, style, depth + 1, index == 0);
+        switch (entry.key) {
+            .string => |s| try writeJsonAsciiString(w, s),
+            .null, .bool, .integer, .float, .number_string => {
+                try w.writeByte('"');
+                try writeJsonOptions(w, entry.key, style, depth + 1, true, false);
+                try w.writeByte('"');
+            },
+            else => return error.ParseValue,
+        }
+        try w.writeAll(if (style == .minified) ":" else ": ");
+        try writeJsonOptions(w, entry.value, style, depth + 1, true, false);
+    }
+    try writeClose(w, style, depth, '}');
+}
+
+fn checkIntegerRepr(text: []const u8) error{ParseValue}!void {
+    if (std.json.isNumberFormattedLikeAnInteger(text) and
+        text.len - @intFromBool(text.len > 0 and text[0] == '-') > 4300)
+        return error.ParseValue;
 }
 
 /// CPython permits lone surrogate code points in strings. Keep their WTF-8
@@ -296,9 +377,12 @@ pub fn writeRepr(w: *Writer, v: Value, depth: u32) Error!void {
         .bool => |b| try w.writeAll(if (b) "True" else "False"),
         .integer => |i| try w.print("{d}", .{i}),
         .float => |f| try writeFloat(w, f, .python),
-        .number_string => |s| try w.writeAll(s),
+        .number_string => |s| {
+            try checkIntegerRepr(s);
+            try w.writeAll(s);
+        },
         .string => |s| try writeReprString(w, s),
-        .custom => |custom| try custom.writeRepr(w),
+        .custom => |custom| try custom.vtable.write_repr(w, custom.ptr, depth),
         .array => |a| {
             try w.writeByte('[');
             for (a.items, 0..) |item, i| {
@@ -335,7 +419,7 @@ pub fn writeReprString(w: *Writer, s: []const u8) Writer.Error!void {
         if (c >= 0x80) {
             const width = std.unicode.utf8ByteSequenceLength(c) catch 1;
             if (width <= s.len - index) {
-                const codepoint = std.unicode.utf8Decode(s[index..][0..width]) catch null;
+                const codepoint = std.unicode.wtf8Decode(s[index..][0..width]) catch null;
                 if (codepoint) |cp| {
                     if (python_unicode.isPrintable(cp)) {
                         try w.writeAll(s[index..][0..width]);

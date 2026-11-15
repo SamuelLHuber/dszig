@@ -8,6 +8,7 @@ pub const ObjectMap = std.array_hash_map.String(Value);
 pub const Array = std.array_list.Managed(Value);
 pub const JsonStyle = enum { compact, minified, indent2, orjson_indent2 };
 pub const CustomError = error{ParseValue} || Allocator.Error;
+pub const SerializationError = CustomError || error{PythonSerializeFallback};
 pub const CustomWriteError = error{ ParseValue, JsonTooDeep } || Writer.Error;
 
 /// Code's base annotation accepts concrete language-specialized instances.
@@ -15,6 +16,24 @@ pub const CustomWriteError = error{ ParseValue, JsonTooDeep } || Writer.Error;
 pub const CodeMetadata = struct {
     language: []const u8,
     content: *const fn (*const anyopaque) []const u8,
+};
+
+/// Borrowed builtin payloads preserve Python's non-JSON value identities.
+pub const EnumValue = struct {
+    class_identity: []const u8,
+    class_name: []const u8,
+    member_name: []const u8,
+    value: Value,
+};
+pub const PythonEntry = struct { key: Value, value: Value };
+pub const PythonValue = union(enum) {
+    bytes: []const u8,
+    tuple: []const Value,
+    set: []const Value,
+    frozen_set: []const Value,
+    complex: struct { real: f64, imag: f64 },
+    ellipsis: void,
+    dictionary: []const PythonEntry,
 };
 
 pub const CustomVTable = struct {
@@ -26,12 +45,21 @@ pub const CustomVTable = struct {
     /// Whether Python's object protocol admits this class as a dictionary key.
     /// Majority rejects mutable/unhashable models before comparing their values.
     hashable: bool = false,
+    /// Classes with cross-value equality must supply a compatible Python hash.
+    python_hash: ?*const fn (*const anyopaque, u32) error{ParseValue}!i64 = null,
     bool_value: ?*const fn (*const anyopaque) bool = null,
     code: ?CodeMetadata = null,
+    python: ?*const fn (*const anyopaque) PythonValue = null,
+    /// Python iteration of actual classes, separate from builtin identity.
+    /// The returned slice borrows its elements and belongs to the allocator.
+    iterate: ?*const fn (Allocator, *const anyopaque) CustomError![]Value = null,
+    enumeration: ?*const fn (*const anyopaque) EnumValue = null,
     raw_value: *const fn (Allocator, *const anyopaque) Allocator.Error!Value,
-    serialized: *const fn (Allocator, *const anyopaque) CustomError!Value,
+    /// Complete strict JSON-mode projection; nested callbacks preserve depth.
+    /// PythonSerializeFallback is handled only by serialize_for_json's root.
+    serialized: *const fn (Allocator, *const anyopaque, u32) SerializationError!Value,
     write_str: *const fn (*Writer, *const anyopaque) CustomWriteError!void,
-    write_repr: *const fn (*Writer, *const anyopaque) CustomWriteError!void,
+    write_repr: *const fn (*Writer, *const anyopaque, u32) CustomWriteError!void,
     write_json: *const fn (*std.json.Stringify, *const anyopaque) Writer.Error!void,
     write_serialized_json: *const fn (*Writer, *const anyopaque, JsonStyle, usize) CustomWriteError!void,
     clone: *const fn (Allocator, *const anyopaque) Allocator.Error!Custom,
@@ -42,7 +70,9 @@ pub const CustomVTable = struct {
     eql_value: ?*const fn (*const anyopaque, Value) bool = null,
 };
 
-/// A boxed native model. The box is always owned; owns_data describes its fields.
+/// Native objects use their class's clone/free protocol. Model boxes are owned;
+/// immutable class-owned singletons may retain their static box across clones.
+/// owns_data describes whether ordinary model fields need deep destruction.
 pub const Custom = struct {
     ptr: *const anyopaque,
     vtable: *const CustomVTable,
@@ -61,8 +91,8 @@ pub const Custom = struct {
         return self.vtable.raw_value(allocator, self.ptr);
     }
 
-    pub fn serialize(self: Custom, allocator: Allocator) CustomError!Value {
-        return self.vtable.serialized(allocator, self.ptr);
+    pub fn serialize(self: Custom, allocator: Allocator) SerializationError!Value {
+        return self.vtable.serialized(allocator, self.ptr, 0);
     }
 
     pub fn writeStr(self: Custom, writer: *Writer) CustomWriteError!void {
@@ -70,7 +100,7 @@ pub const Custom = struct {
     }
 
     pub fn writeRepr(self: Custom, writer: *Writer) CustomWriteError!void {
-        return self.vtable.write_repr(writer, self.ptr);
+        return self.vtable.write_repr(writer, self.ptr, 0);
     }
 
     pub fn writeSerializedJson(self: Custom, writer: *Writer, style: JsonStyle, depth: usize) CustomWriteError!void {
@@ -134,7 +164,12 @@ pub const Value = union(enum) {
             .bool => |inner| try jws.write(inner),
             .integer => |inner| try jws.write(inner),
             .float => |inner| try jws.write(inner),
-            .number_string => |inner| try jws.print("{s}", .{inner}),
+            .number_string => |inner| {
+                if (std.json.isNumberFormattedLikeAnInteger(inner) and
+                    inner.len - @intFromBool(inner.len > 0 and inner[0] == '-') > 4300)
+                    return error.WriteFailed;
+                try jws.print("{s}", .{inner});
+            },
             .string => |inner| try jws.write(inner),
             .array => |inner| try jws.write(inner.items),
             .object => |inner| {

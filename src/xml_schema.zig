@@ -114,7 +114,7 @@ fn validate(arena: Allocator, schema: Value, definitions: Value, input: Value, d
     if (schema_type == .null) return input;
     if (typeIs(schema, "null")) return if (input == .null) input else error.ParseValue;
     if (typeIs(schema, "string")) return if (input == .string) input else error.ParseValue;
-    if (typeIs(schema, "integer")) return value.parseInteger(input);
+    if (typeIs(schema, "integer")) return value.coerceInteger(arena, input);
     if (typeIs(schema, "number")) return types.validate(f64, arena, input);
     if (typeIs(schema, "boolean")) return types.validate(bool, arena, input);
     if (typeIs(schema, "array")) {

@@ -67,6 +67,28 @@ pub fn isSpace(cp: u21) bool {
     return inRanges(&tables.space, cp);
 }
 
+/// Rust/Pydantic White_Space omits U+001C..U+001F from Python whitespace.
+/// Invalid UTF-8/WTF-8 ends trimming without replacing the original bytes.
+pub fn strip(text: []const u8, pydantic: bool) []const u8 {
+    var start: usize = 0;
+    var end = text.len;
+    while (start < end) {
+        const len = std.unicode.utf8ByteSequenceLength(text[start]) catch break;
+        if (len > end - start) break;
+        const cp = std.unicode.utf8Decode(text[start..][0..len]) catch break;
+        if (!isSpace(cp) or (pydantic and cp >= 0x1c and cp <= 0x1f)) break;
+        start += len;
+    }
+    while (end > start) {
+        var first = end - 1;
+        while (first > start and text[first] & 0xc0 == 0x80) first -= 1;
+        const cp = std.unicode.utf8Decode(text[first..end]) catch break;
+        if (!isSpace(cp) or (pydantic and cp >= 0x1c and cp <= 0x1f)) break;
+        end = first;
+    }
+    return text[start..end];
+}
+
 /// UTF-8 to code points; invalid bytes become U+FFFD.
 pub fn decode(arena: Allocator, s: []const u8) Allocator.Error![]u21 {
     var out: std.ArrayList(u21) = .empty;

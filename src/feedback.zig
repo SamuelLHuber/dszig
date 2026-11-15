@@ -9,7 +9,7 @@ const types = @import("types.zig");
 const code = @import("code.zig");
 const Allocator = std.mem.Allocator;
 const Value = @import("runtime_value.zig").Value;
-pub const Error = Allocator.Error || error{JsonTooDeep};
+pub const Error = Allocator.Error || error{ JsonTooDeep, ParseValue };
 /// Null means no replacement; consumers can preserve the original container.
 pub const Mask = *const fn (Allocator, Value) Error!?Value;
 
@@ -29,7 +29,7 @@ pub fn maskValue(arena: Allocator, v: Value) Error!Value {
 }
 
 fn needsMask(comptime T: type) bool {
-    if (T == signature.StrDict or T == []const u8 or T == []u8) return false;
+    if (T == signature.StrDict or T == []const u8 or T == []u8) return true;
     if (T == Value or T == @import("runtime_value.zig").ObjectMap) return true;
     if (comptime types.isDict(T)) return needsMask(T.dszig_dict_value);
     return switch (@typeInfo(T)) {
@@ -45,14 +45,51 @@ fn needsMask(comptime T: type) bool {
 fn replacement(arena: Allocator, comptime T: type, v: Value, depth: u32, comptime reasoning_as_text: bool) Error!?Value {
     if (depth >= @import("pyjson.zig").max_depth) return error.JsonTooDeep;
     if (v == .null) return null;
+    if (v == .string and !std.unicode.utf8ValidateSlice(v.string))
+        return .{ .string = "<non-serializable: str>" };
     if (v == .custom) {
         const custom = v.custom;
+        if (custom.vtable.enumeration) |inspect| {
+            if (orjsonAccepts(inspect(custom.ptr).value, depth + 1)) return null;
+        }
+        if (custom.vtable.python) |inspect| {
+            switch (inspect(custom.ptr)) {
+                .tuple => |items| {
+                    var result: ?[]Value = null;
+                    for (items, 0..) |item, index| {
+                        if (try replacement(arena, Value, item, depth + 1, reasoning_as_text)) |changed| {
+                            if (result == null) result = try arena.dupe(Value, items);
+                            result.?[index] = changed;
+                        }
+                    }
+                    return if (result) |changed|
+                        try @import("python_value.zig").tuple(arena, changed)
+                    else
+                        null;
+                },
+                .dictionary => |entries| {
+                    var result: ?[]@import("runtime_value.zig").PythonEntry = null;
+                    for (entries, 0..) |entry, index| {
+                        if (try replacement(arena, Value, entry.value, depth + 1, reasoning_as_text)) |changed| {
+                            if (result == null) result = try arena.dupe(@import("runtime_value.zig").PythonEntry, entries);
+                            result.?[index].value = changed;
+                        }
+                    }
+                    return if (result) |changed|
+                        try @import("python_value.zig").dictionary(arena, changed)
+                    else
+                        null;
+                },
+                else => {},
+            }
+        }
         if (comptime reasoning_as_text) {
             if (custom.get(signature.Reasoning)) |reasoning| return .{ .string = reasoning.content };
         }
         return .{ .string = try std.fmt.allocPrint(arena, "<non-serializable: {s}>", .{custom.vtable.model_name}) };
     }
-    if (T == signature.StrDict) return null;
+    if (T == signature.StrDict) return objectReplacement(arena, []const u8, v, depth, reasoning_as_text);
+    if (T == @import("integer.zig").Integer) return replacement(arena, Value, v, depth, reasoning_as_text);
     if (T == signature.Reasoning or T == @import("file.zig").File or
         T == @import("bounding_box.zig").BoundingBox or comptime code.isCode(T))
         return replacement(arena, Value, v, depth, reasoning_as_text);
@@ -71,6 +108,38 @@ fn replacement(arena: Allocator, comptime T: type, v: Value, depth: u32, comptim
         .@"struct" => .{ .string = comptime "<non-serializable: " ++ types.modelName(T) ++ ">" },
         .int => integerReplacement(v),
         else => null,
+    };
+}
+
+fn orjsonAccepts(v: Value, depth: u32) bool {
+    if (depth >= @import("pyjson.zig").max_depth) return false;
+    return switch (v) {
+        .null, .bool, .integer, .float => true,
+        .string => |s| std.unicode.utf8ValidateSlice(s),
+        .number_string => integerReplacement(v) == null,
+        .array => |a| blk: {
+            for (a.items) |item| if (!orjsonAccepts(item, depth + 1)) break :blk false;
+            break :blk true;
+        },
+        .object => |o| blk: {
+            for (o.keys(), o.values()) |key, item|
+                if (!std.unicode.utf8ValidateSlice(key) or !orjsonAccepts(item, depth + 1)) break :blk false;
+            break :blk true;
+        },
+        .custom => |custom| blk: {
+            if (custom.vtable.enumeration) |inspect|
+                break :blk orjsonAccepts(inspect(custom.ptr).value, depth + 1);
+            if (custom.vtable.python) |inspect| {
+                switch (inspect(custom.ptr)) {
+                    .tuple => |items| {
+                        for (items) |item| if (!orjsonAccepts(item, depth + 1)) break :blk false;
+                        break :blk true;
+                    },
+                    else => {},
+                }
+            }
+            break :blk false;
+        },
     };
 }
 

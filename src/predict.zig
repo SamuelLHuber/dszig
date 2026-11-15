@@ -487,6 +487,7 @@ pub fn ChainOfThoughtWithOptions(comptime Sig: type, comptime options: ChainOfTh
             f.xml_literal = false;
             f.nullable = false;
             f.reasoning_type = true;
+            f.dspy_type = true;
             f.native_reasoning = true;
             f.reasoning_fallback = "plan";
         }

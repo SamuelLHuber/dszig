@@ -177,7 +177,7 @@ fn CodeType(comptime language_name: []const u8, comptime is_default: bool, compt
             return runtimeCode(ptr).toValue();
         }
 
-        fn serializedRuntimeValue(_: Allocator, ptr: *const anyopaque) runtime.CustomError!Value {
+        fn serializedRuntimeValue(_: Allocator, ptr: *const anyopaque, _: u32) runtime.CustomError!Value {
             return runtimeCode(ptr).toValue();
         }
 
@@ -185,7 +185,7 @@ fn CodeType(comptime language_name: []const u8, comptime is_default: bool, compt
             try runtimeCode(ptr).writeStr(writer);
         }
 
-        fn writeRuntimeRepr(writer: *Writer, ptr: *const anyopaque) runtime.CustomWriteError!void {
+        fn writeRuntimeRepr(writer: *Writer, ptr: *const anyopaque, _: u32) runtime.CustomWriteError!void {
             try runtimeCode(ptr).writeRepr(writer);
         }
 

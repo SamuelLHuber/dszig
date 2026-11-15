@@ -11,6 +11,7 @@ const Value = @import("runtime_value.zig").Value;
 const code = @import("code.zig");
 const BoundingBox = @import("bounding_box.zig").BoundingBox;
 const File = @import("file.zig").File;
+const Integer = @import("integer.zig").Integer;
 
 pub const Error = error{ ParseValue, OutOfMemory };
 
@@ -38,11 +39,13 @@ pub fn isDict(comptime T: type) bool {
 
 /// A struct typed as a Pydantic model (not a dict).
 fn isModel(comptime T: type) bool {
-    return @typeInfo(T) == .@"struct" and T != @import("runtime_value.zig").ObjectMap and !isDict(T) and !@hasField(T, "map");
+    return @typeInfo(T) == .@"struct" and T != Integer and T != @import("runtime_value.zig").ObjectMap and !isDict(T) and !@hasField(T, "map");
 }
 
 /// Types that need the JSON-typed field kind.
 pub fn isNested(comptime T: type) bool {
+    if (T == Value) return true;
+    if (T == Integer) return false;
     if (T == []const u8 or T == []const []const u8 or T == @import("runtime_value.zig").ObjectMap) return false;
     return switch (@typeInfo(T)) {
         .optional => true,
@@ -69,6 +72,8 @@ pub fn pyName(comptime T: type) []const u8 {
     comptime {
         if (T == []const u8 or T == @import("signature.zig").Reasoning) return "str";
         if (T == bool) return "bool";
+        if (T == Integer) return "int";
+        if (T == Value) return "Any";
         if (T == @import("runtime_value.zig").ObjectMap) return "dict[str, Any]";
         if (isDict(T)) return "dict[str, " ++ pyName(T.dszig_dict_value) ++ "]";
         return switch (@typeInfo(T)) {
@@ -99,7 +104,8 @@ fn lessKey(a: []const u8, b: []const u8) bool {
 fn render(comptime entries: []const Entry) []const u8 {
     comptime {
         var sorted: [entries.len]Entry = entries[0..entries.len].*;
-        for (1..sorted.len) |i| {
+        var i: usize = 1;
+        while (i < sorted.len) : (i += 1) {
             var j = i;
             while (j > 0 and lessKey(sorted[j].key, sorted[j - 1].key)) : (j -= 1) {
                 const t = sorted[j];
@@ -163,8 +169,10 @@ fn entriesOf(comptime T: type) []const Entry {
     comptime {
         if (T == []const u8) return &.{.{ .key = "type", .val = quote("string") }};
         if (T == bool) return &.{.{ .key = "type", .val = quote("boolean") }};
+        if (T == Integer) return &.{.{ .key = "type", .val = quote("integer") }};
+        if (T == Value) return &.{};
         if (T == @import("runtime_value.zig").ObjectMap) return &.{ .{ .key = "type", .val = quote("object") }, .{ .key = "additionalProperties", .val = "true" } };
-        if (isDict(T)) return &.{ .{ .key = "type", .val = quote("object") }, .{ .key = "additionalProperties", .val = render(entriesOf(T.dszig_dict_value)) } };
+        if (isDict(T)) return &.{ .{ .key = "type", .val = quote("object") }, .{ .key = "additionalProperties", .val = if (T.dszig_dict_value == Value) "true" else render(entriesOf(T.dszig_dict_value)) } };
         return switch (@typeInfo(T)) {
             .int => &.{.{ .key = "type", .val = quote("integer") }},
             .float => &.{.{ .key = "type", .val = quote("number") }},
@@ -181,12 +189,63 @@ fn entriesOf(comptime T: type) []const Entry {
     }
 }
 
+fn enumEntries(comptime T: type) []const Entry {
+    comptime {
+        if (T.dszig_enum_values.len == 0)
+            @compileError("dszig: an empty Enum has no JSON schema");
+        var encoded: []const u8 = "[";
+        for (T.dszig_enum_values, 0..) |v, i| {
+            encoded = encoded ++ (if (i == 0) "" else ", ") ++ enumSchemaValue(v);
+        }
+        const kind = T.dszig_enum_json_type;
+        const fields: []const Entry = &.{
+            .{ .key = "enum", .val = encoded ++ "]" },
+            .{ .key = "title", .val = quote(T.model_name) },
+        };
+        return if (kind) |name| &[_]Entry{.{ .key = "type", .val = quote(name) }} ++ fields else fields;
+    }
+}
+
+fn enumSchemaValue(comptime v: Value) []const u8 {
+    comptime {
+        return switch (v) {
+            .null => "null",
+            .bool => |b| if (b) "true" else "false",
+            .integer => |i| std.fmt.comptimePrint("{d}", .{i}),
+            .number_string => |s| s,
+            .string => |s| quote(s),
+            .float => |f| blk: {
+                if (std.math.isNan(f)) break :blk "NaN";
+                if (std.math.isInf(f)) break :blk if (f < 0) "-Infinity" else "Infinity";
+                var buffer: [64]u8 = undefined;
+                var writer: std.Io.Writer = .fixed(&buffer);
+                @import("pyjson.zig").writeStr(&writer, v) catch @compileError("dszig: invalid enum float");
+                const result = buffer[0..writer.buffered().len].*;
+                break :blk &result;
+            },
+            .array => |a| blk: {
+                var out: []const u8 = "[";
+                for (a.items, 0..) |item, i| out = out ++ (if (i == 0) "" else ", ") ++ enumSchemaValue(item);
+                break :blk out ++ "]";
+            },
+            .object => |o| blk: {
+                var out: []const u8 = "{";
+                for (o.keys(), o.values(), 0..) |key, item, i|
+                    out = out ++ (if (i == 0) "" else ", ") ++ quote(key) ++ ": " ++ enumSchemaValue(item);
+                break :blk out ++ "}";
+            },
+            .custom => @compileError("dszig: enum JSON schema requires serializable native values"),
+        };
+    }
+}
+
 fn hasDefault(comptime S: type, comptime i: usize) bool {
     return @typeInfo(S).@"struct".field_attrs[i].default_value_ptr != null;
 }
 
 fn modelEntries(comptime S: type, comptime ordered_properties: bool) []const Entry {
     comptime {
+        if (@import("enum.zig").isEnum(S)) return enumEntries(S);
         const info = @typeInfo(S).@"struct";
         var props: [if (code.isCode(S)) 1 else info.field_names.len]Entry = undefined;
         var n_props = 0;
@@ -230,7 +289,7 @@ fn modelEntries(comptime S: type, comptime ordered_properties: bool) []const Ent
 fn collectDefs(comptime T: type, comptime seen: []const type) []const type {
     comptime {
         var out = seen;
-        if (T == @import("runtime_value.zig").ObjectMap) return out;
+        if (T == Value or T == Integer or T == @import("runtime_value.zig").ObjectMap) return out;
         if (isDict(T)) return collectDefs(T.dszig_dict_value, out);
         switch (@typeInfo(T)) {
             .optional => |o| out = collectDefs(o.child, out),
@@ -240,7 +299,7 @@ fn collectDefs(comptime T: type, comptime seen: []const type) []const type {
             .@"struct" => |s| {
                 for (out) |t| if (t == T) return out;
                 out = out ++ &[_]type{T};
-                if (code.isCode(T)) return out;
+                if (code.isCode(T) or @import("enum.zig").isEnum(T)) return out;
                 for (s.field_types) |FT| out = collectDefs(FT, out);
             },
             else => {},
@@ -284,11 +343,17 @@ pub fn validate(comptime T: type, arena: Allocator, v: Value) Error!Value {
     return validateMode(T, arena, v, false);
 }
 
-fn validateMode(comptime T: type, arena: Allocator, v: Value, comptime xml_lax: bool) Error!Value {
-    if (comptime code.isCode(T)) return T.validate(arena, v);
+fn validateMode(comptime T: type, arena: Allocator, input: Value, comptime xml_lax: bool) Error!Value {
+    var v = input;
+    if (T == Value) return input;
+    if (comptime code.isCode(T) or @import("enum.zig").isEnum(T)) return T.validate(arena, v);
+    if (T == Integer) return @import("value.zig").coerceInteger(arena, v);
     if (T == File) {
-        const file = File.fromValue(v) catch return error.ParseValue;
-        return if (v == .custom) v else file.toRuntime(arena);
+        const file = File.fromValue(arena, v) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.ParseValue,
+        };
+        return if (v == .custom and v.custom.get(File) != null) v else file.toRuntime(arena);
     }
     if (T == BoundingBox) {
         const box = (if (xml_lax) BoundingBox.fromXmlValue(v) else BoundingBox.fromValue(v)) catch return error.ParseValue;
@@ -298,38 +363,89 @@ fn validateMode(comptime T: type, arena: Allocator, v: Value, comptime xml_lax: 
         const reasoning = @import("signature.zig").Reasoning.fromValue(v) catch return error.ParseValue;
         return if (v == .custom) v else reasoning.toRuntime(arena);
     }
+    if (T == []const u8 and v == .custom) {
+        if (v.custom.vtable.enumeration) |inspect| {
+            const member_value = inspect(v.custom.ptr).value;
+            if (member_value == .string) return member_value;
+            var out: std.Io.Writer.Allocating = .init(arena);
+            @import("pyjson.zig").writeStr(&out.writer, member_value) catch |err| return switch (err) {
+                error.WriteFailed => error.OutOfMemory,
+                error.JsonTooDeep, error.ParseValue => error.ParseValue,
+            };
+            return .{ .string = out.written() };
+        }
+    }
+    if (v == .custom and (T == []const u8 or T == bool or @typeInfo(T) == .float))
+    {
+        const inspect = v.custom.vtable.python orelse return error.ParseValue;
+        v = switch (inspect(v.custom.ptr)) {
+            .bytes => |data| blk: {
+                if (T == []const u8 and !std.unicode.utf8ValidateSlice(data)) return error.ParseValue;
+                break :blk .{ .string = data };
+            },
+            else => return error.ParseValue,
+        };
+    }
     if (T == []const u8) return if (v == .string) v else error.ParseValue;
-    if (T == @import("runtime_value.zig").ObjectMap) return if (v == .object) v else error.ParseValue;
+    if (T == @import("runtime_value.zig").ObjectMap) return stringKeyedObject(arena, v);
     if (comptime isDict(T)) {
-        if (v != .object) return error.ParseValue;
         var out: @import("runtime_value.zig").ObjectMap = .empty;
-        try out.ensureTotalCapacity(arena, v.object.count());
-        var it = v.object.iterator();
-        while (it.next()) |e| out.putAssumeCapacity(e.key_ptr.*, try validateMode(T.dszig_dict_value, arena, e.value_ptr.*, xml_lax));
+        if (v == .object) {
+            try out.ensureTotalCapacity(arena, v.object.count());
+            var it = v.object.iterator();
+            while (it.next()) |e| out.putAssumeCapacity(e.key_ptr.*, try validateMode(T.dszig_dict_value, arena, e.value_ptr.*, xml_lax));
+        } else {
+            if (v != .custom) return error.ParseValue;
+            const inspect = v.custom.vtable.python orelse return error.ParseValue;
+            const entries = switch (inspect(v.custom.ptr)) {
+                .dictionary => |entries| entries,
+                else => return error.ParseValue,
+            };
+            try out.ensureTotalCapacity(arena, entries.len);
+            for (entries) |entry| {
+                const key = try validateMode([]const u8, arena, entry.key, xml_lax);
+                const item = try validateMode(T.dszig_dict_value, arena, entry.value, xml_lax);
+                try out.put(arena, key.string, item);
+            }
+        }
         return .{ .object = out };
     }
     if (T == bool) return switch (v) {
         .bool => v,
         .integer => |i| if (i == 0 or i == 1) Value{ .bool = i == 1 } else error.ParseValue,
+        .float => |f| if (f == 0 or f == 1) Value{ .bool = f == 1 } else error.ParseValue,
+        .number_string => |s| blk: {
+            const parsed = Value.parseFromNumberSlice(s);
+            if (parsed == .number_string) break :blk error.ParseValue;
+            break :blk validateMode(bool, arena, parsed, xml_lax);
+        },
         .string => |s| boolText(s),
         else => error.ParseValue,
     };
     switch (@typeInfo(T)) {
         .int => {
             const value = @import("value.zig");
-            const parsed = value.parseInteger(v) catch if (v == .string) blk: {
-                // Preserve Pydantic's integer-string coercions (sign and digit
-                // separators), while emitting canonical JSON for wide values.
-                const integer = std.fmt.parseInt(T, std.mem.trim(u8, v.string, " \t\n\r"), 10) catch return error.ParseValue;
-                break :blk try value.toValue(arena, T, integer);
-            } else return error.ParseValue;
+            const parsed = try value.coerceInteger(arena, v);
             _ = value.fromValue(arena, T, parsed) catch return error.ParseValue;
             return parsed;
         },
         .float => return switch (v) {
             .float => v,
+            .bool => |b| .{ .float = @floatFromInt(@intFromBool(b)) },
             .integer => |i| .{ .float = @floatFromInt(i) },
-            .string, .number_string => |s| .{ .float = std.fmt.parseFloat(f64, std.mem.trim(u8, s, " \t\n\r")) catch return error.ParseValue },
+            .number_string => |s| blk: {
+                const number = std.fmt.parseFloat(f64, s) catch return error.ParseValue;
+                if (!std.math.isFinite(number)) return error.ParseValue;
+                break :blk .{ .float = number };
+            },
+            .string => |s| blk: {
+                const token = @import("unicode.zig").strip(s, true);
+                const unsigned = if (token.len != 0 and (token[0] == '-' or token[0] == '+')) token[1..] else token;
+                if (std.ascii.startsWithIgnoreCase(unsigned, "0x")) return error.ParseValue;
+                var number = std.fmt.parseFloat(f64, token) catch return error.ParseValue;
+                if (token.len != 0 and token[0] == '-' and std.math.isNan(number)) number = -number;
+                break :blk .{ .float = number };
+            },
             else => error.ParseValue,
         },
         .@"enum" => {
@@ -339,10 +455,22 @@ fn validateMode(comptime T: type, arena: Allocator, v: Value, comptime xml_lax: 
         },
         .optional => |o| return if (v == .null) v else validateMode(o.child, arena, v, xml_lax),
         .pointer => |p| {
-            if (v != .array) return error.ParseValue;
+            const items = if (v == .array) v.array.items else blk: {
+                if (v != .custom) return error.ParseValue;
+                if (v.custom.vtable.iterate) |iterate| {
+                    const items = try iterate(arena, v.custom.ptr);
+                    for (items) |*item| item.* = try validateMode(p.child, arena, item.*, xml_lax);
+                    return .{ .array = .fromOwnedSlice(arena, items) };
+                }
+                const inspect = v.custom.vtable.python orelse return error.ParseValue;
+                break :blk switch (inspect(v.custom.ptr)) {
+                    .tuple, .set, .frozen_set => |items| items,
+                    else => return error.ParseValue,
+                };
+            };
             var out: @import("runtime_value.zig").Array = .init(arena);
-            try out.ensureTotalCapacity(v.array.items.len);
-            for (v.array.items) |item| out.appendAssumeCapacity(try validateMode(p.child, arena, item, xml_lax));
+            try out.ensureTotalCapacity(items.len);
+            for (items) |item| out.appendAssumeCapacity(try validateMode(p.child, arena, item, xml_lax));
             return .{ .array = out };
         },
         .@"struct" => |s| {
@@ -359,6 +487,23 @@ fn validateMode(comptime T: type, arena: Allocator, v: Value, comptime xml_lax: 
         },
         else => @compileError("dszig: unsupported nested type " ++ @typeName(T)),
     }
+}
+
+fn stringKeyedObject(arena: Allocator, input: Value) Error!Value {
+    if (input == .object) return input;
+    if (input != .custom) return error.ParseValue;
+    const inspect = input.custom.vtable.python orelse return error.ParseValue;
+    const entries = switch (inspect(input.custom.ptr)) {
+        .dictionary => |entries| entries,
+        else => return error.ParseValue,
+    };
+    var result: @import("runtime_value.zig").ObjectMap = .empty;
+    try result.ensureTotalCapacity(arena, entries.len);
+    for (entries) |entry| {
+        const key = try validateMode([]const u8, arena, entry.key, false);
+        try result.put(arena, key.string, entry.value);
+    }
+    return .{ .object = result };
 }
 
 fn boolText(s: []const u8) Error!Value {

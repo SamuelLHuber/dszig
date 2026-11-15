@@ -232,7 +232,7 @@ fn isDefaultDesc(f: Field) bool {
 pub fn fieldSchema(arena: Allocator, field: Field) Error!Value {
     if (field.kind == .json or field.code_type) {
         const source = if (field.xml_schema.len > 0) field.xml_schema else field.schema;
-        return std.json.parseFromSliceLeaky(Value, arena, source, .{}) catch |err| switch (err) {
+        return @import("json_repair.zig").parseJson(arena, source) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.AdapterParse,
         };
