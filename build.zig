@@ -86,6 +86,18 @@ pub fn build(b: *std.Build) void {
     run_replay.addPassthruArgs();
     b.step("replay", "Verify a DSPy 3.5 transcript through the native Zig suite").dependOn(&run_replay.step);
     examples_step.dependOn(&replay.step);
+
+    const bench = b.addExecutable(.{ .name = "bench", .root_module = b.createModule(.{
+        .root_source_file = b.path("examples/bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = imports,
+    }) });
+    b.installArtifact(bench);
+    const run_bench = b.addRunArtifact(bench);
+    run_bench.addPassthruArgs();
+    b.step("bench", "Time the native suite replaying a transcript (compare with tools/dspy_reference/bench.py)").dependOn(&run_bench.step);
+    examples_step.dependOn(&bench.step);
 }
 
 /// Each tests/compile_fail/<name>.zig must fail to compile with `message`.
