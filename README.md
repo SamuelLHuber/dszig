@@ -981,7 +981,7 @@ Regenerate this table with
 | `dspy.OldInputField` (`signatures/field.py`) | missing | – | – | – |
 | `dspy.OldOutputField` (`signatures/field.py`) | missing | – | – | – |
 | `dspy.OutputField` (`signatures/field.py`) | partial | `signature.zig` | compile-fail cases, format_cases.json | – |
-| `dspy.Parallel` (`predict/parallel.py`) | missing | – | – | – |
+| `dspy.Parallel` (`predict/parallel.py`) | partial | `parallel.zig` | parallel.json (ParallelExecutor order, failures, max_errors cancel); module-pair dispatch, timeout/straggler resubmit not ported | – |
 | `dspy.Predict` (`predict/predict.py`) | native | `predict.zig` | format_cases.json, xml.json, dspy_3_5_0_mock_suite.json | cases: 23 ms → 0.16 ms |
 | `dspy.Prediction` (`primitives/prediction.py`) | partial | `predict.zig` | suite replay | – |
 | `dspy.Provider` (`clients/provider.py`) | missing | – | – | – |

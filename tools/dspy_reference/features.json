@@ -778,9 +778,9 @@
   },
   {
    "name": "Parallel",
-   "status": "missing",
-   "dszig": [],
-   "checks": "",
+   "status": "partial",
+   "dszig": ["parallel.zig"],
+   "checks": "parallel.json (ParallelExecutor order, failures, max_errors cancel); module-pair dispatch, timeout/straggler resubmit not ported",
    "bench": [],
    "upstream": "predict/parallel.py",
    "sha256": "9359c28c44cb0067a262e0e0ac3bd90a22bafc78510f6e477a353fd7b26d3d19"

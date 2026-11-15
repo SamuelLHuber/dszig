@@ -22,6 +22,7 @@ uv run --locked gen_optuna.py "$tmp/fixtures"
 uv run --locked gen_trace_selection.py "$tmp/fixtures"
 uv run --locked gen_react.py "$tmp/fixtures" 2>/dev/null
 uv run --locked gen_ensemble.py "$tmp/fixtures" 2>/dev/null
+uv run --locked gen_parallel.py "$tmp/fixtures"
 uv run --locked gen_simba.py "$tmp/fixtures" 2>/dev/null
 uv run --locked gen_gepa.py "$tmp/fixtures" 2>/dev/null
 uv run --locked gen_nested.py "$tmp/fixtures" 2>/dev/null

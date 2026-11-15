@@ -16,6 +16,7 @@ const bootstrap_rag = @embedFile("fixtures/bootstrap_rag.json");
 const bootstrap_multihop = @embedFile("fixtures/bootstrap_multihop.json");
 const react_cases = @embedFile("fixtures/react.json");
 const ensemble_cases = @embedFile("fixtures/ensemble.json");
+const parallel_cases = @embedFile("fixtures/parallel.json");
 const simba_case = @embedFile("fixtures/simba.json");
 const gepa_case = @embedFile("fixtures/gepa.json");
 const gepa_merge_case = @embedFile("fixtures/gepa_merge.json");
@@ -799,4 +800,42 @@ fn checkGepa(comptime P: type, case: []const u8, budget: usize) !void {
     try testing.expectEqual(@as(usize, @intCast(want.object.get("total_metric_calls").?.integer)), result.total_metric_calls);
     try testing.expectEqual(@as(usize, @intCast(want.object.get("num_full_val_evals").?.integer)), result.num_full_val_evals);
     try testing.expectEqualStrings(want.object.get("artifact").?.string, try dszig.state.saveAlloc(arena, &result.program));
+}
+
+fn squareOrFail(fail_mod: usize, index: usize, item: *const usize) anyerror!usize {
+    std.debug.assert(index == item.*);
+    if (item.* % fail_mod == fail_mod - 1) return error.ItemFailed;
+    return item.* * item.*;
+}
+
+test "ParallelExecutor matches DSPy 3.5.0 ordering, failures and max_errors cancellation" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const data = try std.json.parseFromSliceLeaky(Value, arena, parallel_cases, .{});
+    for (data.object.get("cases").?.array.items) |case| {
+        const n: usize = @intCast(case.object.get("n").?.integer);
+        const items = try arena.alloc(usize, n);
+        for (items, 0..) |*item, i| item.* = i;
+        const outcomes = try arena.alloc(dszig.parallel.Outcome(usize), n);
+        const options: dszig.parallel.Options = .{
+            .num_threads = @intCast(case.object.get("threads").?.integer),
+            .max_errors = @intCast(case.object.get("max_errors").?.integer),
+        };
+        const fail_mod: usize = @intCast(case.object.get("fail_mod").?.integer);
+        const result = dszig.parallel.execute(usize, usize, testing.io, options, fail_mod, squareOrFail, items, outcomes);
+        try testing.expectEqual(case.object.get("cancelled").?.bool, result == error.ExecutionCancelled);
+        var failed: std.ArrayList(usize) = .empty;
+        for (outcomes, 0..) |outcome, i| if (outcome == .failed) try failed.append(arena, i);
+        const expected_failed = case.object.get("failed").?.array.items;
+        try testing.expectEqual(expected_failed.len, failed.items.len);
+        for (expected_failed, failed.items) |want, got| try testing.expectEqual(@as(usize, @intCast(want.integer)), got);
+        if (case.object.get("results").? == .array) {
+            for (case.object.get("results").?.array.items, outcomes) |want, got| switch (want) {
+                .null => try testing.expect(got == .failed),
+                .integer => |v| try testing.expectEqual(@as(usize, @intCast(v)), got.ok),
+                else => unreachable,
+            };
+        }
+    }
 }

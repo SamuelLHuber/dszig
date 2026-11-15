@@ -88,6 +88,7 @@ pub const ToolCalls = tool.ToolCalls;
 pub const ToolCallResult = tool.ToolCallResult;
 pub const ToolCallResults = tool.ToolCallResults;
 pub const ensemble = @import("ensemble.zig");
+pub const parallel = @import("parallel.zig");
 pub const Ensemble = ensemble.Ensemble;
 pub const metrics = @import("metrics.zig");
 pub const dpr = @import("dpr.zig");
