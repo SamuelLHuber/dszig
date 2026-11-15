@@ -486,10 +486,17 @@ fn DecisionType(comptime config: Configuration) type {
             errdefer result.deinit(allocator);
             if (comptime kind == .choice) result.value = try inference.cloneJsonValue(allocator, self.value);
             if (comptime kind != .noul) {
-                if (self.probabilities) |map| result.probabilities = try inference.cloneJsonValue(allocator, map);
+                if (self.probabilities) |map| {
+                    // Clone first: a failed in-place clone would leave a non-null optional with an undefined payload.
+                    const cloned = try inference.cloneJsonValue(allocator, map);
+                    result.probabilities = cloned;
+                }
             }
             if (comptime kind == .score) {
-                if (self.level) |level| result.level = .{ .value = try inference.cloneJsonValue(allocator, level.value) };
+                if (self.level) |level| {
+                    const cloned = try inference.cloneJsonValue(allocator, level.value);
+                    result.level = .{ .value = cloned };
+                }
             }
             return result;
         }

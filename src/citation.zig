@@ -299,7 +299,11 @@ pub const Citations = struct {
                 } else if (T == ?[]const u8) {
                     @field(copy, name) = if (@field(self, name)) |text| try allocator.dupe(u8, text) else null;
                 } else {
-                    @field(copy, name) = if (@field(self, name)) |integer| .{ .value = try cloneField(allocator, integer.value) } else null;
+                    if (@field(self, name)) |integer| {
+                        // Clone first: a failed in-place clone would leave a non-null optional with an undefined payload.
+                        const value = try cloneField(allocator, integer.value);
+                        @field(copy, name) = .{ .value = value };
+                    }
                 }
             }
             return copy;
