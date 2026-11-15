@@ -314,6 +314,11 @@ operations retain integers above binary64's exact range and support genuine
 complex operands; Decimal/float arithmetic remains refused. Member `str` is
 numeric, while `repr` retains its class and canonical member name.
 
+Declaration-time builtin floats truncate toward zero without routing large
+integers through binary64 arithmetic. Base-ten strings accept signs, leading
+zeros, digit separators and Unicode decimal digits, subject to CPython's default
+4,300-digit string limit. Conversion precedes singleton alias resolution.
+
 The following independent frozen-source observations matched in both native
 Debug and ReleaseSafe, with byte-identical output between modes:
 
@@ -321,15 +326,21 @@ Debug and ReleaseSafe, with byte-identical output between modes:
 | --- | ---: | ---: | ---: |
 | IntEnum runtime operations | 2,294 / 2,324 | 24,577 | 657 |
 | IntEnum scalar validation | 35 / 35 | 379 | 6 |
+| Builtin IntEnum declarations | 19 / 19 | 134 | 0 |
 | Configured Decimal policies | 368 / 368 | 3,950 | 233 |
 
 The runtime consumer deliberately exits nonzero for incomplete coverage:
 sequence repetition is not implemented by the numeric helpers. Unsafe unbounded
-repetitions were separately left unattempted by the Source probe. Static member
-declarations accept exact integers, bools and genuine integer-subclass payloads;
-arbitrary declaration-time Python `int(value)` coercions, custom mixins and
-dynamic Python class construction are not implemented. Normalized native errors
-are not proof of identical Python exception classes.
+repetitions were separately left unattempted by the Source probe. The declaration
+probe includes fractional and maximum finite floats, signed zero, subnormals,
+Unicode/separated strings, exact wide integers and the 4,300-digit boundary.
+Seventeen independently compiled Debug programs also refused the source-observed
+malformed strings, over-limit strings and nonfinite floats; compile-time
+refusals do not establish Python exception identity. Declaration-time bytes,
+Decimal, tuple/base arguments, arbitrary Python `int(value)` protocols, custom
+mixins, configurable Python digit limits and dynamic Python class construction
+are not implemented. Normalized native errors are not proof of identical Python
+exception classes.
 
 ### Native Decimal values and arithmetic
 

@@ -156,13 +156,33 @@ test "IntEnum exact numeric equality does not erase nominal validation or alias 
     try std.testing.expect(left_metadata.class_identity != right_metadata.class_identity);
 }
 
+test "IntEnum declaration coercion truncates floats and canonicalizes Unicode integer strings" {
+    const Converted = IntEnum("Converted", &.{
+        .{ .name = "positive", .value = .{ .float = 1.9 } },
+        .{ .name = "negative", .value = .{ .float = -1.9 } },
+        .{ .name = "alias", .value = .{ .string = " +００１ " } },
+        .{ .name = "zero", .value = .{ .float = -0.0 } },
+        .{ .name = "wide", .value = .{ .string = "\u{2002}٩_٠٠٧_١٩٩_٢٥٤_٧٤٠_٩٩٣\u{2002}" } },
+        .{ .name = "float_wide", .value = .{ .float = 0x1p64 } },
+    });
+    const positive = try Converted.member("positive");
+    try std.testing.expectEqual(@as(i64, 1), positive.custom.integerValue().?.integer);
+    try std.testing.expectEqual(@as(i64, -1), (try Converted.member("negative")).custom.integerValue().?.integer);
+    try std.testing.expectEqual(@as(i64, 0), (try Converted.member("zero")).custom.integerValue().?.integer);
+    try std.testing.expect((try Converted.member("alias")).custom.ptr == positive.custom.ptr);
+    const wide = try Converted.member("wide");
+    try std.testing.expect(try value.pyEqual(wide, .{ .integer = 9007199254740993 }));
+    try std.testing.expect(!try value.pyEqual(wide, .{ .float = 9007199254740992.0 }));
+    try std.testing.expectEqualStrings("18446744073709551616", (try Converted.member("float_wide")).custom.integerValue().?.number_string);
+}
+
 pub fn EnumWithIdentity(comptime name: []const u8, comptime entries: []const Entry, comptime Identity: type) type {
     return EnumClass(name, entries, Identity, false);
 }
 
 /// Genuine immutable integer subclasses with class-owned singleton members.
-/// Native declarations supply exact integer values; bools and other integer
-/// subclasses are normalized to builtin integers before alias resolution.
+/// Declaration-time builtin floats truncate toward zero; decimal strings,
+/// bools and integer subclasses normalize before canonical alias resolution.
 pub fn IntEnum(comptime name: []const u8, comptime entries: []const Entry) type {
     return IntEnumWithIdentity(name, entries, void);
 }
@@ -184,13 +204,73 @@ pub fn IntEnumWithIdentity(comptime name: []const u8, comptime entries: []const 
                         @compileError("dszig: IntEnum values must be exact integers");
                     break :number Value.parseFromNumberSlice(text);
                 },
-                else => @compileError("dszig: IntEnum values must be exact integers"),
+                .float => |number| declarationFloat(number),
+                .string => |text| declarationString(text),
+                else => @compileError("dszig: IntEnum declaration does not support this integer conversion"),
             };
             result[index] = .{ .name = entry.name, .value = integer };
         }
         break :blk result;
     };
     return EnumClass(name, &normalized, Identity, true);
+}
+
+fn declarationFloat(comptime number: f64) Value {
+    if (!std.math.isFinite(number))
+        @compileError("dszig: IntEnum cannot convert a nonfinite float to an integer");
+    const bits: u64 = @bitCast(number);
+    const exponent = @as(i32, @intCast((bits >> 52) & 0x7ff)) - 1023;
+    if (exponent < 0) return .{ .integer = 0 };
+    const significand = (bits & 0x000f_ffff_ffff_ffff) | 0x0010_0000_0000_0000;
+    const magnitude: comptime_int = if (exponent >= 52)
+        @as(comptime_int, significand) << (exponent - 52)
+    else
+        significand >> (52 - exponent);
+    const integer = if (bits >> 63 != 0) -magnitude else magnitude;
+    return Value.parseFromNumberSlice(std.fmt.comptimePrint("{d}", .{integer}));
+}
+
+fn declarationString(comptime text: []const u8) Value {
+    const unicode = @import("unicode.zig");
+    // CPython's integer parser excludes the ASCII information separators
+    // U+001C..U+001F even though str.isspace() includes them.
+    const source = unicode.strip(text, true);
+    if (source.len == 0) @compileError("dszig: invalid IntEnum integer string");
+    const negative = source[0] == '-';
+    const start: usize = @intFromBool(negative or source[0] == '+');
+    var buffer: [text.len]u8 = undefined;
+    var length: usize = 0;
+    var offset = start;
+    var previous_digit = false;
+    while (offset < source.len) {
+        const width = std.unicode.utf8ByteSequenceLength(source[offset]) catch
+            @compileError("dszig: invalid IntEnum integer string");
+        if (width > source.len - offset)
+            @compileError("dszig: invalid IntEnum integer string");
+        const cp = std.unicode.utf8Decode(source[offset..][0..width]) catch
+            @compileError("dszig: invalid IntEnum integer string");
+        offset += width;
+        if (cp == '_') {
+            if (!previous_digit or offset == source.len)
+                @compileError("dszig: invalid IntEnum integer separator");
+            previous_digit = false;
+            continue;
+        }
+        const digit = unicode.decimalDigit(cp) orelse
+            @compileError("dszig: invalid IntEnum integer digit");
+        buffer[length] = '0' + digit;
+        length += 1;
+        previous_digit = true;
+    }
+    if (length == 0) @compileError("dszig: invalid IntEnum integer string");
+    if (length > 4300)
+        @compileError("dszig: IntEnum integer string exceeds CPython's default 4300-digit limit");
+    var first: usize = 0;
+    while (first < length and buffer[first] == '0') first += 1;
+    if (first == length) return .{ .integer = 0 };
+    const frozen = buffer;
+    const magnitude = frozen[first..length];
+    return Value.parseFromNumberSlice(if (negative) "-" ++ magnitude else magnitude);
 }
 
 fn EnumClass(comptime name: []const u8, comptime entries: []const Entry, comptime Identity: type, comptime integer: bool) type {
