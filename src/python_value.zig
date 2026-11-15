@@ -91,6 +91,15 @@ pub fn tuple(a: Allocator, items: []const Value) Error!Value {
     return boxed(a, .{ .tuple = items }, if (hashable) &tuple_vtable else &unhashable_tuple_vtable);
 }
 
+/// Adopt the slice storage only; tuple members remain borrowed. The caller
+/// retains the slice if construction fails. An owning clone deep-copies both
+/// the slice and its members; the borrowed tuple must not outlive its members.
+pub fn tupleFromOwnedSlice(a: Allocator, items: []Value) Error!Value {
+    const result = try tuple(a, items);
+    runtimeBox(result.custom.ptr).owns_storage = true;
+    return result;
+}
+
 pub fn set(a: Allocator, items: []const Value) Error!Value {
     return setWithHashSeed(a, items, 0);
 }
@@ -1632,7 +1641,7 @@ test "CPython seed-zero set layout dedup and frozen cross equality" {
     try expectRepr("{0, 32, 8, 40, 16, 48, 24}", collisions);
     const one_complex = try complex(a, 1, 0);
     const equal_numeric = try set(a, &.{
-        .{ .bool = true }, .{ .integer = 1 }, .{ .float = 1 }, one_complex,
+        .{ .bool = true },  .{ .integer = 1 }, .{ .float = 1 },    one_complex,
         .{ .bool = false }, .{ .integer = 0 }, .{ .float = -0.0 },
     });
     try expectRepr("{False, True}", equal_numeric);
@@ -1650,7 +1659,9 @@ test "CPython Unicode storage and explicit seed determine genuine set order" {
     const a = scratch.allocator();
     const strings = [_]Value{
         .{ .string = "x" }, .{ .string = "y" }, .{ .string = "z" },
-        .{ .string = "é" }, .{ .string = "雪" }, .{ .string = "😀" },
+        .{ .string = "é" },
+        .{ .string = "雪" },
+        .{ .string = "😀" },
     };
     try expectRepr("{'y', 'x', 'é', 'z', '😀', '雪'}", try set(a, &strings));
     try expectRepr("{'z', '雪', 'x', '😀', 'y', 'é'}", try setWithHashSeed(a, &strings, 1));
@@ -1977,4 +1988,16 @@ fn exerciseBuiltinOwnership(a: Allocator) !void {
 test "Builtin construction and recursive clone release all partial allocations" {
     var stable = testing.FailingAllocator.init(testing.allocator, .{ .resize_fail_index = 0 });
     try testing.checkAllAllocationFailures(stable.allocator(), exerciseBuiltinOwnership, .{});
+}
+
+test "owned tuple storage borrows members while its clone owns independent fields" {
+    var source: std.heap.ArenaAllocator = .init(testing.allocator);
+    const text = try source.allocator().dupe(u8, "citation 雪");
+    const items = try testing.allocator.dupe(Value, &.{ .{ .string = "field" }, .{ .string = text } });
+    const borrowed = try tupleFromOwnedSlice(testing.allocator, items);
+    const copy = try borrowed.custom.clone(testing.allocator);
+    defer copy.deinit(testing.allocator);
+    borrowed.custom.deinit(testing.allocator);
+    source.deinit();
+    try testing.expectEqualStrings("citation 雪", view(.{ .custom = copy }).?.tuple[1].string);
 }

@@ -14,6 +14,7 @@ pub const inference = @import("inference.zig");
 const Message = adapter.Message;
 pub const FunctionTool = inference.FunctionTool;
 pub const ToolCall = inference.ToolCall;
+pub const CitationPart = inference.CitationPart;
 pub const Continuation = inference.Continuation;
 pub const ResponseFormat = inference.ResponseFormat;
 pub const ToolChoice = inference.ToolChoice;
@@ -48,6 +49,7 @@ pub const Completion = struct {
     text: ?[]const u8,
     reasoning: ?[]const u8 = null,
     tool_calls: []const ToolCall = &.{},
+    citations: []const CitationPart = &.{},
     continuation: []const Continuation = &.{},
     /// Actual provider JSON, retained separately from canonical continuation.
     provider_data: ?@import("runtime_value.zig").Value = null,
@@ -62,6 +64,8 @@ pub fn cloneCompletion(allocator: Allocator, completion: Completion) Allocator.E
     errdefer if (reasoning) |summary| allocator.free(summary);
     const tool_calls = try inference.cloneToolCalls(allocator, completion.tool_calls);
     errdefer inference.freeToolCalls(allocator, tool_calls);
+    const citations = try inference.cloneCitations(allocator, completion.citations);
+    errdefer inference.freeCitations(allocator, citations);
     const continuation = try inference.cloneContinuations(allocator, completion.continuation);
     errdefer inference.freeContinuations(allocator, continuation);
     const provider_data = if (completion.provider_data) |data| try inference.cloneJsonValue(allocator, data) else null;
@@ -69,6 +73,7 @@ pub fn cloneCompletion(allocator: Allocator, completion: Completion) Allocator.E
         .text = text,
         .reasoning = reasoning,
         .tool_calls = tool_calls,
+        .citations = citations,
         .continuation = continuation,
         .provider_data = provider_data,
     };
@@ -80,6 +85,7 @@ pub fn freeCompletion(allocator: Allocator, completion: Completion) void {
     if (completion.reasoning) |reasoning| allocator.free(reasoning);
     inference.freeContinuations(allocator, completion.continuation);
     inference.freeToolCalls(allocator, completion.tool_calls);
+    inference.freeCitations(allocator, completion.citations);
 }
 
 pub fn cloneOptions(arena: Allocator, options: Options) Allocator.Error!Options {
@@ -144,6 +150,7 @@ pub fn completionValue(arena: Allocator, completion: Completion) Allocator.Error
     try object.put(arena, "text", if (completion.text) |text| .{ .string = text } else .null);
     try object.put(arena, "reasoning", if (completion.reasoning) |reasoning| .{ .string = reasoning } else .null);
     try object.put(arena, "tool_calls", try inference.toolCallsValue(arena, completion.tool_calls));
+    try object.put(arena, "citations", try inference.citationsValue(arena, completion.citations));
     try object.put(arena, "continuation", try inference.continuationsValue(arena, completion.continuation));
     try object.put(arena, "provider_data", completion.provider_data orelse .null);
     return .{ .object = object };
@@ -231,6 +238,7 @@ pub fn completionFromValue(arena: Allocator, input: @import("runtime_value.zig")
     if (input != .object) return error.BadMetadata;
     const text = input.object.get("text") orelse return error.BadMetadata;
     var out: Completion = .{ .text = if (text == .null) null else try arena.dupe(u8, try metadataString(text)) };
+    if (input.object.get("citations")) |citations| out.citations = try inference.citationsFromValue(arena, citations);
     if (input.object.get("reasoning")) |reasoning| {
         if (reasoning != .null) out.reasoning = try arena.dupe(u8, try metadataString(reasoning));
     }
@@ -325,6 +333,7 @@ pub const ScriptedLM = struct {
     /// Optional native summaries, parallel to `responses`.
     reasonings: []const ?[]const u8 = &.{},
     tool_calls: []const []const ToolCall = &.{},
+    citations: []const []const CitationPart = &.{},
     continuation: []const []const Continuation = &.{},
     provider_data: []const ?@import("runtime_value.zig").Value = &.{},
     supports_reasoning: bool = false,
@@ -354,6 +363,7 @@ pub const ScriptedLM = struct {
         if (self.responses.len - self.index < n) return error.ScriptExhausted;
         if (self.reasonings.len != 0 and self.reasonings.len != self.responses.len) return error.LMFailure;
         if (self.tool_calls.len != 0 and self.tool_calls.len != self.responses.len) return error.LMFailure;
+        if (self.citations.len != 0 and self.citations.len != self.responses.len) return error.LMFailure;
         if (self.continuation.len != 0 and self.continuation.len != self.responses.len) return error.LMFailure;
         if (self.provider_data.len != 0 and self.provider_data.len != self.responses.len) return error.LMFailure;
         const out = try arena.alloc(Completion, n);
@@ -363,6 +373,7 @@ pub const ScriptedLM = struct {
                 .text = r,
                 .reasoning = reasoning,
                 .tool_calls = if (self.tool_calls.len != 0) self.tool_calls[i] else &.{},
+                .citations = if (self.citations.len != 0) self.citations[i] else &.{},
                 .continuation = if (self.continuation.len != 0) self.continuation[i] else &.{},
                 .provider_data = if (self.provider_data.len != 0) self.provider_data[i] else null,
             });
@@ -448,6 +459,7 @@ pub const ReplayLM = struct {
         reasonings: []const ?[]const u8 = &.{},
         /// Native calls for each completion, parallel to `all()`.
         tool_calls: []const []const ToolCall = &.{},
+        citations: []const []const CitationPart = &.{},
         continuation: []const []const Continuation = &.{},
         provider_data: []const ?@import("runtime_value.zig").Value = &.{},
 
@@ -497,6 +509,7 @@ pub const ReplayLM = struct {
             }
             if (call.reasonings.len != 0 and call.reasonings.len != recorded.len) return error.LMFailure;
             if (call.tool_calls.len != 0 and call.tool_calls.len != recorded.len) return error.LMFailure;
+            if (call.citations.len != 0 and call.citations.len != recorded.len) return error.LMFailure;
             if (call.continuation.len != 0 and call.continuation.len != recorded.len) return error.LMFailure;
             if (call.provider_data.len != 0 and call.provider_data.len != recorded.len) return error.LMFailure;
             for (recorded, 0..) |text, i| {
@@ -505,6 +518,7 @@ pub const ReplayLM = struct {
                     .text = text,
                     .reasoning = if (call.reasonings.len != 0) call.reasonings[i] else null,
                     .tool_calls = if (call.tool_calls.len != 0) call.tool_calls[i] else &.{},
+                    .citations = if (call.citations.len != 0) call.citations[i] else &.{},
                     .continuation = if (call.continuation.len != 0) call.continuation[i] else &.{},
                     .provider_data = if (call.provider_data.len != 0) call.provider_data[i] else null,
                 });
@@ -588,6 +602,12 @@ pub const RecordingLM = struct {
         for (tool_calls, completions[0..tool_calls.len]) |*kept_calls, completion| {
             kept_calls.* = try inference.cloneToolCalls(self.arena, completion.tool_calls);
         }
+        var has_citations = false;
+        for (completions) |completion| has_citations = has_citations or completion.citations.len != 0;
+        const citations: [][]const CitationPart = if (has_citations) try self.arena.alloc([]const CitationPart, completions.len) else &.{};
+        for (citations, completions[0..citations.len]) |*kept_citations, completion| {
+            kept_citations.* = try inference.cloneCitations(self.arena, completion.citations);
+        }
         var has_continuation = false;
         for (completions) |completion| has_continuation = has_continuation or completion.continuation.len != 0;
         const continuation: [][]const Continuation = if (has_continuation) try self.arena.alloc([]const Continuation, completions.len) else &.{};
@@ -608,6 +628,7 @@ pub const RecordingLM = struct {
             .completions = if (kept.len > 1) kept else &.{},
             .reasonings = reasonings,
             .tool_calls = tool_calls,
+            .citations = citations,
             .continuation = continuation,
             .provider_data = provider_data,
         });
@@ -1081,7 +1102,7 @@ pub const OpenAI = struct {
     fn parseJson(arena: Allocator, body: []const u8) Error!@import("runtime_value.zig").Value {
         // The HTTP body is freed after parsing. Escaped and unescaped strings
         // must both belong to the caller's arena, not to the transport buffer.
-        return std.json.parseFromSliceLeaky(@import("runtime_value.zig").Value, arena, body, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+        return @import("json_repair.zig").parseJson(arena, body) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.LMFailure,
         };
@@ -1091,6 +1112,7 @@ pub const OpenAI = struct {
     pub fn parseCompletions(arena: Allocator, body: []const u8) Error![]const Completion {
         const parsed = try parseJson(arena, body);
         if (parsed != .object) return error.LMFailure;
+        if (!finiteJson(parsed)) return error.LMFailure;
         const choices = parsed.object.get("choices") orelse return error.LMFailure;
         if (choices != .array or choices.array.items.len == 0) return error.LMFailure;
         const out = try arena.alloc(Completion, choices.array.items.len);
@@ -1099,48 +1121,54 @@ pub const OpenAI = struct {
             const message = choice.object.get("message") orelse return error.LMFailure;
             if (message != .object) return error.LMFailure;
             completion.* = .{ .text = null, .provider_data = parsed };
-            if (message.object.get("tool_calls")) |calls| {
-                if (calls != .array) return error.LMFailure;
-                const native = try arena.alloc(ToolCall, calls.array.items.len);
-                var part_index: usize = 0;
-                for ([_][]const u8{ "reasoning_content", "content", "refusal" }) |key| {
-                    if (message.object.get(key)) |part| {
-                        if (part == .string and part.string.len != 0) part_index += 1;
+            var part_index: usize = 0;
+            const reasoning = annotationAlternative(message, &.{ "reasoning_content", "reasoning" });
+            if (responseTruthy(reasoning)) {
+                completion.reasoning = try responseStringValue(arena, reasoning);
+                part_index += 1;
+            }
+            var text: TextParts = .{ .joined = .init(arena) };
+            if (message.object.get("content")) |content| {
+                if (content == .string and content.string.len != 0) {
+                    try text.add(content.string, "");
+                    part_index += 1;
+                } else if (content == .array) {
+                    for (content.array.items) |part| {
+                        if (part != .object) continue;
+                        if (!stringEquals(part.object.get("type") orelse .null, "text")) continue;
+                        try text.add(try responseText(arena, part.object.get("text")), "");
+                        part_index += 1;
                     }
                 }
-                for (calls.array.items, native) |call, *copy| {
-                    if (call != .object or !stringEquals(call.object.get("type") orelse return error.LMFailure, "function")) return error.LMFailure;
-                    const function = call.object.get("function") orelse return error.LMFailure;
-                    if (function != .object) return error.LMFailure;
-                    const raw_id = call.object.get("id");
-                    const call_id = try responseText(arena, raw_id);
-                    copy.* = .{
-                        .id = if (call_id.len != 0) call_id else try std.fmt.allocPrint(arena, "call_{d}", .{part_index}),
-                        .name = try responseString(function, "name", true),
-                        .arguments = try responseArguments(arena, function.object.get("arguments"), call_id.len != 0 and raw_id != null and raw_id.? == .string),
-                    };
-                    part_index += 1;
-                }
-                completion.tool_calls = native;
             }
-            if (message.object.get("content")) |content| {
-                switch (content) {
-                    .string => completion.text = content.string,
-                    .null => if (completion.tool_calls.len == 0) {
-                        completion.text = "";
-                    },
-                    else => return error.LMFailure,
-                }
-            } else if (completion.tool_calls.len == 0) {
-                completion.text = "";
+            if (message.object.get("refusal")) |refusal| {
+                if (responseTruthy(refusal)) part_index += 1;
             }
-            if (message.object.get("reasoning_content")) |reasoning| {
-                switch (reasoning) {
-                    .null => {},
-                    .string => completion.reasoning = reasoning.string,
-                    else => return error.LMFailure,
-                }
+            if (message.object.get("tool_calls")) |calls| {
+                if (calls == .array) {
+                    var native: std.ArrayList(ToolCall) = .empty;
+                    for (calls.array.items) |call| {
+                        if (call != .object) continue;
+                        const kind = call.object.get("type") orelse .null;
+                        if (responseTruthy(kind) and !stringEquals(kind, "function")) continue;
+                        const function = call.object.get("function") orelse return error.LMFailure;
+                        if (function != .object) return error.LMFailure;
+                        const name = try responseText(arena, function.object.get("name"));
+                        if (name.len == 0) return error.LMFailure;
+                        const raw_id = call.object.get("id");
+                        const call_id = try responseText(arena, raw_id);
+                        try native.append(arena, .{
+                            .id = if (call_id.len != 0) call_id else try std.fmt.allocPrint(arena, "call_{d}", .{part_index}),
+                            .name = name,
+                            .arguments = try responseArguments(arena, function.object.get("arguments"), call_id.len != 0 and raw_id != null and raw_id.? == .string),
+                        });
+                        part_index += 1;
+                    }
+                    completion.tool_calls = native.items;
+                } else if (calls != .object and calls != .string and responseTruthy(calls)) return error.LMFailure;
             }
+            if (part_index == 0) try text.add("", "");
+            completion.text = text.value();
         }
         return out;
     }
@@ -1159,6 +1187,7 @@ pub const OpenAI = struct {
     pub fn parseResponsesResponse(arena: Allocator, body: []const u8) Error!Completion {
         const parsed = try parseJson(arena, body);
         if (parsed != .object) return error.LMFailure;
+        if (!finiteJson(parsed)) return error.LMFailure;
         if (parsed.object.get("error")) |failure| {
             if (failure == .object) return error.LMFailure;
         }
@@ -1169,6 +1198,7 @@ pub const OpenAI = struct {
         var text: TextParts = .{ .joined = .init(arena) };
         var reasoning: TextParts = .{ .joined = .init(arena) };
         var calls: std.ArrayList(ToolCall) = .empty;
+        var citations: std.ArrayList(CitationPart) = .empty;
         var continuation: std.ArrayList(Continuation) = .empty;
         for (items) |item| {
             if (item != .object) continue;
@@ -1215,8 +1245,22 @@ pub const OpenAI = struct {
                         if (refused.len == 0) try text.add("", "");
                         part_count += 1;
                     } else if (stringEquals(part_type, "output_text") or stringEquals(part_type, "text")) {
-                        try text.add(try responseText(arena, part.object.get("text")), "");
+                        const visible = try responseText(arena, part.object.get("text"));
+                        try text.add(visible, "");
                         part_count += 1;
+                        if (part.object.get("annotations")) |annotations| {
+                            if (annotations == .array) {
+                                for (annotations.array.items) |annotation| {
+                                    if (annotation != .object) continue;
+                                    if (try responseCitation(arena, annotation, visible)) |citation| {
+                                        try citations.append(arena, citation);
+                                        part_count += 1;
+                                    }
+                                }
+                            } else if (annotations != .object and annotations != .string and responseTruthy(annotations)) {
+                                return error.LMFailure;
+                            }
+                        }
                     }
                 }
             }
@@ -1227,24 +1271,130 @@ pub const OpenAI = struct {
             .text = answer,
             .reasoning = reasoning.value(),
             .tool_calls = calls.items,
+            .citations = citations.items,
             .continuation = continuation.items,
             .provider_data = parsed,
         };
     }
 
+    fn responseTruthy(value: @import("runtime_value.zig").Value) bool {
+        return switch (value) {
+            .null => false,
+            .bool => |b| b,
+            .integer => |n| n != 0,
+            .float => |n| n != 0,
+            .string => |s| s.len != 0,
+            .array => |a| a.items.len != 0,
+            .object => |o| o.count() != 0,
+            .number_string => true,
+            .custom => |c| c.truthy(),
+        };
+    }
+
+    fn annotationString(arena: Allocator, value: @import("runtime_value.zig").Value) Error!?[]const u8 {
+        if (value == .null or (value == .string and value.string.len == 0)) return null;
+        return try responseStringValue(arena, value);
+    }
+
+    /// Python `a or b or c` keeps the last operand even when it is false.
+    fn annotationAlternative(annotation: @import("runtime_value.zig").Value, comptime names: []const []const u8) @import("runtime_value.zig").Value {
+        inline for (names, 0..) |name, i| {
+            const value = annotation.object.get(name) orelse .null;
+            if (i + 1 == names.len or responseTruthy(value)) return value;
+        }
+        unreachable;
+    }
+
+    /// Convert only indices which can address this text. Python int truncates
+    /// floats and admits Unicode decimal digits; Pydantic integer coercion does
+    /// neither, so it is not the right validator here. No big integer allocation
+    /// is needed when an index already lies outside the byte-length upper bound.
+    fn annotationIndex(value: @import("runtime_value.zig").Value, bound: usize) Error!?usize {
+        switch (value) {
+            .integer => |n| return if (n >= 0 and @as(u64, @intCast(n)) <= bound) @intCast(n) else null,
+            .float => |n| {
+                if (std.math.isInf(n)) return error.LMFailure; // Source catches ValueError, not OverflowError.
+                if (std.math.isNan(n)) return null;
+                const truncated = @trunc(n);
+                return if (truncated >= 0 and truncated <= @as(f64, @floatFromInt(bound))) @intFromFloat(truncated) else null;
+            },
+            .number_string => |s| {
+                const n = std.fmt.parseInt(usize, s, 10) catch return null;
+                return if (n <= bound) n else null;
+            },
+            .string => |raw| {
+                const source = @import("unicode.zig").strip(raw, true);
+                if (source.len == 0) return null;
+                const negative = source[0] == '-';
+                var i: usize = @intFromBool(source[0] == '-' or source[0] == '+');
+                var n: usize = 0;
+                var digits: usize = 0;
+                var previous_digit = false;
+                while (i < source.len) {
+                    if (source[i] == '_') {
+                        if (!previous_digit) return null;
+                        previous_digit = false;
+                        i += 1;
+                        continue;
+                    }
+                    const size = std.unicode.utf8ByteSequenceLength(source[i]) catch return null;
+                    if (size > source.len - i) return null;
+                    const cp = std.unicode.utf8Decode(source[i..][0..size]) catch return null;
+                    const digit = @import("unicode.zig").decimalDigit(cp) orelse return null;
+                    const product = @mulWithOverflow(n, 10);
+                    if (product[1] != 0) return null;
+                    const sum = @addWithOverflow(product[0], digit);
+                    if (sum[1] != 0 or sum[0] > bound) return null;
+                    n = sum[0];
+                    digits += 1;
+                    if (digits > 4300) return null;
+                    previous_digit = true;
+                    i += size;
+                }
+                return if (previous_digit and (!negative or n == 0)) n else null;
+            },
+            else => return null,
+        }
+    }
+
+    fn codepointOffset(text: []const u8, index: usize) ?usize {
+        var i: usize = 0;
+        var count: usize = 0;
+        while (count < index and i < text.len) : (count += 1) {
+            const size = std.unicode.utf8ByteSequenceLength(text[i]) catch return null;
+            if (size > text.len - i) return null;
+            i += size;
+        }
+        return if (count == index) i else null;
+    }
+
+    fn responseCitation(arena: Allocator, annotation: @import("runtime_value.zig").Value, text: []const u8) Error!?CitationPart {
+        const url = try annotationString(arena, annotationAlternative(annotation, &.{ "url", "uri" }));
+        const title = try annotationString(arena, annotationAlternative(annotation, &.{ "title", "filename", "file_id" }));
+        var cited: ?[]const u8 = null;
+        for ([_][]const u8{ "text", "snippet", "cited_text", "quote" }) |name| {
+            if (try annotationString(arena, annotation.object.get(name) orelse .null)) |s| {
+                cited = s;
+                break;
+            }
+        }
+        if (cited == null) {
+            const start = try annotationIndex(annotation.object.get("start_index") orelse .null, text.len);
+            const end = try annotationIndex(annotation.object.get("end_index") orelse .null, text.len);
+            if (start != null and end != null and start.? < end.?) {
+                if (codepointOffset(text, start.?)) |first| {
+                    if (codepointOffset(text, end.?)) |last| cited = text[first..last];
+                }
+            }
+        }
+        if (url == null and title == null and cited == null) return null;
+        return .{ .text = cited, .title = title, .url = url };
+    }
+
     /// lm15's str(value or ""), retaining strings without allocation.
     fn responseText(arena: Allocator, input: ?@import("runtime_value.zig").Value) Error![]const u8 {
         const value = input orelse return "";
-        switch (value) {
-            .null => return "",
-            .string => |s| return s,
-            .bool => |b| if (!b) return "",
-            .integer => |n| if (n == 0) return "",
-            .float => |n| if (n == 0) return "",
-            .array => |a| if (a.items.len == 0) return "",
-            .object => |o| if (o.count() == 0) return "",
-            .number_string, .custom => {},
-        }
+        if (!responseTruthy(value)) return "";
         return responseStringValue(arena, value);
     }
 
@@ -1290,7 +1440,7 @@ pub const OpenAI = struct {
                 }
             }
         }
-        if (!finiteToolArguments(normalized)) return error.LMFailure;
+        if (!finiteJson(normalized)) return error.LMFailure;
         if (normalized.object.count() == 0) return "{}";
         var out: Writer.Allocating = .init(arena);
         defer out.deinit();
@@ -1301,15 +1451,15 @@ pub const OpenAI = struct {
         return out.toOwnedSlice();
     }
 
-    // ToolCallPart's JSON-value invariant rejects nonfinite decoded numbers.
-    fn finiteToolArguments(value: @import("runtime_value.zig").Value) bool {
+    // Both ToolCallPart input and Response.provider_data require finite JSON.
+    fn finiteJson(value: @import("runtime_value.zig").Value) bool {
         switch (value) {
             .float => |number| return std.math.isFinite(number),
             .array => |items| for (items.items) |item| {
-                if (!finiteToolArguments(item)) return false;
+                if (!finiteJson(item)) return false;
             },
             .object => |object| for (object.values()) |item| {
-                if (!finiteToolArguments(item)) return false;
+                if (!finiteJson(item)) return false;
             },
             else => {},
         }

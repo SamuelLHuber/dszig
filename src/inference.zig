@@ -7,6 +7,93 @@ const Allocator = std.mem.Allocator;
 const Value = @import("runtime_value.zig").Value;
 
 pub const MetadataError = error{BadMetadata} || Allocator.Error;
+pub const SchemaError = error{ InvalidSchema, JsonTooDeep } || Allocator.Error;
+
+/// DSPy's request builder closes schemas generated from Pydantic classes.
+/// This is separate from adapter schema generation and is not applied to an
+/// explicit raw response-format dictionary supplied by a caller.
+pub fn closeObjectSchemas(arena: Allocator, schema: Value) SchemaError!Value {
+    return closeSchema(arena, schema, schema, 0);
+}
+
+fn closeSchema(arena: Allocator, schema: Value, root: Value, depth: usize) SchemaError!Value {
+    if (schema != .object) return schema;
+    if (depth >= @import("pyjson.zig").max_depth) return error.JsonTooDeep;
+    var closed: @import("runtime_value.zig").ObjectMap = .empty;
+    try closed.ensureTotalCapacity(arena, schema.object.count());
+    for (schema.object.keys(), schema.object.values()) |key, value| closed.putAssumeCapacity(key, value);
+    inline for (.{ "items", "additionalProperties", "not", "if", "then", "else", "contains", "propertyNames" }) |key| {
+        if (closed.getPtr(key)) |child| {
+            if (child.* == .object) child.* = try closeSchema(arena, child.*, root, depth + 1);
+        }
+    }
+    inline for (.{ "items", "prefixItems", "anyOf", "oneOf", "allOf" }) |key| {
+        if (closed.getPtr(key)) |child| {
+            if (child.* == .array) {
+                var array: @import("runtime_value.zig").Array = .init(arena);
+                try array.ensureTotalCapacity(child.array.items.len);
+                for (child.array.items) |item| array.appendAssumeCapacity(try closeSchema(arena, item, root, depth + 1));
+                child.* = .{ .array = array };
+            }
+        }
+    }
+    inline for (.{ "properties", "patternProperties", "$defs", "definitions" }) |key| {
+        if (closed.getPtr(key)) |child| {
+            if (child.* == .object) {
+                var fields: @import("runtime_value.zig").ObjectMap = .empty;
+                try fields.ensureTotalCapacity(arena, child.object.count());
+                for (child.object.keys(), child.object.values()) |name, value| {
+                    fields.putAssumeCapacity(name, try closeSchema(arena, value, root, depth + 1));
+                }
+                child.* = .{ .object = fields };
+            }
+        }
+    }
+    if (closed.get("type")) |kind| {
+        if (kind == .string and std.mem.eql(u8, kind.string, "object") and !closed.contains("additionalProperties")) {
+            try closed.put(arena, "additionalProperties", .{ .bool = false });
+        }
+    }
+    if (closed.get("properties")) |properties| {
+        if (properties == .object) {
+            var required: @import("runtime_value.zig").Array = .init(arena);
+            try required.ensureTotalCapacity(properties.object.count());
+            for (properties.object.keys()) |key| required.appendAssumeCapacity(.{ .string = key });
+            try closed.put(arena, "required", .{ .array = required });
+        }
+    }
+    if (closed.get("allOf")) |all| {
+        if (all == .array and all.array.items.len == 1) {
+            const only = all.array.items[0];
+            if (only != .object) return error.InvalidSchema;
+            _ = closed.orderedRemove("allOf");
+            for (only.object.keys(), only.object.values()) |key, value| try closed.put(arena, key, value);
+        }
+    }
+    if (closed.get("default")) |default| {
+        if (default == .null) _ = closed.orderedRemove("default");
+    }
+    if (closed.get("$ref")) |ref| {
+        if (ref == .string and closed.count() > 1) {
+            if (!std.mem.startsWith(u8, ref.string, "#/")) return error.InvalidSchema;
+            var resolved = root;
+            var segments = std.mem.splitScalar(u8, ref.string[2..], '/');
+            while (segments.next()) |part| {
+                if (resolved != .object) return error.InvalidSchema;
+                resolved = resolved.object.get(part) orelse return error.InvalidSchema;
+                if (resolved == .null) return error.InvalidSchema;
+            }
+            if (resolved == .object) {
+                var merged = try closeSchema(arena, resolved, root, depth + 1);
+                for (closed.keys(), closed.values()) |key, value| {
+                    if (!std.mem.eql(u8, key, "$ref")) try merged.object.put(arena, key, value);
+                }
+                return merged;
+            }
+        }
+    }
+    return .{ .object = closed };
+}
 
 pub const FunctionTool = struct {
     name: []const u8,
@@ -27,6 +114,85 @@ pub const ToolCall = struct {
     arguments: []const u8,
     continuation: []const Continuation = &.{},
 };
+
+/// Canonical source reference returned by a provider, independent of its wire
+/// annotation shape. A nonempty field is required at the decoding boundary.
+pub const CitationPart = struct {
+    text: ?[]const u8 = null,
+    title: ?[]const u8 = null,
+    url: ?[]const u8 = null,
+    continuation: []const Continuation = &.{},
+};
+
+pub fn cloneCitations(allocator: Allocator, input: []const CitationPart) Allocator.Error![]const CitationPart {
+    const out = try allocator.alloc(CitationPart, input.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |part| freeCitation(allocator, part);
+        allocator.free(out);
+    }
+    for (input, out) |part, *copy| {
+        const text = if (part.text) |s| try allocator.dupe(u8, s) else null;
+        errdefer if (text) |s| allocator.free(s);
+        const title = if (part.title) |s| try allocator.dupe(u8, s) else null;
+        errdefer if (title) |s| allocator.free(s);
+        const url = if (part.url) |s| try allocator.dupe(u8, s) else null;
+        errdefer if (url) |s| allocator.free(s);
+        const continuation = try cloneContinuations(allocator, part.continuation);
+        copy.* = .{ .text = text, .title = title, .url = url, .continuation = continuation };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn freeCitation(allocator: Allocator, part: CitationPart) void {
+    if (part.text) |s| allocator.free(s);
+    if (part.title) |s| allocator.free(s);
+    if (part.url) |s| allocator.free(s);
+    freeContinuations(allocator, part.continuation);
+}
+
+pub fn freeCitations(allocator: Allocator, input: []const CitationPart) void {
+    for (input) |part| freeCitation(allocator, part);
+    allocator.free(input);
+}
+
+pub fn citationsValue(arena: Allocator, input: []const CitationPart) Allocator.Error!Value {
+    var out: @import("runtime_value.zig").Array = .init(arena);
+    try out.ensureTotalCapacity(input.len);
+    for (input) |part| {
+        var row: @import("runtime_value.zig").ObjectMap = .empty;
+        try row.put(arena, "type", .{ .string = "citation" });
+        try row.put(arena, "text", if (part.text) |s| .{ .string = s } else .null);
+        try row.put(arena, "title", if (part.title) |s| .{ .string = s } else .null);
+        try row.put(arena, "url", if (part.url) |s| .{ .string = s } else .null);
+        try row.put(arena, "continuation", try continuationsValue(arena, part.continuation));
+        out.appendAssumeCapacity(.{ .object = row });
+    }
+    return .{ .array = out };
+}
+
+pub fn citationsFromValue(arena: Allocator, input: Value) MetadataError![]const CitationPart {
+    if (input != .array) return error.BadMetadata;
+    const out = try arena.alloc(CitationPart, input.array.items.len);
+    for (input.array.items, out) |row, *copy| {
+        if (row != .object) return error.BadMetadata;
+        var part: CitationPart = .{};
+        inline for (.{ "text", "title", "url" }) |name| {
+            if (row.object.get(name)) |value| {
+                if (value != .null) {
+                    const text = try string(value);
+                    if (text.len == 0) return error.BadMetadata;
+                    @field(part, name) = try arena.dupe(u8, text);
+                }
+            }
+        }
+        if (part.text == null and part.title == null and part.url == null) return error.BadMetadata;
+        if (row.object.get("continuation")) |state| part.continuation = try continuationsFromValue(arena, state);
+        copy.* = part;
+    }
+    return out;
+}
 
 pub const JsonSchema = struct {
     name: []const u8,

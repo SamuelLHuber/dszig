@@ -42,7 +42,7 @@ pub fn renderer(comptime T: type) ?Render {
 fn needsRendering(comptime T: type) bool {
     if (comptime code.isCode(T) or @import("enum.zig").isEnum(T) or @import("literal.zig").isLiteral(T) or T == @import("integer.zig").Integer) return false;
     if (T == signature.Reasoning or T == @import("file.zig").File or
-        T == @import("bounding_box.zig").BoundingBox or T == signature.StrDict or T == Value or
+        T == @import("bounding_box.zig").BoundingBox or comptime @import("citation.zig").isCitation(T) or T == signature.StrDict or T == Value or
         T == @import("runtime_value.zig").ObjectMap or T == []const u8 or T == []u8) return false;
     if (comptime types.isDict(T)) return needsRendering(T.dszig_dict_value);
     return switch (@typeInfo(T)) {

@@ -91,7 +91,7 @@ fn replacement(arena: Allocator, comptime T: type, v: Value, depth: u32, comptim
     if (T == signature.StrDict) return objectReplacement(arena, []const u8, v, depth, reasoning_as_text);
     if (T == @import("integer.zig").Integer or comptime @import("literal.zig").isLiteral(T)) return replacement(arena, Value, v, depth, reasoning_as_text);
     if (T == signature.Reasoning or T == @import("file.zig").File or
-        T == @import("bounding_box.zig").BoundingBox or comptime code.isCode(T))
+        T == @import("bounding_box.zig").BoundingBox or @import("citation.zig").isCitation(T) or comptime code.isCode(T))
         return replacement(arena, Value, v, depth, reasoning_as_text);
     if (T == Value) return switch (v) {
         .array => arrayReplacement(arena, Value, v, depth, reasoning_as_text),

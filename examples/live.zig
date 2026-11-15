@@ -139,6 +139,11 @@ fn smokeTranscript(
     var tool_calls: dszig.Array = .init(arena);
     for (call.tool_calls) |native_calls| try tool_calls.append(try dszig.inference.toolCallsValue(arena, native_calls));
     try row.put(arena, "tool_calls", .{ .array = tool_calls });
+    if (call.citations.len != 0) {
+        var citations: dszig.Array = .init(arena);
+        for (call.citations) |parts| try citations.append(try dszig.inference.citationsValue(arena, parts));
+        try row.put(arena, "citations", .{ .array = citations });
+    }
     var continuation: dszig.Array = .init(arena);
     for (call.continuation) |state| try continuation.append(try dszig.inference.continuationsValue(arena, state));
     try row.put(arena, "continuation", .{ .array = continuation });

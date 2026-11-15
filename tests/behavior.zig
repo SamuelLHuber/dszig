@@ -345,14 +345,17 @@ test "Chat Completions retain native reasoning without inventing absent summarie
         \\  {"message":{"content":"first","reasoning_content":"Actual summary."}},
         \\  {"message":{"content":"second"}},
         \\  {"message":{"content":"third","reasoning_content":null}},
-        \\  {"message":{"content":"fourth","reasoning_content":""}}
+        \\  {"message":{"content":"fourth","reasoning_content":""}},
+        \\  {"message":{"content":"fifth","reasoning_content":42}},
+        \\  {"message":{"content":"sixth","reasoning_content":[]}},
+        \\  {"message":{"content":"seventh","reasoning_content":["bad"]}}
         \\]}
     ;
     const body = try arena.dupe(u8, json);
     const completions = try dszig.lm.OpenAI.parseCompletions(arena, body);
     // Provider response buffers are released after parsing.
     @memset(body, 'x');
-    try testing.expectEqual(@as(usize, 4), completions.len);
+    try testing.expectEqual(@as(usize, 7), completions.len);
     try testing.expectEqualStrings("first", completions[0].text.?);
     try testing.expectEqualStrings("Actual summary.", completions[0].reasoning.?);
     try testing.expectEqualStrings("second", completions[1].text.?);
@@ -360,15 +363,12 @@ test "Chat Completions retain native reasoning without inventing absent summarie
     try testing.expectEqualStrings("third", completions[2].text.?);
     try testing.expect(completions[2].reasoning == null);
     try testing.expectEqualStrings("fourth", completions[3].text.?);
-    try testing.expectEqualStrings("", completions[3].reasoning.?);
+    try testing.expect(completions[3].reasoning == null);
+    try testing.expectEqualStrings("42", completions[4].reasoning.?);
+    try testing.expect(completions[5].reasoning == null);
+    try testing.expectEqualStrings("['bad']", completions[6].reasoning.?);
 
-    for ([_][]const u8{
-        "{\"choices\":[]}",
-        "{\"choices\":[{\"message\":{\"content\":\"answer\",\"reasoning_content\":42}}]}",
-        "{\"choices\":[{\"message\":{\"content\":\"answer\",\"reasoning_content\":[]}}]}",
-    }) |invalid| {
-        try testing.expectError(error.LMFailure, dszig.lm.OpenAI.parseCompletions(arena, invalid));
-    }
+    try testing.expectError(error.LMFailure, dszig.lm.OpenAI.parseCompletions(arena, "{\"choices\":[]}"));
 }
 
 test "Responses parse assistant output after reasoning and preserve real summary parts" {
@@ -410,6 +410,84 @@ test "Responses parse assistant output after reasoning and preserve real summary
         \\]}
     );
     try testing.expect(empty_summary.reasoning == null);
+}
+
+test "Responses citation spans count Python characters and affect canonical call identifiers" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    const arena = out.allocator();
+    const completion = try dszig.lm.OpenAI.parseResponsesResponse(arena,
+        \\{"output":[
+        \\ {"type":"message","content":[{"type":"output_text","text":"A😀B","annotations":[
+        \\   {"start_index":"١","end_index":2.9,"url":"https://example.org","title":"Unicode"},
+        \\   {"quote":"fact","url":false,"uri":false,"title":"","file_id":0},
+        \\   {"start_index":true,"end_index":2}
+        \\ ]}]},
+        \\ {"type":"function_call","name":"probe","arguments":"{}"}
+        \\]}
+    );
+    try testing.expectEqual(@as(usize, 2), completion.citations.len);
+    try testing.expectEqualStrings("😀", completion.citations[0].text.?);
+    try testing.expectEqualStrings("https://example.org", completion.citations[0].url.?);
+    try testing.expectEqualStrings("Unicode", completion.citations[0].title.?);
+    try testing.expectEqualStrings("fact", completion.citations[1].text.?);
+    try testing.expectEqualStrings("False", completion.citations[1].url.?);
+    try testing.expectEqualStrings("0", completion.citations[1].title.?);
+    try testing.expectEqualStrings("call_3", completion.tool_calls[0].id);
+    try testing.expectError(error.LMFailure, dszig.lm.OpenAI.parseResponsesResponse(arena,
+        \\{"output":[{"type":"message","content":[{"type":"text","text":"x","annotations":[{"start_index":Infinity}]}]}]}
+    ));
+    try testing.expectError(error.LMFailure, dszig.lm.OpenAI.parseResponsesResponse(arena,
+        \\{"output":[{"type":"message","content":[{"type":"text","text":"x","annotations":[{"quote":"quoted","start_index":Infinity}]}]}]}
+    ));
+    const quoted = try dszig.lm.OpenAI.parseResponsesResponse(arena,
+        \\{"output":[{"type":"message","content":[{"type":"text","text":"x","annotations":[{"quote":"\ud800"}]}]}]}
+    );
+    try testing.expectEqualStrings("\xed\xa0\x80", quoted.citations[0].text.?);
+}
+
+test "Chat text blocks preserve canonical indices and reasoning-only responses have no text" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    const arena = out.allocator();
+    const blocks = try dszig.lm.OpenAI.parseCompletions(arena,
+        \\{"choices":[{"message":{"content":[{"type":"text","text":""},{"type":"text","text":"b"}],
+        \\ "tool_calls":[{"type":"function","function":{"name":"probe","arguments":"{}"}}]}}]}
+    );
+    try testing.expectEqualStrings("b", blocks[0].text.?);
+    try testing.expectEqualStrings("call_2", blocks[0].tool_calls[0].id);
+    const reasoning = try dszig.lm.OpenAI.parseCompletions(arena,
+        \\{"choices":[{"message":{"content":null,"reasoning_content":"","reasoning":"fallback reasoning",
+        \\ "tool_calls":[{"type":"function","function":{"name":"probe","arguments":"{}"}}]}}]}
+    );
+    try testing.expect(reasoning[0].text == null);
+    try testing.expectEqualStrings("fallback reasoning", reasoning[0].reasoning.?);
+    try testing.expectEqualStrings("call_1", reasoning[0].tool_calls[0].id);
+}
+
+test "citation completion clones unwind every failed allocation" {
+    const Clone = struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            const completion = try dszig.lm.cloneCompletion(allocator, .{
+                .text = "answer",
+                .citations = &.{
+                    .{
+                        .text = "quoted",
+                        .title = "source",
+                        .url = "https://example.org",
+                        .continuation = &.{.{ .provider = "fixture", .kind = "citation", .data = .{ .string = "state" } }},
+                    },
+                    .{ .url = "https://example.net" },
+                },
+            });
+            defer dszig.lm.freeCompletion(allocator, completion);
+            try testing.expectEqualStrings("quoted", completion.citations[0].text.?);
+            try testing.expectEqualStrings("state", completion.citations[0].continuation[0].data.string);
+            try testing.expectEqualStrings("https://example.net", completion.citations[1].url.?);
+        }
+    };
+    var stable_backing = testing.FailingAllocator.init(testing.allocator, .{ .resize_fail_index = 0 });
+    try testing.checkAllAllocationFailures(stable_backing.allocator(), Clone.run, .{});
 }
 
 test "Responses distinguish absent text from empty output and retain fallback call identifiers" {

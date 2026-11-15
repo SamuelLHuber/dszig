@@ -107,8 +107,8 @@ retain the actual continuation and raw provider response independently.
 
 | DSPy surface | Native Zig surface and coverage |
 |---|---|
-| Class-style signatures and typed fields | `Signature`, `Dict`, `Code`, `CodeWithLanguage`, `BoundingBox`, `File`, scalar/string/list/optional/model fields, string literal enums and mixed scalar/Enum/bytes `Literal`, field descriptions/defaults, compile-time rejection of invalid signatures |
-| Runtime values and documents | `Value`, `Array`, `ObjectMap`, boxed native Code/File/Reasoning/BoundingBox identity, recursive typed-class serialization, text/canonical-document content union and bounded Responses `input_file` translation |
+| Class-style signatures and typed fields | `Signature`, `Dict`, `Code`, `CodeWithLanguage`, `BoundingBox`, `File`, `Citations` and `Citations.Citation`, scalar/string/list/optional/model fields, string literal enums and mixed scalar/Enum/bytes `Literal`, field descriptions/defaults, compile-time rejection of invalid signatures |
+| Runtime values and documents | `Value`, `Array`, `ObjectMap`, boxed native Code/File/Reasoning/BoundingBox/Citations identity, recursive typed-class serialization, text/canonical-document content union and bounded Responses `input_file` translation |
 | Chat, JSON, XML and two-stage adapters | `Adapter.chat`, `.json`, `.xml`, `.two_step`; `TwoStepAdapter` with a separate extraction LM; independent prompt/parse fixtures, strict response-schema construction, JSON fallback, typed XML and Unicode key handling |
 | Prediction and reasoning | `Predict`, `ChainOfThought`, `BestOfN`, `Refine`, `MultiChainComparison`, explicit `Context`, typed outputs, serialized `Trace`, named predictor/parameter discovery |
 | Retrieval and embeddings | `Retrieve`, lexical `InMemoryRetriever`, HTTP `ColBERTv2` with shared mutable-graph memory caching, custom/OpenAI/Azure `Embedder`, float32 `KNN`, per-query `KNNFewShot`, and brute-force `Embeddings`/`EmbeddingsWithScores` with NumPy persistence |
@@ -228,8 +228,8 @@ on six near-recursion-limit cases. Python's cutoff depends on its caller frame
 depth; the native AST-depth ceiling is deterministic. This is a real parity
 limit, not a passing check. Generic Python execution is still unsupported.
 
-After these cutovers, including scalar, Enum and bytes Literal integration, the pinned
-Debug and ReleaseSafe gates each passed all 334 tests and 28 build steps,
+After these cutovers, including Literal and native citation integration, the
+pinned Debug and ReleaseSafe gates each passed all 344 tests and 28 build steps,
 including actual RAG/bootstrap executions. Native
 687-request replay and the pinned Python fixture/artifact/replay gate also
 passed. These gates do not erase the literal-recursion and NaN-identity
@@ -253,10 +253,11 @@ are joined by `.custom`, which retains a boxed native class instead of erasing
 it into a lookalike dictionary. `std.json` parsing and Stringify work directly
 with `dszig.Value`; parsing JSON creates ordinary values, never class identity.
 A custom value exposes its type through `custom.get(dszig.File)`,
-`custom.get(dszig.Reasoning)` or `custom.get(dszig.BoundingBox)` and retains
-class-specific validation, formatting, equality, truthiness and cloning.
+`custom.get(dszig.Reasoning)`, `custom.get(dszig.BoundingBox)` or
+`custom.get(dszig.Citations)` and retains class-specific validation, formatting,
+equality, truthiness and cloning.
 
-Typed conversion boxes these three model families; parsing ordinary JSON does
+Typed conversion boxes the supported native model families; parsing ordinary JSON does
 not. A raw lookalike dictionary remains a dictionary until explicit typed
 validation. Native class validation preserves an existing box, subject to the
 model's actual validators. Owning clones retain their class and copy borrowed
@@ -658,6 +659,57 @@ Pinned Debug/ReleaseSafe each passed **334/334 tests and 28/28 build steps**,
 actual RAG/bootstrap, native **687-request replay** and the Python
 fixture/artifact/reference gate, including regeneration of the DPR tables.
 
+### Citations and provider references
+
+`Citations.Citation` and `Citations` are genuine native model types, not aliases
+for dictionaries. They retain typed validation, raw/model serialization,
+Python-style display, equality, truthiness, iteration and owning clones.
+`Citations` supports negative indexing and slicing; slices borrow their Citation
+elements. `fromDictList` is a separate iterable constructor, not the annotation
+validator. An owning clone copies nested fields and survives the original arena;
+borrowed iterator values do not recreate Python garbage-collector lifetimes.
+
+LM completions carry canonical `inference.CitationPart` references independently
+of their text, tools and reasoning. Recording, replay and caching retain them.
+Responses annotation extraction follows the actual SDK's text/title/URL
+fallbacks and Unicode-code-point spans, including Python integer conversion.
+The pinned Chat Completions reader ignores message annotations; it does not
+share Responses extraction. Chat text blocks and reasoning/refusal parts retain
+their actual nullable-text behavior and canonical tool-ID indices.
+
+After normal adapter parsing, nonempty canonical references replace an exact
+direct `Citations` output. They do not repair invalid text, bypass parsing or
+override optional/container annotations. Citation fields remain in prompts.
+Generated JSON response schemas undergo the separate DSPy request-builder
+closure step; caller-supplied raw response-format dictionaries remain untouched.
+
+Independent installed-source oracles and native executables matched:
+
+- **10,484 observations across 1,572 citation model/protocol/schema/adapter/Predict
+  rows**, including exact prompts and complete generated request bodies;
+- **143 provider cases**, comparing acceptance, nullable text, reasoning,
+  citation fields and decoded tool calls;
+- **175 generated-request schema cases**, including nonmutation, nullable
+  defaults, nested unions and source-specific reference resolution.
+
+The model consumer deliberately exits nonzero for **150 unsupported input rows**
+requiring genuine Decimal, bytearray or dynamic subclass/lookalike-model types.
+Provider stream readers/events, LiteLLM-specific SDK views, listener scheduling
+and streamify cases are also unconsumed by this model proof. Those rows are
+retained, not converted to fake dictionaries or counted as matches. Python
+exception classes/messages, arbitrary mutable aliases and all Python class
+operations are not identical.
+
+Actual `zig build live -- --smoke` runs through localhost Responses and Chat
+HTTP returned answer `4`. The recording retained canonical Responses references
+and omitted Chat annotations exactly as the pinned reader does. This is real
+HTTP/codec/CLI evidence, **not authenticated homelab inference**.
+
+All three differential consumers produced the same comparison results in Debug
+and ReleaseSafe, including the explicit unsupported-row failure. The pinned
+344-test/28-step Debug and ReleaseSafe gates, actual RAG/bootstrap, 687-request
+replay and independent Python fixture/artifact/reference gate also passed.
+
 ## Cross-runtime verification
 
 ```sh
@@ -858,13 +910,15 @@ The following prevent a claim that DSZig can do everything DSPy can:
   class identity; Refine shares this boundary. Mid-bootstrap mutation of a
   borrowed teacher-settings object is not reflected after Bootstrap's entry
   snapshot.
-- **Runtime model identity:** File, Reasoning and BoundingBox are genuine boxed
-  classes, not a complete Python object runtime. Other model families still
-  use their existing representations. Generic arrays/maps do not preserve
-  shared container/class aliases through memoized deepcopy. Python tuple
-  identity/dispatch, NaN float-object identity across distinct or cloned boxes,
-  Reasoning indexing/iteration/string-method delegation, arbitrary attribute
-  mutation and Python frozen-assignment exceptions are not reproduced.
+- **Runtime model identity:** Code, File, Reasoning, BoundingBox and Citations
+  have genuine boxed classes, not a complete Python object runtime. Other model
+  families still use their existing representations. Generic arrays/maps do not
+  preserve shared container/class aliases through memoized deepcopy. Complete
+  Python builtin identity/dispatch, NaN float-object identity across distinct or
+  cloned boxes, Reasoning indexing/string-method delegation, arbitrary attribute
+  mutation and Python frozen-assignment exceptions are not reproduced. The
+  citation proof retains 150 unsupported Decimal/bytearray/dynamic-model rows;
+  its finite passing observations do not establish complete Citations parity.
 - **Providers and media:** native File construction, adapter/typed prediction
   handling, File tool-result markers and bounded Responses document translation
   are implemented as described above. There is still no complete lm15 provider

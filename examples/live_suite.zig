@@ -394,6 +394,14 @@ pub fn parseCalls(arena: Allocator, transcript: Value) ![]const Call {
             if (list.len != 0 and list.len != (if (completions.len > 0) completions.len else 1)) return error.BadTranscript;
             tool_calls = list;
         }
+        var citations: []const []const dszig.inference.CitationPart = &.{};
+        if (item.object.get("citations")) |all| {
+            if (all != .array) return error.BadTranscript;
+            const list = try arena.alloc([]const dszig.inference.CitationPart, all.array.items.len);
+            for (all.array.items, list) |parts, *dst| dst.* = try dszig.inference.citationsFromValue(arena, parts);
+            if (list.len != 0 and list.len != (if (completions.len > 0) completions.len else 1)) return error.BadTranscript;
+            citations = list;
+        }
         var continuation: []const []const dszig.inference.Continuation = &.{};
         if (item.object.get("continuation")) |all| {
             if (all != .array) return error.BadTranscript;
@@ -434,6 +442,7 @@ pub fn parseCalls(arena: Allocator, transcript: Value) ![]const Call {
             .options = options,
             .tools = tools,
             .tool_calls = tool_calls,
+            .citations = citations,
             .continuation = continuation,
             .provider_data = provider_data,
         };
@@ -465,6 +474,11 @@ pub fn writeTranscript(arena: Allocator, runtime: []const u8, model: []const u8,
         var native_calls: dszig.Array = .init(arena);
         for (call.tool_calls) |calls_value| try native_calls.append(try dszig.inference.toolCallsValue(arena, calls_value));
         try obj.put(arena, "tool_calls", .{ .array = native_calls });
+        if (call.citations.len != 0) {
+            var citations: dszig.Array = .init(arena);
+            for (call.citations) |parts| try citations.append(try dszig.inference.citationsValue(arena, parts));
+            try obj.put(arena, "citations", .{ .array = citations });
+        }
         var continuation: dszig.Array = .init(arena);
         for (call.continuation) |state| try continuation.append(try dszig.inference.continuationsValue(arena, state));
         try obj.put(arena, "continuation", .{ .array = continuation });

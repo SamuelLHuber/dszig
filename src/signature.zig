@@ -21,6 +21,7 @@ const History = @import("history.zig").History;
 const ToolCalls = @import("tool.zig").ToolCalls;
 const BoundingBox = @import("bounding_box.zig").BoundingBox;
 const File = @import("file.zig").File;
+const citation = @import("citation.zig");
 const code = @import("code.zig");
 const python_str = @import("python_str.zig");
 const assert = std.debug.assert;
@@ -97,6 +98,9 @@ pub const Field = struct {
     reasoning_type: bool = false,
     /// Direct Reasoning annotations can use the LM's native reasoning feature.
     native_reasoning: bool = false,
+    /// Only direct Citations annotations consume canonical provider citations.
+    /// Adaptation remains a no-op: the field is still requested as text.
+    native_citations: bool = false,
     /// Default CoT uses this wire name only when native reasoning is unavailable.
     reasoning_fallback: ?[]const u8 = null,
     /// Custom DSPy content types keep their JSON conventions inside XML leaves.
@@ -208,9 +212,9 @@ pub fn isSignature(comptime T: type) bool {
 /// list item. Recursive custom-type discovery is a separate description rule.
 fn customXmlLiteral(comptime T: type) bool {
     const annotation = if (@typeInfo(T) == .optional) @typeInfo(T).optional.child else T;
-    if (code.isCode(annotation) or annotation == BoundingBox or annotation == File) return true;
+    if (code.isCode(annotation) or annotation == BoundingBox or annotation == File or citation.isCitation(annotation)) return true;
     return switch (@typeInfo(annotation)) {
-        .pointer => |p| p.size == .slice and (code.isCode(p.child) or p.child == BoundingBox or p.child == File),
+        .pointer => |p| p.size == .slice and (code.isCode(p.child) or p.child == BoundingBox or p.child == File or citation.isCitation(p.child)),
         else => false,
     };
 }
@@ -237,12 +241,13 @@ fn fieldsOf(comptime T: type, comptime role: []const u8, comptime descriptions: 
                 .reasoning_type = FT == Reasoning or FT == ?Reasoning,
                 // DSPy adapts direct Reasoning annotations, not Optional unions.
                 .native_reasoning = FT == Reasoning,
+                .native_citations = FT == citation.Citations,
                 .xml_literal = FT == History or FT == ToolCalls or FT == ?Reasoning or customXmlLiteral(FT),
                 .native_tool_calls = FT == ToolCalls,
-                .type_description = if (code.annotationType(FT)) |C| C.description else if (FT == ToolCalls) ToolCalls.description else "",
-                .type_description_name = if (code.annotationType(FT)) |C| C.model_name else "",
+                .type_description = if (code.annotationType(FT)) |C| C.description else if (citation.annotationType(FT)) |C| C.description else if (FT == ToolCalls) ToolCalls.description else "",
+                .type_description_name = if (code.annotationType(FT)) |C| C.model_name else if (citation.annotationType(FT)) |C| C.model_name else "",
                 .code_type = code.isCode(FT),
-                .dspy_type = code.isCode(FT) or FT == Reasoning or FT == BoundingBox or FT == File or FT == History or FT == ToolCalls,
+                .dspy_type = code.isCode(FT) or citation.isCitation(FT) or FT == Reasoning or FT == BoundingBox or FT == File or FT == History or FT == ToolCalls,
                 .parse_value = if (@import("enum.zig").isEnum(FT) or @import("literal.zig").isLiteral(FT)) FT.parseValue else null,
                 .schema_definition_name = if (code.isCode(FT)) FT.schema_name else "",
                 .nullable = @typeInfo(FT) == .optional,

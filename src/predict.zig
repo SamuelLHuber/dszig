@@ -321,13 +321,23 @@ fn runAdapterMany(ctx: Context, adapter: Adapter, original: adapter_mod.View, de
         }
         processed_demos = mapped;
     }
-    if (adapter == .json and ctx.lm.supports_response_format)
+    if (adapter == .json and ctx.lm.supports_response_format) {
         options.response_format = try adapter_mod.responseFormat(ctx.arena, processed, ctx.lm.supports_response_schema);
+        if (options.response_format.? == .json_schema) {
+            options.response_format.?.json_schema.schema = @import("inference.zig").closeObjectSchemas(ctx.arena, options.response_format.?.json_schema.schema) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.JsonTooDeep => error.JsonTooDeep,
+                error.InvalidSchema => error.AdapterParse,
+            };
+        }
+    }
     // Explicit-null intent has now been resolved into the effective signature.
     options.reasoning_effort_present = false;
     const messages = try adapter.format(ctx.arena, processed, processed_demos, inputs);
     const completions = try ctx.lm.completeResponses(ctx.arena, .{ .messages = messages, .options = options, .tools = request_tools });
     const outputs = try ctx.arena.alloc(Record, completions.len);
+    var has_citation_field = false;
+    for (original.outputs) |field| has_citation_field = has_citation_field or field.native_citations;
     for (completions, outputs) |c, *o| {
         const has_tool_calls = use_native_tools and c.tool_calls.len > 0;
         if (adapter == .two_step and !has_tool_calls and (c.text == null or c.text.?.len == 0)) return error.AdapterParse;
@@ -339,14 +349,16 @@ fn runAdapterMany(ctx: Context, adapter: Adapter, original: adapter_mod.View, de
                 else => Record.empty,
             };
         } else try parseCompletion(ctx, adapter, processed, c.text orelse return error.AdapterParse);
-        if (!needs_preprocess and !use_native_tools and adapter != .two_step) {
+        if (!needs_preprocess and !use_native_tools and !has_citation_field and adapter != .two_step) {
             o.* = parsed;
             continue;
         }
         o.* = .empty;
         try o.ensureTotalCapacity(ctx.arena, original.outputs.len);
         for (original.outputs) |f| {
-            const v = if (f.native_tool_calls and has_tool_calls)
+            const v = if (f.native_citations and c.citations.len != 0)
+                try (try @import("citation.zig").Citations.fromParts(ctx.arena, c.citations)).toRuntime(ctx.arena)
+            else if (f.native_tool_calls and has_tool_calls)
                 tool_mod.callsFromNative(ctx.arena, c.tool_calls) catch |err| return switch (err) {
                     error.OutOfMemory => error.OutOfMemory,
                     else => error.AdapterParse,

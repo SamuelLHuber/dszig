@@ -10,7 +10,7 @@ import tempfile
 
 import dspy
 from dspy._vendor.lm15.serde import request_to_dict, response_from_dict, response_to_dict
-from dspy.lm15 import ContinuationState, Message, TextPart, ThinkingPart, ToolCallPart, ToolResultPart
+from dspy.lm15 import CitationPart, ContinuationState, Message, TextPart, ThinkingPart, ToolCallPart, ToolResultPart
 
 import reference as ref
 
@@ -292,12 +292,18 @@ def transcript_call(request, response, rollout):
     """Keep canonical native protocol data as well as the shared Zig projection."""
     reasoning = "".join(part.text for part in response.message.parts_of(ThinkingPart)) or None
     calls = normalized_tool_calls(response.message.parts_of(ToolCallPart))
+    citations = [
+        {"type": "citation", "text": part.text, "title": part.title, "url": part.url,
+         "continuation": normalized_continuation(part.continuation)}
+        for part in response.message.parts_of(CitationPart)
+    ]
     continuation = message_continuation(response.message)
     return {
         **request_metadata(request, rollout),
         "completion": response.text or "",
         **({"reasonings": [reasoning]} if reasoning is not None else {}),
         "tool_calls": [calls] if calls else [],
+        **({"citations": [citations]} if citations else {}),
         "continuation": [continuation] if continuation else [],
         "provider_data": [response.provider_data] if response.provider_data is not None else [],
         "request": request_to_dict(request),
@@ -373,11 +379,12 @@ class ReplayLM(ref.ReferenceLM):
             if "response" in call:
                 return response_from_dict(call["response"])
             native_calls = call.get("tool_calls", [])
+            citations = call.get("citations", [])
             continuations = call.get("continuation", [])
             reasoning = (call.get("reasonings") or [None])[0]
             provider_data = call.get("provider_data", [])
             raw = provider_data[0] if provider_data else None
-            if native_calls or continuations or reasoning is not None or raw is not None:
+            if native_calls or citations or continuations or reasoning is not None or raw is not None:
                 from dataclasses import replace
                 parts = []
                 states = restore_continuation(continuations[0]) if continuations else ()
@@ -389,6 +396,10 @@ class ReplayLM(ref.ReferenceLM):
                     parts.extend(ToolCallPart(id=c["id"], name=c["name"], input=json.loads(c["arguments"]),
                                               continuation=restore_continuation(c.get("continuation", [])))
                                  for c in native_calls[0])
+                if citations:
+                    parts.extend(CitationPart(text=c.get("text"), title=c.get("title"), url=c.get("url"),
+                                              continuation=restore_continuation(c.get("continuation", [])))
+                                 for c in citations[0])
                 if not parts:
                     parts.append(TextPart(text))
                 return replace(ref.text_response(self.model, text), message=Message.assistant(parts), provider_data=raw)

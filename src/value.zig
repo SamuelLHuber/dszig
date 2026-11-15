@@ -15,6 +15,7 @@ const pyjson = @import("pyjson.zig");
 const signature = @import("signature.zig");
 const types = @import("types.zig");
 const code = @import("code.zig");
+const citation = @import("citation.zig");
 const Field = signature.Field;
 
 pub const Record = ObjectMap;
@@ -311,7 +312,7 @@ pub fn toRecord(arena: Allocator, comptime T: type, value: T) Allocator.Error!Re
 
 pub fn toValue(arena: Allocator, comptime T: type, v: T) Allocator.Error!Value {
     if (comptime code.isCode(T) or @import("enum.zig").isEnum(T) or @import("literal.zig").isLiteral(T) or T == @import("integer.zig").Integer) return v.toRuntime(arena);
-    if (T == @import("file.zig").File or T == @import("bounding_box.zig").BoundingBox or T == signature.Reasoning)
+    if (comptime citation.isCitation(T) or T == @import("file.zig").File or T == @import("bounding_box.zig").BoundingBox or T == signature.Reasoning)
         return v.toRuntime(arena);
     if (T == @import("tool.zig").ToolCalls) return v.toValue(arena);
     if (T == Value) return v;
@@ -362,6 +363,10 @@ pub fn fromRecord(arena: Allocator, comptime T: type, record: *const Record) Con
 }
 
 pub fn fromValue(arena: Allocator, comptime T: type, v: Value) ConvertError!T {
+    if (comptime citation.isCitation(T)) return T.fromValue(arena, v) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.TypeMismatch,
+    };
     if (comptime code.isCode(T)) return T.fromValue(v) catch error.TypeMismatch;
     if (T == @import("bounding_box.zig").BoundingBox) return T.fromValue(v) catch error.TypeMismatch;
     if (T == @import("file.zig").File) return T.fromValue(arena, v) catch |err| switch (err) {

@@ -11,6 +11,7 @@ const Value = @import("runtime_value.zig").Value;
 const code = @import("code.zig");
 const BoundingBox = @import("bounding_box.zig").BoundingBox;
 const File = @import("file.zig").File;
+const citation = @import("citation.zig");
 const Integer = @import("integer.zig").Integer;
 
 pub const Error = error{ ParseValue, OutOfMemory };
@@ -297,20 +298,25 @@ fn modelEntries(comptime S: type, comptime ordered_properties: bool) []const Ent
     comptime {
         if (@import("enum.zig").isEnum(S)) return enumEntries(S);
         const info = @typeInfo(S).@"struct";
-        var props: [if (code.isCode(S)) 1 else info.field_names.len]Entry = undefined;
+        var props: [if (code.isCode(S) or S == citation.Citations) 1 else if (S == citation.Citations.Citation) 8 else info.field_names.len]Entry = undefined;
         var n_props = 0;
         var required: []const u8 = "[";
         var n_required = 0;
         for (info.field_names, info.field_types, 0..) |name, FT, i| {
             if (code.isCode(S) and !std.mem.eql(u8, name, "code")) continue;
+            if (citation.isCitation(S) and std.mem.eql(u8, name, "runtime_origin")) continue;
             var e: []const Entry = entriesOf(FT) ++ &[_]Entry{.{ .key = "title", .val = quote(title(name)) }};
             if (isModel(FT) or (@typeInfo(FT) == .optional and isModel(@typeInfo(FT).optional.child))) e = entriesOf(FT);
             if (S == BoundingBox) e = e ++ &[_]Entry{.{ .key = "description", .val = quote(BoundingBox.edge_descriptions[i]) }};
             if (hasDefault(S, i)) {
-                if (@typeInfo(FT) != .optional or @as(*const FT, @ptrCast(@alignCast(info.field_attrs[i].default_value_ptr.?))).* != null) {
-                    @compileError("dszig: model field `" ++ name ++ "` may only default to null");
+                if (S == citation.Citations.Citation and std.mem.eql(u8, name, "type")) {
+                    e = e ++ &[_]Entry{.{ .key = "default", .val = quote("char_location") }};
+                } else {
+                    if (@typeInfo(FT) != .optional or @as(*const FT, @ptrCast(@alignCast(info.field_attrs[i].default_value_ptr.?))).* != null) {
+                        @compileError("dszig: model field `" ++ name ++ "` may only default to null");
+                    }
+                    e = e ++ &[_]Entry{.{ .key = "default", .val = "null" }};
                 }
-                e = e ++ &[_]Entry{.{ .key = "default", .val = "null" }};
             } else {
                 required = required ++ (if (n_required > 0) ", " else "") ++ quote(name);
                 n_required += 1;
@@ -350,7 +356,10 @@ fn collectDefs(comptime T: type, comptime seen: []const type) []const type {
                 for (out) |t| if (t == T) return out;
                 out = out ++ &[_]type{T};
                 if (code.isCode(T) or @import("enum.zig").isEnum(T)) return out;
-                for (s.field_types) |FT| out = collectDefs(FT, out);
+                for (s.field_names, s.field_types) |name, FT| {
+                    if (citation.isCitation(T) and std.mem.eql(u8, name, "runtime_origin")) continue;
+                    out = collectDefs(FT, out);
+                }
             },
             else => {},
         }
@@ -398,6 +407,7 @@ fn validateMode(comptime T: type, arena: Allocator, input: Value, comptime xml_l
     if (T == Value) return input;
     if (comptime code.isCode(T) or @import("enum.zig").isEnum(T) or @import("literal.zig").isLiteral(T)) return T.validate(arena, v);
     if (T == Integer) return @import("value.zig").coerceInteger(arena, v);
+    if (comptime citation.isCitation(T)) return T.validate(arena, v);
     if (T == File) {
         const file = File.fromValue(arena, v) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
@@ -425,8 +435,7 @@ fn validateMode(comptime T: type, arena: Allocator, input: Value, comptime xml_l
             return .{ .string = out.written() };
         }
     }
-    if (v == .custom and (T == []const u8 or T == bool or @typeInfo(T) == .float))
-    {
+    if (v == .custom and (T == []const u8 or T == bool or @typeInfo(T) == .float)) {
         const inspect = v.custom.vtable.python orelse return error.ParseValue;
         v = switch (inspect(v.custom.ptr)) {
             .bytes => |data| blk: {

@@ -40,6 +40,7 @@ pub const CodeWithLanguage = @import("code.zig").CodeWithLanguage;
 pub const CodeWithLanguageIdentity = @import("code.zig").CodeWithLanguageIdentity;
 pub const BoundingBox = @import("bounding_box.zig").BoundingBox;
 pub const File = @import("file.zig").File;
+pub const Citations = @import("citation.zig").Citations;
 pub const History = @import("history.zig").History;
 pub const Retrieve = predict.Retrieve;
 pub const colbertv2 = @import("colbertv2.zig");
