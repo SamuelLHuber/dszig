@@ -41,6 +41,7 @@ diff "$root/examples/dates_class_source.txt" "$tmp/program_code/dates_class_sour
 echo "ok: DSPy 3.5.0 regenerates examples/dates_program_code.txt and dates_class_source.txt unchanged"
 
 (cd "$root" && zig build bootstrap -- "$tmp/dszig_rag.json" >/dev/null)
+uv run --locked upstream_report.py
 uv run --locked check_artifact.py "$tmp/dszig_rag.json"
 
 uv run --locked check_live.py "$root/tests/fixtures/dspy_3_5_0_mock_suite.json"

@@ -59,6 +59,19 @@ in
     dz-test.exec = ''zig build test --summary all "$@"'';
     dz-examples.exec = ''zig build examples --summary all "$@"'';
     dz-dspy.exec = ''tools/dspy_reference/check.sh'';
+    # Framework-overhead benchmark: both runtimes replay the same full-suite transcript.
+    dz-bench.exec = ''
+      set -euo pipefail
+      transcript="''${1:-tests/fixtures/dspy_3_5_0_mock_suite.json}"
+      out="''${DSZIG_BENCH_OUT:-zig-out/bench}"
+      mkdir -p "$out"
+      zig build -Doptimize=ReleaseFast --prefix zig-out/fast
+      zig-out/fast/bin/bench "$transcript" "''${DSZIG_BENCH_REPS:-20}" > "$out/dszig.json"
+      (cd tools/dspy_reference && uv run --locked bench.py "../../$transcript" "''${DSPY_BENCH_REPS:-5}" 2>/dev/null) > "$out/dspy.json"
+      python3 tools/dspy_reference/bench_report.py "$out/dszig.json" "$out/dspy.json"
+    '';
+    # Fails when DSPy exports a name or changes a source file that features.json has not reviewed.
+    dz-upstream.exec = ''(cd tools/dspy_reference && uv run --locked upstream_report.py)'';
     # Re-record real-model transcripts (needs OPENAI_API_KEY; not run by CI).
     dz-live.exec = ''
       set -euo pipefail
@@ -87,7 +100,7 @@ in
     ''
     + ''
       echo "dszig: zig $(zig version), $(python3 --version), uv $(uv --version | cut -d' ' -f2)"
-      echo "  dz-test, dz-examples, dz-dspy (cross-check with DSPy 3.5.0), dz-check (what CI runs), dz-live (record current-model transcripts)"
+      echo "  dz-test, dz-examples, dz-dspy (cross-check with DSPy 3.5.0), dz-check (what CI runs), dz-bench, dz-upstream, dz-live (record current-model transcripts)"
     '';
 
   enterTest = ''

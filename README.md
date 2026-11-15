@@ -854,6 +854,180 @@ and ReleaseSafe, including the explicit unsupported-row failure. The pinned
 344-test/28-step Debug and ReleaseSafe gates, actual RAG/bootstrap, 687-request
 replay and independent Python fixture/artifact/reference gate also passed.
 
+## Benchmarks against DSPy
+
+`dz-bench` (in `devenv shell`) builds ReleaseFast and has both runtimes replay
+the same full-suite transcript: eight adapter cases and nine optimizer
+pipelines, 687 LM calls. Replay removes network and model time, so these are
+framework-overhead numbers: prompt formatting, parsing, optimizer logic,
+evaluation, serialization and the replay lookup. Each run is verified first
+(every request matched, every call consumed, identical outputs, scores and
+artifacts), so accuracy is equal by construction on this transcript.
+Segments end where DSPy starts the next pipeline's first LM call.
+DSPy's own progress printing and logging stay enabled (stdout to /dev/null,
+logging disabled). Peak heap is `tracemalloc` for DSPy and a counting
+allocator around every DSZig allocation. Measured 2026-11-15 on an 8-vCPU
+Intel Xeon Linux VM:
+
+Transcript: `tests/fixtures/dspy_3_5_0_mock_suite.json`, 687 LM calls; DSZig fast x20, dspy 3.5.0 (Python 3.11.17) x5. Medians; no network.
+
+| Segment | DSPy ms | DSZig ms | Speedup |
+|---|---:|---:|---:|
+| cases | 22.9 | 0.16 | 141x |
+| rag | 52.5 | 0.24 | 222x |
+| dates | 115.6 | 0.43 | 266x |
+| dates_search | 346.0 | 1.37 | 252x |
+| dates_mipro | 396.2 | 1.56 | 254x |
+| dates_mipro_aware | 211.1 | 0.85 | 249x |
+| rag_react | 161.2 | 1.48 | 109x |
+| dates_copro | 367.5 | 1.14 | 324x |
+| dates_simba | 282.1 | 2.10 | 134x |
+| dates_gepa | 264.2 | 1.64 | 161x |
+| total | 2282.9 | 10.97 | 208x |
+
+| Metric | DSPy | DSZig |
+|---|---:|---:|
+| Throughput (LM calls/s of framework work) | 301 | 62,639 |
+| Per-call overhead p50 (us) | 2,925.3 | 11.5 |
+| Per-call overhead p99 (us) | 8,045.9 | 88.0 |
+| Startup: `import dspy` vs none (ms) | 365 | 0 |
+| Peak heap, one run (MiB) | 6.5 (tracemalloc) | 2.8 (counting allocator) |
+| Peak RSS, process (MiB) | 123 | 18 |
+
+Real-model accuracy and latency come from the live transcripts (see Real
+inference); there the model dominates latency in both runtimes.
+
+## Feature map
+
+Every public `dspy.*` name in DSPy 3.5.0, from
+`tools/dspy_reference/features.json`. `native` means implemented and compared
+against DSPy-generated fixtures or oracles; `partial` means implemented with
+the limits in Compatibility limits; `missing` means not implemented.
+`dz-upstream` (also run by `tools/dspy_reference/check.sh`) fails when DSPy
+exports a name without a row or changes a source file a row was reviewed
+against (pinned by SHA-256), so a DSPy release shows exactly what to port.
+Regenerate this table with
+`uv run --locked upstream_report.py --markdown dszig.json dspy.json`.
+
+| DSPy 3.5.0 | Status | DSZig source | Equality checks | Replay benchmark (DSPy → DSZig) |
+|---|---|---|---|---|
+| `dspy.Adapter` (`adapters/base.py`) | partial | `adapter.zig` | format_cases.json, xml.json, dspy_3_5_0_mock_suite.json | cases: 23 ms → 0.16 ms |
+| `dspy.AdapterParseError` (`utils/exceptions.py`) | partial | `adapter.zig` | error.AdapterParse outcome compared in suite cases | – |
+| `dspy.Audio` (`adapters/types/audio.py`) | missing | – | – | – |
+| `dspy.AvatarOptimizer` (`teleprompt/avatar_optimizer.py`) | missing | – | – | – |
+| `dspy.BaseLM` (`clients/base_lm.py`) | partial | `lm.zig` | lm_response_oracle.py, request_schema_oracle.py | – |
+| `dspy.BaseModule` (`primitives/base_module.py`) | partial | `predict.zig` | named predictor discovery tests | – |
+| `dspy.BestOfN` (`predict/best_of_n.py`) | native | `best_of_n.zig` | behavior tests vs DSPy source | – |
+| `dspy.BetterTogether` (`teleprompt/bettertogether.py`) | missing | – | – | – |
+| `dspy.BootstrapFewShot` (`teleprompt/bootstrap.py`) | native | `optimize.zig` | bootstrap_rag.json, bootstrap_multihop.json, trace_selection.json, live replay | rag: 52 ms → 0.24 ms; dates: 116 ms → 0.43 ms; rag_react: 161 ms → 1.48 ms |
+| `dspy.BootstrapFewShotWithOptuna` (`teleprompt/teleprompt_optuna.py`) | partial | `bootstrap_optuna.zig`, `tpe.zig` | bootstrap_optuna_oracle.py, optuna_tpe.json | – |
+| `dspy.BootstrapFewShotWithRandomSearch` (`teleprompt/random_search.py`) | native | `optimize.zig` | suite replay candidates | dates_search: 346 ms → 1.37 ms |
+| `dspy.BootstrapFinetune` (`teleprompt/bootstrap_finetune.py`) | missing | – | – | – |
+| `dspy.BootstrapRS` (`teleprompt/random_search.py`) | native | `optimize.zig` | alias of BootstrapFewShotWithRandomSearch | dates_search: 346 ms → 1.37 ms |
+| `dspy.BoundingBox` (`adapters/types/bounding_box.py`) | native | `bounding_box.zig` | bounding_box_oracle.py, bounding_box_identity_oracle.py | – |
+| `dspy.COPRO` (`teleprompt/copro_optimizer.py`) | native | `copro.zig` | suite replay candidates and scores | dates_copro: 368 ms → 1.14 ms |
+| `dspy.ChainOfThought` (`predict/chain_of_thought.py`) | native | `predict.zig` | format_cases.json, xml.json, dspy_3_5_0_mock_suite.json | cases: 23 ms → 0.16 ms |
+| `dspy.ChatAdapter` (`adapters/chat_adapter.py`) | native | `adapter.zig` | format_cases.json, xml.json, dspy_3_5_0_mock_suite.json | cases: 23 ms → 0.16 ms |
+| `dspy.Code` (`adapters/types/code.py`) | native | `code.zig` | code_oracle.py, code_identity_oracle.py | – |
+| `dspy.CodeExecutionError` (`primitives/code_interpreter.py`) | missing | – | – | – |
+| `dspy.CodeInterpreter` (`primitives/code_interpreter.py`) | missing | – | – | – |
+| `dspy.CodeInterpreterError` (`primitives/code_interpreter.py`) | missing | – | – | – |
+| `dspy.ColBERTv2` (`dsp/colbertv2.py`) | native | `colbertv2.zig` | colbertv2_oracle.py (81 HTTP requests) | – |
+| `dspy.Completions` (`primitives/prediction.py`) | partial | `predict.zig` | suite replay | – |
+| `dspy.ContextWindowExceededError` (`utils/exceptions.py`) | partial | `lm.zig` | – | – |
+| `dspy.DSPyError` (`utils/exceptions.py`) | partial | `lm.zig` | – | – |
+| `dspy.Embedder` (`clients/embedding.py`) | native | `embedder.zig` | embeddings_oracle.py | – |
+| `dspy.Embeddings` (`retrievers/embeddings.py`) | native | `embeddings.zig` | embeddings_oracle.py | – |
+| `dspy.EmbeddingsWithScores` (`retrievers/embeddings.py`) | native | `embeddings.zig` | embeddings_oracle.py | – |
+| `dspy.Ensemble` (`teleprompt/ensemble.py`) | native | `ensemble.zig` | ensemble.json | – |
+| `dspy.Evaluate` (`evaluate/evaluate.py`) | partial | `optimize.zig` | bootstrap_rag_eval scores, suite replay (serial only) | rag: 52 ms → 0.24 ms; dates: 116 ms → 0.43 ms |
+| `dspy.Example` (`primitives/example.py`) | partial | `predict.zig` | suite replay | – |
+| `dspy.File` (`adapters/types/file.py`) | native | `file.zig` | file_oracle.py | – |
+| `dspy.FinalOutput` (`primitives/code_interpreter.py`) | missing | – | – | – |
+| `dspy.Flex` (`predict/flex/flex.py`) | missing | – | – | – |
+| `dspy.GEPA` (`teleprompt/gepa/gepa.py`) | partial | `gepa.zig` | gepa.json, gepa_merge.json, suite replay | dates_gepa: 264 ms → 1.64 ms |
+| `dspy.History` (`adapters/types/history.py`) | native | `history.zig` | react.json | – |
+| `dspy.Image` (`adapters/types/image.py`) | missing | – | – | – |
+| `dspy.InferRules` (`teleprompt/infer_rules.py`) | native | `infer_rules.zig` | infer_rules_oracle.py | – |
+| `dspy.InputField` (`signatures/field.py`) | partial | `signature.zig` | compile-fail cases, format_cases.json | – |
+| `dspy.InterpreterPool` (`primitives/interpreter_pool.py`) | missing | – | – | – |
+| `dspy.JSONAdapter` (`adapters/json_adapter.py`) | native | `adapter.zig`, `json_repair.zig` | format_cases.json, xml.json, dspy_3_5_0_mock_suite.json, adapter_repair_oracle.py | cases: 23 ms → 0.16 ms |
+| `dspy.KNN` (`predict/knn.py`) | native | `knn.zig` | knn_oracle.py | – |
+| `dspy.KNNFewShot` (`teleprompt/knn_fewshot.py`) | native | `knn_fewshot.zig` | knn_oracle.py | – |
+| `dspy.LM` (`clients/lm.py`) | partial | `lm.zig`, `http.zig` | lm_response_oracle.py, live transcripts (Chat Completions/Responses only) | – |
+| `dspy.LMAuthError` (`utils/exceptions.py`) | partial | `lm.zig` | Zig error set, not Python exception classes | – |
+| `dspy.LMBillingError` (`utils/exceptions.py`) | partial | `lm.zig` | Zig error set, not Python exception classes | – |
+| `dspy.LMCollectionLimitError` (`utils/exceptions.py`) | partial | `lm.zig` | Zig error set, not Python exception classes | – |
+| `dspy.LMConfigurationError` (`utils/exceptions.py`) | partial | `lm.zig` | Zig error set, not Python exception classes | – |
+| `dspy.LMError` (`utils/exceptions.py`) | partial | `lm.zig` | Zig error set, not Python exception classes | – |
+| `dspy.LMInvalidRequestError` (`utils/exceptions.py`) | partial | `lm.zig` | Zig error set, not Python exception classes | – |
+| `dspy.LMLockTimeoutError` (`utils/exceptions.py`) | partial | `lm.zig` | Zig error set, not Python exception classes | – |
+| `dspy.LMNotConfiguredError` (`utils/exceptions.py`) | partial | `lm.zig` | Zig error set, not Python exception classes | – |
+| `dspy.LMProviderError` (`utils/exceptions.py`) | partial | `lm.zig` | Zig error set, not Python exception classes | – |
+| `dspy.LMRateLimitError` (`utils/exceptions.py`) | partial | `lm.zig` | Zig error set, not Python exception classes | – |
+| `dspy.LMServerError` (`utils/exceptions.py`) | partial | `lm.zig` | Zig error set, not Python exception classes | – |
+| `dspy.LMStreamAssemblyError` (`utils/exceptions.py`) | partial | `lm.zig` | Zig error set, not Python exception classes | – |
+| `dspy.LMTimeoutError` (`utils/exceptions.py`) | partial | `lm.zig` | Zig error set, not Python exception classes | – |
+| `dspy.LMTransportError` (`utils/exceptions.py`) | partial | `lm.zig` | Zig error set, not Python exception classes | – |
+| `dspy.LMUnexpectedError` (`utils/exceptions.py`) | partial | `lm.zig` | Zig error set, not Python exception classes | – |
+| `dspy.LMUnsupportedFeatureError` (`utils/exceptions.py`) | partial | `lm.zig` | Zig error set, not Python exception classes | – |
+| `dspy.LMUnsupportedModelError` (`utils/exceptions.py`) | partial | `lm.zig` | Zig error set, not Python exception classes | – |
+| `dspy.LabeledFewShot` (`teleprompt/vanilla.py`) | native | `optimize.zig` | golden tests | – |
+| `dspy.LocalInterpreter` (`primitives/local_interpreter.py`) | missing | – | – | – |
+| `dspy.MIPROv2` (`teleprompt/mipro_optimizer_v2.py`) | native | `mipro.zig`, `tpe.zig` | suite replay instructions and trial logs, optuna_tpe.json | dates_mipro: 396 ms → 1.56 ms; dates_mipro_aware: 211 ms → 0.85 ms |
+| `dspy.Module` (`primitives/module.py`) | partial | `predict.zig` | comptime program structs | – |
+| `dspy.MultiChainComparison` (`predict/multi_chain_comparison.py`) | native | `multi_chain_comparison.zig` | behavior tests vs DSPy source | – |
+| `dspy.OldField` (`signatures/field.py`) | missing | – | – | – |
+| `dspy.OldInputField` (`signatures/field.py`) | missing | – | – | – |
+| `dspy.OldOutputField` (`signatures/field.py`) | missing | – | – | – |
+| `dspy.OutputField` (`signatures/field.py`) | partial | `signature.zig` | compile-fail cases, format_cases.json | – |
+| `dspy.Parallel` (`predict/parallel.py`) | missing | – | – | – |
+| `dspy.Predict` (`predict/predict.py`) | native | `predict.zig` | format_cases.json, xml.json, dspy_3_5_0_mock_suite.json | cases: 23 ms → 0.16 ms |
+| `dspy.Prediction` (`primitives/prediction.py`) | partial | `predict.zig` | suite replay | – |
+| `dspy.Provider` (`clients/provider.py`) | missing | – | – | – |
+| `dspy.PythonInterpreter` (`primitives/python_interpreter.py`) | missing | – | – | – |
+| `dspy.RLM` (`predict/rlm.py`) | missing | – | – | – |
+| `dspy.ReAct` (`predict/react.py`) | native | `react.zig`, `tool.zig` | react.json, refine_react_oracle.py, suite replay | rag_react: 161 ms → 1.48 ms |
+| `dspy.ReActV2` (`predict/react_v2.py`) | missing | – | – | – |
+| `dspy.Reasoning` (`adapters/types/reasoning.py`) | native | `reasoning.zig` | reasoning_identity_oracle.py | – |
+| `dspy.Refine` (`predict/refine.py`) | native | `refine.zig` | refine_oracle.py | – |
+| `dspy.Retrieve` (`retrievers/retrieve.py`) | native | `predict.zig` | bootstrap_rag.json, suite replay | rag: 52 ms → 0.24 ms |
+| `dspy.SIMBA` (`teleprompt/simba.py`) | native | `simba.zig`, `nprandom.zig` | simba.json, suite replay train scores | dates_simba: 282 ms → 2.10 ms |
+| `dspy.SandboxSerializable` (`primitives/sandbox_serializable.py`) | missing | – | – | – |
+| `dspy.Signature` (`signatures/signature.py`) | partial | `signature.zig` | compile-fail cases, format_cases.json, nested.json | – |
+| `dspy.SignatureMeta` (`signatures/signature.py`) | partial | `signature.zig` | comptime signatures | – |
+| `dspy.Tool` (`adapters/types/tool.py`) | native | `tool.zig` | react.json, tool_argument_repair_oracle.py | – |
+| `dspy.ToolCallResults` (`adapters/types/tool.py`) | native | `tool.zig` | react.json | – |
+| `dspy.ToolCalls` (`adapters/types/tool.py`) | native | `tool.zig` | react.json | – |
+| `dspy.TrainingJob` (`clients/provider.py`) | missing | – | – | – |
+| `dspy.TwoStepAdapter` (`adapters/two_step_adapter.py`) | native | `adapter.zig` | two_step_oracle.py | – |
+| `dspy.Type` (`adapters/types/base_type.py`) | partial | `types.zig` | nested.json | – |
+| `dspy.XMLAdapter` (`adapters/xml_adapter.py`) | native | `xml.zig`, `xml_schema.zig` | xml.json | cases: 23 ms → 0.16 ms |
+| `dspy.asyncify` (`utils/asyncify.py`) | missing | – | – | – |
+| `dspy.bootstrap_trace_data` (`teleprompt/bootstrap_trace.py`) | missing | – | – | – |
+| `dspy.configure` (`dsp/utils/settings.py`) | partial | `predict.zig` | explicit Context instead of global settings | – |
+| `dspy.configure_cache` (`clients/__init__.py`) | partial | `cache.zig`, `request_cache.zig` | cache tests | – |
+| `dspy.configure_dspy_loggers` (`utils/logging_utils.py`) | missing | – | – | – |
+| `dspy.context` (–) | partial | `predict.zig` | explicit Context | – |
+| `dspy.disable_litellm_logging` (`clients/__init__.py`) | missing | – | no litellm | – |
+| `dspy.disable_logging` (`utils/logging_utils.py`) | missing | – | – | – |
+| `dspy.enable_litellm_logging` (`clients/__init__.py`) | missing | – | no litellm | – |
+| `dspy.enable_logging` (`utils/logging_utils.py`) | missing | – | – | – |
+| `dspy.ensure_signature` (`signatures/signature.py`) | partial | `signature.zig` | comptime | – |
+| `dspy.infer_prefix` (`signatures/signature.py`) | partial | `signature.zig` | format_cases.json | – |
+| `dspy.inspect_history` (`clients/base_lm.py`) | missing | – | – | – |
+| `dspy.is_retryable_lm_error` (`utils/exceptions.py`) | partial | `http.zig` | transport retry tests | – |
+| `dspy.load` (`utils/saving.py`) | native | `state.zig` | check_artifact.py (DSPy loads and re-saves DSZig artifacts) | – |
+| `dspy.load_settings` (`dsp/utils/settings.py`) | missing | – | – | – |
+| `dspy.majority` (`predict/aggregation.py`) | native | `ensemble.zig` | ensemble.json | – |
+| `dspy.make_signature` (`signatures/signature.py`) | partial | `signature.zig` | comptime | – |
+| `dspy.resolve_interpreter_factory` (`primitives/code_interpreter.py`) | missing | – | – | – |
+| `dspy.settings` (–) | partial | `predict.zig` | explicit Context | – |
+| `dspy.streamify` (`streaming/streamify.py`) | missing | – | – | – |
+| `dspy.syncify` (`utils/syncify.py`) | missing | – | – | – |
+| `dspy.track_usage` (–) | missing | – | – | – |
+
+
 ## Cross-runtime verification
 
 ```sh
