@@ -4,6 +4,8 @@
 //! attempt, not a separate extraction predictor. All tools remain native Zig
 //! callbacks. Async execution, JSON repair, context-window error classification,
 //! and Python traceback text are not supported.
+//!
+//! Upstream (DSPy 3.5.0): dspy/predict/react.py
 
 const std = @import("std");
 const assert = std.debug.assert;

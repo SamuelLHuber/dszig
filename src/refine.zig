@@ -3,6 +3,8 @@
 //! Python's inspect.getsource. All borrowed source slices must outlive Self.
 //! Attempt programs, signatures, advice, outputs and trace snapshots live in the
 //! call arena. Mutable program data must be stored by value, like BestOfN.
+//!
+//! Upstream (DSPy 3.5.0): dspy/predict/refine.py
 
 const std = @import("std");
 const predict = @import("predict.zig");

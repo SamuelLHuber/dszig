@@ -18,6 +18,8 @@
 //! Sources: DSPy 3.5.0 predict/knn.py; NumPy v2.4.6
 //! numpy/_core/src/npysort/{quicksort.cpp,npysort_heapsort.h,npysort_common.h}
 //! and numpy/_core/src/multiarray/arraytypes.c.src (FLOAT_dot fallback).
+//!
+//! Upstream (DSPy 3.5.0): dspy/predict/knn.py
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

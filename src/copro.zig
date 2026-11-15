@@ -5,6 +5,8 @@
 //! numbers, so the same LM answers give the same program.
 //!
 //! Not supported: `track_stats`.
+//!
+//! Upstream (DSPy 3.5.0): dspy/teleprompt/copro_optimizer.py
 
 const std = @import("std");
 const assert = std.debug.assert;

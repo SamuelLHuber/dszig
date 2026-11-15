@@ -3,6 +3,8 @@
 //!
 //! Matching Python's stream is what makes a Zig-compiled program select the
 //! same few-shot demos as DSPy given the same seed and trainset.
+//!
+//! Upstream (DSPy 3.5.0): CPython 3.11 Lib/random.py, Modules/_randommodule.c
 
 const std = @import("std");
 const assert = std.debug.assert;

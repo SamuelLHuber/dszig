@@ -5,6 +5,8 @@
 //! `RandomState` stream, cumulative sums and pairwise sums are reproduced
 //! exactly; `log`/`exp` come from Zig's libm, so only an exact tie broken by a
 //! last-ulp difference could diverge from NumPy.
+//!
+//! Upstream (DSPy 3.5.0): dspy/teleprompt/mipro_optimizer_v2.py, dspy/teleprompt/teleprompt_optuna.py
 
 const std = @import("std");
 const assert = std.debug.assert;

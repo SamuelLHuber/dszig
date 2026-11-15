@@ -2,6 +2,8 @@
 //! `BootstrapFewShot` (ports of DSPy 3.5.0 `dspy.evaluate` and
 //! `dspy.teleprompt`). Random choices use the CPython `random.Random` port,
 //! so a Zig compile selects the same demos as DSPy for the same inputs.
+//!
+//! Upstream (DSPy 3.5.0): dspy/evaluate/evaluate.py, dspy/teleprompt/bootstrap.py, dspy/teleprompt/random_search.py, dspy/teleprompt/vanilla.py
 
 const std = @import("std");
 const assert = std.debug.assert;

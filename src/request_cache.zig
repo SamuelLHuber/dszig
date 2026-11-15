@@ -9,6 +9,8 @@
 //!
 //! The mutex serializes the entry map only. Payload graphs are unsynchronized:
 //! callers must not mutate a cached graph while another thread reads it.
+//!
+//! Upstream (DSPy 3.5.0): dspy/clients/__init__.py
 
 const std = @import("std");
 const assert = std.debug.assert;

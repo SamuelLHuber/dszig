@@ -2,6 +2,8 @@
 //! `([\p{L}\p{N}\p{M}]+)|([^\p{Z}\p{C}])`, then `str.lower` on each token.
 //! The character classes in dpr_unicode.zig are the pinned regex package's
 //! actual matches, which use newer Unicode data than CPython's NFD/lower.
+//!
+//! Upstream (DSPy 3.5.0): dspy/dsp/utils/dpr.py
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

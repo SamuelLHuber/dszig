@@ -1,6 +1,8 @@
 //! Language-model interface. Programs never name a model: they call through
 //! `LM`, so a scripted mock, a keyword mock, or an OpenAI-compatible HTTP
 //! endpoint can be swapped without touching program code.
+//!
+//! Upstream (DSPy 3.5.0): dspy/clients/base_lm.py, dspy/clients/lm.py, dspy/utils/exceptions.py
 
 const std = @import("std");
 const assert = std.debug.assert;

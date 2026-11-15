@@ -1,5 +1,7 @@
 //! DSPy 3.5 citation models. Typed views borrow fields; owning clones copy
 //! every nested field and keep genuine model identity in erased runtime values.
+//!
+//! Upstream (DSPy 3.5.0): dspy/adapters/types/citation.py
 const std = @import("std");
 const runtime = @import("runtime_value.zig");
 const values = @import("value.zig");

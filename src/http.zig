@@ -1,4 +1,6 @@
 //! Shared standard-library HTTP transport for generation and retrieval.
+//!
+//! Upstream (DSPy 3.5.0): dspy/clients/lm.py, dspy/utils/exceptions.py
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const TimedIo = @import("timed_io.zig");

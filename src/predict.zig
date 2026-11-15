@@ -5,6 +5,8 @@
 //! `Output` decls, and `pub fn forward(self: *const P, ctx: Context, input:
 //! P.Input) !P.Output`. Nothing is global: allocator, LM, adapter, retriever
 //! and trace are all passed in `Context`.
+//!
+//! Upstream (DSPy 3.5.0): dspy/dsp/utils/settings.py, dspy/predict/chain_of_thought.py, dspy/predict/predict.py, dspy/primitives/base_module.py, dspy/primitives/example.py, dspy/primitives/module.py, dspy/primitives/prediction.py, dspy/retrievers/retrieve.py
 
 const std = @import("std");
 const assert = std.debug.assert;

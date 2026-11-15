@@ -12,6 +12,8 @@
 //! does; DSZig does not mutate the teacher LM's `rollout_id` afterwards.
 //! Not supported: parallel threads, metrics returning a
 //! `dspy.Prediction` with feedback. `np.exp` is Zig's `@exp`.
+//!
+//! Upstream (DSPy 3.5.0): dspy/teleprompt/simba.py
 
 const std = @import("std");
 const assert = std.debug.assert;

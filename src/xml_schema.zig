@@ -1,6 +1,8 @@
 //! Validation for runtime schema-backed Fields without a native Zig validator.
 //! This is the same primitive/model/list/dictionary/union schema vocabulary
 //! emitted by signature types. Custom annotations still supply Field.validate.
+//!
+//! Upstream (DSPy 3.5.0): dspy/adapters/xml_adapter.py
 const std = @import("std");
 const value = @import("value.zig");
 const types = @import("types.zig");

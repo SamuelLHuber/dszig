@@ -1,6 +1,8 @@
 //! DSPy 3.5 File construction and canonical lm15 document serialization.
 //! Constructors validate model fields, not media: malformed inline data is
 //! deliberately rejected only by format/serialize, just as it is upstream.
+//!
+//! Upstream (DSPy 3.5.0): dspy/adapters/types/file.py
 const std = @import("std");
 const pyjson = @import("pyjson.zig");
 const unicode = @import("unicode.zig");

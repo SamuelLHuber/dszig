@@ -1,6 +1,8 @@
 //! DSPy 3.5 ColBERTv2's stateless GET/POST retrieval and memory-cache semantics.
 //! HTTP/TLS, inactivity timeouts, response bounds and redirects stay in http.zig.
 //! Cache keys are native identities, not Python diskcache-compatible hashes.
+//!
+//! Upstream (DSPy 3.5.0): dspy/dsp/colbertv2.py
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;

@@ -1,5 +1,7 @@
 //! DSPy 3.5's axis-aligned normalized image rectangle.
 //! Construct with init or fromValue to enforce finite edges and positive area.
+//!
+//! Upstream (DSPy 3.5.0): dspy/adapters/types/bounding_box.py
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const runtime = @import("runtime_value.zig");

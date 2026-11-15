@@ -19,6 +19,8 @@
 //! `forward` takes a mutable wrapper because DSPy's failure budget persists
 //! between calls. Python's nonnumeric rollout addition errors are represented
 //! by `error.UnsupportedRolloutId`, not coerced into numeric IDs.
+//!
+//! Upstream (DSPy 3.5.0): dspy/predict/best_of_n.py
 
 const std = @import("std");
 const predict = @import("predict.zig");

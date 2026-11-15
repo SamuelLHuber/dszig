@@ -1,5 +1,7 @@
 //! DSPy-compatible program state: `program.save("x.json")` /
 //! `program.load("x.json")` with `save_program=False`.
+//!
+//! Upstream (DSPy 3.5.0): dspy/utils/saving.py
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

@@ -17,6 +17,8 @@
 //! Generation LM errors erase provider exception types. Recoverable failures
 //! therefore require an explicit classifier backed by the provider's real error
 //! metadata; an opaque LMFailure is never assumed to be a context-window error.
+//!
+//! Upstream (DSPy 3.5.0): dspy/teleprompt/infer_rules.py
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

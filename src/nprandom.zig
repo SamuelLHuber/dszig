@@ -1,6 +1,8 @@
 //! The parts of NumPy 2.x `np.random.default_rng(seed)` that DSPy's SIMBA
 //! draws from: `SeedSequence` seeding of PCG64 (XSL-RR), `random()` and
 //! `poisson(lam)`, plus `np.percentile` with linear interpolation.
+//!
+//! Upstream (DSPy 3.5.0): dspy/teleprompt/simba.py, NumPy 2.4 numpy/random (PCG64, SeedSequence, Generator)
 
 const std = @import("std");
 const assert = std.debug.assert;

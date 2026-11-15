@@ -28,6 +28,8 @@
 //! Headers are parsed as data, never evaluated; source's 10,000-byte header
 //! bound is retained. Unsupported FAISS construction or indexed saves return
 //! UnsupportedFaiss, never silently substitute an approximate or brute index.
+//!
+//! Upstream (DSPy 3.5.0): dspy/retrievers/embeddings.py
 
 const std = @import("std");
 const builtin = @import("builtin");

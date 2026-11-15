@@ -1,5 +1,7 @@
 //! DSPy 3.5 tool protocol values and native function-tool boundary conversion.
 //! Per-call provider continuation is preserved; malformed JSON repair is not.
+//!
+//! Upstream (DSPy 3.5.0): dspy/adapters/types/tool.py, dspy/predict/react.py
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

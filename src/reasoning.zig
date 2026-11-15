@@ -1,5 +1,7 @@
 //! DSPy 3.5 Reasoning retains model identity even though its prompt dump is text.
 //! Typed values borrow content; runtime boxes own only their box until cloned.
+//!
+//! Upstream (DSPy 3.5.0): dspy/adapters/types/reasoning.py
 const std = @import("std");
 const runtime = @import("runtime_value.zig");
 const pyjson = @import("pyjson.zig");

@@ -1,6 +1,8 @@
 //! Prompt adapters: DSPy 3.5.0 XMLAdapter and explicit ChatAdapter,
 //! JSONAdapter and TwoStepAdapter. They turn (signature view, demos, inputs) into chat
 //! messages and parse an LM completion back into an output record.
+//!
+//! Upstream (DSPy 3.5.0): dspy/adapters/base.py, dspy/adapters/chat_adapter.py, dspy/adapters/json_adapter.py, dspy/adapters/two_step_adapter.py, dspy/utils/exceptions.py
 
 const std = @import("std");
 const assert = std.debug.assert;

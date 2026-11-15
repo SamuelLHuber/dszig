@@ -1,5 +1,7 @@
 //! DSPy 3.5.0 XMLAdapter. Tags delimit typed fields; scalar bodies are
 //! literal text, deliberately not XML entity-decoded or parsed as markup.
+//!
+//! Upstream (DSPy 3.5.0): dspy/adapters/xml_adapter.py
 const std = @import("std");
 const adapter = @import("adapter.zig");
 const signature = @import("signature.zig");

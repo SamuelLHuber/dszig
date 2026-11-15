@@ -49,6 +49,8 @@
 //! are bounded by the shared transport's integer type; invalid/out-of-range
 //! options fail explicitly. Cache hashes are native, not DSPy's Python
 //! disk-cache serialization.
+//!
+//! Upstream (DSPy 3.5.0): dspy/clients/embedding.py
 
 const std = @import("std");
 const lm = @import("lm.zig");

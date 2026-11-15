@@ -4,6 +4,8 @@
 //! bypasses earlier entries. Entries live in memory, least recently used
 //! evicted first; `dump`/`load` persist them as JSON. Failed calls are not
 //! cached. DSPy's on-disk `diskcache` format and key hashing are not shared.
+//!
+//! Upstream (DSPy 3.5.0): dspy/clients/__init__.py
 
 const std = @import("std");
 const assert = std.debug.assert;

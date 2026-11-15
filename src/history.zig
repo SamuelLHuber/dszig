@@ -3,6 +3,8 @@
 //! storage; clone into a longer-lived allocator before releasing a call arena.
 //! Text/native function-tool replay includes per-call continuation. REPL events
 //! and media parts are outside this native JSON-value representation.
+//!
+//! Upstream (DSPy 3.5.0): dspy/adapters/types/history.py
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

@@ -3,6 +3,8 @@
 //! `Ensemble(P, n)` runs every program (or, with `size`, a `random.sample`
 //! of them drawn from `rng`, which stands in for Python's global `random`)
 //! and reduces the outputs with `majority` on the last output field.
+//!
+//! Upstream (DSPy 3.5.0): dspy/predict/aggregation.py, dspy/teleprompt/ensemble.py
 
 const std = @import("std");
 const assert = std.debug.assert;

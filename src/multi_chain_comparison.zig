@@ -12,6 +12,8 @@
 //! Context LM options take precedence over the module's temperature (0.7).
 //! The embedded `predict` is a normal typed predictor, visible to discovery,
 //! state serialization, demos, optimizer edits, and tracing.
+//!
+//! Upstream (DSPy 3.5.0): dspy/predict/multi_chain_comparison.py
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

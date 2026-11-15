@@ -34,6 +34,8 @@
 //! LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 //! OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 //! SOFTWARE.
+//!
+//! Upstream (DSPy 3.5.0): dspy/adapters/json_adapter.py, json_repair (pinned by DSPy 3.5.0)
 
 const std = @import("std");
 const runtime = @import("runtime_value.zig");

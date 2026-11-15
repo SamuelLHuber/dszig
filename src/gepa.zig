@@ -12,6 +12,8 @@
 //! types other than `"instance"`, `"epsilon_greedy"`/`"top_k_pareto"`,
 //! `add_format_failure_as_feedback`, `log_dir`, parallel threads. CPython
 //! iterates small-int sets in ascending order; DSZig assumes it always does.
+//!
+//! Upstream (DSPy 3.5.0): dspy/teleprompt/gepa/gepa.py
 
 const std = @import("std");
 const assert = std.debug.assert;

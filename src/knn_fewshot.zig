@@ -19,6 +19,8 @@
 //!
 //! Source: DSPy 3.5.0 teleprompt/knn_fewshot.py. Numerical portability limits of
 //! the retrieval kernel are stated in knn.zig; no optimizer engine is duplicated.
+//!
+//! Upstream (DSPy 3.5.0): dspy/teleprompt/knn_fewshot.py
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

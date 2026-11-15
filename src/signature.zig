@@ -14,6 +14,8 @@
 //!
 //! Every structural mistake DSPy reports at class-creation time or at the
 //! first LM call is a `@compileError` here.
+//!
+//! Upstream (DSPy 3.5.0): dspy/signatures/field.py, dspy/signatures/signature.py
 
 const std = @import("std");
 const nested = @import("types.zig");

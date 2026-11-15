@@ -9,6 +9,8 @@
 //! `inspect.getsource`; DSZig takes it as `Options.program_code` and runs
 //! without it, like `program_aware_proposer=False`, when none is given.
 //! Not supported: `track_stats` program copies and `log_dir`.
+//!
+//! Upstream (DSPy 3.5.0): dspy/teleprompt/mipro_optimizer_v2.py
 
 const std = @import("std");
 const assert = std.debug.assert;

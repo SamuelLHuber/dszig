@@ -1,6 +1,8 @@
 //! DSPy 3.5 Code retains its concrete class while serializing as a raw string.
 //! Typed values and runtime boxes borrow content; owning runtime clones copy it.
 //! A borrowed base projection also requires the original runtime box to stay alive.
+//!
+//! Upstream (DSPy 3.5.0): dspy/adapters/types/code.py
 
 const std = @import("std");
 const runtime = @import("runtime_value.zig");

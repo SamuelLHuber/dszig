@@ -4,6 +4,8 @@
 //! annotation names, their Pydantic JSON schemas with keys in DSPy's
 //! `move_type_to_front` order, and Pydantic's lax validation, which also
 //! normalizes a value to declaration order with defaults filled in.
+//!
+//! Upstream (DSPy 3.5.0): dspy/adapters/types/base_type.py
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

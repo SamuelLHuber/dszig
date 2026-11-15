@@ -20,6 +20,8 @@
 //! selects precisely ONE demo per predictor, regardless of that constructor
 //! value. Failed evaluation exceptions abort the study; NaN objectives instead
 //! mark trials failed and let optimization continue.
+//!
+//! Upstream (DSPy 3.5.0): dspy/teleprompt/teleprompt_optuna.py
 
 // DSPy-derived portions: MIT License.
 // Copyright (c) 2023 Stanford Future Data Systems
