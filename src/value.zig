@@ -92,7 +92,20 @@ pub fn parseText(arena: Allocator, field: Field, text: []const u8) ParseError!Va
         .str => .{ .string = text },
         .literal => parseLiteralText(field, text),
         .boolean => parseBoolText(text),
-        .int => parseIntText(text),
+        .int => blk: {
+            const token = pyStrip(text);
+            // Ordinary JSON integers need neither repair nor parser scratch.
+            if (isJsonNumber(token) and std.json.isNumberFormattedLikeAnInteger(token)) {
+                if (std.fmt.parseInt(i64, token, 10)) |integer| {
+                    break :blk Value{ .integer = integer };
+                } else |_| {}
+            }
+            const candidate = @import("json_repair.zig").loads(arena, text) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.ParseValue,
+            };
+            break :blk parseInteger(candidate);
+        },
         .float => parseFloatText(text),
         .str_list => parseStrListText(arena, text),
         .json_object => parseObjectText(arena, text),
@@ -244,6 +257,7 @@ fn parseBoolText(text: []const u8) ParseError!Value {
 pub fn parseInteger(v: Value) error{ParseValue}!Value {
     return switch (v) {
         .integer => v,
+        .bool => |b| .{ .integer = @intFromBool(b) },
         .string, .number_string => |s| parseIntText(s),
         .float => |f| floatToInt(f),
         else => error.ParseValue,

@@ -158,6 +158,14 @@ synthesized IDs, legitimate `partial_json` objects and failure categories.
 The development oracle is `tools/dspy_reference/tool_argument_repair_oracle.py`.
 This does not prove every malformed input, optional upstream parser setting or
 Python exception identity; the native parser has a 512-level nesting bound.
+JSONAdapter also repairs the whole completion before trying DSPy's first
+balanced-brace fallback for nonobject results, then filters and validates output
+fields. A native consumer matched **141 actual DSPy JSONAdapter calls** across
+string, required-pair and integer outputs, including malformed objects, comments,
+multiple objects, nonobject roots, exact large integers, nonfinite numbers and
+lone surrogates. Integer string fields use repair before conversion and accept
+Pydantic's boolean-to-integer coercion. This does not establish every shared
+`parse_value` annotation or Python `ast.literal_eval` fallback.
 
 Pinned native parser consumers matched **42 Responses and 4 Chat actual DSPy
 3.5 localhost HTTP observations**, comparing visible text, reasoning and tool

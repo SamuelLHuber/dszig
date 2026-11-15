@@ -743,9 +743,9 @@ fn requireAllOutputs(arena: Allocator, view: View, fields: *Record) Error!void {
 }
 
 fn parseJson(arena: Allocator, view: View, completion: []const u8) Error!Record {
-    const object = parseObject(arena, completion) orelse blk: {
+    const object = (try parseObject(arena, completion)) orelse blk: {
         const span = firstBalancedBraces(completion) orelse return error.AdapterParse;
-        break :blk parseObject(arena, span) orelse return error.AdapterParse;
+        break :blk (try parseObject(arena, span)) orelse return error.AdapterParse;
     };
     var fields: Record = .empty;
     var it = object.iterator();
@@ -758,10 +758,12 @@ fn parseJson(arena: Allocator, view: View, completion: []const u8) Error!Record 
     return fields;
 }
 
-fn parseObject(arena: Allocator, text: []const u8) ?Record {
-    const v = std.json.parseFromSliceLeaky(Value, arena, value.pyStrip(text), .{
-        .duplicate_field_behavior = .use_last,
-    }) catch return null;
+fn parseObject(arena: Allocator, text: []const u8) Error!?Record {
+    const v = @import("json_repair.zig").loads(arena, text) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.JsonTooDeep => error.JsonTooDeep,
+        error.ParseValue, error.IntegerTooLong => error.AdapterParse,
+    };
     return if (v == .object) v.object else null;
 }
 
