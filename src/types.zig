@@ -200,20 +200,26 @@ fn literalEntries(comptime T: type) []const Entry {
             encoded = encoded ++ "]";
         }
         const fields: []const Entry = &.{.{ .key = if (values.len == 1) "const" else "enum", .val = encoded }};
-        const first = literalJsonType(values[0]);
-        for (values[1..]) |v| if (!std.mem.eql(u8, first, literalJsonType(v))) return fields;
+        const first = literalJsonType(values[0]) orelse return fields;
+        for (values[1..]) |v| {
+            const kind = literalJsonType(v) orelse return fields;
+            if (!std.mem.eql(u8, first, kind)) return fields;
+        }
         return &[_]Entry{.{ .key = "type", .val = quote(first) }} ++ fields;
     }
 }
 
-fn literalJsonType(comptime v: Value) []const u8 {
+fn literalJsonType(comptime v: Value) ?[]const u8 {
+    // Pydantic selects the type after recursively projecting Enum values.
     return switch (v) {
         .null => "null",
         .bool => "boolean",
         .integer, .number_string => "integer",
         .float => "number",
         .string => "string",
-        else => unreachable,
+        .array => "array",
+        .custom => |c| literalJsonType(c.vtable.enumeration.?(c.ptr).value),
+        else => null,
     };
 }
 
@@ -262,7 +268,10 @@ fn enumSchemaValue(comptime v: Value) []const u8 {
                     out = out ++ (if (i == 0) "" else ", ") ++ quote(key) ++ ": " ++ enumSchemaValue(item);
                 break :blk out ++ "}";
             },
-            .custom => @compileError("dszig: enum JSON schema requires serializable native values"),
+            .custom => |c| if (c.vtable.enumeration) |inspect|
+                enumSchemaValue(inspect(c.ptr).value)
+            else
+                @compileError("dszig: enum JSON schema requires serializable native values"),
         };
     }
 }

@@ -78,7 +78,7 @@ pub const Field = struct {
     desc: []const u8,
     /// `prefix` as stored by DSPy: `infer_prefix(name) + ":"`.
     prefix: []const u8,
-    /// Display strings for `.literal`, in declaration order. Scalar Literal
+    /// Display strings for `.literal`, in declaration order. Explicit Literal
     /// annotations carry their actual values in parse_value and schema.
     literals: []const []const u8 = &.{},
     /// `.json`: the Pydantic JSON schema, its validator, and whether the

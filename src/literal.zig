@@ -1,5 +1,5 @@
-//! Explicit typing.Literal annotations. Unlike Enum, these return primitive
-//! values, and DSPy's membership shortcut preserves the input's numeric type.
+//! Explicit typing.Literal annotations. These retain the allowed scalar or
+//! genuine Enum member, and DSPy's membership shortcut preserves input type.
 const std = @import("std");
 const runtime = @import("runtime_value.zig");
 const value = @import("value.zig");
@@ -12,7 +12,14 @@ pub fn isLiteral(comptime T: type) bool {
 
 fn repr(comptime v: Value, comptime as_str: bool) []const u8 {
     comptime {
-        const size = switch (v) { .string, .number_string => |s| s.len * 10 + 64, else => 128 };
+        const size = switch (v) {
+            .string, .number_string => |s| s.len * 10 + 64,
+            .custom => |c| blk: {
+                const member = c.vtable.enumeration.?(c.ptr);
+                break :blk member.class_name.len + member.member_name.len + 1;
+            },
+            else => 128,
+        };
         var buffer: [size]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&buffer);
         if (as_str) @import("pyjson.zig").writeStr(&writer, v) catch @compileError("dszig: invalid Literal value") else
@@ -34,10 +41,10 @@ fn primitive(v: Value) bool {
     return v == .bool or v == .string or smallInt(v) != null;
 }
 
-/// Scalar Literal arguments are flattened explicitly. Equal values of different
+/// Literal arguments are flattened explicitly. Equal values of different
 /// Python types remain separate (Literal[1, True] has distinct fast buckets).
-/// Python Enum/bytes arguments and dynamically constructed annotations are not
-/// supported by this scalar factory.
+/// Enum members retain their class identity rather than becoming their values.
+/// Bytes arguments and dynamically constructed annotations are unsupported.
 pub fn Literal(comptime arguments: []const Value) type {
     const allowed = comptime blk: {
         @setEvalBranchQuota(100_000);
@@ -48,7 +55,9 @@ pub fn Literal(comptime arguments: []const Value) type {
                 .null, .bool, .integer, .float, .string => {},
                 .number_string => |s| if (!std.json.isNumberFormattedLikeAnInteger(s))
                     @compileError("dszig: Literal number_string must be an integer"),
-                else => @compileError("dszig: Literal supports scalar values only"),
+                .custom => |c| if (c.vtable.enumeration == null)
+                    @compileError("dszig: Literal custom arguments must be genuine Enum members"),
+                else => @compileError("dszig: Literal supports scalars and Enum members only"),
             }
             for (result[0..len]) |previous| {
                 const same_kind = (smallInt(v) != null and smallInt(previous) != null) or std.meta.activeTag(v) == std.meta.activeTag(previous);
@@ -67,7 +76,7 @@ pub fn Literal(comptime arguments: []const Value) type {
         pub const dszig_literal_values = allowed;
         pub const annotation_name = blk: {
             var text: []const u8 = "Literal[";
-            for (allowed, 0..) |v, i| text = text ++ (if (i == 0) "" else ", ") ++ repr(v, false);
+            for (allowed, 0..) |v, i| text = text ++ (if (i == 0) "" else ", ") ++ repr(v, v == .custom);
             break :blk text ++ "]";
         };
         pub const display_values = blk: {
@@ -157,6 +166,30 @@ pub fn parseValues(arena: Allocator, allowed: []const Value, input: Value) runti
         .name = "literal", .kind = .json, .type_name = "Literal", .desc = "", .prefix = "", .validate = identity,
     }, text);
     return validateValues(allowed, candidate);
+}
+
+test "Enum Literal preserves member identity and rejects equal projected values" {
+    const enums = @import("enum.zig");
+    const entries = &[_]enums.Entry{
+        .{ .name = "red", .value = .{ .string = "red" } },
+        .{ .name = "alias", .value = .{ .string = "red" } },
+    };
+    const Left = enums.EnumWithIdentity("Color", entries, struct {});
+    const Right = enums.EnumWithIdentity("Color", entries, struct {});
+    const red = comptime Left.member("red") catch unreachable;
+    const T = Literal(&.{ red, comptime Left.member("alias") catch unreachable });
+    const a = std.testing.allocator;
+    try std.testing.expect((try T.validate(a, red)).custom.ptr == red.custom.ptr);
+    try std.testing.expect((try T.parseValue(a, red)).custom.ptr == red.custom.ptr);
+    try std.testing.expectError(error.ParseValue, T.validate(a, try Right.member("red")));
+    try std.testing.expectError(error.ParseValue, T.parseValue(a, .{ .string = "red" }));
+    try std.testing.expectError(error.ParseValue, T.parseValue(a, .{ .string = "Color.red" }));
+    const Mixed = Literal(&.{ red, .{ .string = "red" } });
+    try std.testing.expect((try Mixed.parseValue(a, red)).custom.ptr == red.custom.ptr);
+    try std.testing.expectEqualStrings("red", (try Mixed.parseValue(a, .{ .string = "red" })).string);
+    const Wrapped = enums.Enum("Wrapped", &.{.{ .name = "member", .value = red }});
+    const Nested = Literal(&.{comptime Wrapped.member("member") catch unreachable});
+    try std.testing.expectEqualStrings("{\"type\": \"string\", \"const\": \"red\"}", @import("types.zig").schema(Nested));
 }
 
 test "Mixed Literal retains DSPy membership type while Pydantic selects exact buckets" {
