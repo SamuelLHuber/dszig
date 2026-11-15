@@ -20,6 +20,12 @@ fn jsonType(v: Value) ?[]const u8 {
         .string => "string",
         .array => "array",
         .object => "object",
+        .custom => |c| if (c.vtable.enumeration) |inspect|
+            jsonType(inspect(c.ptr).value)
+        else if (@import("python_value.zig").view(v)) |builtin|
+            if (builtin == .bytes) "string" else null
+        else
+            null,
         else => null,
     };
 }
@@ -53,6 +59,27 @@ test "Enum resolution preserves value-before-name priority and canonical aliases
     const cloned = try value.cloneValue(a, alias);
     defer cloned.custom.deinit(a);
     try std.testing.expect(cloned.custom.ptr == first.custom.ptr);
+}
+
+test "Enum schemas classify genuine bytes and recursively wrapped member values" {
+    const binary = @import("python_value.zig").staticBytes;
+    const Binary = Enum("Bytes", &.{
+        .{ .name = "one", .value = binary("one") },
+        .{ .name = "two", .value = binary("two") },
+    });
+    const MixedText = Enum("MixedText", &.{
+        .{ .name = "binary", .value = binary("one") },
+        .{ .name = "text", .value = .{ .string = "one" } },
+    });
+    const Wrapped = Enum("Wrapped", &.{.{ .name = "member", .value = comptime Binary.member("one") catch unreachable }});
+    const schema = @import("types.zig").schema;
+    const a = std.testing.allocator;
+    try std.testing.expectEqualStrings("{\"type\": \"string\", \"enum\": [\"one\", \"two\"], \"title\": \"Bytes\"}", schema(Binary));
+    try std.testing.expectEqualStrings("{\"type\": \"string\", \"enum\": [\"one\", \"one\"], \"title\": \"MixedText\"}", schema(MixedText));
+    try std.testing.expectEqualStrings("{\"type\": \"string\", \"enum\": [\"one\"], \"title\": \"Wrapped\"}", schema(Wrapped));
+    const member = try Binary.validate(a, comptime binary("one"));
+    try std.testing.expect(member.custom.ptr == (try Binary.member("one")).custom.ptr);
+    try std.testing.expectError(error.ParseValue, Binary.validate(a, .{ .string = "one" }));
 }
 
 test "Independent same-name Enum classes cannot validate or compare as one class" {

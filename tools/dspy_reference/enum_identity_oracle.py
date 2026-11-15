@@ -116,9 +116,14 @@ def main():
             result = dspy.Predict(Typed)(question="Decode")
         predictions.append({"adapter": type(adapter).__name__, "response": response,
                             "outputs": tagged(result.toDict()), "requests": lm.calls})
+    byte_enum = enum.Enum("Bytes", {"one": b"one", "two": b"two"})
+    mixed_text = enum.Enum("MixedText", {"binary": b"one", "text": "one"})
+    wrapped = enum.Enum("Wrapped", {"member": byte_enum.one})
+    byte_schemas = [TypeAdapter(cls).json_schema() for cls in (byte_enum, mixed_text, wrapped)]
     receipt = {"evidence_kind": "actual_dspy_enum_calls", "provenance": repair.provenance(),
                "schemas": schemas, "validation": validation, "scalar_validation": scalar_validation,
-               "views": views, "equality": equality, "predictions": predictions}
+               "views": views, "equality": equality, "predictions": predictions,
+               "byte_schemas": byte_schemas}
     data = json.dumps(receipt, ensure_ascii=True, allow_nan=False, indent=2) + "\n"
     if args.output:
         args.output.write_text(data)

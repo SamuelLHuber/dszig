@@ -200,7 +200,9 @@ type. Schemas project Enum values recursively, but parsing does not erase their
 identity. Another native smoke matched **753 Enum-literal observations**:
 720 actual validation/parse calls, 12 schemas, 12 annotation names, three typed
 Predict outputs/call counts and six exact adapter prompt messages. It also
-replayed the scalar observations unchanged.
+replayed the scalar observations unchanged. General Enum schemas also classify
+genuine bytes, mixed bytes/text values and recursively wrapped Enum members
+after projection; all-string projected values retain `type: "string"`.
 
 Bytes arguments use `Literal(&.{python_value.staticBytes("hi")})`. These
 allocation-free immutable values retain bytes identity, not string identity;
@@ -226,7 +228,7 @@ depth; the native AST-depth ceiling is deterministic. This is a real parity
 limit, not a passing check. Generic Python execution is still unsupported.
 
 After these cutovers, including scalar, Enum and bytes Literal integration, the pinned
-Debug and ReleaseSafe gates each passed all 329 tests and 28 build steps,
+Debug and ReleaseSafe gates each passed all 330 tests and 28 build steps,
 including actual RAG/bootstrap executions. Native
 687-request replay and the pinned Python fixture/artifact/replay gate also
 passed. These gates do not erase the literal-recursion and NaN-identity
