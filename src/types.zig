@@ -288,11 +288,11 @@ fn validateMode(comptime T: type, arena: Allocator, v: Value, comptime xml_lax: 
     }
     if (T == BoundingBox) {
         const box = (if (xml_lax) BoundingBox.fromXmlValue(v) else BoundingBox.fromValue(v)) catch return error.ParseValue;
-        return box.toValue(arena);
+        return if (v == .custom) v else box.toRuntime(arena);
     }
     if (T == @import("signature.zig").Reasoning) {
-        const content = if (v == .object) v.object.get("content") orelse return error.ParseValue else v;
-        return if (content == .string) content else error.ParseValue;
+        const reasoning = @import("signature.zig").Reasoning.fromValue(v) catch return error.ParseValue;
+        return if (v == .custom) v else reasoning.toRuntime(arena);
     }
     if (T == []const u8) return if (v == .string) v else error.ParseValue;
     if (T == @import("runtime_value.zig").ObjectMap) return if (v == .object) v else error.ParseValue;

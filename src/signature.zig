@@ -50,7 +50,7 @@ pub const Kind = enum {
 pub const StrDict = struct { map: @import("runtime_value.zig").ObjectMap };
 
 /// DSPy native reasoning. Its custom serializer emits the content string.
-pub const Reasoning = struct { content: []const u8 };
+pub const Reasoning = @import("reasoning.zig").Reasoning;
 
 /// `dict[str, V]` for any supported nested `V`.
 pub const Dict = nested.Dict;

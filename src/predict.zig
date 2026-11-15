@@ -352,7 +352,7 @@ fn runAdapterMany(ctx: Context, adapter: Adapter, original: adapter_mod.View, de
                     else => error.AdapterParse,
                 }
             else if (f.native_reasoning and native)
-                if (c.reasoning) |r| if (r.len > 0) @import("runtime_value.zig").Value{ .string = r } else .null else .null
+                if (c.reasoning) |r| if (r.len > 0) try (signature.Reasoning{ .content = r }).toRuntime(ctx.arena) else .null else .null
             else
                 parsed.get(if (f.native_reasoning) try fallbackName(ctx.arena, original, f) else f.name) orelse
                     (try signature.outputDefault(ctx.arena, f)) orelse
@@ -916,7 +916,7 @@ test "typed Predict preserves custom nullable Reasoning null and empty content" 
                 try testing.expectEqualStrings("ok", out.answer);
                 if (case[2]) |expected| {
                     try testing.expectEqualStrings(expected, out.analysis.?.content);
-                    try testing.expectEqualStrings(expected, trace.steps.items[0].outputs.get("analysis").?.string);
+                    try testing.expectEqualStrings(expected, (try signature.Reasoning.fromValue(trace.steps.items[0].outputs.get("analysis").?)).content);
                 } else {
                     try testing.expect(out.analysis == null);
                     try testing.expect(trace.steps.items[0].outputs.get("analysis").? == .null);
@@ -990,7 +990,7 @@ test "native reasoning preserves absent summaries and records actual content" {
     native.summary = "Paris is France's capital.";
     const with = try cot.forward(ctx, .{ .question = "Capital?" });
     try testing.expectEqualStrings(native.summary.?, with.reasoning.?.content);
-    try testing.expectEqualStrings(native.summary.?, trace.steps.items[1].outputs.get("reasoning").?.string);
+    try testing.expectEqualStrings(native.summary.?, (try signature.Reasoning.fromValue(trace.steps.items[1].outputs.get("reasoning").?)).content);
     native.summary = "";
     const empty = try cot.forward(ctx, .{ .question = "Capital?" });
     try testing.expectEqual(@as(?signature.Reasoning, null), empty.reasoning);

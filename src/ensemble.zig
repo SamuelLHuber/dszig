@@ -129,8 +129,33 @@ fn normalizedKey(arena: Allocator, v: Value) Error!Value {
             break :blk if (n.len == 0) .null else .{ .string = n };
         },
         .array, .object => error.UnhashableVote,
+        .custom => |custom| if (custom.vtable.hashable) v else error.UnhashableVote,
         else => v,
     };
+}
+
+test "majority rejects Reasoning but accepts frozen File and BoundingBox models" {
+    var scratch: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    const Reasoning = @import("signature.zig").Reasoning;
+    const File = @import("file.zig").File;
+    const Box = @import("bounding_box.zig").BoundingBox;
+    const models = [_]Value{
+        try (Reasoning{ .content = "vote" }).toRuntime(arena),
+        try (try File.fromFileId("file-vote", null)).toRuntime(arena),
+        try (try Box.init(0, 1, 0, 1)).toRuntime(arena),
+    };
+    var rows: [2]Record = @splat(.empty);
+    for (models, 0..) |model, index| {
+        try rows[0].put(arena, "answer", model);
+        try rows[1].put(arena, "answer", model);
+        if (index == 0) {
+            try std.testing.expectError(error.UnhashableVote, majority(arena, &rows, "answer"));
+        } else {
+            try std.testing.expectEqual(@as(usize, 0), try majority(arena, &rows, "answer"));
+        }
+    }
 }
 
 test "majority distinguishes text from numbers and groups Python numeric equals" {

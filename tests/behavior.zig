@@ -180,7 +180,7 @@ test "BootstrapFewShot zero threshold accepts a zero score while null rejects it
     try testing.expectEqual(@as(usize, 1), demos.len);
     try testing.expectEqualStrings("Munich", demos[0].get("answer").?.string);
     try testing.expectEqual(@as(f64, 0.0), rag.keywordMetric(arena, &trainset[0], &demos[0], null));
-    try testing.expectEqualStrings("Not sure.", demos[0].get("reasoning").?.string);
+    try testing.expectEqualStrings("Not sure.", (try dszig.Reasoning.fromValue(demos[0].get("reasoning").?)).content);
 
     optimizer.metric_threshold = null;
     const rejected = try optimizer.compile(rag.RAG, arena, testing.allocator, ctx, .{}, null, trainset);
@@ -222,7 +222,7 @@ test "the same forward pass yields identical traces" {
     try testing.expectEqual(@as(usize, 1), traces[0].steps.items.len);
     try testing.expect(traces[0].eql(&traces[1]));
     try testing.expectEqualStrings("What is the capital of France?", traces[0].steps.items[0].inputs.get("question").?.string);
-    try testing.expectEqualStrings("The context says Paris is the capital of France.", traces[0].steps.items[0].outputs.get("reasoning").?.string);
+    try testing.expectEqualStrings("The context says Paris is the capital of France.", (try dszig.Reasoning.fromValue(traces[0].steps.items[0].outputs.get("reasoning").?)).content);
 }
 
 test "compile is deterministic and does not mutate its inputs" {
@@ -433,8 +433,7 @@ test "Responses distinguish absent text from empty output and retain fallback ca
     }
     const tool_only = try dszig.lm.OpenAI.parseResponsesResponse(arena, cases[cases.len - 1].body);
     try testing.expectEqualStrings("call_0", tool_only.tool_calls[0].id);
-    try testing.expectError(error.LMFailure, dszig.lm.OpenAI.parseResponsesResponse(arena,
-        "{\"error\":{\"code\":\"fixture_error\",\"message\":\"source fixture error\"},\"output_text\":\"not a successful response\"}"));
+    try testing.expectError(error.LMFailure, dszig.lm.OpenAI.parseResponsesResponse(arena, "{\"error\":{\"code\":\"fixture_error\",\"message\":\"source fixture error\"},\"output_text\":\"not a successful response\"}"));
 }
 
 test "provider request bodies select reasoning JSON and completion-count contracts" {

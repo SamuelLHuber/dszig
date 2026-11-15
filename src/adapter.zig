@@ -950,7 +950,7 @@ test "JSON nullable custom Reasoning retains its model schema and accepts explic
         "{\"analysis\":{\"content\":\"\"},\"answer\":\"yes\"}",
     }) |completion| {
         const empty = try Adapter.json.parse(arena, view, completion);
-        try testing.expectEqualStrings("", empty.get("analysis").?.string);
+        try testing.expectEqualStrings("", (try signature.Reasoning.fromValue(empty.get("analysis").?)).content);
     }
     try testing.expectError(error.AdapterParse, Adapter.json.parse(arena, view, "{\"analysis\":{\"content\":7},\"answer\":\"yes\"}"));
 }

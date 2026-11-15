@@ -446,21 +446,15 @@ pub const SIMBA = struct {
 
         const better_outputs = good.prediction orelse return error.StrategyFailed;
         const worse_outputs = bad.prediction orelse Record.empty;
-        const ProgramSignature = signature.Signature(struct {
-            pub const Input = struct {};
-            pub const Output = P.Output;
-        });
-        const better_feedback_outputs = try maskReasoningFields(out, ProgramSignature.output_fields_list, &better_outputs);
-        const worse_feedback_outputs = try maskReasoningFields(out, ProgramSignature.output_fields_list, &worse_outputs);
         var inputs: Record = .empty;
         try inputs.put(out, "program_code", .{ .string = options.program_code });
         try inputs.put(out, "modules_defn", .{ .string = try inspectModules(out, preds) });
         try inputs.put(out, "program_inputs", try dumps(out, .{ .object = try example.inputs(out) }));
         try inputs.put(out, "oracle_metadata", try dumps(out, .{ .object = labels }));
         try inputs.put(out, "better_program_trajectory", try dumps(out, try trajectory(out, good)));
-        try inputs.put(out, "better_program_outputs", try dumps(out, .{ .object = better_feedback_outputs }));
+        try inputs.put(out, "better_program_outputs", try dumps(out, .{ .object = better_outputs }));
         try inputs.put(out, "worse_program_trajectory", try dumps(out, try trajectory(out, bad)));
-        try inputs.put(out, "worse_program_outputs", try dumps(out, .{ .object = worse_feedback_outputs }));
+        try inputs.put(out, "worse_program_outputs", try dumps(out, .{ .object = worse_outputs }));
         try inputs.put(out, "worse_reward_value", try reward(out, bad.score));
         try inputs.put(out, "better_reward_value", try reward(out, good.score));
         try inputs.put(out, "worse_reward_info", .{ .string = "{}" });
@@ -507,7 +501,7 @@ fn mask(out: Allocator, run: anytype) Allocator.Error!void {
     run.prediction = na;
 }
 
-fn reward(out: Allocator, score: ?f64) Allocator.Error!Value {
+fn reward(out: Allocator, score: ?f64) (@import("feedback.zig").Error || error{ParseValue})!Value {
     const s = score orelse return .{ .string = "N/A" };
     return dumps(out, .{ .float = s });
 }
@@ -519,37 +513,21 @@ fn trajectory(out: Allocator, run: anytype) Allocator.Error!Value {
         const name = nameOf(run.names, step.predictor) orelse continue;
         var item: Record = .empty;
         try item.put(out, "module_name", .{ .string = name });
-        const fields = step.predictor.fields;
-        try item.put(out, "inputs", .{ .object = try maskReasoningFields(out, fields[0..step.predictor.input_count], &step.inputs) });
-        try item.put(out, "outputs", .{ .object = try maskReasoningFields(out, fields[step.predictor.input_count..], &step.outputs) });
+        try item.put(out, "inputs", .{ .object = step.inputs });
+        try item.put(out, "outputs", .{ .object = step.outputs });
         try list.append(.{ .object = item });
     }
     return .{ .array = list };
 }
 
-/// SIMBA's `recursive_mask` sees typed Reasoning objects before DSPy's custom
-/// JSON serializer runs. Restore that distinction from field metadata without
-/// mutating the serialized prediction/trace or masking ordinary string fields.
-fn maskReasoningFields(out: Allocator, fields: []const signature.Field, record: *const Record) Allocator.Error!Record {
-    var masked = record.*;
-    var copied = false;
-    for (fields) |field| {
-        if (!field.reasoning_type) continue;
-        const item = record.get(field.name) orelse continue;
-        if (item == .null) continue;
-        if (!copied) {
-            masked = try record.clone(out);
-            copied = true;
-        }
-        masked.getPtr(field.name).?.* = .{ .string = "<non-serializable: Reasoning>" };
-    }
-    return masked;
-}
-
-/// `orjson.dumps(v, option=OPT_INDENT_2).decode()`.
-fn dumps(out: Allocator, v: Value) Allocator.Error!Value {
+/// `orjson.dumps(recursive_mask(v), option=OPT_INDENT_2).decode()`.
+fn dumps(out: Allocator, v: Value) (@import("feedback.zig").Error || error{ParseValue})!Value {
+    const masked = try @import("feedback.zig").maskValue(out, v);
     var aw: Writer.Allocating = .init(out);
-    pyjson.writeJson(&aw.writer, v, .indent2) catch return error.OutOfMemory;
+    pyjson.writeJson(&aw.writer, masked, .orjson_indent2) catch |err| return switch (err) {
+        error.WriteFailed => error.OutOfMemory,
+        else => |failure| failure,
+    };
     return .{ .string = aw.written() };
 }
 
@@ -648,15 +626,16 @@ test "feedback masks typed Reasoning without masking ordinary strings or mutatin
         .reasoning = "An ordinary string.",
         .absent = null,
     });
-    const masked = try maskReasoningFields(out, Sig.output_fields_list, &original);
+    const serialized = try dumps(out, .{ .object = original });
+    const masked = (try std.json.parseFromSliceLeaky(Value, out, serialized.string, .{})).object;
     try std.testing.expectEqualStrings("<non-serializable: Reasoning>", masked.get("analysis").?.string);
     try std.testing.expectEqualStrings("<non-serializable: Reasoning>", masked.get("direct").?.string);
     try std.testing.expectEqualStrings("<non-serializable: Reasoning>", masked.get("empty").?.string);
     try std.testing.expectEqualStrings("An ordinary string.", masked.get("reasoning").?.string);
     try std.testing.expect(masked.get("absent").? == .null);
-    try std.testing.expectEqualStrings("Actual reasoning.", original.get("analysis").?.string);
-    try std.testing.expectEqualStrings("Direct reasoning.", original.get("direct").?.string);
-    try std.testing.expectEqualStrings("", original.get("empty").?.string);
+    try std.testing.expectEqualStrings("Actual reasoning.", (try signature.Reasoning.fromValue(original.get("analysis").?)).content);
+    try std.testing.expectEqualStrings("Direct reasoning.", (try signature.Reasoning.fromValue(original.get("direct").?)).content);
+    try std.testing.expectEqualStrings("", (try signature.Reasoning.fromValue(original.get("empty").?)).content);
 }
 
 test "roundHalfEven matches Python round" {

@@ -391,8 +391,8 @@ pub fn toRecord(arena: Allocator, comptime T: type, value: T) Allocator.Error!Re
 
 pub fn toValue(arena: Allocator, comptime T: type, v: T) Allocator.Error!Value {
     if (comptime code.isCode(T)) return v.toValue();
-    if (T == @import("file.zig").File) return v.toRuntime(arena);
-    if (T == signature.Reasoning) return .{ .string = v.content };
+    if (T == @import("file.zig").File or T == @import("bounding_box.zig").BoundingBox or T == signature.Reasoning)
+        return v.toRuntime(arena);
     if (T == @import("tool.zig").ToolCalls) return v.toValue(arena);
     if (T == Value) return v;
     if (T == []const u8) return .{ .string = v };
@@ -450,11 +450,7 @@ pub fn fromValue(arena: Allocator, comptime T: type, v: Value) ConvertError!T {
         error.OutOfMemory => error.OutOfMemory,
         else => error.TypeMismatch,
     };
-    if (T == signature.Reasoning) {
-        const content = if (v == .object) v.object.get("content") orelse return error.MissingField else v;
-        if (content != .string) return error.TypeMismatch;
-        return .{ .content = content.string };
-    }
+    if (T == signature.Reasoning) return T.fromValue(v) catch error.TypeMismatch;
     if (T == []const u8) return if (v == .string) v.string else error.TypeMismatch;
     if (T == []const []const u8) {
         if (v != .array) return error.TypeMismatch;
@@ -523,6 +519,14 @@ pub fn fromValue(arena: Allocator, comptime T: type, v: Value) ConvertError!T {
 /// Python `==` for JSON-loaded values (dict equality ignores key order;
 /// `1 == 1.0` and `True == 1` as in Python).
 pub fn pyEqual(a: Value, b: Value) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) {
+        if (a == .custom) {
+            if (a.custom.vtable.eql_value) |equal| return equal(a.custom.ptr, b);
+        }
+        if (b == .custom) {
+            if (b.custom.vtable.eql_value) |equal| return equal(b.custom.ptr, a);
+        }
+    }
     if (a == .bool) return pyEqual(.{ .integer = if (a.bool) 1 else 0 }, b);
     if (b == .bool) return pyEqual(a, .{ .integer = if (b.bool) 1 else 0 });
     return switch (a) {

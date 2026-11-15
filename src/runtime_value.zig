@@ -16,6 +16,10 @@ pub const CustomVTable = struct {
     /// DSPy Type objects can supply bare text for a native tool result;
     /// ordinary models whose JSON serializer returns a string stay JSON-quoted.
     is_type: bool = false,
+    /// Whether Python's object protocol admits this class as a dictionary key.
+    /// Majority rejects mutable/unhashable models before comparing their values.
+    hashable: bool = false,
+    bool_value: ?*const fn (*const anyopaque) bool = null,
     raw_value: *const fn (Allocator, *const anyopaque) Allocator.Error!Value,
     serialized: *const fn (Allocator, *const anyopaque) CustomError!Value,
     write_str: *const fn (*Writer, *const anyopaque) CustomWriteError!void,
@@ -25,6 +29,9 @@ pub const CustomVTable = struct {
     clone: *const fn (Allocator, *const anyopaque) Allocator.Error!Custom,
     deinit: *const fn (Allocator, *const anyopaque, bool) void,
     eql: *const fn (*const anyopaque, *const anyopaque) bool,
+    /// Optional Python equality against a different value tag (e.g. Reasoning
+    /// compares equal to its content string, but not to a lookalike dictionary).
+    eql_value: ?*const fn (*const anyopaque, Value) bool = null,
 };
 
 /// A boxed native model. The box is always owned; owns_data describes its fields.
@@ -36,6 +43,10 @@ pub const Custom = struct {
     pub fn get(self: Custom, comptime T: type) ?*const T {
         if (!std.mem.eql(u8, self.vtable.type_name, @typeName(T))) return null;
         return @ptrCast(@alignCast(self.ptr));
+    }
+
+    pub fn truthy(self: Custom) bool {
+        return if (self.vtable.bool_value) |value| value(self.ptr) else true;
     }
 
     pub fn rawValue(self: Custom, allocator: Allocator) Allocator.Error!Value {

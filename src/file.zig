@@ -200,6 +200,7 @@ pub const File = struct {
         .type_name = @typeName(File),
         .model_name = "File",
         .is_type = true,
+        .hashable = true,
         .raw_value = rawRuntimeValue,
         .serialized = serializedRuntimeValue,
         .write_str = writeRuntimeStr,

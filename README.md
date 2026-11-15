@@ -108,7 +108,7 @@ retain the actual continuation and raw provider response independently.
 | DSPy surface | Native Zig surface and coverage |
 |---|---|
 | Class-style signatures and typed fields | `Signature`, `Dict`, `Code`, `CodeWithLanguage`, `BoundingBox`, `File`, scalar/string/list/optional/model fields, literal enums, field descriptions/defaults, compile-time rejection of invalid signatures |
-| Runtime values and documents | `Value`, `Array`, `ObjectMap`, boxed native File identity, recursive typed-class serialization, text/canonical-document content union and bounded Responses `input_file` translation |
+| Runtime values and documents | `Value`, `Array`, `ObjectMap`, boxed native File/Reasoning/BoundingBox identity, recursive typed-class serialization, text/canonical-document content union and bounded Responses `input_file` translation |
 | Chat, JSON, XML and two-stage adapters | `Adapter.chat`, `.json`, `.xml`, `.two_step`; `TwoStepAdapter` with a separate extraction LM; independent prompt/parse fixtures, strict response-schema construction, JSON fallback, typed XML and Unicode key handling |
 | Prediction and reasoning | `Predict`, `ChainOfThought`, `BestOfN`, `Refine`, `MultiChainComparison`, explicit `Context`, typed outputs, serialized `Trace`, named predictor/parameter discovery |
 | Retrieval and embeddings | `Retrieve`, lexical `InMemoryRetriever`, HTTP `ColBERTv2` with shared mutable-graph memory caching, custom/OpenAI/Azure `Embedder`, float32 `KNN`, per-query `KNNFewShot`, and brute-force `Embeddings`/`EmbeddingsWithScores` with NumPy persistence |
@@ -151,7 +151,7 @@ escaping, normalization and fallback IDs. The repeatable development oracle is
 not authenticated model inference, provider streaming or complete lm15
 compatibility.
 
-### Native runtime values and File
+### Native runtime values and model identity
 
 Public runtime records, tool results and JSON-shaped APIs use **`dszig.Value`**,
 not `std.json.Value`. `dszig.Array` is the managed list of these values;
@@ -160,8 +160,35 @@ not `std.json.Value`. `dszig.Array` is the managed list of these values;
 are joined by `.custom`, which retains a boxed native class instead of erasing
 it into a lookalike dictionary. `std.json` parsing and Stringify work directly
 with `dszig.Value`; parsing JSON creates ordinary values, never class identity.
-A custom value exposes its type through `custom.get(dszig.File)` and retains
-class-specific validation, formatting, equality and cloning.
+A custom value exposes its type through `custom.get(dszig.File)`,
+`custom.get(dszig.Reasoning)` or `custom.get(dszig.BoundingBox)` and retains
+class-specific validation, formatting, equality, truthiness and cloning.
+
+Typed conversion boxes these three model families; parsing ordinary JSON does
+not. A raw lookalike dictionary remains a dictionary until explicit typed
+validation. Native class validation preserves an existing box, subject to the
+model's actual validators. Owning clones retain their class and copy borrowed
+strings; generic container copies do not reproduce Python's memoized alias graph.
+
+- `Reasoning{ .content = ... }` borrows its content. `toRuntime(arena)` boxes it;
+  `toValue(arena)` returns the raw `{ "content": ... }` fields. Its ordinary
+  serialization is the content string, `str` is bare content and `repr` is the
+  quoted Python string. It compares equal to the same content string in either
+  order, but not to a lookalike dictionary. Empty Reasoning is false; nonempty
+  content is true. It remains unhashable, so `majority` rejects it.
+- `BoundingBox` keeps structured geometry in both raw and ordinary serialization.
+  Its Python `str`/`repr` are model displays, distinct from its JSON `format`.
+  Raw dictionary validation checks finite edges and positive area; validation
+  of an existing box reruns the source's ordering check, not field validators.
+  JSON-mode serialization converts unvalidated nonfinite fields to null, while
+  raw fields and `format` retain them. Frozen File and BoundingBox instances
+  are admissible majority-vote keys.
+- Refine's recursive mask preserves actual Reasoning content; SIMBA masks that
+  same object as `<non-serializable: Reasoning>`. Both preserve ordinary strings
+  and dictionaries. Class identity, not an annotation alone, controls this
+  distinction.
+
+#### File constructors
 
 `File` has three nullable UTF-8 fields: `file_data`, `file_id` and `filename`.
 Its constructors are explicit:
@@ -495,14 +522,15 @@ scores, saved artifact bytes, instruction candidates, trial logs, candidate
 scores and SIMBA train scores. It is **mock-provider behavioral evidence**, not
 proof of real-model performance or complete DSPy equivalence.
 
-Local verification on 2026-11-15 of the File/native runtime-value,
-nullable-completion and File-copy constructor cutover passed **261/261 tests**
-in both Debug and ReleaseSafe, with all 28 build steps, including the actual
+Local verification on 2026-11-15 of the File/Reasoning/BoundingBox native
+runtime-value and nullable-completion cutover passed **274/274 tests** in both
+Debug and ReleaseSafe, with all 28 build steps, including the actual
 RAG/bootstrap examples. Its actual replay executable consumed all **687**
 deterministic mock calls and matched every adapter case and pipeline; the
 independent real-DSPy reference gate also passed.
 
-The actual `zig build live -- --smoke` CLI completed once through Chat
+At the preceding 261-test File checkpoint, the actual
+`zig build live -- --smoke` CLI completed once through Chat
 Completions and once through Responses against an isolated localhost HTTP
 fixture, returning `4` and writing each protocol's transcript. A separate
 negative run exited before HTTP when a dummy `CODEX_LB_API_KEY` was supplied
@@ -534,6 +562,15 @@ compared 3,671 source operations and 329 additional streaming-writer outputs.
 Explicitly skipped dispatches and Python DocumentPart operations remain limits.
 These smokes do not establish exhaustive constructor or DocumentPart coverage,
 full File parity or full provider/SDK compatibility.
+
+The subsequent Reasoning/BoundingBox native-object consumer matched **592**
+assertions against independently executed DSPy 3.5 source receipts: 63
+Reasoning validation rows, eight constructor view sets, equality and nested
+JSON/tool boundaries, five valid and four unvalidated BoundingBox cases, plus
+Refine/SIMBA masking, model truthiness and majority hashability. It rebuilt
+actual native boxes rather than substituting their dictionaries. The checks
+explicitly exclude tuple repr/dispatch, shared deepcopy aliases, NaN
+cross-instance float-object identity and Reasoning's Python string operators.
 
 Additional native executable checks exercised hosted OpenAI/Azure embeddings,
 base64/index ordering, cache reuse, vector KNN, repeated KNNFewShot predictions
@@ -652,6 +689,13 @@ The following prevent a claim that DSZig can do everything DSPy can:
   class identity; Refine shares this boundary. Mid-bootstrap mutation of a
   borrowed teacher-settings object is not reflected after Bootstrap's entry
   snapshot.
+- **Runtime model identity:** File, Reasoning and BoundingBox are genuine boxed
+  classes, not a complete Python object runtime. Other model families still
+  use their existing representations. Generic arrays/maps do not preserve
+  shared container/class aliases through memoized deepcopy. Python tuple
+  identity/dispatch, NaN float-object identity across distinct or cloned boxes,
+  Reasoning indexing/iteration/string-method delegation, arbitrary attribute
+  mutation and Python frozen-assignment exceptions are not reproduced.
 - **Providers and media:** native File construction, adapter/typed prediction
   handling, File tool-result markers and bounded Responses document translation
   are implemented as described above. There is still no complete lm15 provider

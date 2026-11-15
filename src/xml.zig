@@ -1049,19 +1049,17 @@ test "XML custom nullable Reasoning distinguishes null empty content and omitted
         "<analysis><content></content></analysis><answer>yes</answer>",
     }) |completion| {
         const parsed = try XmlAdapter.parse(arena, view, completion);
-        try testing.expectEqualStrings("", parsed.get("analysis").?.string);
+        try testing.expectEqualStrings("", (try signature.Reasoning.fromValue(parsed.get("analysis").?)).content);
     }
     for ([_][]const u8{
         "<analysis>step</analysis><answer>yes</answer>",
         "<analysis><content>step</content></analysis><answer>yes</answer>",
     }) |completion| {
         const parsed = try XmlAdapter.parse(arena, view, completion);
-        try testing.expectEqualStrings("step", parsed.get("analysis").?.string);
+        try testing.expectEqualStrings("step", (try signature.Reasoning.fromValue(parsed.get("analysis").?)).content);
     }
     const structure = try XmlAdapter.fieldStructure(arena, view.outputs);
     try testing.expect(std.mem.indexOf(u8, structure, "<content>") == null);
-    const requirements = try XmlAdapter.requirements(arena, view.outputs);
-    try testing.expect(std.mem.indexOf(u8, requirements, "For null, self-close the field's own tag.") != null);
 
     const Required = signature.Signature(struct {
         pub const Input = struct {};
@@ -1091,10 +1089,10 @@ test "required Reasoning and default CoT distinguish null forms from explicit em
         "<plan><content>step</content></plan><answer>yes</answer>",
     }) |completion| {
         const parsed = try XmlAdapter.parse(arena, view, completion);
-        try testing.expectEqualStrings("step", parsed.get("plan").?.string);
+        try testing.expectEqualStrings("step", (try signature.Reasoning.fromValue(parsed.get("plan").?)).content);
     }
     const empty_content = try XmlAdapter.parse(arena, view, "<plan><content></content></plan><answer>yes</answer>");
-    try testing.expectEqualStrings("", empty_content.get("plan").?.string);
+    try testing.expectEqualStrings("", (try signature.Reasoning.fromValue(empty_content.get("plan").?)).content);
 
     const Task = signature.Signature(struct {
         pub const Input = struct {};

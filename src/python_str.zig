@@ -40,7 +40,8 @@ pub fn renderer(comptime T: type) ?Render {
 /// True only for declared types whose Python `str`/`repr` differs from the
 /// JSON-lowered `Value` rendering: models, Code, and containers of them.
 fn needsRendering(comptime T: type) bool {
-    if (T == signature.Reasoning or T == signature.StrDict or T == Value or
+    if (T == signature.Reasoning or T == @import("file.zig").File or
+        T == @import("bounding_box.zig").BoundingBox or T == signature.StrDict or T == Value or
         T == @import("runtime_value.zig").ObjectMap or T == []const u8 or T == []u8) return false;
     if (comptime types.isDict(T)) return needsRendering(T.dszig_dict_value);
     return switch (@typeInfo(T)) {
@@ -56,6 +57,9 @@ const Mode = enum { str, repr };
 
 fn write(comptime T: type, w: *Writer, v: Value, mode: Mode, depth: u32) WriteError!void {
     if (depth >= pyjson.max_depth) return error.JsonTooDeep;
+    if (v == .custom) {
+        return if (mode == .str) pyjson.writeStr(w, v) else pyjson.writeRepr(w, v, depth);
+    }
     if (comptime !needsRendering(T)) {
         // `str(value)` of a bare str is raw text; everything else is repr.
         if (mode == .str and v == .string) return w.writeAll(v.string);
@@ -63,7 +67,6 @@ fn write(comptime T: type, w: *Writer, v: Value, mode: Mode, depth: u32) WriteEr
     }
     if (v == .null) return w.writeAll("None");
     if (comptime code.isCode(T)) return writeCode(T, w, v, mode, depth);
-    if (T == @import("file.zig").File) return writeFile(w, v, mode, depth);
     if (comptime types.isDict(T)) return writeDict(T.dszig_dict_value, w, v, depth);
     return switch (@typeInfo(T)) {
         .optional => |o| write(o.child, w, v, mode, depth),
@@ -86,10 +89,6 @@ fn writeCode(comptime T: type, w: *Writer, v: Value, mode: Mode, depth: u32) pyj
     try w.writeAll("code=");
     try pyjson.writeRepr(w, content, depth + 1);
     if (mode == .repr) try w.writeByte(')');
-}
-
-fn writeFile(w: *Writer, v: Value, mode: Mode, depth: u32) WriteError!void {
-    return if (mode == .str) pyjson.writeStr(w, v) else pyjson.writeRepr(w, v, depth);
 }
 
 fn writeList(comptime Child: type, w: *Writer, v: Value, depth: u32) WriteError!void {

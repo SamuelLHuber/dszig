@@ -343,10 +343,9 @@ pub fn ReActIters(comptime Sig: type, comptime user_tools: []const Tool, comptim
             var event = try turn_inputs.clone(arena);
             if (pred.get("next_thought")) |thought| {
                 if (thought != .null) {
-                    // History's JSON serialization invokes Reasoning.format,
-                    // while predictor traces retain its {content} value.
-                    const recorded = if (thought == .object) thought.object.get("content") orelse thought else thought;
-                    try event.put(arena, "next_thought", recorded);
+                    // Keep the actual class; JSON serialization invokes its
+                    // content serializer without changing stored trace values.
+                    try event.put(arena, "next_thought", thought);
                 }
             }
             var recorded_calls = calls;

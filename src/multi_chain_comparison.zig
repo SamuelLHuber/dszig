@@ -243,7 +243,7 @@ fn truthy(v: Value) bool {
         .string => |s| s.len > 0,
         .array => |a| a.items.len > 0,
         .object => |o| o.count() > 0,
-        .custom => true,
+        .custom => |custom| custom.truthy(),
     };
 }
 
