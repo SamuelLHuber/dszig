@@ -20,7 +20,8 @@ pub const CodeMetadata = struct {
 
 /// Borrowed builtin payloads preserve Python's non-JSON value identities.
 pub const EnumValue = struct {
-    class_identity: []const u8,
+    /// Same nominal token as CustomVTable.type_identity, never a display name.
+    class_identity: *const anyopaque,
     class_name: []const u8,
     member_name: []const u8,
     value: Value,
@@ -71,6 +72,10 @@ pub const CustomVTable = struct {
     bool_value: ?*const fn (*const anyopaque) bool = null,
     /// Python __float__, without numeric identity or numeric equality.
     float_value: ?*const fn (*const anyopaque) CustomError!f64 = null,
+    /// Actual Python int-subclass payload, not an arbitrary __int__ conversion.
+    /// The immutable borrowed result is .integer or canonical integer
+    /// .number_string; it must never contain another custom object or a float.
+    integer_value: ?*const fn (*const anyopaque) Value = null,
     decision: ?DecisionMetadata = null,
     code: ?CodeMetadata = null,
     python: ?*const fn (*const anyopaque) PythonValue = null,
@@ -113,7 +118,24 @@ pub const Custom = struct {
     }
 
     pub fn truthy(self: Custom) bool {
-        return if (self.vtable.bool_value) |value| value(self.ptr) else true;
+        if (self.vtable.bool_value) |value| return value(self.ptr);
+        if (self.integerValue()) |integer| return switch (integer) {
+            .integer => |number| number != 0,
+            .number_string => |text| for (text) |byte| {
+                if (byte >= '1' and byte <= '9') break true;
+            } else false,
+            else => unreachable,
+        };
+        return true;
+    }
+
+    /// Borrow the exact builtin integer base without discarding this object's
+    /// class identity at storage, validation or serialization boundaries.
+    pub fn integerValue(self: Custom) ?Value {
+        const inspect = self.vtable.integer_value orelse return null;
+        const result = inspect(self.ptr);
+        std.debug.assert(result == .integer or result == .number_string);
+        return result;
     }
 
     pub fn rawValue(self: Custom, allocator: Allocator) Allocator.Error!Value {

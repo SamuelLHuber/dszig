@@ -196,6 +196,7 @@ pub fn parseInteger(v: Value) error{ParseValue}!Value {
             break :blk Value.parseFromNumberSlice(s);
         },
         .float => |f| floatToInt(f),
+        .custom => |custom| custom.integerValue() orelse error.ParseValue,
         else => error.ParseValue,
     };
 }
@@ -205,6 +206,7 @@ pub fn parseInteger(v: Value) error{ParseValue}!Value {
 pub fn coerceInteger(arena: Allocator, input: Value) ParseError!Value {
     var v = input;
     if (v == .custom) {
+        if (v.custom.integerValue()) |integer| return integer;
         if (v.custom.vtable.enumeration) |inspect| return inspect(v.custom.ptr).value;
     }
     if (v == .custom) {
@@ -314,7 +316,7 @@ fn floatToInt(f: f64) error{ParseValue}!Value {
 }
 
 /// JSON number grammar: -?(0|[1-9]\\d*)(\\.\\d+)?([eE][+-]?\\d+)?
-fn isJsonNumber(s: []const u8) bool {
+pub fn isJsonNumber(s: []const u8) bool {
     var i: usize = 0;
     if (i < s.len and s[i] == '-') i += 1;
     if (i >= s.len) return false;
@@ -356,7 +358,7 @@ pub fn toRecord(arena: Allocator, comptime T: type, value: T) Allocator.Error!Re
 }
 
 pub fn toValue(arena: Allocator, comptime T: type, v: T) Allocator.Error!Value {
-    if (comptime code.isCode(T) or @import("enum.zig").isEnum(T) or @import("literal.zig").isLiteral(T) or T == @import("integer.zig").Integer or T == @import("decimal_type.zig").Decimal) return v.toRuntime(arena);
+    if (comptime code.isCode(T) or @import("enum.zig").isEnum(T) or @import("literal.zig").isLiteral(T) or T == @import("integer.zig").Integer or @import("decimal_type.zig").isDecimal(T)) return v.toRuntime(arena);
     if (comptime decision.isDecision(T) or citation.isCitation(T) or T == @import("file.zig").File or T == @import("bounding_box.zig").BoundingBox or T == signature.Reasoning)
         return v.toRuntime(arena);
     if (T == @import("tool.zig").ToolCalls) return v.toValue(arena);
@@ -424,7 +426,7 @@ pub fn fromValue(arena: Allocator, comptime T: type, v: Value) ConvertError!T {
     };
     if (T == Value) return v;
     if (T == @import("integer.zig").Integer) return T.fromValue(v);
-    if (T == @import("decimal_type.zig").Decimal) return T.fromValue(v) catch error.TypeMismatch;
+    if (comptime @import("decimal_type.zig").isDecimal(T)) return T.fromValue(v) catch error.TypeMismatch;
     if (comptime @import("enum.zig").isEnum(T) or @import("literal.zig").isLiteral(T)) return T.fromValue(v) catch error.TypeMismatch;
     if (T == @import("tool.zig").ToolCalls) return T.fromValue(arena, v) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
@@ -459,12 +461,12 @@ pub fn fromValue(arena: Allocator, comptime T: type, v: Value) ConvertError!T {
         return .{ .keys = keys, .values = values };
     }
     switch (@typeInfo(T)) {
-        .int => return switch (v) {
+        .int => return switch (numericBase(v)) {
             .integer => |i| std.math.cast(T, i) orelse error.TypeMismatch,
             .number_string => |s| std.fmt.parseInt(T, s, 10) catch error.TypeMismatch,
             else => error.TypeMismatch,
         },
-        .float => return switch (v) {
+        .float => return switch (numericBase(v)) {
             .float => |f| @floatCast(f),
             .integer => |i| @floatFromInt(i),
             .number_string => |s| std.fmt.parseFloat(T, s) catch error.TypeMismatch,
@@ -500,17 +502,19 @@ pub fn fromValue(arena: Allocator, comptime T: type, v: Value) ConvertError!T {
 /// Python `==` for JSON-loaded values (dict equality ignores key order;
 /// `1 == 1.0` and `True == 1` as in Python). User equality can fail: signaling
 /// Decimal NaNs, for example, must propagate rather than silently compare false.
-pub fn pyEqual(a: Value, b: Value) ParseError!bool {
-    if (std.meta.activeTag(a) != std.meta.activeTag(b) or
-        (a == .custom and b == .custom and !a.custom.sameType(b.custom)))
-    {
-        if (a == .custom) {
-            if (a.custom.vtable.eql_value) |equal| return equal(a.custom.ptr, b);
-        }
-        if (b == .custom) {
-            if (b.custom.vtable.eql_value) |equal| return equal(b.custom.ptr, a);
-        }
+pub fn pyEqual(a_input: Value, b_input: Value) ParseError!bool {
+    if (a_input == .custom and b_input == .custom and a_input.custom.sameType(b_input.custom))
+        return a_input.custom.eql(b_input.custom);
+    // Reflected class protocols receive the original object, not an erased
+    // integer base. Numeric fallback alone discards the subclass identity.
+    if (a_input == .custom) {
+        if (a_input.custom.vtable.eql_value) |equal| return equal(a_input.custom.ptr, b_input);
     }
+    if (b_input == .custom) {
+        if (b_input.custom.vtable.eql_value) |equal| return equal(b_input.custom.ptr, a_input);
+    }
+    const a = numericBase(a_input);
+    const b = numericBase(b_input);
     if (a == .bool) return pyEqual(.{ .integer = if (a.bool) 1 else 0 }, b);
     if (b == .bool) return pyEqual(a, .{ .integer = if (b.bool) 1 else 0 });
     return switch (a) {
@@ -599,6 +603,12 @@ test "Decimal identity shortcuts belong to container elements, not direct equali
     }
 }
 
+/// Arithmetic and builtin numeric protocols operate on an integer subclass's
+/// exact base, while records and typed enum decoding retain the original box.
+fn numericBase(input: Value) Value {
+    return if (input == .custom) input.custom.integerValue() orelse input else input;
+}
+
 const IntegerText = struct {
     negative: bool,
     digits: []const u8,
@@ -620,7 +630,7 @@ const IntegerText = struct {
     }
 
     fn fromValue(v: Value, buffer: *[20]u8) ?IntegerText {
-        return parse(switch (v) {
+        return parse(switch (numericBase(v)) {
             .bool => |b| if (b) "1" else "0",
             .integer => |i| std.fmt.bufPrint(buffer, "{d}", .{i}) catch unreachable,
             .number_string => |text| text,
@@ -669,7 +679,8 @@ fn integralFloatText(f: f64, buffer: *[310]u8) ?[]const u8 {
 }
 
 /// Python float >= numeric scalar, retaining arbitrary integer boundaries.
-pub fn floatAtLeast(f: f64, threshold: Value) error{InvalidNumber}!bool {
+pub fn floatAtLeast(f: f64, input: Value) error{InvalidNumber}!bool {
+    const threshold = numericBase(input);
     if (decimalView(threshold) != null) {
         const order = try numericOrder(.{ .float = f }, threshold);
         return order == .gt or order == .eq;
@@ -694,7 +705,8 @@ pub fn floatAtLeast(f: f64, threshold: Value) error{InvalidNumber}!bool {
 }
 
 /// Python arithmetic's implicit float conversion, including integer overflow.
-pub fn numericFloat(v: Value) error{InvalidNumber}!f64 {
+pub fn numericFloat(input: Value) error{InvalidNumber}!f64 {
+    const v = numericBase(input);
     return switch (v) {
         .bool => |b| if (b) 1 else 0,
         .integer => |i| @floatFromInt(i),
@@ -709,7 +721,9 @@ pub fn numericFloat(v: Value) error{InvalidNumber}!f64 {
 }
 
 /// Python numeric ordering. NaNs are unordered; integers never round to float.
-pub fn numericOrder(a: Value, b: Value) error{InvalidNumber}!?std.math.Order {
+pub fn numericOrder(a_input: Value, b_input: Value) error{InvalidNumber}!?std.math.Order {
+    const a = numericBase(a_input);
+    const b = numericBase(b_input);
     if (decimalView(a) != null or decimalView(b) != null) {
         const context = decimal_environment.getContext();
         if (isFloatingOperand(a) or isFloatingOperand(b))
@@ -745,9 +759,13 @@ pub fn numericOrder(a: Value, b: Value) error{InvalidNumber}!?std.math.Order {
 /// Python numeric multiplication. Integer-only products remain exact; float
 /// products first convert BOTH operands, even when the other operand is zero.
 /// Zero/one integer products borrow unchanged numeric text without allocation.
-pub fn numericProduct(arena: Allocator, a: Value, b: Value) (Allocator.Error || error{InvalidNumber})!Value {
+pub fn numericProduct(arena: Allocator, a_input: Value, b_input: Value) (Allocator.Error || error{InvalidNumber})!Value {
+    const a = numericBase(a_input);
+    const b = numericBase(b_input);
     if (decimalView(a) != null or decimalView(b) != null)
         return decimalBinary(arena, a, b, .multiply);
+    if (complexView(a) != null or complexView(b) != null)
+        return complexBinary(arena, a, b, .multiply);
     var a_buffer: [20]u8 = undefined;
     var b_buffer: [20]u8 = undefined;
     if (IntegerText.fromValue(a, &a_buffer)) |a_integer| {
@@ -813,9 +831,62 @@ fn decimalMathFailure(err: decimal_environment.Context.Error) NumericError {
     return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidNumber;
 }
 
-const DecimalOperation = enum { add, subtract, multiply, divide };
+const NumericOperation = enum { add, subtract, multiply, divide };
 
-fn decimalBinary(arena: Allocator, a: Value, b: Value, comptime operation: DecimalOperation) NumericError!Value {
+const Complex = @FieldType(@import("runtime_value.zig").PythonValue, "complex");
+
+fn complexView(input: Value) ?Complex {
+    const builtin = python.view(input) orelse return null;
+    return if (builtin == .complex) builtin.complex else null;
+}
+
+fn complexOperand(input: Value) error{InvalidNumber}!Complex {
+    if (complexView(input)) |number| return number;
+    return .{ .real = try numericFloat(input), .imag = 0 };
+}
+
+fn complexBinary(arena: Allocator, a: Value, b: Value, comptime operation: NumericOperation) NumericError!Value {
+    const left = try complexOperand(a);
+    const right = try complexOperand(b);
+    const result: Complex = switch (operation) {
+        .add => .{ .real = left.real + right.real, .imag = left.imag + right.imag },
+        .subtract => .{ .real = left.real - right.real, .imag = left.imag - right.imag },
+        .multiply => .{
+            .real = left.real * right.real - left.imag * right.imag,
+            .imag = left.real * right.imag + left.imag * right.real,
+        },
+        .divide => divide: {
+            // CPython 3.11 _Py_c_quot scales by the larger denominator
+            // component; the naive squared-magnitude formula overflows.
+            const real = @abs(right.real);
+            const imag = @abs(right.imag);
+            if (real >= imag) {
+                if (real == 0) return error.InvalidNumber;
+                const ratio = right.imag / right.real;
+                const denominator = right.real + right.imag * ratio;
+                break :divide .{
+                    .real = (left.real + left.imag * ratio) / denominator,
+                    .imag = (left.imag - left.real * ratio) / denominator,
+                };
+            }
+            if (imag >= real) {
+                const ratio = right.real / right.imag;
+                const denominator = right.real * ratio + right.imag;
+                break :divide .{
+                    .real = (left.real * ratio + left.imag) / denominator,
+                    .imag = (left.imag * ratio - left.real) / denominator,
+                };
+            }
+            break :divide .{ .real = std.math.nan(f64), .imag = std.math.nan(f64) };
+        },
+    };
+    return python.complex(arena, result.real, result.imag) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.ParseValue => error.InvalidNumber,
+    };
+}
+
+fn decimalBinary(arena: Allocator, a: Value, b: Value, comptime operation: NumericOperation) NumericError!Value {
     var left_buffer: [768]u8 = undefined;
     var right_buffer: [768]u8 = undefined;
     // Reject mixed floats before any operation, including NaN propagation.
@@ -833,7 +904,7 @@ fn decimalBinary(arena: Allocator, a: Value, b: Value, comptime operation: Decim
 }
 
 fn smallInteger(input: Value) ?i64 {
-    return switch (input) {
+    return switch (numericBase(input)) {
         .bool => |number| @intFromBool(number),
         .integer => |number| number,
         .number_string => |text| if (text.len <= 20) std.fmt.parseInt(i64, text, 10) catch null else null,
@@ -874,9 +945,13 @@ pub fn numericDifference(arena: Allocator, a: Value, b: Value) NumericError!Valu
     return numericAddSubtract(arena, a, b, true);
 }
 
-fn numericAddSubtract(arena: Allocator, a: Value, b: Value, comptime subtract: bool) NumericError!Value {
+fn numericAddSubtract(arena: Allocator, a_input: Value, b_input: Value, comptime subtract: bool) NumericError!Value {
+    const a = numericBase(a_input);
+    const b = numericBase(b_input);
     if (decimalView(a) != null or decimalView(b) != null)
         return decimalBinary(arena, a, b, if (subtract) .subtract else .add);
+    if (complexView(a) != null or complexView(b) != null)
+        return complexBinary(arena, a, b, if (subtract) .subtract else .add);
     var a_buffer: [20]u8 = undefined;
     var b_buffer: [20]u8 = undefined;
     if (IntegerText.fromValue(a, &a_buffer)) |left_integer| {
@@ -916,9 +991,13 @@ fn numericAddSubtract(arena: Allocator, a: Value, b: Value, comptime subtract: b
 
 /// True division of integers rounds the ratio, not independently rounded or
 /// overflowing binary64 operands. Decimal division retains its context/flags.
-pub fn numericQuotient(arena: Allocator, a: Value, b: Value) NumericError!Value {
+pub fn numericQuotient(arena: Allocator, a_input: Value, b_input: Value) NumericError!Value {
+    const a = numericBase(a_input);
+    const b = numericBase(b_input);
     if (decimalView(a) != null or decimalView(b) != null)
         return decimalBinary(arena, a, b, .divide);
+    if (complexView(a) != null or complexView(b) != null)
+        return complexBinary(arena, a, b, .divide);
     var a_buffer: [20]u8 = undefined;
     var b_buffer: [20]u8 = undefined;
     if (IntegerText.fromValue(a, &a_buffer)) |numerator| {
@@ -952,7 +1031,8 @@ pub fn numericQuotient(arena: Allocator, a: Value, b: Value) NumericError!Value 
     return .{ .float = left / right };
 }
 
-pub fn numericAbs(arena: Allocator, input: Value) NumericError!Value {
+pub fn numericAbs(arena: Allocator, v: Value) NumericError!Value {
+    const input = numericBase(v);
     if (decimalView(input)) |data| {
         const result = decimal_environment.getContext().absolute(arena, data) catch |err| return decimalMathFailure(err);
         errdefer result.deinit(arena);
@@ -967,7 +1047,7 @@ pub fn numericAbs(arena: Allocator, input: Value) NumericError!Value {
 }
 
 fn setBigInteger(out: *std.math.big.int.Managed, v: Value) (Allocator.Error || error{InvalidNumber})!void {
-    switch (v) {
+    switch (numericBase(v)) {
         .integer => |i| try out.set(i),
         .bool => |b| try out.set(@intFromBool(b)),
         .number_string => |text| out.setString(10, text) catch |err| return switch (err) {

@@ -15,6 +15,11 @@ fn repr(comptime v: Value, comptime as_str: bool) []const u8 {
         const size = switch (v) {
             .string, .number_string => |s| s.len * 10 + 64,
             .custom => |c| blk: {
+                if (c.integerValue()) |integer| break :blk switch (integer) {
+                    .integer => 20,
+                    .number_string => |text| text.len,
+                    else => unreachable,
+                };
                 if (c.vtable.enumeration) |inspect| {
                     const member = inspect(c.ptr);
                     break :blk member.class_name.len + member.member_name.len + 1;
@@ -69,7 +74,10 @@ pub fn Literal(comptime arguments: []const Value) type {
                 else => @compileError("dszig: Literal supports scalars, Enum members and bytes only"),
             }
             for (result[0..len]) |previous| {
-                const same_kind = (smallInt(v) != null and smallInt(previous) != null) or std.meta.activeTag(v) == std.meta.activeTag(previous);
+                const same_kind = if (v == .custom and previous == .custom)
+                    v.custom.sameType(previous.custom)
+                else
+                    (smallInt(v) != null and smallInt(previous) != null) or std.meta.activeTag(v) == std.meta.activeTag(previous);
                 if (same_kind and (value.pyEqual(v, previous) catch @compileError("dszig: Literal argument equality failed"))) break;
             } else {
                 result[len] = v;

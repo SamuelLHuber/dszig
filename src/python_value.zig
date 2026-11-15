@@ -232,7 +232,8 @@ fn decimalTupleItems(input: Value) ?[]const Value {
 }
 
 fn decimalTupleInteger(input: Value) ?i64 {
-    return switch (input) {
+    const integer = if (input == .custom) input.custom.integerValue() orelse input else input;
+    return switch (integer) {
         .bool => |number| @intFromBool(number),
         .integer => |number| number,
         .number_string => |text| if (std.json.isNumberFormattedLikeAnInteger(text))
@@ -721,7 +722,14 @@ fn tupleHash(items: []const Value, seed: u32) error{ParseValue}!u64 {
     return if (acc == std.math.maxInt(u64)) 1546275796 else acc;
 }
 
-fn hashValue(v: Value, seed: u32) error{ParseValue}!u64 {
+fn hashValue(input: Value, seed: u32) error{ParseValue}!u64 {
+    const v = if (input == .custom) integer: {
+        const number = input.custom.integerValue() orelse break :integer input;
+        if (!input.custom.vtable.hashable) return error.ParseValue;
+        if (input.custom.vtable.python_hash) |hash|
+            return validHash(@bitCast(try hash(input.custom.ptr, seed)));
+        break :integer number;
+    } else input;
     if (view(v)) |python| return switch (python) {
         .bytes => |data| bytesHash(data, seed),
         .tuple => |items| try tupleHash(items, seed),
@@ -905,7 +913,8 @@ fn equalValue(ptr: *const anyopaque, other: Value) Error!bool {
     };
 }
 
-fn decimalEqual(data: decimals.Decimal, other: Value) Error!bool {
+fn decimalEqual(data: decimals.Decimal, input: Value) Error!bool {
+    const other = if (input == .custom) input.custom.integerValue() orelse input else input;
     var buffer: [768]u8 = undefined;
     const operand: decimals.Decimal = switch (other) {
         .bool => |number| .{ .digits = if (number) "1" else "0" },
@@ -1397,7 +1406,9 @@ const KeyIterator = struct {
                     } else self.floatText(std.fmt.parseFloat(f64, text) catch return error.PythonSerializeFallback),
                     .float => |f| self.floatText(f),
                     .custom => |custom| {
-                        if (custom.vtable.enumeration) |inspect| {
+                        if (custom.integerValue()) |integer| {
+                            self.pending = integer;
+                        } else if (custom.vtable.enumeration) |inspect| {
                             self.pending = inspect(custom.ptr).value;
                         } else {
                             self.opaque_key = custom;

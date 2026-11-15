@@ -297,17 +297,61 @@ element without invoking Decimal equality or raising `InvalidOperation`. Direct
 Decimal equality remains different: a quiet NaN is unequal to itself, while a
 signaling NaN can fail. This does not add missing float-object identity.
 
+### Native integer-subclass enums
+
+`dszig.IntEnum(name, entries)` creates genuine immutable integer-subclass
+members alongside the existing nominal `dszig.Enum` classes.
+`IntEnumWithIdentity(name, entries, Identity)` supplies an explicit nominal class
+identity. Aliases share a singleton. Numeric equality and hashing cross class
+boundaries without making those classes identical: lax validation can resolve
+an equal member of another class, while strict validation requires the actual
+declared class. Reflection exposes a nominal identity token, not a type-name
+string.
+
+Exact borrowed integer payloads participate in bool/int/float/string and Decimal
+validation, arithmetic, ordering and Python dictionary key equality. Numeric
+operations retain integers above binary64's exact range and support genuine
+complex operands; Decimal/float arithmetic remains refused. Member `str` is
+numeric, while `repr` retains its class and canonical member name.
+
+The following independent frozen-source observations matched in both native
+Debug and ReleaseSafe, with byte-identical output between modes:
+
+| Native consumer | Compared / Source rows | Outcome/value/identity/signal observations | Normalized exception identities unobserved |
+| --- | ---: | ---: | ---: |
+| IntEnum runtime operations | 2,294 / 2,324 | 24,577 | 657 |
+| IntEnum scalar validation | 35 / 35 | 379 | 6 |
+| Configured Decimal policies | 368 / 368 | 3,950 | 233 |
+
+The runtime consumer deliberately exits nonzero for incomplete coverage:
+sequence repetition is not implemented by the numeric helpers. Unsafe unbounded
+repetitions were separately left unattempted by the Source probe. Static member
+declarations accept exact integers, bools and genuine integer-subclass payloads;
+arbitrary declaration-time Python `int(value)` coercions, custom mixins and
+dynamic Python class construction are not implemented. Normalized native errors
+are not proof of identical Python exception classes.
+
 ### Native Decimal values and arithmetic
 
 `dszig.Decimal` stores a genuine runtime Decimal box; it is not a string or a
 lookalike dictionary. `python_value.decimal(allocator, text)` constructs an exact
 coefficient/exponent value, preserving signed zero, trailing-zero quantum and
-NaN payloads. Typed Decimal validation is finite-only and distinct from the
-constructor. `Decimal.validate` follows Python-input coercion;
-`Decimal.validateStrict` accepts only genuine finite Decimal instances, retaining
-their identity and rejecting other kinds before conversion or signaling.
-`Decimal.validateJson` follows JSON-input coercion, including its different
-shortest plain float spelling. Quoted JSON text retains its original quantum.
+NaN payloads. Default typed Decimal validation is finite-only and distinct from
+the constructor. `DecimalWithOptions(.{ .allow_inf_nan = true })` admits genuine
+nonfinite values without changing their runtime class. `Decimal.validate`
+follows Python-input coercion; `validateStrict` requires a genuine Decimal
+instance before applying the configured finite/nonfinite policy, retaining
+accepted identity and rejecting other kinds before conversion or signaling.
+
+`validateJson` follows JSON-input coercion, including its different shortest
+plain float spelling and lax constructor-array path. `validateJsonStrict`
+accepts JSON scalars but refuses constructor arrays before conversion. Quoted
+JSON text retains its original quantum. Configured malformed-input coercion
+preserves the actual `InvalidOperation` flag/trap transition: an untrapped
+constructor can produce a quiet NaN, accepted only by the nonfinite policy.
+`schemaSerialization()` provides the actual string-only serialization schema,
+distinct from the validation schema. These policies, identities and all nine
+signals are covered by the configured-policy observations above.
 
 `dszig.decimal` exposes the explicitly managed context environment.
 `LocalContext.enter` copies a context into the stable local guard; `deinit`
@@ -325,7 +369,7 @@ Python-mode dump dictionaries, recursively projecting those nested generated
 models without revalidating their fields. Aliased backend projection remains a
 separate API.
 
-A native Debug executable matched all **30,100** frozen independent
+Native Debug and ReleaseSafe executables matched all **30,100** frozen independent
 CPython/DSPy arithmetic, context and configured-decision rows: **1,462,558**
 observations, including **9,465** independently executed model-dump views.
 The receipt includes both successful and refused operations. Exact Decimal
@@ -337,14 +381,15 @@ genuine-Decimal container probe went from six mismatches to zero across
 This is finite evidence, not complete Decimal or DSPy parity. Other Decimal
 operators, general Python numeric protocols, arbitrary mutable alias graphs,
 full Pydantic policies and Python exception reconstruction are not established
-by those runs. The separate validation consumer matched **17,685 of 21,837
-Source rows** and **24,752 actual dump calls**, with 1,511,530 observations and
-zero remaining mismatches. This includes 54 additional strict-Decimal refusals
-checked through the actual native validator, not synthetic consumer refusals.
+by those runs. The separate validation consumer matched **18,016 of 21,837
+Source rows** and **24,752 actual dump calls**, with 1,521,288 observations and
+zero mismatches in both native modes. This includes actual strict Enum and
+Decimal boundaries, the declared numeric IntEnum class, configured nonfinite
+validation and both Decimal schema modes, not synthetic consumer refusals.
 It still exits nonzero for incomplete coverage:
-3,451 rows are unsupported, 701 are unconsumed (including 699 preserved
+3,120 rows are unsupported, 701 are unconsumed (including 699 preserved
 invalid-baseline cases), and 35,392 Source dump frames are unobserved. Warning
-emission, 1,258 identity frames and 11,066 normalized exception classes remain
+emission, 1,196 identity frames and 11,331 normalized exception classes remain
 unobserved. Those gaps are not passing observations.
 
 A separate integer-division consumer matched 679 actual CPython rows through
