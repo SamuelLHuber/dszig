@@ -664,7 +664,7 @@ test "comparison state roundtrip preserves optimizer metadata demos and cheap-co
     try testing.expectEqualDeep(compare.predict.state.prefixes, restored.predict.state.prefixes);
     try testing.expect(restored.predict.state.fields.ptr == Compare.Extended.fields.ptr);
     try testing.expectEqual(@as(usize, 1), restored.predict.state.demos.len);
-    try testing.expect(value.recordEqual(&demo, &restored.predict.state.demos[0]));
+    try testing.expect(try value.recordEqual(&demo, &restored.predict.state.demos[0]));
 
     var history: lm.History = .{ .arena = arena };
     var script: lm.ScriptedLM = .{

@@ -286,6 +286,71 @@ configurations. Custom vtables that support typed `get(T)` provide
 `type_identity = runtime_value.typeIdentity(T)`; opaque callback objects do not
 acquire a typed identity from their display name.
 
+Equality is fallible: `value.pyEqual`, `value.recordEqual` and custom vtable
+`eql`/`eql_value` callbacks return `ParseValue || OutOfMemory` error unions.
+Callers must propagate comparison failures rather than convert them to `false`.
+The same contract extends through class equality, content/request matching,
+trace equality and replay; strict JSON matching still distinguishes booleans
+from numbers. Container-element comparison uses `python_value.containerEqual`:
+the same genuine boxed Decimal NaN is equal to itself as a list/dictionary/tuple
+element without invoking Decimal equality or raising `InvalidOperation`. Direct
+Decimal equality remains different: a quiet NaN is unequal to itself, while a
+signaling NaN can fail. This does not add missing float-object identity.
+
+### Native Decimal values and arithmetic
+
+`dszig.Decimal` stores a genuine runtime Decimal box; it is not a string or a
+lookalike dictionary. `python_value.decimal(allocator, text)` constructs an exact
+coefficient/exponent value, preserving signed zero, trailing-zero quantum and
+NaN payloads. Typed Decimal validation is finite-only and distinct from the
+constructor. `Decimal.validate` follows Python-input coercion;
+`Decimal.validateJson` follows JSON-input coercion, including its different
+shortest plain float spelling. Quoted JSON text retains its original quantum.
+
+`dszig.decimal` exposes the explicitly managed context environment.
+`LocalContext.enter` copies a context into the stable local guard; `deinit`
+restores the previously borrowed context object. Contexts provide precision,
+eight rounding modes, exponent bounds, capitals/clamp settings, and nine sticky
+signals with independent traps. Native contextual add/subtract/multiply/divide
+and absolute value return owned exact metadata; quiet `copyAbs` does not round
+or signal. Runtime numeric helpers preserve Decimal/integer arithmetic and
+refuse Decimal/float arithmetic rather than silently converting it to binary64.
+DecisionState uses those same helpers before final model validation.
+
+Generated decision evidence retains genuine nested probability models in its
+raw fields. `toPythonValue(allocator, by_alias)` instead returns fresh
+Python-mode dump dictionaries, recursively projecting those nested generated
+models without revalidating their fields. Aliased backend projection remains a
+separate API.
+
+A native Debug executable matched all **30,100** frozen independent
+CPython/DSPy arithmetic, context and configured-decision rows: **1,462,558**
+observations, including **9,465** independently executed model-dump views.
+The receipt includes both successful and refused operations. Exact Decimal
+signal exception classes were compared for 1,989 refusals; **9,665 normalized
+exception classes remain unobserved**, not proven equivalent. A separate
+genuine-Decimal container probe went from six mismatches to zero across
+16 Source rows and 160 outcome/signal observations.
+
+This is finite evidence, not complete Decimal or DSPy parity. Other Decimal
+operators, general Python numeric protocols, arbitrary mutable alias graphs,
+full Pydantic policies and Python exception reconstruction are not established
+by those runs. The separate validation consumer matched **17,631 of 21,837
+Source rows** and **24,752 actual dump calls**, with 1,510,018 observations and
+zero remaining mismatches. It still exits nonzero for incomplete coverage:
+3,505 rows are unsupported, 701 are unconsumed (including 699 preserved
+invalid-baseline cases), and 35,392 Source dump frames are unobserved. Warning
+emission, 1,258 identity frames and 11,012 normalized exception classes remain
+unobserved. Those gaps are not passing observations.
+
+A separate integer-division consumer matched 679 actual CPython rows through
+both the direct exact-ratio helper and public `numericQuotient`, checking 1,358
+outcome/binary64-bit observations. Its 53 refusal rows do not compare Python
+exception identity. The public SIMBA smoke also exercised a failed program
+whose metric received a genuine null prediction exactly once and returned the
+Source fallback score 0.375 without any LM requests; this is not whole-SIMBA
+or live-inference parity.
+
 Typed conversion boxes the supported native model families; parsing ordinary JSON does
 not. A raw lookalike dictionary remains a dictionary until explicit typed
 validation. Native class validation preserves an existing box, subject to the
@@ -444,6 +509,19 @@ signature equality.
 `optimize.evaluate` follows Python's exact `round(score, 2)`, including
 ties-to-even, binary decimal boundaries such as `2.675 → 2.67`, signed zero
 and nonfinite scores. It does not round an already-rounded `score * 100`.
+
+`optimize.Metric` and GEPA feedback callbacks can return `ParseValue` or
+`OutOfMemory`. Evaluate and bootstrap apply their existing error budgets to
+metric failures as well as program failures; bootstrap restores temporary
+teacher demos before scoring. SIMBA retains a successful prediction and trace
+when scoring fails, with a zero score. GEPA uses its configured failure score,
+with an empty prediction when trace capture is disabled versus no prediction
+or trajectory when capture is enabled. Reflective feedback failures propagate.
+Allocation failures remain fatal. `optimize.Metric` receives a nullable
+`?*const Record` prediction: SIMBA calls it with null after a program failure,
+rather than skipping scoring or supplying an empty record. A callback may
+assign its own fallback score; callbacks that require an actual prediction
+must explicitly reject null.
 
 `BootstrapFewShotWithOptuna.compile` takes explicit `std.Io` and a required
 `max_demos` bootstrap limit. Each candidate selects exactly one demo per

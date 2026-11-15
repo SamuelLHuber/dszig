@@ -236,32 +236,37 @@ const TestProgram = struct {
     }
 };
 
-fn sourceMetric(_: Allocator, example: *const Example, prediction: *const Record, trace: ?*const predict.Trace) f64 {
+fn sourceMetric(_: Allocator, example: *const Example, maybe_prediction: ?*const Record, trace: ?*const predict.Trace) value.ParseError!f64 {
     if (trace != null) return 1;
     const target = std.fmt.parseInt(i64, example.record.get("question").?.string, 10) catch return 0;
+    const prediction = maybe_prediction orelse return error.ParseValue;
     return if (@mod(2 * prediction.get("z").?.integer + prediction.get("a").?.integer, 5) == @mod(target, 5)) 1 else 0;
 }
 
-fn tiedMetric(_: Allocator, _: *const Example, _: *const Record, _: ?*const predict.Trace) f64 {
+fn tiedMetric(_: Allocator, _: *const Example, _: ?*const Record, _: ?*const predict.Trace) value.ParseError!f64 {
     return 1;
 }
 
-fn nanMetric(_: Allocator, _: *const Example, _: *const Record, trace: ?*const predict.Trace) f64 {
+fn nanMetric(_: Allocator, _: *const Example, _: ?*const Record, trace: ?*const predict.Trace) value.ParseError!f64 {
     return if (trace != null) 1 else std.math.nan(f64);
 }
 
-fn mixedNanMetric(_: Allocator, _: *const Example, prediction: *const Record, trace: ?*const predict.Trace) f64 {
-    if (trace != null or prediction.get("z").?.integer != 0) return 1;
+fn mixedNanMetric(_: Allocator, _: *const Example, maybe_prediction: ?*const Record, trace: ?*const predict.Trace) value.ParseError!f64 {
+    if (trace != null) return 1;
+    const prediction = maybe_prediction orelse return error.ParseValue;
+    if (prediction.get("z").?.integer != 0) return 1;
     return std.math.nan(f64);
 }
 
-fn teacherMetric(_: Allocator, _: *const Example, prediction: *const Record, trace: ?*const predict.Trace) f64 {
+fn teacherMetric(_: Allocator, _: *const Example, maybe_prediction: ?*const Record, trace: ?*const predict.Trace) value.ParseError!f64 {
     if (trace == null) return 1;
+    const prediction = maybe_prediction orelse return error.ParseValue;
     return if (prediction.get("z").?.integer == 88 and prediction.get("a").?.integer == 77) 1 else 0;
 }
 
-fn resetTeacherMetric(_: Allocator, _: *const Example, prediction: *const Record, trace: ?*const predict.Trace) f64 {
+fn resetTeacherMetric(_: Allocator, _: *const Example, maybe_prediction: ?*const Record, trace: ?*const predict.Trace) value.ParseError!f64 {
     if (trace == null) return 1;
+    const prediction = maybe_prediction orelse return error.ParseValue;
     return if (prediction.get("z").?.integer == -1 and prediction.get("a").?.integer == -1) 1 else 0;
 }
 
@@ -309,7 +314,7 @@ test "BootstrapOptuna selects one demo in predictor order and retains every tria
         .num_threads = 1,
     };
     const result = try optimizer.compile(TestProgram, out.allocator(), testing.allocator, testing.io, ctx, student, null, 3, trainset, valset);
-    try testing.expect(value.recordEqual(&original, &student.z.state.demos[0]));
+    try testing.expect(try value.recordEqual(&original, &student.z.state.demos[0]));
     try testing.expectEqual(@as(usize, 3), result.best_trial);
     try testing.expectEqual(@as(usize, 3), result.bootstrap_report.bootstrapped);
     try testing.expectEqual(@as(usize, 0), silent.index);

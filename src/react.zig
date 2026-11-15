@@ -485,10 +485,10 @@ fn TypedValidator(comptime T: type) type {
         fn run(arena: Allocator, input: Value) types.Error!Value {
             // Tool validates a schema only when its root has a `type` key.
             // Optional roots use Pydantic's lax conversion, matching upstream.
-            if (@typeInfo(T) != .optional and !strictAccepts(T, input)) return error.ParseValue;
+            if (@typeInfo(T) != .optional and !(try strictAccepts(T, input))) return error.ParseValue;
             if (T == signature.StrDict) return input;
             if (@typeInfo(T) == .optional and @typeInfo(T).optional.child == signature.StrDict) {
-                if (input != .null and !strictAccepts(signature.StrDict, input)) return error.ParseValue;
+                if (input != .null and !(try strictAccepts(signature.StrDict, input))) return error.ParseValue;
                 return input;
             }
             const parsed = try types.validate(T, arena, input);
@@ -498,13 +498,13 @@ fn TypedValidator(comptime T: type) type {
     };
 }
 
-fn strictAccepts(comptime T: type, input: Value) bool {
+fn strictAccepts(comptime T: type, input: Value) value.ParseError!bool {
     if (T == Value) return true;
     if (T == @import("integer.zig").Integer) return schemaAccepts("integer", input);
     if (comptime @import("enum.zig").isEnum(T)) {
         if (T.dszig_enum_json_type) |kind| {
             if (!schemaAccepts(kind, input)) return false;
-            for (T.dszig_enum_values) |member| if (value.pyEqual(member, input)) return true;
+            for (T.dszig_enum_values) |member| if (try value.pyEqual(member, input)) return true;
             return false;
         }
         return true;
@@ -525,24 +525,24 @@ fn strictAccepts(comptime T: type, input: Value) bool {
     }
     if (comptime types.isDict(T)) {
         if (input != .object) return false;
-        for (input.object.values()) |item| if (!strictAccepts(T.dszig_dict_value, item)) return false;
+        for (input.object.values()) |item| if (!(try strictAccepts(T.dszig_dict_value, item))) return false;
         return true;
     }
     return switch (@typeInfo(T)) {
         .int => schemaAccepts("integer", input),
         .float => schemaAccepts("number", input),
         .@"enum" => input == .string and std.meta.stringToEnum(T, input.string) != null,
-        .optional => |optional| input == .null or strictAccepts(optional.child, input),
+        .optional => |optional| input == .null or try strictAccepts(optional.child, input),
         .pointer => |pointer| blk: {
             if (input != .array) break :blk false;
-            for (input.array.items) |item| if (!strictAccepts(pointer.child, item)) break :blk false;
+            for (input.array.items) |item| if (!(try strictAccepts(pointer.child, item))) break :blk false;
             break :blk true;
         },
         .@"struct" => |info| blk: {
             if (input != .object) break :blk false;
             inline for (info.field_names, info.field_types, 0..) |name, FT, index| {
                 if (input.object.get(name)) |item| {
-                    if (!strictAccepts(FT, item)) break :blk false;
+                    if (!(try strictAccepts(FT, item))) break :blk false;
                 } else if (info.field_attrs[index].default_value_ptr == null) break :blk false;
             }
             break :blk true;

@@ -192,7 +192,7 @@ pub const BoundingBox = struct {
         allocator.destroy(runtimeBox(ptr));
     }
 
-    fn equalRuntime(left: *const anyopaque, right: *const anyopaque) bool {
+    fn equalRuntime(left: *const anyopaque, right: *const anyopaque) runtime.CustomError!bool {
         // Python model equality compares field dictionaries, whose same-object
         // fast path remains reflexive even for a forged NaN field.
         if (left == right) return true;
@@ -224,7 +224,7 @@ test "unvalidated box JSON mode nulls nonfinite fields without changing raw form
     const actual = try box.toRuntime(arena);
     const validated = try @import("types.zig").validate(BoundingBox, arena, actual);
     try std.testing.expectEqual(actual.custom.ptr, validated.custom.ptr);
-    try std.testing.expect(@import("value.zig").pyEqual(actual, actual));
+    try std.testing.expect(try @import("value.zig").pyEqual(actual, actual));
     const raw = try actual.custom.rawValue(arena);
     try std.testing.expect(std.math.isNan(raw.object.get("top").?.float));
     const serialized = try actual.custom.serialize(arena);
@@ -303,15 +303,15 @@ test "BoundingBox runtime identity stays structured and distinct from raw dictio
     const dictionary = try box.toValue(arena);
     try std.testing.expect(actual.custom.get(BoundingBox) != null);
     try std.testing.expect(dictionary == .object);
-    try std.testing.expect(!value.pyEqual(actual, dictionary));
-    try std.testing.expect(!value.pyEqual(dictionary, actual));
-    try std.testing.expect(value.pyEqual(actual, try box.toRuntime(arena)));
+    try std.testing.expect(!try value.pyEqual(actual, dictionary));
+    try std.testing.expect(!try value.pyEqual(dictionary, actual));
+    try std.testing.expect(try value.pyEqual(actual, try box.toRuntime(arena)));
     // Pydantic compares float fields with Python ==, so signed zero is equal.
-    try std.testing.expect(value.pyEqual(
+    try std.testing.expect(try value.pyEqual(
         try (try BoundingBox.init(-0.0, 1, 0, 1)).toRuntime(arena),
         try (try BoundingBox.init(0, 1, 0, 1)).toRuntime(arena),
     ));
-    try std.testing.expect(!value.pyEqual(actual, try (try BoundingBox.init(0, 0.5, 1e-5, 0.1 + 0.2)).toRuntime(arena)));
+    try std.testing.expect(!try value.pyEqual(actual, try (try BoundingBox.init(0, 0.5, 1e-5, 0.1 + 0.2)).toRuntime(arena)));
     try std.testing.expectEqualStrings(
         try std.json.Stringify.valueAlloc(arena, dictionary, .{}),
         try std.json.Stringify.valueAlloc(arena, actual, .{}),
@@ -347,7 +347,7 @@ test "BoundingBox runtime identity stays structured and distinct from raw dictio
     const serialized = try value.serializedValue(arena, input);
     const serialized_items = serialized.object.get("boxes").?.array.items;
     try std.testing.expect(serialized_items[0] == .object);
-    try std.testing.expect(value.pyEqual(dictionary, serialized_items[0]));
+    try std.testing.expect(try value.pyEqual(dictionary, serialized_items[0]));
     try std.testing.expect(serialized_items[1] == .object);
     try std.testing.expectEqual(actual.custom.ptr, items.items[0].custom.ptr);
     text.clearRetainingCapacity();
@@ -390,9 +390,9 @@ test "BoundingBox typed validation retains instances and boxes dictionaries" {
     const coerced = try types.validate(BoundingBox, arena, dictionary);
     try std.testing.expect(coerced == .custom);
     try std.testing.expect(coerced.custom.ptr != actual.custom.ptr);
-    try std.testing.expect(value.pyEqual(actual, coerced));
+    try std.testing.expect(try value.pyEqual(actual, coerced));
     try std.testing.expect(dictionary == .object);
-    try std.testing.expect(!value.pyEqual(dictionary, coerced));
+    try std.testing.expect(!try value.pyEqual(dictionary, coerced));
     try std.testing.expectEqual(box, try value.fromValue(arena, BoundingBox, actual));
 }
 
@@ -424,7 +424,7 @@ test "BoundingBox runtime clone owns its box after source arena release" {
     defer check.deinit();
     const arena = check.allocator();
     try std.testing.expectEqual(box, owned_boxes[0].custom.get(BoundingBox).?.*);
-    try std.testing.expect(value.pyEqual(try box.toRuntime(arena), owned_boxes[0]));
+    try std.testing.expect(try value.pyEqual(try box.toRuntime(arena), owned_boxes[0]));
     try std.testing.expect(owned_boxes[1] == .object);
-    try std.testing.expect(!value.pyEqual(owned_boxes[0], owned_boxes[1]));
+    try std.testing.expect(!try value.pyEqual(owned_boxes[0], owned_boxes[1]));
 }

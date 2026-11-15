@@ -43,7 +43,7 @@ pub const FeedbackMetric = *const fn (
     trace: ?*const Trace,
     pred_name: ?[]const u8,
     pred_step: ?*const Trace.Step,
-) Feedback;
+) value.ParseError!Feedback;
 
 pub const ProposeInstruction = signature.Signature(struct {
     pub const instructions = PROPOSE_INSTRUCTIONS;
@@ -170,21 +170,32 @@ pub const GEPA = struct {
                 return copy;
             }
 
+            fn failedRun(e: *const Self, trace: *Trace, capture: bool) Run {
+                // Evaluate substitutes an empty Prediction, while bootstrap
+                // trace capture drops failed rows and their trajectories.
+                trace.steps.clearRetainingCapacity();
+                return .{
+                    .prediction = if (capture) null else Record.empty,
+                    .trace = trace,
+                    .score = e.gepa.failure_score,
+                };
+            }
+
             fn runOne(e: *const Self, program: *const P, example: *const Example, capture: bool) Allocator.Error!Run {
                 const trace = try e.out.create(Trace);
                 trace.* = .{ .arena = e.out };
                 var c = e.ctx;
                 c.arena = e.out;
                 c.trace = if (capture) trace else null;
-                const prediction: ?Record = optimize.runProgram(P, c, program, example) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => null,
+                const prediction = optimize.runProgram(P, c, program, example) catch |err| {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    return e.failedRun(trace, capture);
                 };
-                const score = if (prediction) |*p|
-                    e.gepa.metric(e.out, example, p, if (capture) trace else null, null, null).score
-                else
-                    e.gepa.failure_score;
-                return .{ .prediction = prediction, .trace = trace, .score = score };
+                const feedback = e.gepa.metric(e.out, example, &prediction, if (capture) trace else null, null, null) catch |err| {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    return e.failedRun(trace, capture);
+                };
+                return .{ .prediction = prediction, .trace = trace, .score = feedback.score };
             }
 
             fn evalIds(e: *Self, candidate: []const []const u8, set: []const Example, ids: []const usize, capture: bool) Allocator.Error![]Run {
@@ -390,7 +401,7 @@ pub const GEPA = struct {
 
             /// `DspyAdapter.make_reflective_dataset`; `null` where no example
             /// produced a usable trace for that predictor.
-            fn reflectiveDataset(e: *Self, candidate: []const []const u8, runs: []const Run, ids: []const usize, components: []const usize) Allocator.Error![]?[]const @import("runtime_value.zig").ObjectMap {
+            fn reflectiveDataset(e: *Self, candidate: []const []const u8, runs: []const Run, ids: []const usize, components: []const usize) value.ParseError![]?[]const @import("runtime_value.zig").ObjectMap {
                 const program = try e.build(candidate);
                 const preds = try predict.namedPredictors(e.out, program);
                 const result = try e.out.alloc(?[]const @import("runtime_value.zig").ObjectMap, components.len);
@@ -403,7 +414,7 @@ pub const GEPA = struct {
                         for (run.trace.steps.items) |*step| if (predict.sameSignature(step.predictor, module)) try matching.append(e.out, step);
                         if (matching.items.len == 0) continue;
                         const step = matching.items[e.adapter_rng.randbelow(matching.items.len)];
-                        const fb = e.gepa.metric(e.out, &e.trainset[id], &prediction, run.trace, e.names[k], step);
+                        const fb = try e.gepa.metric(e.out, &e.trainset[id], &prediction, run.trace, e.names[k], step);
                         var item: @import("runtime_value.zig").ObjectMap = .empty;
                         try item.put(e.out, "Inputs", .{ .object = step.inputs });
                         try item.put(e.out, "Generated Outputs", .{ .object = step.outputs });
@@ -723,6 +734,94 @@ pub const GEPA = struct {
         };
     }
 };
+
+test "GEPA scoring failures preserve capture-specific outputs while feedback errors propagate" {
+    const Sig = signature.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: []const u8 };
+    });
+    const P = predict.Predict(Sig);
+    const FailingMetric = struct {
+        fn failure(_: Allocator, _: *const Example, _: *const Record, _: ?*const Trace, _: ?[]const u8, _: ?*const Trace.Step) value.ParseError!Feedback {
+            return error.ParseValue;
+        }
+
+        fn feedbackFailure(_: Allocator, _: *const Example, _: *const Record, _: ?*const Trace, pred_name: ?[]const u8, _: ?*const Trace.Step) value.ParseError!Feedback {
+            if (pred_name != null) return error.ParseValue;
+            return .{ .score = 1 };
+        }
+
+        fn allocationFailure(_: Allocator, _: *const Example, _: *const Record, _: ?*const Trace, _: ?[]const u8, _: ?*const Trace.Step) value.ParseError!Feedback {
+            return error.OutOfMemory;
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var script: @import("lm.zig").ScriptedLM = .{
+        .responses = &.{
+            "<answer>ok</answer>", "<answer>ok</answer>", "<answer>ok</answer>",
+            "<answer>ok</answer>", "<answer>ok</answer>",
+        },
+    };
+    const ctx: Context = .{ .arena = arena, .lm = script.lm(), .adapter = .xml };
+    const examples = [_]Example{try Example.fromJson(arena, "{\"question\":\"q\",\"answer\":\"ok\"}", &.{"question"})};
+    var program: P = .{};
+    var front_scores = [_]f64{0};
+    var fronts = [_]std.ArrayList(usize){.empty};
+    var engine: GEPA.Engine(P) = .{
+        .gepa = .{ .metric = FailingMetric.failure, .failure_score = 0.125 },
+        .out = arena,
+        .ctx = ctx,
+        .reflection = ctx,
+        .student = &program,
+        .names = &.{"self"},
+        .trainset = &examples,
+        .valset = &examples,
+        .rng = .init(0),
+        .adapter_rng = .init(0),
+        .front_score = &front_scores,
+        .fronts = &fronts,
+    };
+
+    for ([_]bool{ false, true }) |capture| {
+        const run = try engine.runOne(&program, &examples[0], capture);
+        try std.testing.expectEqual(@as(f64, 0.125), run.score);
+        if (capture) {
+            try std.testing.expect(run.prediction == null);
+        } else {
+            try std.testing.expectEqual(@as(usize, 0), run.prediction.?.count());
+        }
+        try std.testing.expectEqual(@as(usize, 0), run.trace.steps.items.len);
+    }
+    try std.testing.expectEqual(@as(usize, 2), script.index);
+
+    var program_failure: @import("lm.zig").ScriptedLM = .{ .responses = &.{} };
+    engine.ctx.lm = program_failure.lm();
+    for ([_]bool{ false, true }) |capture| {
+        const run = try engine.runOne(&program, &examples[0], capture);
+        try std.testing.expectEqual(@as(f64, 0.125), run.score);
+        if (capture) {
+            try std.testing.expect(run.prediction == null);
+        } else {
+            try std.testing.expectEqual(@as(usize, 0), run.prediction.?.count());
+        }
+        try std.testing.expectEqual(@as(usize, 0), run.trace.steps.items.len);
+    }
+
+    engine.ctx = ctx;
+    engine.gepa.metric = FailingMetric.feedbackFailure;
+    const successful = try engine.runOne(&program, &examples[0], true);
+    try std.testing.expectEqualStrings("ok", successful.prediction.?.get("answer").?.string);
+    try std.testing.expectEqual(@as(usize, 1), successful.trace.steps.items.len);
+    try std.testing.expectError(error.ParseValue, engine.reflectiveDataset(&.{program.state.instructions}, &.{successful}, &.{0}, &.{0}));
+
+    engine.gepa.metric = FailingMetric.allocationFailure;
+    for ([_]bool{ false, true }) |capture| {
+        try std.testing.expectError(error.OutOfMemory, engine.runOne(&program, &examples[0], capture));
+    }
+    try std.testing.expectEqual(@as(usize, 5), script.index);
+}
 
 fn sumScores(runs: []const GEPA.Run) f64 {
     var sum: f64 = 0;

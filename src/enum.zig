@@ -88,8 +88,8 @@ test "Independent same-name Enum classes cannot validate or compare as one class
     const Right = EnumWithIdentity("Color", entries, struct {});
     const left = try Left.member("red");
     const right = try Right.member("red");
-    try std.testing.expect(!value.pyEqual(left, right));
-    try std.testing.expect(!value.pyEqual(left, .{ .string = "red" }));
+    try std.testing.expect(!try value.pyEqual(left, right));
+    try std.testing.expect(!try value.pyEqual(left, .{ .string = "red" }));
     try std.testing.expectError(error.ParseValue, Left.validate(std.testing.allocator, right));
 }
 
@@ -106,6 +106,26 @@ test "Pydantic Enum fast integer lookup overflow differs from DSPy value resolut
     try std.testing.expect(resolved.custom.ptr == (try Mixed.member("big")).custom.ptr);
     const validated = try OnlyBig.validate(a, big);
     try std.testing.expect(validated.custom.ptr == (try OnlyBig.member("big")).custom.ptr);
+}
+
+test "long integer enum values retain distinct members and exact aliases" {
+    const zeros: [1000]u8 = @splat('0');
+    const first = "1" ++ zeros;
+    const next = "1" ++ zeros[0..999].* ++ "1";
+    const Long = Enum("Long", &.{
+        .{ .name = "zero", .value = .{ .integer = 0 } },
+        .{ .name = "first", .value = .{ .number_string = first } },
+        .{ .name = "next", .value = .{ .number_string = next } },
+        .{ .name = "alias", .value = .{ .number_string = first } },
+    });
+    const member = try Long.member("first");
+    const alias = try Long.member("alias");
+    const other = try Long.member("next");
+    try std.testing.expect(member.custom.ptr == alias.custom.ptr);
+    try std.testing.expect(member.custom.ptr != other.custom.ptr);
+    try std.testing.expect(std.mem.eql(u8, first, Long.dszig_enum_values[3].number_string));
+    const parsed = try Long.parseValue(std.testing.allocator, .{ .number_string = next });
+    try std.testing.expect(parsed.custom.ptr == other.custom.ptr);
 }
 
 pub fn EnumWithIdentity(comptime name: []const u8, comptime entries: []const Entry, comptime Identity: type) type {
@@ -125,7 +145,14 @@ pub fn EnumWithIdentity(comptime name: []const u8, comptime entries: []const Ent
 
         fn canonical(comptime index: usize) usize {
             return comptime resolved: {
-                for (entries[0..index], 0..) |previous, i| if (value.pyEqual(previous.value, entries[index].value)) break :resolved canonical(i);
+                // Lazy enum tables and member lookups evaluate independently
+                // of the caller's quota, including exact long-integer equality.
+                @setEvalBranchQuota(1_000_000);
+                for (entries[0..index], 0..) |previous, i| {
+                    const same = value.pyEqual(previous.value, entries[index].value) catch |err|
+                        @compileError("dszig: enum alias equality failed: " ++ @errorName(err));
+                    if (same) break :resolved canonical(i);
+                }
                 break :resolved index;
             };
         }
@@ -165,7 +192,7 @@ pub fn EnumWithIdentity(comptime name: []const u8, comptime entries: []const Ent
         pub fn parseValue(_: Allocator, input: Value) runtime.CustomError!Value {
             inline for (entries, 0..) |entry, index| {
                 if (comptime canonical(index) != index) continue;
-                if (value.pyEqual(entry.value, input)) return boxed(index);
+                if (try value.pyEqual(entry.value, input)) return boxed(index);
             }
             if (input == .string) return member(input.string);
             return error.ParseValue;
@@ -194,7 +221,7 @@ pub fn EnumWithIdentity(comptime name: []const u8, comptime entries: []const Ent
             }
             inline for (entries, 0..) |entry, index| {
                 if (comptime canonical(index) != index) continue;
-                if (value.pyEqual(entry.value, input)) return boxed(index);
+                if (try value.pyEqual(entry.value, input)) return boxed(index);
             }
             return error.ParseValue;
         }
@@ -264,7 +291,7 @@ pub fn EnumWithIdentity(comptime name: []const u8, comptime entries: []const Ent
             return result;
         }
         fn deinit(_: Allocator, _: *const anyopaque, _: bool) void {}
-        fn equal(left: *const anyopaque, right: *const anyopaque) bool {
+        fn equal(left: *const anyopaque, right: *const anyopaque) runtime.CustomError!bool {
             return instance(left).index == instance(right).index;
         }
     };

@@ -43,7 +43,10 @@ pub const Example = struct {
 };
 
 /// `metric(example, prediction, trace=None)`; booleans map to 1.0 / 0.0.
-pub const Metric = *const fn (arena: Allocator, example: *const Example, prediction: *const Record, trace: ?*const Trace) f64;
+/// SIMBA passes null after program failure, as Source passes None. Other
+/// scoring paths pass a successful prediction. Comparison failures enter the
+/// optimizer's existing error policy.
+pub const Metric = *const fn (arena: Allocator, example: *const Example, prediction: ?*const Record, trace: ?*const Trace) value.ParseError!f64;
 
 pub const Evaluation = struct {
     /// `round(100 * sum / n, 2)` as reported by `dspy.Evaluate`.
@@ -53,8 +56,8 @@ pub const Evaluation = struct {
     errors: usize,
 };
 
-/// Run `program` over `devset`. Failed examples score 0; once `max_errors`
-/// failures accumulate the last error is returned, like DSPy.
+/// Run `program` and `metric` over `devset`. Failed examples score 0; once
+/// `max_errors` failures accumulate, return an error.
 pub fn evaluate(
     comptime P: type,
     gpa: Allocator,
@@ -73,13 +76,16 @@ pub fn evaluate(
         var c = ctx;
         c.arena = scratch.allocator();
         c.trace = null;
-        const prediction = runProgram(P, c, program, example) catch |err| {
+        const score: anyerror!f64 = if (runProgram(P, c, program, example)) |prediction|
+            metric(c.arena, example, &prediction, null)
+        else |err|
+            err;
+        sum += score catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             errors += 1;
             if (errors >= max_errors) return err;
             continue;
         };
-        sum += metric(c.arena, example, &prediction, null);
     }
     const ratio = 100.0 * sum / @as(f64, @floatFromInt(devset.len));
     return .{ .score = roundScore(ratio), .sum = sum, .total = devset.len, .errors = errors };
@@ -283,29 +289,35 @@ pub const BootstrapFewShot = struct {
             c.lm_options.rollout_id = .{ .integer = @intCast(round_idx) };
         }
 
-        const cached = try arena.alloc([]const Record, teacher_preds.len);
-        for (teacher_preds, cached) |p, *cache| {
-            cache.* = p.param.predict.demos;
-            var kept: std.ArrayList(Record) = .empty;
-            for (cache.*) |*demo| {
-                if (!value.recordEqual(demo, &example.record)) try kept.append(arena, demo.*);
+        const run = blk: {
+            const cached = try arena.alloc([]const Record, teacher_preds.len);
+            for (teacher_preds, cached) |p, *cache| cache.* = p.param.predict.demos;
+            defer {
+                for (teacher_preds, cached) |p, cache| p.param.predict.demos = cache;
             }
-            p.param.predict.demos = kept.items;
-        }
-        const run = runProgram(P, c, teacher, example);
-        for (teacher_preds, cached) |p, cache| p.param.predict.demos = cache;
-        const prediction = run catch |err| {
+            for (teacher_preds, cached) |p, cache| {
+                var kept: std.ArrayList(Record) = .empty;
+                for (cache) |*demo| {
+                    if (!(try value.recordEqual(demo, &example.record))) try kept.append(arena, demo.*);
+                }
+                p.param.predict.demos = kept.items;
+            }
+            break :blk runProgram(P, c, teacher, example);
+        };
+        const success: anyerror!bool = if (run) |prediction| metric_result: {
+            if (self.metric) |metric| {
+                const score = metric(arena, example, &prediction, &trace) catch |err| break :metric_result err;
+                break :metric_result if (self.metric_threshold) |threshold| score >= threshold else score != 0;
+            }
+            break :metric_result true;
+        } else |err| err;
+        const accepted = success catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             errors.* += 1;
             if (errors.* >= self.max_errors) return err;
             return false;
         };
-
-        if (self.metric) |metric| {
-            const score = metric(arena, example, &prediction, &trace);
-            const success = if (self.metric_threshold) |threshold| score >= threshold else score != 0;
-            if (!success) return false;
-        }
+        if (!accepted) return false;
 
         const local = try arena.alloc(std.ArrayList(Record), teacher_preds.len);
         for (local) |*l| l.* = .empty;

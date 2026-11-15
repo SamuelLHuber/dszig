@@ -18,6 +18,9 @@ const types = @import("types.zig");
 const code = @import("code.zig");
 const citation = @import("citation.zig");
 const decision = @import("decision.zig");
+const decimals = @import("decimal.zig");
+const decimal_environment = @import("decimal_environment.zig");
+const python = @import("python_value.zig");
 const Field = signature.Field;
 
 pub const Record = ObjectMap;
@@ -126,7 +129,7 @@ pub fn parseJsonValue(arena: Allocator, field: Field, v: Value) ParseError!Value
         return .{ .string = out.written() };
     }
     if (field.kind == .literal) {
-        for (field.literals) |allowed| if (pyEqual(v, .{ .string = allowed })) return v;
+        for (field.literals) |allowed| if (try pyEqual(v, .{ .string = allowed })) return v;
     }
     if (v == .string) return parseText(arena, field, v.string);
     return validateCandidate(arena, field, v);
@@ -208,6 +211,7 @@ pub fn coerceInteger(arena: Allocator, input: Value) ParseError!Value {
         const view = if (v.custom.vtable.python) |inspect| inspect(v.custom.ptr) else return error.ParseValue;
         v = switch (view) {
             .bytes => |data| .{ .string = data },
+            .decimal => |data| return coerceDecimalInteger(arena, data),
             else => return error.ParseValue,
         };
     }
@@ -266,6 +270,43 @@ pub fn coerceInteger(arena: Allocator, input: Value) ParseError!Value {
     return Value.parseFromNumberSlice(canonical);
 }
 
+fn coerceDecimalInteger(arena: Allocator, data: @import("decimal.zig").Decimal) ParseError!Value {
+    if (data.kind != .finite) return error.ParseValue;
+    if (data.isZero()) return .{ .integer = 0 };
+    var digits = data.digits;
+    var zeroes: usize = 0;
+    if (data.exponent < 0) {
+        const point = @as(i128, digits.len) + data.exponent;
+        if (point <= 0) return error.ParseValue;
+        const end: usize = @intCast(point);
+        for (digits[end..]) |digit| if (digit != '0') return error.ParseValue;
+        digits = digits[0..end];
+    } else {
+        zeroes = std.math.cast(usize, data.exponent) orelse return error.OutOfMemory;
+    }
+    const magnitude_length = std.math.add(usize, digits.len, zeroes) catch return error.OutOfMemory;
+    const length = std.math.add(usize, magnitude_length, @intFromBool(data.negative)) catch return error.OutOfMemory;
+    if (length <= 20) {
+        var buffer: [20]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buffer);
+        if (data.negative) writer.writeByte('-') catch unreachable;
+        writer.writeAll(digits) catch unreachable;
+        writer.splatByteAll('0', zeroes) catch unreachable;
+        if (std.fmt.parseInt(i64, writer.buffered(), 10)) |integer|
+            return .{ .integer = integer }
+        else |_| {}
+    }
+    // Match the existing arbitrary-width integer borrowing contract when no
+    // normalization is necessary; never round an integral Decimal via f64.
+    if (!data.negative and zeroes == 0) return .{ .number_string = digits };
+    const canonical = try arena.alloc(u8, length);
+    var writer: std.Io.Writer = .fixed(canonical);
+    if (data.negative) writer.writeByte('-') catch unreachable;
+    writer.writeAll(digits) catch unreachable;
+    writer.splatByteAll('0', zeroes) catch unreachable;
+    return .{ .number_string = canonical };
+}
+
 fn floatToInt(f: f64) error{ParseValue}!Value {
     if (!std.math.isFinite(f) or @trunc(f) != f) return error.ParseValue;
     if (f <= -0x1p63 or f >= 0x1p63) return error.ParseValue;
@@ -315,7 +356,7 @@ pub fn toRecord(arena: Allocator, comptime T: type, value: T) Allocator.Error!Re
 }
 
 pub fn toValue(arena: Allocator, comptime T: type, v: T) Allocator.Error!Value {
-    if (comptime code.isCode(T) or @import("enum.zig").isEnum(T) or @import("literal.zig").isLiteral(T) or T == @import("integer.zig").Integer) return v.toRuntime(arena);
+    if (comptime code.isCode(T) or @import("enum.zig").isEnum(T) or @import("literal.zig").isLiteral(T) or T == @import("integer.zig").Integer or T == @import("decimal_type.zig").Decimal) return v.toRuntime(arena);
     if (comptime decision.isDecision(T) or citation.isCitation(T) or T == @import("file.zig").File or T == @import("bounding_box.zig").BoundingBox or T == signature.Reasoning)
         return v.toRuntime(arena);
     if (T == @import("tool.zig").ToolCalls) return v.toValue(arena);
@@ -383,6 +424,7 @@ pub fn fromValue(arena: Allocator, comptime T: type, v: Value) ConvertError!T {
     };
     if (T == Value) return v;
     if (T == @import("integer.zig").Integer) return T.fromValue(v);
+    if (T == @import("decimal_type.zig").Decimal) return T.fromValue(v) catch error.TypeMismatch;
     if (comptime @import("enum.zig").isEnum(T) or @import("literal.zig").isLiteral(T)) return T.fromValue(v) catch error.TypeMismatch;
     if (T == @import("tool.zig").ToolCalls) return T.fromValue(arena, v) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
@@ -456,8 +498,9 @@ pub fn fromValue(arena: Allocator, comptime T: type, v: Value) ConvertError!T {
 }
 
 /// Python `==` for JSON-loaded values (dict equality ignores key order;
-/// `1 == 1.0` and `True == 1` as in Python).
-pub fn pyEqual(a: Value, b: Value) bool {
+/// `1 == 1.0` and `True == 1` as in Python). User equality can fail: signaling
+/// Decimal NaNs, for example, must propagate rather than silently compare false.
+pub fn pyEqual(a: Value, b: Value) ParseError!bool {
     if (std.meta.activeTag(a) != std.meta.activeTag(b) or
         (a == .custom and b == .custom and !a.custom.sameType(b.custom)))
     {
@@ -486,25 +529,74 @@ pub fn pyEqual(a: Value, b: Value) bool {
         .number_string => |s| integerStringEqualsValue(s, b),
         .null => b == .null,
         .string => |s| b == .string and std.mem.eql(u8, s, b.string),
-        .custom => |custom| b == .custom and custom.eql(b.custom),
+        .custom => |custom| b == .custom and try custom.eql(b.custom),
         .array => |x| blk: {
             if (b != .array or b.array.items.len != x.items.len) break :blk false;
-            for (x.items, b.array.items) |p, q| if (!pyEqual(p, q)) break :blk false;
+            for (x.items, b.array.items) |p, q| if (!try python.containerEqual(p, q)) break :blk false;
             break :blk true;
         },
-        .object => |x| b == .object and recordEqual(&x, &b.object),
+        .object => |x| b == .object and try recordEqual(&x, &b.object),
         else => false,
     };
 }
 
-pub fn recordEqual(a: *const Record, b: *const Record) bool {
+pub fn recordEqual(a: *const Record, b: *const Record) ParseError!bool {
     if (a.count() != b.count()) return false;
     var it = a.iterator();
     while (it.next()) |entry| {
         const other = b.get(entry.key_ptr.*) orelse return false;
-        if (!pyEqual(entry.value_ptr.*, other)) return false;
+        if (!try python.containerEqual(entry.value_ptr.*, other)) return false;
     }
     return true;
+}
+
+test "Decimal identity shortcuts belong to container elements, not direct equality" {
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const a = memory.allocator();
+    for ([_][]const u8{ "NaN", "sNaN" }) |literal| {
+        var local: decimal_environment.LocalContext = .{};
+        local.enter(&.{});
+        defer local.deinit();
+        const first = try python.decimal(a, literal);
+        const distinct = try python.decimal(a, literal);
+        const signaling = literal[0] == 's';
+        if (signaling) {
+            try std.testing.expectError(error.ParseValue, pyEqual(first, first));
+            try std.testing.expect(local.context.flags.contains(.invalid_operation));
+        } else {
+            try std.testing.expect(!try pyEqual(first, first));
+            try std.testing.expectEqual(@as(usize, 0), local.context.flags.count());
+        }
+        var left_list: std.array_list.Managed(Value) = .init(a);
+        try left_list.append(first);
+        var same_list: std.array_list.Managed(Value) = .init(a);
+        try same_list.append(first);
+        var distinct_list: std.array_list.Managed(Value) = .init(a);
+        try distinct_list.append(distinct);
+        var left_dict: Record = .empty;
+        try left_dict.put(a, "value", first);
+        var same_dict: Record = .empty;
+        try same_dict.put(a, "value", first);
+        var distinct_dict: Record = .empty;
+        try distinct_dict.put(a, "value", distinct);
+        const pairs = [_]struct { left: Value, same: Value, distinct: Value }{
+            .{ .left = .{ .array = left_list }, .same = .{ .array = same_list }, .distinct = .{ .array = distinct_list } },
+            .{ .left = .{ .object = left_dict }, .same = .{ .object = same_dict }, .distinct = .{ .object = distinct_dict } },
+        };
+        for (pairs) |pair| {
+            local.context.clearFlags();
+            try std.testing.expect(try pyEqual(pair.left, pair.same));
+            try std.testing.expectEqual(@as(usize, 0), local.context.flags.count());
+            if (signaling) {
+                try std.testing.expectError(error.ParseValue, pyEqual(pair.left, pair.distinct));
+                try std.testing.expect(local.context.flags.contains(.invalid_operation));
+            } else {
+                try std.testing.expect(!try pyEqual(pair.left, pair.distinct));
+                try std.testing.expectEqual(@as(usize, 0), local.context.flags.count());
+            }
+        }
+    }
 }
 
 const IntegerText = struct {
@@ -578,6 +670,10 @@ fn integralFloatText(f: f64, buffer: *[310]u8) ?[]const u8 {
 
 /// Python float >= numeric scalar, retaining arbitrary integer boundaries.
 pub fn floatAtLeast(f: f64, threshold: Value) error{InvalidNumber}!bool {
+    if (decimalView(threshold) != null) {
+        const order = try numericOrder(.{ .float = f }, threshold);
+        return order == .gt or order == .eq;
+    }
     return switch (threshold) {
         .float => |g| f >= g,
         .integer => |i| @as(f128, f) >= @as(f128, @floatFromInt(i)),
@@ -614,6 +710,16 @@ pub fn numericFloat(v: Value) error{InvalidNumber}!f64 {
 
 /// Python numeric ordering. NaNs are unordered; integers never round to float.
 pub fn numericOrder(a: Value, b: Value) error{InvalidNumber}!?std.math.Order {
+    if (decimalView(a) != null or decimalView(b) != null) {
+        const context = decimal_environment.getContext();
+        if (isFloatingOperand(a) or isFloatingOperand(b))
+            context.signal(.float_operation) catch return error.InvalidNumber;
+        var left_buffer: [768]u8 = undefined;
+        var right_buffer: [768]u8 = undefined;
+        const left = try decimalOperand(a, &left_buffer, true);
+        const right = try decimalOperand(b, &right_buffer, true);
+        return context.order(left, right) catch return error.InvalidNumber;
+    }
     var a_buffer: [20]u8 = undefined;
     var b_buffer: [20]u8 = undefined;
     const a_integer = IntegerText.fromValue(a, &a_buffer);
@@ -622,13 +728,13 @@ pub fn numericOrder(a: Value, b: Value) error{InvalidNumber}!?std.math.Order {
         if (b_integer) |other| return integer.order(other);
         const f = try numericFloat(b);
         if (std.math.isNan(f)) return null;
-        if (pyEqual(a, .{ .float = f })) return .eq;
+        if (pyEqual(a, .{ .float = f }) catch return error.InvalidNumber) return .eq;
         return if (try floatAtLeast(f, a)) .lt else .gt;
     }
     const f = try numericFloat(a);
     if (b_integer != null) {
         if (std.math.isNan(f)) return null;
-        if (pyEqual(.{ .float = f }, b)) return .eq;
+        if (pyEqual(.{ .float = f }, b) catch return error.InvalidNumber) return .eq;
         return if (try floatAtLeast(f, b)) .gt else .lt;
     }
     const g = try numericFloat(b);
@@ -640,6 +746,8 @@ pub fn numericOrder(a: Value, b: Value) error{InvalidNumber}!?std.math.Order {
 /// products first convert BOTH operands, even when the other operand is zero.
 /// Zero/one integer products borrow unchanged numeric text without allocation.
 pub fn numericProduct(arena: Allocator, a: Value, b: Value) (Allocator.Error || error{InvalidNumber})!Value {
+    if (decimalView(a) != null or decimalView(b) != null)
+        return decimalBinary(arena, a, b, .multiply);
     var a_buffer: [20]u8 = undefined;
     var b_buffer: [20]u8 = undefined;
     if (IntegerText.fromValue(a, &a_buffer)) |a_integer| {
@@ -680,6 +788,182 @@ pub fn numericProduct(arena: Allocator, a: Value, b: Value) (Allocator.Error || 
     const left = try numericFloat(a);
     const right = try numericFloat(b);
     return .{ .float = left * right };
+}
+
+const NumericError = Allocator.Error || error{InvalidNumber};
+
+fn decimalView(input: Value) ?decimals.Decimal {
+    const builtin = python.view(input) orelse return null;
+    return if (builtin == .decimal) builtin.decimal else null;
+}
+
+fn isFloatingOperand(input: Value) bool {
+    return input == .float or (input == .number_string and IntegerText.parse(input.number_string) == null);
+}
+
+fn decimalOperand(input: Value, buffer: *[768]u8, comptime allow_float: bool) error{InvalidNumber}!decimals.Decimal {
+    if (decimalView(input)) |data| return data;
+    if (IntegerText.fromValue(input, buffer[0..20])) |integer|
+        return .{ .negative = integer.negative, .digits = integer.digits };
+    if (!allow_float) return error.InvalidNumber;
+    return decimals.fromFloatExact(try numericFloat(input), buffer);
+}
+
+fn decimalMathFailure(err: decimal_environment.Context.Error) NumericError {
+    return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidNumber;
+}
+
+const DecimalOperation = enum { add, subtract, multiply, divide };
+
+fn decimalBinary(arena: Allocator, a: Value, b: Value, comptime operation: DecimalOperation) NumericError!Value {
+    var left_buffer: [768]u8 = undefined;
+    var right_buffer: [768]u8 = undefined;
+    // Reject mixed floats before any operation, including NaN propagation.
+    const left = try decimalOperand(a, &left_buffer, false);
+    const right = try decimalOperand(b, &right_buffer, false);
+    const context = decimal_environment.getContext();
+    const result = (switch (operation) {
+        .add => context.add(arena, left, right),
+        .subtract => context.subtract(arena, left, right),
+        .multiply => context.multiply(arena, left, right),
+        .divide => context.divide(arena, left, right),
+    }) catch |err| return decimalMathFailure(err);
+    errdefer result.deinit(arena);
+    return python.decimalFromOwnedMetadata(arena, result);
+}
+
+fn smallInteger(input: Value) ?i64 {
+    return switch (input) {
+        .bool => |number| @intFromBool(number),
+        .integer => |number| number,
+        .number_string => |text| if (text.len <= 20) std.fmt.parseInt(i64, text, 10) catch null else null,
+        else => null,
+    };
+}
+
+fn integerResult(arena: Allocator, number: i128) Allocator.Error!Value {
+    if (std.math.cast(i64, number)) |small| return .{ .integer = small };
+    return .{ .number_string = try std.fmt.allocPrint(arena, "{d}", .{number}) };
+}
+
+fn negateInteger(arena: Allocator, input: Value, integer: IntegerText) Allocator.Error!Value {
+    if (smallInteger(input)) |small| return integerResult(arena, -@as(i128, small));
+    if (integer.negative) {
+        if (std.fmt.parseInt(i64, integer.digits, 10)) |small|
+            return .{ .integer = small }
+        else |_| {}
+        return .{ .number_string = integer.digits };
+    }
+    if (integer.digits.len <= 19) {
+        var buffer: [20]u8 = undefined;
+        const text = std.fmt.bufPrint(&buffer, "-{s}", .{integer.digits}) catch unreachable;
+        if (std.fmt.parseInt(i64, text, 10)) |small|
+            return .{ .integer = small }
+        else |_| {}
+    }
+    return .{ .number_string = try std.fmt.allocPrint(arena, "-{s}", .{integer.digits}) };
+}
+
+/// Python addition keeps integer sums exact and applies the current Decimal
+/// context only when a Decimal participates. Mixed Decimal/float is refused.
+pub fn numericSum(arena: Allocator, a: Value, b: Value) NumericError!Value {
+    return numericAddSubtract(arena, a, b, false);
+}
+
+pub fn numericDifference(arena: Allocator, a: Value, b: Value) NumericError!Value {
+    return numericAddSubtract(arena, a, b, true);
+}
+
+fn numericAddSubtract(arena: Allocator, a: Value, b: Value, comptime subtract: bool) NumericError!Value {
+    if (decimalView(a) != null or decimalView(b) != null)
+        return decimalBinary(arena, a, b, if (subtract) .subtract else .add);
+    var a_buffer: [20]u8 = undefined;
+    var b_buffer: [20]u8 = undefined;
+    if (IntegerText.fromValue(a, &a_buffer)) |left_integer| {
+        if (IntegerText.fromValue(b, &b_buffer)) |right_integer| {
+            if (std.mem.eql(u8, left_integer.digits, right_integer.digits) and
+                ((left_integer.negative != right_integer.negative) != subtract)) return .{ .integer = 0 };
+            if (std.mem.eql(u8, right_integer.digits, "0"))
+                return if (a == .bool) .{ .integer = @intFromBool(a.bool) } else a;
+            if (std.mem.eql(u8, left_integer.digits, "0")) {
+                if (subtract) return negateInteger(arena, b, right_integer);
+                return if (b == .bool) .{ .integer = @intFromBool(b.bool) } else b;
+            }
+            const left_small = smallInteger(a);
+            const right_small = smallInteger(b);
+            if (left_small != null and right_small != null) {
+                const left: i128 = left_small.?;
+                const right: i128 = right_small.?;
+                return integerResult(arena, if (subtract) left - right else left + right);
+            }
+            var left = try std.math.big.int.Managed.init(arena);
+            defer left.deinit();
+            var right = try std.math.big.int.Managed.init(arena);
+            defer right.deinit();
+            var result = try std.math.big.int.Managed.init(arena);
+            defer result.deinit();
+            try setBigInteger(&left, a);
+            try setBigInteger(&right, b);
+            if (subtract) try result.sub(&left, &right) else try result.add(&left, &right);
+            if (result.toInt(i64)) |small| return .{ .integer = small } else |_| {}
+            return .{ .number_string = try result.toConst().toStringAlloc(arena, 10, .lower) };
+        }
+    }
+    const left = try numericFloat(a);
+    const right = try numericFloat(b);
+    return .{ .float = if (subtract) left - right else left + right };
+}
+
+/// True division of integers rounds the ratio, not independently rounded or
+/// overflowing binary64 operands. Decimal division retains its context/flags.
+pub fn numericQuotient(arena: Allocator, a: Value, b: Value) NumericError!Value {
+    if (decimalView(a) != null or decimalView(b) != null)
+        return decimalBinary(arena, a, b, .divide);
+    var a_buffer: [20]u8 = undefined;
+    var b_buffer: [20]u8 = undefined;
+    if (IntegerText.fromValue(a, &a_buffer)) |numerator| {
+        if (IntegerText.fromValue(b, &b_buffer)) |denominator| {
+            if (std.mem.eql(u8, denominator.digits, "0")) return error.InvalidNumber;
+            if (std.mem.eql(u8, numerator.digits, "0"))
+                return .{ .float = if (denominator.negative) -0.0 else 0.0 };
+            if (std.mem.eql(u8, numerator.digits, denominator.digits))
+                return .{ .float = if (numerator.negative != denominator.negative) -1.0 else 1.0 };
+            const left_small = smallInteger(a);
+            const right_small = smallInteger(b);
+            if (left_small != null and right_small != null and
+                @abs(left_small.?) <= (1 << 53) and @abs(right_small.?) <= (1 << 53))
+            {
+                const left: f64 = @floatFromInt(left_small.?);
+                const right: f64 = @floatFromInt(right_small.?);
+                return .{ .float = left / right };
+            }
+            var left = try std.math.big.int.Managed.init(arena);
+            defer left.deinit();
+            var right = try std.math.big.int.Managed.init(arena);
+            defer right.deinit();
+            try setBigInteger(&left, a);
+            try setBigInteger(&right, b);
+            return .{ .float = try @import("integer_division.zig").divide(arena, left.toConst(), right.toConst()) };
+        }
+    }
+    const left = try numericFloat(a);
+    const right = try numericFloat(b);
+    if (right == 0) return error.InvalidNumber;
+    return .{ .float = left / right };
+}
+
+pub fn numericAbs(arena: Allocator, input: Value) NumericError!Value {
+    if (decimalView(input)) |data| {
+        const result = decimal_environment.getContext().absolute(arena, data) catch |err| return decimalMathFailure(err);
+        errdefer result.deinit(arena);
+        return python.decimalFromOwnedMetadata(arena, result);
+    }
+    var buffer: [20]u8 = undefined;
+    if (IntegerText.fromValue(input, &buffer)) |integer| {
+        if (integer.negative) return negateInteger(arena, input, integer);
+        return if (input == .bool) .{ .integer = @intFromBool(input.bool) } else input;
+    }
+    return .{ .float = @abs(try numericFloat(input)) };
 }
 
 fn setBigInteger(out: *std.math.big.int.Managed, v: Value) (Allocator.Error || error{InvalidNumber})!void {
@@ -828,12 +1112,12 @@ pub fn cloneRecord(arena: Allocator, r: *const Record) Allocator.Error!Record {
 const testing = std.testing;
 
 test "Python numeric equality preserves integer precision" {
-    try testing.expect(!pyEqual(.{ .integer = 9_007_199_254_740_993 }, .{ .integer = 9_007_199_254_740_992 }));
-    try testing.expect(!pyEqual(.{ .integer = 9_007_199_254_740_993 }, .{ .float = 9_007_199_254_740_992.0 }));
-    try testing.expect(!pyEqual(.{ .integer = std.math.maxInt(i64) }, .{ .float = 9_223_372_036_854_775_808.0 }));
-    try testing.expect(pyEqual(.{ .integer = std.math.minInt(i64) }, .{ .float = -9_223_372_036_854_775_808.0 }));
-    try testing.expect(pyEqual(.{ .bool = true }, .{ .float = 1.0 }));
-    try testing.expect(!pyEqual(.{ .string = "1" }, .{ .integer = 1 }));
+    try testing.expect(!try pyEqual(.{ .integer = 9_007_199_254_740_993 }, .{ .integer = 9_007_199_254_740_992 }));
+    try testing.expect(!try pyEqual(.{ .integer = 9_007_199_254_740_993 }, .{ .float = 9_007_199_254_740_992.0 }));
+    try testing.expect(!try pyEqual(.{ .integer = std.math.maxInt(i64) }, .{ .float = 9_223_372_036_854_775_808.0 }));
+    try testing.expect(try pyEqual(.{ .integer = std.math.minInt(i64) }, .{ .float = -9_223_372_036_854_775_808.0 }));
+    try testing.expect(try pyEqual(.{ .bool = true }, .{ .float = 1.0 }));
+    try testing.expect(!try pyEqual(.{ .string = "1" }, .{ .integer = 1 }));
 }
 
 test "field annotations do not turn dictionaries or class-annotated lists into text blobs" {
@@ -930,7 +1214,7 @@ test "native integer widths preserve exact unquoted decimal values" {
             const parsed = try std.json.parseFromSliceLeaky(Value, arena, json, .{});
             try testing.expectEqual(@as(T, integer), try fromValue(arena, T, try parseJsonValue(arena, testField(.int), parsed)));
             try testing.expectEqual(@as(T, integer), try fromValue(arena, T, try parseText(arena, testField(.int), expected)));
-            try testing.expect(pyEqual(encoded, try cloneValue(arena, encoded)));
+            try testing.expect(try pyEqual(encoded, try cloneValue(arena, encoded)));
         }
     }
 
@@ -979,7 +1263,7 @@ test "nested native integers round trip through typed validation" {
     try testing.expectEqual(original.optional, decoded.optional);
     try testing.expectEqualSlices(i128, original.items, decoded.items);
     try testing.expectEqual(original.counts.get("large"), decoded.counts.get("large"));
-    try testing.expect(pyEqual(encoded, checked));
+    try testing.expect(try pyEqual(encoded, checked));
     try testing.expectError(error.ParseValue, types.validate(u64, arena, .{ .number_string = "18446744073709551616" }));
     try testing.expectError(error.ParseValue, types.validate(i64, arena, encoded.object.get("id").?));
     const signed_text = try types.validate(u64, arena, .{ .string = "+18_446_744_073_709_551_615" });
@@ -989,27 +1273,27 @@ test "nested native integers round trip through typed validation" {
 
 test "wide integer equality is exact across JSON representations" {
     const maximum: Value = .{ .number_string = "18446744073709551615" };
-    try testing.expect(pyEqual(maximum, maximum));
-    try testing.expect(!pyEqual(maximum, .{ .number_string = "18446744073709551614" }));
-    try testing.expect(!pyEqual(maximum, .{ .float = 0x1p64 }));
-    try testing.expect(!pyEqual(.{ .float = 0x1p64 }, maximum));
-    try testing.expect(pyEqual(.{ .number_string = "10000000000000000000" }, .{ .float = 1e19 }));
-    try testing.expect(pyEqual(.{ .float = -0x1p127 }, .{ .number_string = "-170141183460469231731687303715884105728" }));
-    try testing.expect(!pyEqual(.{ .float = -0x1p127 }, .{ .number_string = "-170141183460469231731687303715884105727" }));
-    try testing.expect(pyEqual(.{ .number_string = "9223372036854775807" }, .{ .integer = std.math.maxInt(i64) }));
-    try testing.expect(pyEqual(.{ .integer = std.math.minInt(i64) }, .{ .number_string = "-9223372036854775808" }));
-    try testing.expect(pyEqual(.{ .number_string = "1" }, .{ .bool = true }));
-    try testing.expect(!pyEqual(maximum, .{ .string = "18446744073709551615" }));
-    try testing.expect(!pyEqual(maximum, .{ .float = std.math.inf(f64) }));
-    try testing.expect(!pyEqual(maximum, .{ .float = std.math.nan(f64) }));
-    try testing.expect(pyEqual(.{ .number_string = "0" }, .{ .float = -0.0 }));
-    try testing.expect(!pyEqual(.{ .number_string = "0" }, .{ .float = 0x1p-1074 }));
+    try testing.expect(try pyEqual(maximum, maximum));
+    try testing.expect(!try pyEqual(maximum, .{ .number_string = "18446744073709551614" }));
+    try testing.expect(!try pyEqual(maximum, .{ .float = 0x1p64 }));
+    try testing.expect(!try pyEqual(.{ .float = 0x1p64 }, maximum));
+    try testing.expect(try pyEqual(.{ .number_string = "10000000000000000000" }, .{ .float = 1e19 }));
+    try testing.expect(try pyEqual(.{ .float = -0x1p127 }, .{ .number_string = "-170141183460469231731687303715884105728" }));
+    try testing.expect(!try pyEqual(.{ .float = -0x1p127 }, .{ .number_string = "-170141183460469231731687303715884105727" }));
+    try testing.expect(try pyEqual(.{ .number_string = "9223372036854775807" }, .{ .integer = std.math.maxInt(i64) }));
+    try testing.expect(try pyEqual(.{ .integer = std.math.minInt(i64) }, .{ .number_string = "-9223372036854775808" }));
+    try testing.expect(try pyEqual(.{ .number_string = "1" }, .{ .bool = true }));
+    try testing.expect(!try pyEqual(maximum, .{ .string = "18446744073709551615" }));
+    try testing.expect(!try pyEqual(maximum, .{ .float = std.math.inf(f64) }));
+    try testing.expect(!try pyEqual(maximum, .{ .float = std.math.nan(f64) }));
+    try testing.expect(try pyEqual(.{ .number_string = "0" }, .{ .float = -0.0 }));
+    try testing.expect(!try pyEqual(.{ .number_string = "0" }, .{ .float = 0x1p-1074 }));
     const largest_float_integer: u1024 = @as(u1024, 0x001f_ffff_ffff_ffff) << 971;
     var buffer: [310]u8 = undefined;
     const exact = try std.fmt.bufPrint(&buffer, "{d}", .{largest_float_integer});
-    try testing.expect(pyEqual(.{ .number_string = exact }, .{ .float = 0x1.fffffffffffffp1023 }));
+    try testing.expect(try pyEqual(.{ .number_string = exact }, .{ .float = 0x1.fffffffffffffp1023 }));
     const adjacent = try std.fmt.bufPrint(&buffer, "{d}", .{largest_float_integer + 1});
-    try testing.expect(!pyEqual(.{ .number_string = adjacent }, .{ .float = 0x1.fffffffffffffp1023 }));
+    try testing.expect(!try pyEqual(.{ .number_string = adjacent }, .{ .float = 0x1.fffffffffffffp1023 }));
 }
 
 test "typed record round trip" {
@@ -1023,5 +1307,5 @@ test "typed record round trip" {
     const back = try fromRecord(arena, T, &r);
     try testing.expectEqualStrings("y", back.ctx[1]);
     try testing.expectEqual(in.e, back.e);
-    try testing.expect(recordEqual(&r, &(try cloneRecord(arena, &r))));
+    try testing.expect(try recordEqual(&r, &(try cloneRecord(arena, &r))));
 }

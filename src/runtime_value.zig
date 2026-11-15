@@ -33,6 +33,7 @@ pub const PythonValue = union(enum) {
     set: []const Value,
     frozen_set: []const Value,
     complex: struct { real: f64, imag: f64 },
+    decimal: @import("decimal.zig").Decimal,
     ellipsis: void,
     dictionary: []const PythonEntry,
 };
@@ -87,10 +88,10 @@ pub const CustomVTable = struct {
     write_serialized_json: *const fn (*Writer, *const anyopaque, JsonStyle, usize) CustomWriteError!void,
     clone: *const fn (Allocator, *const anyopaque) Allocator.Error!Custom,
     deinit: *const fn (Allocator, *const anyopaque, bool) void,
-    eql: *const fn (*const anyopaque, *const anyopaque) bool,
+    eql: *const fn (*const anyopaque, *const anyopaque) CustomError!bool,
     /// Optional Python equality against a different value tag (e.g. Reasoning
     /// compares equal to its content string, but not to a lookalike dictionary).
-    eql_value: ?*const fn (*const anyopaque, Value) bool = null,
+    eql_value: ?*const fn (*const anyopaque, Value) CustomError!bool = null,
 };
 
 /// Native objects use their class's clone/free protocol. Model boxes are owned;
@@ -146,7 +147,7 @@ pub const Custom = struct {
         self.vtable.deinit(allocator, self.ptr, self.owns_data);
     }
 
-    pub fn eql(self: Custom, other: Custom) bool {
+    pub fn eql(self: Custom, other: Custom) CustomError!bool {
         if (!self.sameType(other)) return false;
         return self.vtable.eql(self.ptr, other.ptr);
     }

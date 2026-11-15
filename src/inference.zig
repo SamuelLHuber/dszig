@@ -4,7 +4,8 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Value = @import("runtime_value.zig").Value;
+const runtime = @import("runtime_value.zig");
+const Value = runtime.Value;
 
 pub const MetadataError = error{BadMetadata} || Allocator.Error;
 pub const SchemaError = error{ InvalidSchema, JsonTooDeep } || Allocator.Error;
@@ -390,11 +391,11 @@ pub fn continuationsFromValue(arena: Allocator, input: Value) MetadataError![]co
     return out;
 }
 
-pub fn continuationsEqual(a: []const Continuation, b: []const Continuation) bool {
+pub fn continuationsEqual(a: []const Continuation, b: []const Continuation) runtime.CustomError!bool {
     if (a.len != b.len) return false;
     for (a, b) |x, y| {
         if (!std.mem.eql(u8, x.provider, y.provider) or !std.mem.eql(u8, x.kind, y.kind) or
-            !jsonEqual(x.data, y.data)) return false;
+            !(try jsonEqual(x.data, y.data))) return false;
     }
     return true;
 }
@@ -567,13 +568,13 @@ pub fn toolCallsFromValue(arena: Allocator, input: Value) MetadataError![]const 
     return out;
 }
 
-pub fn responseFormatEqual(a: ResponseFormat, b: ResponseFormat) bool {
+pub fn responseFormatEqual(a: ResponseFormat, b: ResponseFormat) runtime.CustomError!bool {
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
     if (a != .json_schema) return true;
     const x = a.json_schema;
     const y = b.json_schema;
     return x.strict == y.strict and std.mem.eql(u8, x.name, y.name) and
-        optionalStringEqual(x.description, y.description) and jsonEqual(x.schema, y.schema);
+        optionalStringEqual(x.description, y.description) and try jsonEqual(x.schema, y.schema);
 }
 
 pub fn toolChoiceEqual(a: *const ToolChoice, b: *const ToolChoice) bool {
@@ -604,32 +605,32 @@ fn toolChoiceNames(choice: *const ToolChoice) []const []const u8 {
     };
 }
 
-pub fn toolsEqual(a: []const FunctionTool, b: []const FunctionTool) bool {
+pub fn toolsEqual(a: []const FunctionTool, b: []const FunctionTool) runtime.CustomError!bool {
     if (a.len != b.len) return false;
     for (a, b) |x, y| {
         if (!std.mem.eql(u8, x.name, y.name) or !std.mem.eql(u8, x.description, y.description) or
-            x.strict != y.strict or !jsonEqual(x.parameters, y.parameters)) return false;
+            x.strict != y.strict or !(try jsonEqual(x.parameters, y.parameters))) return false;
     }
     return true;
 }
 
-pub fn toolCallsEqual(a: []const ToolCall, b: []const ToolCall) bool {
+pub fn toolCallsEqual(a: []const ToolCall, b: []const ToolCall) runtime.CustomError!bool {
     if (a.len != b.len) return false;
     for (a, b) |x, y| {
         if (!std.mem.eql(u8, x.id, y.id) or !std.mem.eql(u8, x.name, y.name) or
             !std.mem.eql(u8, x.arguments, y.arguments) or
-            !continuationsEqual(x.continuation, y.continuation)) return false;
+            !(try continuationsEqual(x.continuation, y.continuation))) return false;
     }
     return true;
 }
 
 /// Schema booleans are not numbers: Python-style true == 1 would accept a
 /// different native request. Object insertion order does not change a schema.
-pub fn jsonEqual(a: Value, b: Value) bool {
+pub fn jsonEqual(a: Value, b: Value) runtime.CustomError!bool {
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
     return switch (a) {
         .null => true,
-        .custom => |custom| custom.eql(b.custom),
+        .custom => |custom| try custom.eql(b.custom),
         .bool => |x| x == b.bool,
         .integer => |x| x == b.integer,
         .float => |x| x == b.float,
@@ -638,7 +639,7 @@ pub fn jsonEqual(a: Value, b: Value) bool {
         .array => |x| blk: {
             if (x.items.len != b.array.items.len) break :blk false;
             for (x.items, b.array.items) |first, second| {
-                if (!jsonEqual(first, second)) break :blk false;
+                if (!(try jsonEqual(first, second))) break :blk false;
             }
             break :blk true;
         },
@@ -646,7 +647,7 @@ pub fn jsonEqual(a: Value, b: Value) bool {
             if (x.count() != b.object.count()) break :blk false;
             var iterator = x.iterator();
             while (iterator.next()) |entry| {
-                if (!jsonEqual(entry.value_ptr.*, b.object.get(entry.key_ptr.*) orelse break :blk false)) break :blk false;
+                if (!(try jsonEqual(entry.value_ptr.*, b.object.get(entry.key_ptr.*) orelse break :blk false))) break :blk false;
             }
             break :blk true;
         },

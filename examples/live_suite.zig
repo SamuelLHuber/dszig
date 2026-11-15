@@ -83,9 +83,10 @@ pub fn dateExamples(arena: Allocator, comptime split: enum { train, dev }) ![]co
 }
 
 /// `pred.answer.strip() == example.answer`.
-pub fn exactMetric(_: Allocator, example: *const dszig.Example, prediction: *const Record, _: ?*const dszig.Trace) f64 {
+pub fn exactMetric(_: Allocator, example: *const dszig.Example, prediction: ?*const Record, _: ?*const dszig.Trace) dszig.value.ParseError!f64 {
     const want = example.record.get("answer").?.string;
-    const got = (prediction.get("answer") orelse return 0).string;
+    const pred = prediction orelse return error.ParseValue;
+    const got = (pred.get("answer") orelse return 0).string;
     return if (std.mem.eql(u8, std.mem.trim(u8, got, " \t\r\n"), want)) 1 else 0;
 }
 
@@ -198,8 +199,8 @@ pub fn gepaMetric(
     trace: ?*const dszig.Trace,
     pred_name: ?[]const u8,
     _: ?*const dszig.Trace.Step,
-) dszig.gepa.Feedback {
-    const score = exactMetric(arena, example, prediction, trace);
+) dszig.value.ParseError!dszig.gepa.Feedback {
+    const score = try exactMetric(arena, example, prediction, trace);
     if (pred_name == null or score != 0) return .{ .score = score };
     const gold = example.record.get("answer").?.string;
     return .{ .score = score, .feedback = std.fmt.allocPrint(arena, "Expected {s}.", .{gold}) catch "" };
@@ -583,7 +584,7 @@ pub const VerifyTranscriptError = error{
     PipelineTrialsMismatch,
     PipelineScoresMismatch,
     PipelineTrainScoresMismatch,
-} || Allocator.Error;
+} || dszig.value.ParseError;
 
 /// Checks the complete suite result against a DSPy 3.5.0 transcript.
 /// Exception names are runtime-specific; their presence must agree.
@@ -602,12 +603,12 @@ pub fn verifyTranscript(arena: Allocator, expected: Value, result: Result) Verif
     for (expected_cases.array.items, actual_cases) |want, got| {
         if (want != .object) return error.BadTranscript;
         const want_name = want.object.get("name") orelse return error.BadTranscript;
-        if (!dszig.value.pyEqual(want_name, got.object.get("name").?)) return error.CaseNameMismatch;
+        if (!(try dszig.value.pyEqual(want_name, got.object.get("name").?))) return error.CaseNameMismatch;
         const want_outputs = want.object.get("outputs");
         const got_outputs = got.object.get("outputs");
         if ((want_outputs == null) != (got_outputs == null)) return error.CaseOutputMismatch;
         if (want_outputs) |outputs| {
-            if (!dszig.value.pyEqual(outputs, got_outputs.?)) return error.CaseOutputMismatch;
+            if (!(try dszig.value.pyEqual(outputs, got_outputs.?))) return error.CaseOutputMismatch;
         }
         if ((want.object.get("error") != null) != (got.object.get("error") != null)) return error.CaseErrorMismatch;
     }
@@ -629,7 +630,7 @@ pub fn verifyTranscript(arena: Allocator, expected: Value, result: Result) Verif
             .{ "train_scores", error.PipelineTrainScoresMismatch },
         }) |field| {
             const expected_field = want.object.get(field[0]) orelse return error.BadTranscript;
-            if (!dszig.value.pyEqual(expected_field, got.get(field[0]).?)) return field[1];
+            if (!(try dszig.value.pyEqual(expected_field, got.get(field[0]).?))) return field[1];
         }
     }
 }

@@ -306,7 +306,7 @@ fn DecisionType(comptime config: Configuration) type {
                     const level = getInput(input, "level") orelse .null;
                     if (level != .null) {
                         const integer = if (mode == .lax) try values.coerceInteger(arena, level) else try strictInteger(level);
-                        if (!nonnegativeInteger(integer)) return error.ParseValue;
+                        if (!try nonnegativeInteger(integer)) return error.ParseValue;
                         if (comptime configured) {
                             if (!(values.floatAtLeast(@floatFromInt(members.len - 1), integer) catch return error.ParseValue)) return error.ParseValue;
                         }
@@ -403,14 +403,14 @@ fn DecisionType(comptime config: Configuration) type {
         pub fn float(self: Self) error{ParseValue}!f64 {
             return if (comptime kind == .score) self.value else error.ParseValue;
         }
-        pub fn eql(self: Self, other: Self) bool {
+        pub fn eql(self: Self, other: Self) runtime.CustomError!bool {
             if (self.runtime_origin) |left| {
                 if (other.runtime_origin) |right| return left.eql(right);
                 if (!std.mem.eql(u8, left.vtable.type_name, @typeName(Self))) return false;
             } else if (other.runtime_origin) |right| {
                 if (!std.mem.eql(u8, right.vtable.type_name, @typeName(Self))) return false;
             }
-            inline for (field_names) |name| if (!values.pyEqual(self.fieldValue(name), other.fieldValue(name))) return false;
+            inline for (field_names) |name| if (!try values.pyEqual(self.fieldValue(name), other.fieldValue(name))) return false;
             return true;
         }
 
@@ -617,8 +617,8 @@ fn DecisionType(comptime config: Configuration) type {
             if (owns_data) actual(ptr).deinit(allocator);
             allocator.destroy(actual(ptr));
         }
-        fn equalRuntime(left: *const anyopaque, right: *const anyopaque) bool {
-            return left == right or actual(left).eql(actual(right).*);
+        fn equalRuntime(left: *const anyopaque, right: *const anyopaque) runtime.CustomError!bool {
+            return left == right or try actual(left).eql(actual(right).*);
         }
     };
 }
@@ -669,10 +669,10 @@ fn strictInteger(input: Value) error{ParseValue}!Value {
         else => error.ParseValue,
     };
 }
-fn nonnegativeInteger(input: Value) bool {
+fn nonnegativeInteger(input: Value) runtime.CustomError!bool {
     return switch (input) {
         .integer => |i| i >= 0,
-        .number_string => |s| s.len > 0 and (s[0] != '-' or values.pyEqual(input, .{ .integer = 0 })),
+        .number_string => |s| s.len > 0 and (s[0] != '-' or try values.pyEqual(input, .{ .integer = 0 })),
         else => false,
     };
 }
@@ -690,8 +690,26 @@ fn bareChoiceValue(arena: Allocator, input: Value, mode: ValidationMode) runtime
         }
     }
     if (mode == .strict) return error.ParseValue;
-    return values.coerceInteger(arena, input);
+    // The bare annotation is a union: failure of the integer branch must
+    // still try its bool branch, which has distinct Decimal float coercion.
+    return values.coerceInteger(arena, input) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => types.validate(bool, arena, input),
+    };
 }
+test "bare Choice tries bool after exact Decimal integer coercion refuses" {
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const a = memory.allocator();
+    const input = try python.decimal(a, "0.9999999999999999999999999999");
+    try std.testing.expectError(error.ParseValue, values.coerceInteger(a, input));
+    const default = try bareChoiceValue(a, input, .declared);
+    try std.testing.expect(default == .bool and default.bool);
+    const lax = try bareChoiceValue(a, input, .lax);
+    try std.testing.expect(lax == .bool and lax.bool);
+    try std.testing.expectError(error.ParseValue, bareChoiceValue(a, input, .strict));
+}
+
 fn probabilityMap(arena: Allocator, input: Value, kind: Kind, mode: ValidationMode, json_input: bool) runtime.CustomError!Value {
     const pairs = if (input == .object) blk: {
         const result = try arena.alloc(runtime.PythonEntry, input.object.count());
@@ -1159,8 +1177,8 @@ test "decision boxes preserve class identity and direct routing eligibility" {
     const base = try Noul.validate(a, configured);
     try std.testing.expectEqual(configured.custom.ptr, base.custom.ptr);
     try std.testing.expectError(error.ParseValue, Second.validate(a, configured));
-    try std.testing.expect(!values.pyEqual(configured, try Noul.validate(a, source)));
-    try std.testing.expect(!values.pyEqual(configured, source));
+    try std.testing.expect(!try values.pyEqual(configured, try Noul.validate(a, source)));
+    try std.testing.expect(!try values.pyEqual(configured, source));
     try std.testing.expect(modelInfo(First) != null);
     try std.testing.expect(modelInfo(?First) == null);
     try std.testing.expect(modelInfo([]const First) == null);
@@ -1198,7 +1216,7 @@ test "decision raw iteration retains defaults while structured dumps filter null
         .prefix = "",
     }, choice);
     const formatted = try testInput(a, writer.written());
-    try std.testing.expect(values.pyEqual(raw, formatted));
+    try std.testing.expect(try values.pyEqual(raw, formatted));
 }
 
 test "decision owning clones outlive input arenas and preserve base projections" {
@@ -1221,13 +1239,13 @@ test "decision owning clones outlive input arenas and preserve base projections"
     try std.testing.expectEqual(@as(f64, 0.8), actual.custom.get(Selected).?.probabilities.?.object.get("borrowed 日本").?.float);
     const again = try actual.custom.clone(std.testing.allocator);
     defer again.deinit(std.testing.allocator);
-    try std.testing.expect(actual.custom.eql(again));
+    try std.testing.expect(try actual.custom.eql(again));
 }
 
 fn exerciseDecisionOwnership(allocator: Allocator, original: Value) !void {
     const copy = try original.custom.clone(allocator);
     defer copy.deinit(allocator);
-    try std.testing.expect(original.custom.eql(copy));
+    try std.testing.expect(try original.custom.eql(copy));
     const fields = try copy.vtable.iterate.?(allocator, copy.ptr);
     defer allocator.free(fields);
     defer for (fields) |field| field.custom.deinit(allocator);
@@ -1257,7 +1275,7 @@ test "nested decision conversion and feedback retain actual model identity" {
     const score = encoded.object.get("scores").?.array.items[0];
     try std.testing.expect(score.custom.get(Rubric) != null);
     try std.testing.expectEqual(@as(f64, 0.5), (try types.validate(f64, a, score)).float);
-    try std.testing.expect(!values.pyEqual(score, .{ .float = 0.5 }));
+    try std.testing.expect(!try values.pyEqual(score, .{ .float = 0.5 }));
     const masked = try @import("feedback.zig").maskValue(a, score);
     try std.testing.expectEqualStrings("<non-serializable: " ++ Rubric.model_name ++ ">", masked.string);
     const dictionary = try score.custom.rawValue(a);

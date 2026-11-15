@@ -292,7 +292,7 @@ pub const File = struct {
         arena.destroy(file);
     }
 
-    fn equalRuntime(left: *const anyopaque, right: *const anyopaque) bool {
+    fn equalRuntime(left: *const anyopaque, right: *const anyopaque) runtime.CustomError!bool {
         const a = runtimeFile(left);
         const b = runtimeFile(right);
         inline for (.{ "file_data", "file_id", "filename" }) |name| {
@@ -508,8 +508,8 @@ test "File runtime identity distinguishes raw dictionaries through nested serial
     try std.testing.expect(actual == .custom);
     try std.testing.expect(actual.custom.get(File) != null);
     try std.testing.expect(dictionary == .object);
-    try std.testing.expect(!value.pyEqual(actual, dictionary));
-    try std.testing.expect(!value.pyEqual(dictionary, actual));
+    try std.testing.expect(!try value.pyEqual(actual, dictionary));
+    try std.testing.expect(!try value.pyEqual(dictionary, actual));
     try std.testing.expectEqualStrings(raw_json, try std.json.Stringify.valueAlloc(arena, actual, .{}));
     try std.testing.expectEqualStrings(raw_json, try std.json.Stringify.valueAlloc(arena, dictionary, .{}));
     const formatted = try adapter.formattedValue(arena, Sig.input_fields_list[0], actual);
@@ -517,7 +517,7 @@ test "File runtime identity distinguishes raw dictionaries through nested serial
     try std.testing.expectEqualStrings(marker, formatted.string);
     const formatted_dictionary = try adapter.formattedValue(arena, Sig.input_fields_list[0], dictionary);
     try std.testing.expect(formatted_dictionary == .object);
-    try std.testing.expect(value.pyEqual(dictionary, formatted_dictionary));
+    try std.testing.expect(try value.pyEqual(dictionary, formatted_dictionary));
 
     var files: runtime.Array = .init(arena);
     try files.append(actual);
@@ -535,7 +535,7 @@ test "File runtime identity distinguishes raw dictionaries through nested serial
     try std.testing.expectEqual(@as(usize, 3), serialized_files.len);
     try std.testing.expectEqualStrings(marker, serialized_files[0].string);
     try std.testing.expect(serialized_files[1] == .object);
-    try std.testing.expect(value.pyEqual(dictionary, serialized_files[1]));
+    try std.testing.expect(try value.pyEqual(dictionary, serialized_files[1]));
     try std.testing.expectEqualStrings(marker, serialized_files[2].string);
     // Serialization must not replace the borrowed original graph in place.
     try std.testing.expectEqual(actual.custom.ptr, files.items[0].custom.ptr);
@@ -553,7 +553,7 @@ test "File runtime identity distinguishes raw dictionaries through nested serial
     try plain_nested.put(arena, "files", .{ .array = plain_files });
     const plain_input: Value = .{ .object = plain_nested };
     const plain_serialized = try value.serializedValue(arena, plain_input);
-    try std.testing.expect(value.pyEqual(plain_input, plain_serialized));
+    try std.testing.expect(try value.pyEqual(plain_input, plain_serialized));
     try std.testing.expectEqual(plain_files.items.ptr, plain_serialized.object.get("files").?.array.items.ptr);
     var plain_streamed: Writer.Allocating = .init(arena);
     try pyjson.writeJson(&plain_streamed.writer, plain_input, .minified);
@@ -621,10 +621,10 @@ test "File validation preserves actual instances and lookalikes do not acquire i
     const coerced = try types.validate(File, arena, dictionary);
     try std.testing.expect(coerced == .custom);
     try std.testing.expect(coerced.custom.ptr != actual.custom.ptr);
-    try std.testing.expect(value.pyEqual(actual, coerced));
+    try std.testing.expect(try value.pyEqual(actual, coerced));
     // Validation returns a model; it must not mutate the caller's dictionary.
     try std.testing.expect(dictionary == .object);
-    try std.testing.expect(!value.pyEqual(dictionary, actual));
+    try std.testing.expect(!try value.pyEqual(dictionary, actual));
     const converted = try value.fromValue(arena, File, actual);
     try std.testing.expectEqualStrings(file.file_data.?, converted.file_data.?);
     try std.testing.expectEqual(file.file_data.?.ptr, converted.file_data.?.ptr);
@@ -663,10 +663,10 @@ test "File runtime clone owns fields after source arena release" {
     try std.testing.expectEqualStrings(expected.file_data.?, owned_file.file_data.?);
     try std.testing.expectEqual(@as(?[]const u8, null), owned_file.file_id);
     try std.testing.expectEqualStrings(expected.filename.?, owned_file.filename.?);
-    try std.testing.expect(value.pyEqual(try expected.toRuntime(arena), owned_files[0]));
+    try std.testing.expect(try value.pyEqual(try expected.toRuntime(arena), owned_files[0]));
     try std.testing.expect(owned_files[1] == .object);
-    try std.testing.expect(value.pyEqual(try expected.toValue(arena), owned_files[1]));
-    try std.testing.expect(!value.pyEqual(owned_files[0], owned_files[1]));
+    try std.testing.expect(try value.pyEqual(try expected.toValue(arena), owned_files[1]));
+    try std.testing.expect(!try value.pyEqual(owned_files[0], owned_files[1]));
 }
 
 test "all-null File constructs but rejects when formatted" {

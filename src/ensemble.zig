@@ -71,7 +71,7 @@ fn isArticle(run: []const u21) bool {
 /// unless every one is empty). Non-string scalars keep Python equality.
 /// DSPy's winning-NaN quirk is retained: the final equality search finds
 /// no match, so it returns the last completion instead.
-pub const Error = Allocator.Error || error{ UnhashableVote, MissingVoteField };
+pub const Error = value.ParseError || error{ UnhashableVote, MissingVoteField };
 
 const VoteKey = struct {
     value: Value,
@@ -79,8 +79,8 @@ const VoteKey = struct {
     // field storage represents identity; equal NaN bits must not merge.
     identity: *const Value,
 
-    fn equal(a: VoteKey, b: VoteKey) bool {
-        return a.identity == b.identity or value.pyEqual(a.value, b.value);
+    fn equal(a: VoteKey, b: VoteKey) value.ParseError!bool {
+        return a.identity == b.identity or try value.pyEqual(a.value, b.value);
     }
 };
 
@@ -97,10 +97,10 @@ pub fn majority(arena: Allocator, completions: []const Record, field: []const u8
     var best_count: usize = 0;
     for (keys, 0..) |k, i| {
         if (any_kept and k.value == .null) continue;
-        if (firstIndex(keys[0..i], k, any_kept) != null) continue;
+        if (try firstIndex(keys[0..i], k, any_kept) != null) continue;
         var count: usize = 0;
         for (keys) |other| {
-            if (k.equal(other)) count += 1;
+            if (try k.equal(other)) count += 1;
         }
         if (count > best_count) {
             best = i;
@@ -110,13 +110,13 @@ pub fn majority(arena: Allocator, completions: []const Record, field: []const u8
     // best already names the first occurrence. DSPy's final search uses
     // equality alone: a non-reflexive winning NaN falls through to the last row.
     const winner = best.?;
-    return if (value.pyEqual(keys[winner].value, keys[winner].value)) winner else completions.len - 1;
+    return if (try value.pyEqual(keys[winner].value, keys[winner].value)) winner else completions.len - 1;
 }
 
-fn firstIndex(keys: []const VoteKey, k: VoteKey, skip_null: bool) ?usize {
+fn firstIndex(keys: []const VoteKey, k: VoteKey, skip_null: bool) value.ParseError!?usize {
     for (keys, 0..) |other, i| {
         if (skip_null and other.value == .null) continue;
-        if (k.equal(other)) return i;
+        if (try k.equal(other)) return i;
     }
     return null;
 }

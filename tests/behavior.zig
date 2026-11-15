@@ -45,7 +45,7 @@ test "Evaluate uses Python decimal ties-to-even without intermediate rounding or
         pub fn forward(_: *const @This(), _: dszig.Context, _: Input) !Output {
             return .{};
         }
-        fn metric(_: Allocator, example: *const dszig.Example, _: *const dszig.value.Record, _: ?*const dszig.Trace) f64 {
+        fn metric(_: Allocator, example: *const dszig.Example, _: ?*const dszig.value.Record, _: ?*const dszig.Trace) dszig.value.ParseError!f64 {
             return example.record.get("score").?.float;
         }
     };
@@ -75,6 +75,148 @@ test "Evaluate uses Python decimal ties-to-even without intermediate rounding or
     try example.record.put(arena, "score", .{ .float = std.math.nan(f64) });
     const result = try dszig.optimize.evaluate(P, testing.allocator, ctx, &.{}, &.{example}, P.metric, 1);
     try testing.expect(std.math.isNan(result.score));
+}
+
+test "Evaluate counts program and metric failures together and keeps allocation failures fatal" {
+    const P = struct {
+        calls: *usize,
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct {};
+
+        pub fn forward(self: *const @This(), _: dszig.Context, input: Input) !Output {
+            self.calls.* += 1;
+            if (std.mem.eql(u8, input.question, "program_fail")) return error.LMFailure;
+            if (std.mem.eql(u8, input.question, "program_oom")) return error.OutOfMemory;
+            return .{};
+        }
+
+        fn metric(_: Allocator, example: *const dszig.Example, _: ?*const dszig.value.Record, _: ?*const dszig.Trace) dszig.value.ParseError!f64 {
+            const question = example.record.get("question").?.string;
+            if (std.mem.eql(u8, question, "metric_fail")) return error.ParseValue;
+            if (std.mem.eql(u8, question, "metric_oom")) return error.OutOfMemory;
+            return 1;
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var unused: dszig.lm.ScriptedLM = .{ .responses = &.{} };
+    const ctx: dszig.Context = .{ .arena = arena, .lm = unused.lm() };
+    const devset = [_]dszig.Example{
+        try dszig.Example.fromJson(arena, "{\"question\":\"metric_fail\"}", &.{"question"}),
+        try dszig.Example.fromJson(arena, "{\"question\":\"good1\"}", &.{"question"}),
+        try dszig.Example.fromJson(arena, "{\"question\":\"good2\"}", &.{"question"}),
+    };
+    var calls: usize = 0;
+    const program: P = .{ .calls = &calls };
+    const result = try dszig.optimize.evaluate(P, testing.allocator, ctx, &program, &devset, P.metric, 2);
+    try testing.expectEqual(@as(f64, 66.67), result.score);
+    try testing.expectEqual(@as(f64, 2), result.sum);
+    try testing.expectEqual(@as(usize, 3), result.total);
+    try testing.expectEqual(@as(usize, 1), result.errors);
+    try testing.expectEqual(@as(usize, 3), calls);
+
+    for ([_]usize{ 0, 1 }) |max_errors| {
+        calls = 0;
+        try testing.expectError(error.ParseValue, dszig.optimize.evaluate(P, testing.allocator, ctx, &program, &devset, P.metric, max_errors));
+        try testing.expectEqual(@as(usize, 1), calls);
+    }
+
+    const program_failure = try dszig.Example.fromJson(arena, "{\"question\":\"program_fail\"}", &.{"question"});
+    calls = 0;
+    try testing.expectError(error.ParseValue, dszig.optimize.evaluate(P, testing.allocator, ctx, &program, &.{ program_failure, devset[0], devset[1] }, P.metric, 2));
+    try testing.expectEqual(@as(usize, 2), calls);
+
+    for ([_][]const u8{ "metric_oom", "program_oom" }) |question| {
+        var failure = try dszig.Example.fromJson(arena, "{\"question\":\"unused\"}", &.{"question"});
+        try failure.record.put(arena, "question", .{ .string = question });
+        calls = 0;
+        try testing.expectError(error.OutOfMemory, dszig.optimize.evaluate(P, testing.allocator, ctx, &program, &.{ failure, devset[1] }, P.metric, 100));
+        try testing.expectEqual(@as(usize, 1), calls);
+    }
+}
+
+test "BootstrapFewShot counts metric failures with program failures after restoring teacher demos" {
+    const Sig = dszig.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: []const u8 };
+    });
+    const P = dszig.Predict(Sig);
+    const Model = struct {
+        calls: usize = 0,
+        fail_first: bool = false,
+
+        fn complete(ptr: *anyopaque, arena: Allocator, request: dszig.lm.Request) dszig.lm.Error![]const dszig.lm.Completion {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.fail_first and self.calls == 1) return error.LMFailure;
+            const out = try arena.alloc(dszig.lm.Completion, request.options.n);
+            for (out) |*completion| completion.* = .{ .text = "<answer>ok</answer>" };
+            return out;
+        }
+    };
+    const Metric = struct {
+        fn run(_: Allocator, example: *const dszig.Example, _: ?*const dszig.value.Record, trace: ?*const dszig.Trace) dszig.value.ParseError!f64 {
+            const steps = trace.?.steps.items;
+            // A successful metric must see the teacher's full, restored demos,
+            // not the per-example filtered slice used during prediction.
+            if (steps.len != 1 or steps[0].predictor.demos.len != 3) return error.ParseValue;
+            const question = example.record.get("question").?.string;
+            if (std.mem.eql(u8, question, "metric_fail")) return error.ParseValue;
+            if (std.mem.eql(u8, question, "metric_oom")) return error.OutOfMemory;
+            return 1;
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const trainset = [_]dszig.Example{
+        try dszig.Example.fromJson(arena, "{\"question\":\"metric_fail\",\"answer\":\"ok\"}", &.{"question"}),
+        try dszig.Example.fromJson(arena, "{\"question\":\"good1\",\"answer\":\"ok\"}", &.{"question"}),
+        try dszig.Example.fromJson(arena, "{\"question\":\"good2\",\"answer\":\"ok\"}", &.{"question"}),
+    };
+    var teacher: P = .{};
+    teacher.state.demos = &.{ trainset[0].record, trainset[1].record, trainset[2].record };
+    var model: Model = .{};
+    const ctx: dszig.Context = .{
+        .arena = arena,
+        .lm = .{ .ptr = &model, .vtable = &.{ .complete = Model.complete } },
+        .adapter = .xml,
+    };
+    var optimizer: dszig.BootstrapFewShot = .{
+        .metric = Metric.run,
+        .max_bootstrapped_demos = 3,
+        .max_labeled_demos = 0,
+        .max_errors = 2,
+    };
+    const result = try optimizer.compile(P, arena, testing.allocator, ctx, .{}, teacher, &trainset);
+    try testing.expectEqual(@as(usize, 3), result.report.attempts);
+    try testing.expectEqual(@as(usize, 1), result.report.errors);
+    try testing.expectEqual(@as(usize, 2), result.report.bootstrapped);
+    try testing.expectEqual(@as(usize, 1), result.report.validation);
+    try testing.expectEqual(@as(usize, 3), model.calls);
+    try testing.expectEqual(@as(usize, 3), teacher.state.demos.len);
+    try testing.expectEqual(@as(usize, 2), result.program.state.demos.len);
+
+    for ([_]usize{ 0, 1 }) |max_errors| {
+        model.calls = 0;
+        optimizer.max_errors = max_errors;
+        try testing.expectError(error.ParseValue, optimizer.compile(P, arena, testing.allocator, ctx, .{}, teacher, &trainset));
+        try testing.expectEqual(@as(usize, 1), model.calls);
+    }
+
+    model.calls = 0;
+    model.fail_first = true;
+    optimizer.max_errors = 2;
+    try testing.expectError(error.ParseValue, optimizer.compile(P, arena, testing.allocator, ctx, .{}, teacher, &.{ trainset[1], trainset[0], trainset[2] }));
+    try testing.expectEqual(@as(usize, 2), model.calls);
+
+    const allocation_failure = try dszig.Example.fromJson(arena, "{\"question\":\"metric_oom\",\"answer\":\"ok\"}", &.{"question"});
+    model.calls = 0;
+    model.fail_first = false;
+    optimizer.max_errors = 100;
+    try testing.expectError(error.OutOfMemory, optimizer.compile(P, arena, testing.allocator, ctx, .{}, teacher, &.{ allocation_failure, trainset[1] }));
+    try testing.expectEqual(@as(usize, 1), model.calls);
 }
 
 test "BootstrapFewShot scores never drop across three generations" {
@@ -179,7 +321,7 @@ test "BootstrapFewShot zero threshold accepts a zero score while null rejects it
     const demos = accepted.program.generate_answer.predict.state.demos;
     try testing.expectEqual(@as(usize, 1), demos.len);
     try testing.expectEqualStrings("Munich", demos[0].get("answer").?.string);
-    try testing.expectEqual(@as(f64, 0.0), rag.keywordMetric(arena, &trainset[0], &demos[0], null));
+    try testing.expectEqual(@as(f64, 0.0), try rag.keywordMetric(arena, &trainset[0], &demos[0], null));
     try testing.expectEqualStrings("Not sure.", (try dszig.Reasoning.fromValue(demos[0].get("reasoning").?)).content);
 
     optimizer.metric_threshold = null;
@@ -220,7 +362,7 @@ test "the same forward pass yields identical traces" {
         try testing.expectEqualStrings("The context says Paris is the capital of France.", output.reasoning.?.content);
     }
     try testing.expectEqual(@as(usize, 1), traces[0].steps.items.len);
-    try testing.expect(traces[0].eql(&traces[1]));
+    try testing.expect(try traces[0].eql(&traces[1]));
     try testing.expectEqualStrings("What is the capital of France?", traces[0].steps.items[0].inputs.get("question").?.string);
     try testing.expectEqualStrings("The context says Paris is the capital of France.", (try dszig.Reasoning.fromValue(traces[0].steps.items[0].outputs.get("reasoning").?)).content);
 }

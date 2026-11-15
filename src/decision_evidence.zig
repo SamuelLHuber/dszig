@@ -138,6 +138,34 @@ test "owning evidence clones retain nested probability classes after source dest
     try std.testing.expectEqual(@as(f64, 0.6), wire.object.get("probabilities").?.object.get("日本").?.float);
 }
 
+test "Python evidence dumps unwrap nested models without mutating their raw fields" {
+    const Choice = decision.ChoiceWithOptions(&.{
+        .{ .value = .{ .string = "left" }, .description_json = "\"Left\"" },
+        .{ .value = .{ .string = "right" }, .description_json = "\"Right\"" },
+    });
+    const Evidence = evidenceType(Choice);
+    const Probabilities = probabilitiesType(Choice);
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const a = memory.allocator();
+    const boxed = try Evidence.validateJson(a,
+        \\{"probabilities":{"left":0.6,"right":0.4},"confidence":0.8}
+    );
+    const model = boxed.custom.get(Evidence).?;
+    const nested = model.field("probabilities").?.custom.get(Probabilities).?;
+    var by_field = try model.toPythonValue(a, false);
+    const named = &by_field.object.getPtr("probabilities").?.object;
+    try std.testing.expectEqual(@as(f64, 0.6), named.get("option_0").?.float);
+    try std.testing.expect(!named.contains("left"));
+    const by_alias = try model.toPythonValue(a, true);
+    const aliased = by_alias.object.get("probabilities").?.object;
+    try std.testing.expectEqual(@as(f64, 0.6), aliased.get("left").?.float);
+    try std.testing.expect(!aliased.contains("option_0"));
+    named.getPtr("option_0").?.* = .{ .float = 0.2 };
+    try std.testing.expectEqual(@as(f64, 0.6), nested.field("option_0").?.float);
+    try std.testing.expect(model.toValue().object.get("probabilities").?.custom.get(Probabilities).? == nested);
+}
+
 fn Generated(comptime T: type, comptime probabilities: bool) type {
     const info = decision.modelInfo(T) orelse @compileError("dszig: decision has no configured evidence type");
     if (probabilities and info.kind == .noul) @compileError("dszig: Noul evidence has no probabilities model");
@@ -172,6 +200,28 @@ fn Generated(comptime T: type, comptime probabilities: bool) type {
 
         pub fn toValue(self: Self) Value {
             return .{ .object = self.fields };
+        }
+
+        /// Python-mode model_dump: nested generated probability models become
+        /// fresh dictionaries while raw field reflection keeps their identity.
+        /// These models have no Json[T] fields, so round_trip has the same view.
+        pub fn toPythonValue(self: Self, arena: Allocator, by_alias: bool) Allocator.Error!Value {
+            var result: runtime.ObjectMap = .empty;
+            errdefer result.deinit(arena);
+            try result.ensureTotalCapacity(arena, model_fields.len);
+            for (model_fields) |metadata| {
+                const field_value = self.fields.get(metadata.name) orelse continue;
+                const projected = if (comptime !probabilities and info.kind != .noul) blk: {
+                    if (field_value == .custom) {
+                        if (field_value.custom.get(probabilitiesType(T))) |nested|
+                            break :blk try nested.toPythonValue(arena, by_alias);
+                    }
+                    break :blk field_value;
+                } else field_value;
+                const key = if (by_alias) metadata.alias orelse metadata.name else metadata.name;
+                result.putAssumeCapacity(key, projected);
+            }
+            return .{ .object = result };
         }
 
         pub fn toAliasedValue(self: Self, arena: Allocator) types.Error!Value {
@@ -293,7 +343,7 @@ fn Generated(comptime T: type, comptime probabilities: bool) type {
             arena.destroy(actual(ptr));
         }
 
-        fn equal(a: *const anyopaque, b: *const anyopaque) bool {
+        fn equal(a: *const anyopaque, b: *const anyopaque) runtime.CustomError!bool {
             return @import("value.zig").recordEqual(&actual(a).fields, &actual(b).fields);
         }
 
@@ -328,8 +378,33 @@ fn Generated(comptime T: type, comptime probabilities: bool) type {
 }
 
 fn probabilityMode(arena: Allocator, input: Value, strict: bool) types.Error!Value {
-    if (strict and input != .integer and input != .float and input != .number_string) return error.ParseValue;
+    if (strict and input != .integer and input != .float and input != .number_string) {
+        if (input != .custom or input.custom.vtable.float_value == null) return error.ParseValue;
+    }
     return probability(arena, input);
+}
+
+test "strict probability evidence accepts Decimal float protocol without FloatOperation" {
+    const python = @import("python_value.zig");
+    const environment = @import("decimal_environment.zig");
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const a = memory.allocator();
+    var context: environment.Context = .{};
+    context.traps.insert(.float_operation);
+    var local: environment.LocalContext = .{};
+    local.enter(&context);
+    defer local.deinit();
+    const Evidence = evidenceType(decision.Noul);
+    var input: runtime.ObjectMap = .empty;
+    try input.put(a, "noul", try python.decimal(a, "0.5"));
+    const checked = try Evidence.validateStrict(a, .{ .object = input });
+    try std.testing.expectEqual(@as(f64, 0.5), checked.custom.get(Evidence).?.field("noul").?.float);
+    try std.testing.expectEqual(@as(usize, 0), local.context.flags.count());
+    try input.put(a, "noul", .{ .bool = true });
+    try std.testing.expectError(error.ParseValue, Evidence.validateStrict(a, .{ .object = input }));
+    try input.put(a, "noul", .{ .string = "0.5" });
+    try std.testing.expectError(error.ParseValue, Evidence.validateStrict(a, .{ .object = input }));
 }
 
 fn probability(arena: Allocator, input: Value) types.Error!Value {

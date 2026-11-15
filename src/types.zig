@@ -14,6 +14,7 @@ const File = @import("file.zig").File;
 const citation = @import("citation.zig");
 const decision = @import("decision.zig");
 const Integer = @import("integer.zig").Integer;
+const Decimal = @import("decimal_type.zig").Decimal;
 
 pub const Error = error{ ParseValue, OutOfMemory };
 
@@ -41,7 +42,7 @@ pub fn isDict(comptime T: type) bool {
 
 /// A struct typed as a Pydantic model (not a dict).
 fn isModel(comptime T: type) bool {
-    return @typeInfo(T) == .@"struct" and T != Integer and !@import("literal.zig").isLiteral(T) and T != @import("runtime_value.zig").ObjectMap and !isDict(T) and !@hasField(T, "map");
+    return @typeInfo(T) == .@"struct" and T != Integer and T != Decimal and !@import("literal.zig").isLiteral(T) and T != @import("runtime_value.zig").ObjectMap and !isDict(T) and !@hasField(T, "map");
 }
 
 /// Types that need the JSON-typed field kind.
@@ -75,6 +76,7 @@ pub fn pyName(comptime T: type) []const u8 {
         if (T == []const u8 or T == @import("signature.zig").Reasoning) return "str";
         if (T == bool) return "bool";
         if (T == Integer) return "int";
+        if (T == Decimal) return "Decimal";
         if (@import("literal.zig").isLiteral(T)) return T.annotation_name;
         if (T == Value) return "Any";
         if (T == @import("runtime_value.zig").ObjectMap) return "dict[str, Any]";
@@ -163,6 +165,7 @@ fn entriesOf(comptime T: type) []const Entry {
         if (T == []const u8) return &.{.{ .key = "type", .val = quote("string") }};
         if (T == bool) return &.{.{ .key = "type", .val = quote("boolean") }};
         if (T == Integer) return &.{.{ .key = "type", .val = quote("integer") }};
+        if (T == Decimal) return &.{.{ .key = "anyOf", .val = "[{\"type\": \"number\"}, {\"type\": \"string\"}]" }};
         if (@import("literal.zig").isLiteral(T)) return literalEntries(T);
         if (T == Value) return &.{};
         if (T == @import("runtime_value.zig").ObjectMap) return &.{ .{ .key = "type", .val = quote("object") }, .{ .key = "additionalProperties", .val = "true" } };
@@ -372,7 +375,7 @@ fn decisionEntries(comptime S: type, comptime ordered_properties: bool) []const 
 fn collectDefs(comptime T: type, comptime seen: []const type) []const type {
     comptime {
         var out = seen;
-        if (T == Value or T == Integer or @import("literal.zig").isLiteral(T) or T == @import("runtime_value.zig").ObjectMap) return out;
+        if (T == Value or T == Integer or T == Decimal or @import("literal.zig").isLiteral(T) or T == @import("runtime_value.zig").ObjectMap) return out;
         if (isDict(T)) return collectDefs(T.dszig_dict_value, out);
         switch (@typeInfo(T)) {
             .optional => |o| out = collectDefs(o.child, out),
@@ -434,6 +437,7 @@ fn validateMode(comptime T: type, arena: Allocator, input: Value, comptime xml_l
     if (T == Value) return input;
     if (comptime code.isCode(T) or @import("enum.zig").isEnum(T) or @import("literal.zig").isLiteral(T)) return T.validate(arena, v);
     if (T == Integer) return @import("value.zig").coerceInteger(arena, v);
+    if (T == Decimal) return Decimal.validate(arena, v);
     if (comptime citation.isCitation(T)) return T.validate(arena, v);
     if (comptime decision.isDecision(T)) return if (xml_lax) T.validateLax(arena, v) else T.validate(arena, v);
     if (T == File) {
@@ -477,6 +481,9 @@ fn validateMode(comptime T: type, arena: Allocator, input: Value, comptime xml_l
                 if (T != []const u8 or !std.unicode.utf8ValidateSlice(data)) return error.ParseValue;
                 break :blk .{ .string = try arena.dupe(u8, data) };
             },
+            // Pydantic's lax bool validator uses Decimal's binary64 conversion,
+            // including rounding to one and underflow to signed zero.
+            .decimal => |data| if (T == bool) .{ .float = try data.toFloat() } else return error.ParseValue,
             else => return error.ParseValue,
         };
     }

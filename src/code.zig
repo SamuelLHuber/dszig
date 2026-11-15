@@ -213,7 +213,7 @@ fn CodeType(comptime language_name: []const u8, comptime is_default: bool, compt
             allocator.destroy(code);
         }
 
-        fn equalRuntime(left: *const anyopaque, right: *const anyopaque) bool {
+        fn equalRuntime(left: *const anyopaque, right: *const anyopaque) runtime.CustomError!bool {
             // Custom.eql checks concrete class identity before field equality.
             return std.mem.eql(u8, runtimeCode(left).code, runtimeCode(right).code);
         }
@@ -288,7 +288,7 @@ test "Code typed nested values validate and round trip as raw strings" {
     const expected = try std.json.parseFromSliceLeaky(Value, arena,
         \\{"primary":"run();","optional":null,"snippets":["x","y"],"files":{"main":"main();"}}
     , .{});
-    try testing.expect(value.pyEqual(expected, try value.serializedValue(arena, encoded)));
+    try testing.expect(try value.pyEqual(expected, try value.serializedValue(arena, encoded)));
     const cloned = try value.cloneValue(arena, encoded);
     try testing.expectEqualStrings("main();", (try value.fromValue(arena, Bundle, cloned)).files.get("main").?.code);
     const adapter = @import("adapter.zig");
@@ -451,9 +451,9 @@ test "Code XML literal selection stops at the immediate list item" {
         const text = try adapter.formatAssistantPartial(.xml, arena, view, &outputs);
         try testing.expectEqualStrings(case[2], text);
         const parsed = try adapter.Adapter.xml.parse(arena, view, text);
-        try testing.expect(value.pyEqual(expected, try value.serializedValue(arena, parsed.get("result").?)));
+        try testing.expect(try value.pyEqual(expected, try value.serializedValue(arena, parsed.get("result").?)));
         const restored = try value.fromRecord(arena, Sig.Output, &parsed);
-        try testing.expect(value.pyEqual(expected, try value.serializedValue(arena, try value.toValue(arena, case[0], restored.result))));
+        try testing.expect(try value.pyEqual(expected, try value.serializedValue(arena, try value.toValue(arena, case[0], restored.result))));
     }
     inline for (.{
         .{
@@ -747,8 +747,8 @@ test "separate same-language Code class identities reject sibling instances" {
     const arena = memory.allocator();
     const a = try JavaA.init("x = 1").toRuntime(arena);
     const b = try JavaB.init("x = 1").toRuntime(arena);
-    try testing.expect(!value.pyEqual(a, b));
-    try testing.expect(!value.pyEqual(b, a));
+    try testing.expect(!try value.pyEqual(a, b));
+    try testing.expect(!try value.pyEqual(b, a));
     try testing.expectError(error.ParseValue, types.validate(JavaA, arena, b));
     try testing.expectError(error.ParseValue, types.validate(JavaB, arena, a));
     const as_base_a = try types.validate(Code, arena, a);
@@ -775,10 +775,10 @@ test "Code runtime boxes keep class identity apart from strings and dictionaries
         try testing.expect(actual.custom.vtable.is_type);
         try testing.expect(!actual.custom.vtable.hashable);
         try testing.expect(actual.custom.vtable.code != null);
-        try testing.expect(!value.pyEqual(actual, plain));
-        try testing.expect(!value.pyEqual(plain, actual));
-        try testing.expect(!value.pyEqual(actual, dictionary));
-        try testing.expect(!value.pyEqual(dictionary, actual));
+        try testing.expect(!try value.pyEqual(actual, plain));
+        try testing.expect(!try value.pyEqual(plain, actual));
+        try testing.expect(!try value.pyEqual(actual, dictionary));
+        try testing.expect(!try value.pyEqual(dictionary, actual));
         // Both the ordinary and the round-trip dumps are the bare string.
         const raw = try actual.custom.rawValue(arena);
         const serialized = try actual.custom.serialize(arena);
@@ -802,12 +802,12 @@ test "Code runtime boxes keep class identity apart from strings and dictionaries
     try testing.expectEqualStrings("python", base.custom.vtable.code.?.language);
     try testing.expectEqualStrings(content, java.custom.vtable.code.?.content(java.custom.ptr));
     // Equal fields compare equal only within one concrete class.
-    try testing.expect(value.pyEqual(base, try (Code{ .code = content }).toRuntime(arena)));
-    try testing.expect(value.pyEqual(java, try (Java{ .code = content }).toRuntime(arena)));
-    try testing.expect(!value.pyEqual(base, java));
-    try testing.expect(!value.pyEqual(java, base));
-    try testing.expect(!value.pyEqual(java, try (CodeWithLanguage("python"){ .code = content }).toRuntime(arena)));
-    try testing.expect(!value.pyEqual(java, try (Java{ .code = "other" }).toRuntime(arena)));
+    try testing.expect(try value.pyEqual(base, try (Code{ .code = content }).toRuntime(arena)));
+    try testing.expect(try value.pyEqual(java, try (Java{ .code = content }).toRuntime(arena)));
+    try testing.expect(!try value.pyEqual(base, java));
+    try testing.expect(!try value.pyEqual(java, base));
+    try testing.expect(!try value.pyEqual(java, try (CodeWithLanguage("python"){ .code = content }).toRuntime(arena)));
+    try testing.expect(!try value.pyEqual(java, try (Java{ .code = "other" }).toRuntime(arena)));
     const empty = try (Code{ .code = "" }).toRuntime(arena);
     try testing.expect(empty.custom.truthy());
     try testing.expectEqualStrings("\"\"", try std.json.Stringify.valueAlloc(arena, empty, .{}));
@@ -903,10 +903,10 @@ test "Code owning clones copy content without a borrowed projection origin" {
     const reprojected = try Code.fromValue(copy);
     try testing.expectEqualStrings("JAVA", reprojected.instanceLanguage());
     try testing.expectEqualStrings(expected, (try value.serializedValue(arena, owned)).array.items[0].string);
-    try testing.expect(!value.pyEqual(copy, owned.array.items[1]));
+    try testing.expect(!try value.pyEqual(copy, owned.array.items[1]));
     const second = try inference.cloneJsonValue(allocator, copy);
     defer inference.freeJsonValue(allocator, second);
-    try testing.expect(value.pyEqual(second, copy));
+    try testing.expect(try value.pyEqual(second, copy));
 }
 
 test "Code clone allocation failures preserve the borrowed source" {

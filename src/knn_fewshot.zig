@@ -204,11 +204,12 @@ fn xmlField(text: []const u8, opening: []const u8, closing: []const u8) error{LM
     return std.mem.trim(u8, text[start..end], value.py_whitespace);
 }
 
-fn testMetric(_: Allocator, example: *const Example, prediction: *const Record, trace: ?*const predict.Trace) f64 {
+fn testMetric(_: Allocator, example: *const Example, maybe_prediction: ?*const Record, trace: ?*const predict.Trace) value.ParseError!f64 {
     const captured = trace orelse return 0;
     if (captured.steps.items.len != 1) return 0;
     const input = captured.steps.items[0].inputs.get("question") orelse return 0;
     const expected = example.record.get("question") orelse return 0;
+    const prediction = maybe_prediction orelse return error.ParseValue;
     const answer = prediction.get("answer") orelse return 0;
     return if (std.mem.startsWith(u8, input.string, expected.string) and
         std.mem.startsWith(u8, answer.string, "teacher:")) 1 else 0;

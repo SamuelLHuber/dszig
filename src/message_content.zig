@@ -8,7 +8,7 @@ const Value = @import("runtime_value.zig").Value;
 
 pub const start_marker = "<<CUSTOM-TYPE-START-IDENTIFIER>>";
 pub const end_marker = "<<CUSTOM-TYPE-END-IDENTIFIER>>";
-pub const Error = Allocator.Error || error{InvalidContent, JsonTooDeep};
+pub const Error = Allocator.Error || error{ InvalidContent, JsonTooDeep };
 
 pub const Content = union(enum) {
     text: []const u8,
@@ -102,13 +102,13 @@ pub const Content = union(enum) {
         };
     }
 
-    pub fn eql(a: Content, b: Content) bool {
+    pub fn eql(a: Content, b: Content) @import("runtime_value.zig").CustomError!bool {
         if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
         return switch (a) {
             .text => |text| std.mem.eql(u8, text, b.text),
             .parts => |parts| blk: {
                 if (parts.len != b.parts.len) break :blk false;
-                for (parts, b.parts) |x, y| if (!inference.jsonEqual(x, y)) break :blk false;
+                for (parts, b.parts) |x, y| if (!(try inference.jsonEqual(x, y))) break :blk false;
                 break :blk true;
             },
         };
