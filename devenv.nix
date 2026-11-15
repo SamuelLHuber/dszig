@@ -76,15 +76,17 @@ in
     dz-live.exec = ''
       set -euo pipefail
       model="''${DSZIG_LIVE_MODEL:-gpt-4o-mini}"
+      # Namespaced model ids (org/model) must not become path separators.
+      slug="''${model//\//_}"
       (cd tools/dspy_reference && uv run --locked live.py \
-        "../../tests/fixtures/live/dspy_3.5.0_$model.json" "openai/$model")
-      zig build replay -- "tests/fixtures/live/dspy_3.5.0_$model.json"
+        "../../tests/fixtures/live/dspy_3.5.0_$slug.json" "openai/$model")
+      zig build replay -- "tests/fixtures/live/dspy_3.5.0_$slug.json"
       # DSPy 3.5 sends openai/* through the Responses API; record DSZig on the same route.
       DSZIG_LIVE_API="''${DSZIG_LIVE_API:-responses}" \
         DSZIG_LIVE_RESPONSE_SCHEMA="''${DSZIG_LIVE_RESPONSE_SCHEMA:-1}" \
         DSZIG_LIVE_FUNCTION_CALLING="''${DSZIG_LIVE_FUNCTION_CALLING:-1}" \
-        zig build live -- "tests/fixtures/live/dszig_3.5.0_$model.json"
-      (cd tools/dspy_reference && uv run --locked check_live.py "../../tests/fixtures/live/dszig_3.5.0_$model.json")
+        zig build live -- "tests/fixtures/live/dszig_3.5.0_$slug.json"
+      (cd tools/dspy_reference && uv run --locked check_live.py "../../tests/fixtures/live/dszig_3.5.0_$slug.json")
       tools/dspy_reference/check.sh
     '';
     dz-check.exec = ''
