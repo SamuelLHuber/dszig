@@ -1,21 +1,31 @@
-//! DSPy 3.5 Code: a validated, raw-string-serialized custom value.
-//! Code slices borrow their input; no allocation or deinit is required. Keep
-//! the original string/JSON arena alive for as long as the value is used.
+//! DSPy 3.5 Code retains its concrete class while serializing as a raw string.
+//! Typed values and runtime boxes borrow content; owning runtime clones copy it.
+//! A borrowed base projection also requires the original runtime box to stay alive.
 
 const std = @import("std");
-const Value = @import("runtime_value.zig").Value;
+const runtime = @import("runtime_value.zig");
+const Value = runtime.Value;
+const Allocator = std.mem.Allocator;
+const Writer = std.Io.Writer;
+const pyjson = @import("pyjson.zig");
 const unicode = @import("unicode.zig");
 const strip = @import("xml_unicode.zig").strip;
 
 pub const Error = error{ParseValue};
 
 /// The unparameterized DSPy Code class, whose language is Python.
-pub const Code = CodeType("python", true);
+pub const Code = CodeType("python", true, void);
 
 /// A language-specialized Code type. Different languages are distinct types;
 /// repeated instantiations with the same language use Zig's canonical type.
 pub fn CodeWithLanguage(comptime language: []const u8) type {
-    return CodeType(language, false);
+    return CodeType(language, false, void);
+}
+
+/// Give separate class declarations distinct identities even when their
+/// language and model name match. Reuse the same tag to refer to that class.
+pub fn CodeWithLanguageIdentity(comptime language: []const u8, comptime Identity: type) type {
+    return CodeType(language, false, Identity);
 }
 
 pub fn isCode(comptime T: type) bool {
@@ -33,11 +43,12 @@ pub fn annotationType(comptime T: type) ?type {
     };
 }
 
-fn CodeType(comptime language_name: []const u8, comptime is_default: bool) type {
+fn CodeType(comptime language_name: []const u8, comptime is_default: bool, comptime Identity: type) type {
     if (!std.unicode.utf8ValidateSlice(language_name)) @compileError("dszig: Code language must be valid UTF-8");
     return struct {
         const Self = @This();
         pub const dszig_code_type = true;
+        pub const class_identity = Identity;
         pub const language = language_name;
         pub const model_name = if (is_default) "Code" else "Code_" ++ language_name;
         pub const schema_name = definitionName(model_name);
@@ -47,6 +58,10 @@ fn CodeType(comptime language_name: []const u8, comptime is_default: bool) type 
         pub const schema_description_json = if (is_default) default_schema_description_json else "";
 
         code: []const u8,
+        /// A base-typed view can borrow a specialized instance without losing
+        /// its concrete class. Only toRuntime carries this identity onward;
+        /// toValue remains the public plain-string dump.
+        runtime_origin: ?runtime.Custom = null,
 
         /// Validate text, borrowing either the entire original or its code body.
         pub fn init(text: []const u8) Self {
@@ -59,6 +74,10 @@ fn CodeType(comptime language_name: []const u8, comptime is_default: bool) type 
         pub fn validateInput(input: anytype) Error!(if (is_default and isCode(@TypeOf(input))) @TypeOf(input) else Self) {
             const T = @TypeOf(input);
             if (comptime T == Self or (is_default and isCode(T))) return input;
+            if (comptime isCode(T)) {
+                if (input.runtime_origin) |origin| return fromValue(.{ .custom = origin });
+                return error.ParseValue;
+            }
             if (T == Value) return fromValue(input);
             if (T == []const u8 or T == []u8) return init(input);
             if (@typeInfo(T) == .pointer) {
@@ -69,14 +88,23 @@ fn CodeType(comptime language_name: []const u8, comptime is_default: bool) type 
         }
 
         pub fn fromValue(input: Value) Error!Self {
+            if (input == .custom) {
+                if (input.custom.get(Self)) |actual| return actual.*;
+                if (comptime is_default) {
+                    const metadata = input.custom.vtable.code orelse return error.ParseValue;
+                    return .{ .code = metadata.content(input.custom.ptr), .runtime_origin = input.custom };
+                }
+                return error.ParseValue;
+            }
             const content = if (input == .object) input.object.get("code") orelse return error.ParseValue else input;
             if (content != .string) return error.ParseValue;
             return init(content.string);
         }
 
-        pub fn validate(arena: std.mem.Allocator, input: Value) error{ ParseValue, OutOfMemory }!Value {
-            _ = arena;
-            return (try fromValue(input)).toValue();
+        /// Existing instances bypass filtering and retain their exact box.
+        pub fn validate(arena: Allocator, input: Value) runtime.CustomError!Value {
+            const checked = try fromValue(input);
+            return if (input == .custom) input else checked.toRuntime(arena);
         }
 
         pub fn format(self: Self) []const u8 {
@@ -86,6 +114,107 @@ fn CodeType(comptime language_name: []const u8, comptime is_default: bool) type 
         /// No wrapper object or custom-type markers, including nested records.
         pub fn toValue(self: Self) Value {
             return .{ .string = self.code };
+        }
+
+        /// Unlike other Type subclasses, Code overrides the serializer itself:
+        /// ordinary and round-trip dumps are both strings, never {code: ...}.
+        pub fn jsonStringify(self: Self, writer: *std.json.Stringify) Writer.Error!void {
+            try writer.write(self.code);
+        }
+
+        pub fn instanceLanguage(self: Self) []const u8 {
+            return if (self.runtime_origin) |origin| origin.vtable.code.?.language else language;
+        }
+
+        /// Box the actual class without owning its borrowed content. A base
+        /// projection returns its original specialized box, not a new Code.
+        pub fn toRuntime(self: Self, arena: Allocator) Allocator.Error!Value {
+            if (self.runtime_origin) |origin| return .{ .custom = origin };
+            const boxed = try arena.create(Self);
+            boxed.* = self;
+            return .{ .custom = .{ .ptr = boxed, .vtable = &runtime_vtable } };
+        }
+
+        pub fn writeStr(self: Self, writer: *Writer) runtime.CustomWriteError!void {
+            if (self.runtime_origin) |origin| return origin.writeStr(writer);
+            try writer.writeAll("code=");
+            try pyjson.writeReprString(writer, self.code);
+        }
+
+        pub fn writeRepr(self: Self, writer: *Writer) runtime.CustomWriteError!void {
+            if (self.runtime_origin) |origin| return origin.writeRepr(writer);
+            try writer.writeAll(model_name ++ "(");
+            try self.writeStr(writer);
+            try writer.writeByte(')');
+        }
+
+        const runtime_vtable: runtime.CustomVTable = .{
+            .type_name = @typeName(Self),
+            .model_name = model_name,
+            .is_type = true,
+            .hashable = false,
+            .code = .{ .language = language, .content = runtimeContent },
+            .raw_value = rawRuntimeValue,
+            .serialized = serializedRuntimeValue,
+            .write_str = writeRuntimeStr,
+            .write_repr = writeRuntimeRepr,
+            .write_json = writeRuntimeJson,
+            .write_serialized_json = writeRuntimeSerializedJson,
+            .clone = cloneRuntime,
+            .deinit = deinitRuntime,
+            .eql = equalRuntime,
+        };
+
+        fn runtimeCode(ptr: *const anyopaque) *const Self {
+            return @ptrCast(@alignCast(ptr));
+        }
+
+        fn runtimeContent(ptr: *const anyopaque) []const u8 {
+            return runtimeCode(ptr).code;
+        }
+
+        fn rawRuntimeValue(_: Allocator, ptr: *const anyopaque) Allocator.Error!Value {
+            return runtimeCode(ptr).toValue();
+        }
+
+        fn serializedRuntimeValue(_: Allocator, ptr: *const anyopaque) runtime.CustomError!Value {
+            return runtimeCode(ptr).toValue();
+        }
+
+        fn writeRuntimeStr(writer: *Writer, ptr: *const anyopaque) runtime.CustomWriteError!void {
+            try runtimeCode(ptr).writeStr(writer);
+        }
+
+        fn writeRuntimeRepr(writer: *Writer, ptr: *const anyopaque) runtime.CustomWriteError!void {
+            try runtimeCode(ptr).writeRepr(writer);
+        }
+
+        fn writeRuntimeJson(writer: *std.json.Stringify, ptr: *const anyopaque) Writer.Error!void {
+            try writer.write(runtimeCode(ptr).code);
+        }
+
+        fn writeRuntimeSerializedJson(writer: *Writer, ptr: *const anyopaque, _: runtime.JsonStyle, _: usize) runtime.CustomWriteError!void {
+            try pyjson.writeJsonString(writer, runtimeCode(ptr).code);
+        }
+
+        fn cloneRuntime(allocator: Allocator, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+            const copy = try allocator.create(Self);
+            errdefer allocator.destroy(copy);
+            // Runtime projections are never boxed as a different class. Clone
+            // the concrete instance and reset any borrowed projection origin.
+            copy.* = .{ .code = try allocator.dupe(u8, runtimeCode(ptr).code) };
+            return .{ .ptr = copy, .vtable = &runtime_vtable, .owns_data = true };
+        }
+
+        fn deinitRuntime(allocator: Allocator, ptr: *const anyopaque, owns_data: bool) void {
+            const code = runtimeCode(ptr);
+            if (owns_data) allocator.free(code.code);
+            allocator.destroy(code);
+        }
+
+        fn equalRuntime(left: *const anyopaque, right: *const anyopaque) bool {
+            // Custom.eql checks concrete class identity before field equality.
+            return std.mem.eql(u8, runtimeCode(left).code, runtimeCode(right).code);
         }
     };
 }
@@ -124,6 +253,12 @@ const default_schema_description_json = "\"Code type in DSPy.\\n\\nThis type is 
 
 const testing = std.testing;
 
+/// Adapter results and traces retain the actual class, not a string lookalike.
+fn expectCode(comptime T: type, expected: []const u8, actual: Value) !void {
+    try testing.expect(actual == .custom);
+    try testing.expectEqualStrings(expected, (actual.custom.get(T) orelse return error.TestUnexpectedResult).code);
+}
+
 test "Code typed nested values validate and round trip as raw strings" {
     const types = @import("types.zig");
     const value = @import("value.zig");
@@ -152,7 +287,7 @@ test "Code typed nested values validate and round trip as raw strings" {
     const expected = try std.json.parseFromSliceLeaky(Value, arena,
         \\{"primary":"run();","optional":null,"snippets":["x","y"],"files":{"main":"main();"}}
     , .{});
-    try testing.expect(value.pyEqual(expected, encoded));
+    try testing.expect(value.pyEqual(expected, try value.serializedValue(arena, encoded)));
     const cloned = try value.cloneValue(arena, encoded);
     try testing.expectEqualStrings("main();", (try value.fromValue(arena, Bundle, cloned)).files.get("main").?.code);
     const adapter = @import("adapter.zig");
@@ -212,7 +347,7 @@ test "Code JSON chat and XML adapters validate actual custom values and format r
     };
     inline for (cases) |case| {
         const parsed = try case[0].parse(arena, view, case[1]);
-        try testing.expectEqualStrings("run();", parsed.get("result").?.string);
+        try expectCode(Java, "run();", parsed.get("result").?);
         try testing.expectEqualStrings("run();", (try value.fromRecord(arena, Sig.Output, &parsed)).result.code);
         try testing.expectEqualStrings(case[2], try adapter.formatUser(case[0], arena, view, &inputs, false));
         try testing.expectEqualStrings(case[3], try adapter.formatAssistantPartial(case[0], arena, view, &outputs));
@@ -231,15 +366,15 @@ test "Code JSON chat and XML adapters validate actual custom values and format r
         "<result><code>run();</code><extra>4</extra></result>",
     }) |completion| try testing.expectError(error.AdapterParse, adapter.Adapter.xml.parse(arena, view, completion));
     const literal = try adapter.Adapter.xml.parse(arena, view, "<result>if (a < b) x = '<tag>';</result>");
-    try testing.expectEqualStrings("if (a < b) x = '<tag>';", literal.get("result").?.string);
+    try expectCode(Java, "if (a < b) x = '<tag>';", literal.get("result").?);
     // A direct custom Type retries the original text after candidate validation;
     // an object provided by JSONAdapter has no such string fallback.
     const fallback = try adapter.Adapter.chat.parse(arena, view, "[[ ## result ## ]]\n{\"code\":7}");
-    try testing.expectEqualStrings("{\"code\":7}", fallback.get("result").?.string);
+    try expectCode(Java, "{\"code\":7}", fallback.get("result").?);
     const parsed_object_text = try adapter.Adapter.chat.parse(arena, view, "[[ ## result ## ]]\n{\"code\":\"inside\"}");
-    try testing.expectEqualStrings("inside", parsed_object_text.get("result").?.string);
+    try expectCode(Java, "inside", parsed_object_text.get("result").?);
     const fenced_json = try adapter.Adapter.json.parse(arena, view, "{\"result\":\"```json\\n{\\\"code\\\":\\\"inside\\\"}\\n```\"}");
-    try testing.expectEqualStrings("inside", fenced_json.get("result").?.string);
+    try expectCode(Java, "inside", fenced_json.get("result").?);
 }
 
 test "Code optional and collection adapters keep null empty and invalid values distinct" {
@@ -315,9 +450,9 @@ test "Code XML literal selection stops at the immediate list item" {
         const text = try adapter.formatAssistantPartial(.xml, arena, view, &outputs);
         try testing.expectEqualStrings(case[2], text);
         const parsed = try adapter.Adapter.xml.parse(arena, view, text);
-        try testing.expect(value.pyEqual(expected, parsed.get("result").?));
+        try testing.expect(value.pyEqual(expected, try value.serializedValue(arena, parsed.get("result").?)));
         const restored = try value.fromRecord(arena, Sig.Output, &parsed);
-        try testing.expect(value.pyEqual(expected, try value.toValue(arena, case[0], restored.result)));
+        try testing.expect(value.pyEqual(expected, try value.serializedValue(arena, try value.toValue(arena, case[0], restored.result))));
     }
     inline for (.{
         .{
@@ -525,8 +660,8 @@ test "Code typed Predict traces and saved demos remain consumer-visible raw stri
             .trace = &trace,
         }, .{ .source = Code.init("```python\nprint(1)\n```") });
         try testing.expectEqualStrings("run();", result.result.code);
-        try testing.expectEqualStrings("print(1)", trace.steps.items[0].inputs.get("source").?.string);
-        try testing.expectEqualStrings("run();", trace.steps.items[0].outputs.get("result").?.string);
+        try expectCode(Code, "print(1)", trace.steps.items[0].inputs.get("source").?);
+        try expectCode(Java, "run();", trace.steps.items[0].outputs.get("result").?);
     }
     var program: predict.Predict(Sig) = .{};
     const Demo = struct { source: Code, result: Java };
@@ -599,6 +734,193 @@ test "Code validates object payloads and serializes raw strings without allocati
         const invalid = try std.json.parseFromSliceLeaky(Value, arena, text, .{});
         try testing.expectError(error.ParseValue, Code.fromValue(invalid));
     }
+}
+
+test "separate same-language Code class identities reject sibling instances" {
+    const types = @import("types.zig");
+    const value = @import("value.zig");
+    const JavaA = CodeWithLanguageIdentity("JAVA", struct {});
+    const JavaB = CodeWithLanguageIdentity("JAVA", struct {});
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const a = try JavaA.init("x = 1").toRuntime(arena);
+    const b = try JavaB.init("x = 1").toRuntime(arena);
+    try testing.expect(!value.pyEqual(a, b));
+    try testing.expect(!value.pyEqual(b, a));
+    try testing.expectError(error.ParseValue, types.validate(JavaA, arena, b));
+    try testing.expectError(error.ParseValue, types.validate(JavaB, arena, a));
+    const as_base_a = try types.validate(Code, arena, a);
+    const as_base_b = try types.validate(Code, arena, b);
+    try testing.expectEqual(a.custom.ptr, as_base_a.custom.ptr);
+    try testing.expectEqual(b.custom.ptr, as_base_b.custom.ptr);
+    const projection = try Code.fromValue(b);
+    try testing.expectEqualStrings("JAVA", projection.instanceLanguage());
+    try testing.expectEqual(b.custom.ptr, (try projection.toRuntime(arena)).custom.ptr);
+}
+
+test "Code runtime boxes keep class identity apart from strings and dictionaries" {
+    const value = @import("value.zig");
+    const Java = CodeWithLanguage("JAVA");
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const content = "x = 'a\"b'\n";
+    const base = try (Code{ .code = content }).toRuntime(arena);
+    const java = try (Java{ .code = content }).toRuntime(arena);
+    const plain: Value = .{ .string = content };
+    const dictionary = try std.json.parseFromSliceLeaky(Value, arena, "{\"code\":\"x = 'a\\\"b'\\n\"}", .{});
+    for ([_]Value{ base, java }) |actual| {
+        try testing.expect(actual.custom.vtable.is_type);
+        try testing.expect(!actual.custom.vtable.hashable);
+        try testing.expect(actual.custom.vtable.code != null);
+        try testing.expect(!value.pyEqual(actual, plain));
+        try testing.expect(!value.pyEqual(plain, actual));
+        try testing.expect(!value.pyEqual(actual, dictionary));
+        try testing.expect(!value.pyEqual(dictionary, actual));
+        // Both the ordinary and the round-trip dumps are the bare string.
+        const raw = try actual.custom.rawValue(arena);
+        const serialized = try actual.custom.serialize(arena);
+        try testing.expectEqualStrings(content, raw.string);
+        try testing.expectEqualStrings(content, serialized.string);
+        try testing.expectEqualStrings("\"x = 'a\\\"b'\\n\"", try std.json.Stringify.valueAlloc(arena, actual, .{}));
+        var json: Writer.Allocating = .init(arena);
+        try pyjson.writeJson(&json.writer, actual, .compact);
+        try testing.expectEqualStrings("\"x = 'a\\\"b'\\n\"", json.written());
+        var text: Writer.Allocating = .init(arena);
+        try pyjson.writeStr(&text.writer, actual);
+        try testing.expectEqualStrings("code='x = \\'a\"b\\'\\n'", text.written());
+    }
+    var repr: Writer.Allocating = .init(arena);
+    try pyjson.writeRepr(&repr.writer, base, 0);
+    try testing.expectEqualStrings("Code(code='x = \\'a\"b\\'\\n')", repr.written());
+    var java_repr: Writer.Allocating = .init(arena);
+    try pyjson.writeRepr(&java_repr.writer, java, 0);
+    try testing.expectEqualStrings("Code_JAVA(code='x = \\'a\"b\\'\\n')", java_repr.written());
+    try testing.expectEqualStrings("JAVA", java.custom.vtable.code.?.language);
+    try testing.expectEqualStrings("python", base.custom.vtable.code.?.language);
+    try testing.expectEqualStrings(content, java.custom.vtable.code.?.content(java.custom.ptr));
+    // Equal fields compare equal only within one concrete class.
+    try testing.expect(value.pyEqual(base, try (Code{ .code = content }).toRuntime(arena)));
+    try testing.expect(value.pyEqual(java, try (Java{ .code = content }).toRuntime(arena)));
+    try testing.expect(!value.pyEqual(base, java));
+    try testing.expect(!value.pyEqual(java, base));
+    try testing.expect(!value.pyEqual(java, try (CodeWithLanguage("python"){ .code = content }).toRuntime(arena)));
+    try testing.expect(!value.pyEqual(java, try (Java{ .code = "other" }).toRuntime(arena)));
+    const empty = try (Code{ .code = "" }).toRuntime(arena);
+    try testing.expect(empty.custom.truthy());
+    try testing.expectEqualStrings("\"\"", try std.json.Stringify.valueAlloc(arena, empty, .{}));
+    // The typed public dump stays a string even with std.json reflection.
+    try testing.expectEqualStrings("\"run();\"", try std.json.Stringify.valueAlloc(arena, Java.init("run();"), .{}));
+    try testing.expect(Java.init("run();").toValue() == .string);
+}
+
+test "Code validation reuses actual boxes and enforces specialization inheritance" {
+    const types = @import("types.zig");
+    const Java = CodeWithLanguage("JAVA");
+    const Python = CodeWithLanguage("python");
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    // Existing instances are not filtered again, unlike strings and objects.
+    const fenced = "```java\nrun();\n```";
+    const base = try (Code{ .code = fenced }).toRuntime(arena);
+    const java = try (Java{ .code = fenced }).toRuntime(arena);
+    const python = try (Python{ .code = fenced }).toRuntime(arena);
+    for ([_]Value{ base, java, python }) |actual| {
+        const checked = try types.validate(Code, arena, actual);
+        try testing.expectEqual(actual.custom.ptr, checked.custom.ptr);
+        try testing.expectEqual(actual.custom.vtable, checked.custom.vtable);
+        try testing.expectEqualStrings(fenced, (try Code.fromValue(actual)).code);
+    }
+    try testing.expectEqual(java.custom.ptr, (try types.validate(Java, arena, java)).custom.ptr);
+    try testing.expectError(error.ParseValue, types.validate(Java, arena, base));
+    try testing.expectError(error.ParseValue, types.validate(Java, arena, python));
+    try testing.expectError(error.ParseValue, types.validate(Python, arena, base));
+    try testing.expectError(error.ParseValue, types.validate(Python, arena, java));
+    const other = try @import("reasoning.zig").Reasoning.toRuntime(.{ .content = "run();" }, arena);
+    try testing.expectError(error.ParseValue, types.validate(Code, arena, other));
+    // Strings and objects construct this annotation's class after filtering.
+    const from_text = try types.validate(Java, arena, .{ .string = fenced });
+    try expectCode(Java, "run();", from_text);
+    const object = try std.json.parseFromSliceLeaky(Value, arena, "{\"code\":\"```x```\",\"extra\":1}", .{});
+    try expectCode(Code, "x", try types.validate(Code, arena, object));
+    try testing.expectEqual(@as(usize, 2), object.object.count());
+
+    // A base-typed projection borrows the specialized box and restores it.
+    const projected = try Code.fromValue(java);
+    try testing.expectEqualStrings("JAVA", projected.instanceLanguage());
+    try testing.expectEqualStrings("python", Code.init("x").instanceLanguage());
+    try testing.expectEqual(java.custom.ptr, (try projected.toRuntime(arena)).custom.ptr);
+    try testing.expect(projected.toValue() == .string);
+    try testing.expectEqualStrings(fenced, projected.toValue().string);
+    var repr: Writer.Allocating = .init(arena);
+    try projected.writeRepr(&repr.writer);
+    try testing.expectEqualStrings("Code_JAVA(code='```java\\nrun();\\n```')", repr.written());
+    const as_java = try Java.validateInput(projected);
+    try testing.expectEqual(projected.code.ptr, as_java.code.ptr);
+    try testing.expectError(error.ParseValue, Python.validateInput(projected));
+    try testing.expectError(error.ParseValue, Java.validateInput(Code.init("run();")));
+    try testing.expectEqual(java.custom.ptr, (try Code.validateInput(projected)).runtime_origin.?.ptr);
+}
+
+test "Code owning clones copy content without a borrowed projection origin" {
+    const inference = @import("inference.zig");
+    const types = @import("types.zig");
+    const value = @import("value.zig");
+    const Java = CodeWithLanguage("JAVA");
+    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
+    defer std.debug.assert(debug_allocator.deinit() == .ok);
+    const allocator = debug_allocator.allocator();
+    var source: std.heap.ArenaAllocator = .init(testing.allocator);
+    var source_live = true;
+    defer if (source_live) source.deinit();
+    const expected = "clone 雪\n'\"\\\x00";
+    const content = try source.allocator().dupe(u8, expected);
+    const java = try (Java{ .code = content }).toRuntime(source.allocator());
+    const projected = try Code.fromValue(java);
+    var items: runtime.Array = .init(source.allocator());
+    try items.append(try projected.toRuntime(source.allocator()));
+    try items.append(.{ .string = content });
+    const owned = try inference.cloneJsonValue(allocator, .{ .array = items });
+    defer inference.freeJsonValue(allocator, owned);
+    const copy = owned.array.items[0];
+    try testing.expect(copy.custom.owns_data);
+    try testing.expect(copy.custom.ptr != java.custom.ptr);
+    const typed = copy.custom.get(Java).?;
+    try testing.expect(typed.runtime_origin == null);
+    try testing.expect(typed.code.ptr != content.ptr);
+    @memset(content, 'x');
+    source.deinit();
+    source_live = false;
+
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    try testing.expectEqualStrings(expected, typed.code);
+    try testing.expectEqual(copy.custom.ptr, (try types.validate(Code, arena, copy)).custom.ptr);
+    const reprojected = try Code.fromValue(copy);
+    try testing.expectEqualStrings("JAVA", reprojected.instanceLanguage());
+    try testing.expectEqualStrings(expected, (try value.serializedValue(arena, owned)).array.items[0].string);
+    try testing.expect(!value.pyEqual(copy, owned.array.items[1]));
+    const second = try inference.cloneJsonValue(allocator, copy);
+    defer inference.freeJsonValue(allocator, second);
+    try testing.expect(value.pyEqual(second, copy));
+}
+
+test "Code clone allocation failures preserve the borrowed source" {
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn clone(allocator: Allocator) !void {
+            const inference = @import("inference.zig");
+            const Java = CodeWithLanguage("JAVA");
+            const original = try (Java{ .code = "borrowed 雪" }).toRuntime(testing.allocator);
+            defer original.custom.deinit(testing.allocator);
+            const copy = try inference.cloneJsonValue(allocator, original);
+            defer inference.freeJsonValue(allocator, copy);
+            try testing.expectEqualStrings("borrowed 雪", copy.custom.get(Java).?.code);
+            try testing.expectEqualStrings("borrowed 雪", original.custom.get(Java).?.code);
+        }
+    }.clone, .{});
 }
 
 test "Code language descriptions lowercase Unicode only in the markdown fence" {

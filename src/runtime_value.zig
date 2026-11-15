@@ -10,6 +10,13 @@ pub const JsonStyle = enum { compact, minified, indent2, orjson_indent2 };
 pub const CustomError = error{ParseValue} || Allocator.Error;
 pub const CustomWriteError = error{ ParseValue, JsonTooDeep } || Writer.Error;
 
+/// Code's base annotation accepts concrete language-specialized instances.
+/// This borrowed view avoids allocating a raw model dump to project its text.
+pub const CodeMetadata = struct {
+    language: []const u8,
+    content: *const fn (*const anyopaque) []const u8,
+};
+
 pub const CustomVTable = struct {
     type_name: []const u8,
     model_name: []const u8,
@@ -20,6 +27,7 @@ pub const CustomVTable = struct {
     /// Majority rejects mutable/unhashable models before comparing their values.
     hashable: bool = false,
     bool_value: ?*const fn (*const anyopaque) bool = null,
+    code: ?CodeMetadata = null,
     raw_value: *const fn (Allocator, *const anyopaque) Allocator.Error!Value,
     serialized: *const fn (Allocator, *const anyopaque) CustomError!Value,
     write_str: *const fn (*Writer, *const anyopaque) CustomWriteError!void,

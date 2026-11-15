@@ -1,4 +1,4 @@
-//! Python-compatible rendering of `std.json.Value`.
+//! Python-compatible rendering of native runtime values.
 //!
 //! DSPy formats prompts with `json.dumps` (separators ", " and ": ",
 //! `ensure_ascii=False`), `str()` / `repr()` of Python values, and saves
@@ -28,6 +28,31 @@ pub fn writeJsonAscii(w: *Writer, v: Value) Error!void {
     try writeJsonDepth(w, v, .compact, 0, true);
 }
 
+test "ASCII JSON preserves lone surrogates and escapes surrogate keys as strings" {
+    const cases = [_][2][]const u8{
+        .{ "\xed\xa0\x80", "\"\\ud800\"" },
+        .{ "\xed\xb0\x80", "\"\\udc00\"" },
+        .{ "\xf0\x90\x80\x80", "\"\\ud800\\udc00\"" },
+        .{ "\x00\x7f雪", "\"\\u0000\\u007f\\u96ea\"" },
+    };
+    for (cases) |case| {
+        var buffer: [64]u8 = undefined;
+        var writer: Writer = .fixed(&buffer);
+        try writeJsonAscii(&writer, .{ .string = case[0] });
+        try std.testing.expectEqualStrings(case[1], writer.buffered());
+    }
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var object: @import("runtime_value.zig").ObjectMap = .empty;
+    try object.put(arena.allocator(), "\xed\xa0\x80", .{ .string = "\xed\xb0\x80" });
+    var buffer: [64]u8 = undefined;
+    var writer: Writer = .fixed(&buffer);
+    try writeJsonAscii(&writer, .{ .object = object });
+    try std.testing.expectEqualStrings("{\"\\ud800\": \"\\udc00\"}", writer.buffered());
+    writer.end = 0;
+    try std.testing.expectError(error.ParseValue, writeJsonAscii(&writer, .{ .string = "\xff" }));
+}
+
 fn writeJsonDepth(w: *Writer, v: Value, style: Style, depth: u32, comptime ascii: bool) Error!void {
     if (depth >= max_depth) return error.JsonTooDeep;
     switch (v) {
@@ -36,7 +61,7 @@ fn writeJsonDepth(w: *Writer, v: Value, style: Style, depth: u32, comptime ascii
         .integer => |i| try w.print("{d}", .{i}),
         .float => |f| try writeFloat(w, f, if (style == .orjson_indent2) .orjson else .json),
         .number_string => |s| try w.writeAll(s),
-        .string => |s| if (ascii) try std.json.Stringify.value(s, .{ .escape_unicode = true }, w) else try writeJsonString(w, s),
+        .string => |s| if (ascii) try writeJsonAsciiString(w, s) else try writeJsonString(w, s),
         .custom => |custom| if (ascii) return error.ParseValue else try custom.writeSerializedJson(w, style, depth),
         .array => |a| {
             if (a.items.len == 0) return w.writeAll("[]");
@@ -55,13 +80,67 @@ fn writeJsonDepth(w: *Writer, v: Value, style: Style, depth: u32, comptime ascii
             while (it.next()) |entry| {
                 try writeSeparator(w, style, depth + 1, first);
                 first = false;
-                if (ascii) try std.json.Stringify.value(entry.key_ptr.*, .{ .escape_unicode = true }, w) else try writeJsonString(w, entry.key_ptr.*);
+                if (ascii) try writeJsonAsciiString(w, entry.key_ptr.*) else try writeJsonString(w, entry.key_ptr.*);
                 try w.writeAll(if (style == .minified) ":" else ": ");
                 try writeJsonDepth(w, entry.value_ptr.*, style, depth + 1, ascii);
             }
             try writeClose(w, style, depth, '}');
         },
     }
+}
+
+/// CPython permits lone surrogate code points in strings. Keep their WTF-8
+/// representation lossless instead of std.json's invalid-UTF8 byte-array path.
+fn writeJsonAsciiString(w: *Writer, s: []const u8) Error!void {
+    try w.writeByte('"');
+    var start: usize = 0;
+    var index: usize = 0;
+    while (index < s.len) {
+        const byte = s[index];
+        if (byte >= 0x20 and byte < 0x7f and byte != '"' and byte != '\\') {
+            index += 1;
+            continue;
+        }
+        try w.writeAll(s[start..index]);
+        const escaped: ?[]const u8 = switch (byte) {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            8 => "\\b",
+            9 => "\\t",
+            10 => "\\n",
+            12 => "\\f",
+            13 => "\\r",
+            else => null,
+        };
+        if (escaped) |text| {
+            try w.writeAll(text);
+            index += 1;
+        } else {
+            const count = std.unicode.utf8ByteSequenceLength(byte) catch return error.ParseValue;
+            if (count > s.len - index) return error.ParseValue;
+            const point = std.unicode.wtf8Decode(s[index..][0..count]) catch return error.ParseValue;
+            if (point <= 0xffff) {
+                try writeAsciiCodeUnit(w, @intCast(point));
+            } else {
+                const pair = point - 0x10000;
+                try writeAsciiCodeUnit(w, @intCast(0xd800 | (pair >> 10)));
+                try writeAsciiCodeUnit(w, @intCast(0xdc00 | (pair & 0x3ff)));
+            }
+            index += count;
+        }
+        start = index;
+    }
+    try w.writeAll(s[start..]);
+    try w.writeByte('"');
+}
+
+fn writeAsciiCodeUnit(w: *Writer, unit: u16) Writer.Error!void {
+    const hex = "0123456789abcdef";
+    const escaped = [_]u8{
+        '\\',                  'u',            hex[unit >> 12], hex[(unit >> 8) & 15],
+        hex[(unit >> 4) & 15], hex[unit & 15],
+    };
+    try w.writeAll(&escaped);
 }
 
 fn writeSeparator(w: *Writer, style: Style, depth: u32, first: bool) Writer.Error!void {

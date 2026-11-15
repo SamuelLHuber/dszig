@@ -651,7 +651,6 @@ test "native function-only completions preserve identifiers and normalize Respon
     var out: std.heap.ArenaAllocator = .init(testing.allocator);
     defer out.deinit();
     const arena = out.allocator();
-    const arguments = "{ \"query\": \"Paris\", \"limit\": 2 }";
     const chat_body = try arena.dupe(u8,
         \\{"choices":[{"message":{"content":null,"reasoning_content":"Look up the fact.","tool_calls":[
         \\  {"id":"call_chat","type":"function","function":{"name":"lookup","arguments":"{ \"query\": \"Paris\", \"limit\": 2 }"}}
@@ -665,7 +664,6 @@ test "native function-only completions preserve identifiers and normalize Respon
     try testing.expectEqual(@as(usize, 1), chat[0].tool_calls.len);
     try testing.expectEqualStrings("call_chat", chat[0].tool_calls[0].id);
     try testing.expectEqualStrings("lookup", chat[0].tool_calls[0].name);
-    try testing.expectEqualStrings(arguments, chat[0].tool_calls[0].arguments);
 
     const responses_body = try arena.dupe(u8,
         \\{"status":"completed","output":[
@@ -1016,16 +1014,30 @@ test "LM fans out actual n1 candidate requests and replay preserves strict rollo
     }
 }
 
-test "native provider calls require real identifiers names and argument strings" {
+test "tool JSON repair requires raw ID provenance and preserves legitimate partial_json" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const completions = try dszig.lm.OpenAI.parseCompletions(arena,
+        \\{"choices":[{"message":{"content":null,"tool_calls":[
+        \\ {"id":"real","type":"function","function":{"name":"lookup","arguments":"{\"query\":\"Paris\""}},
+        \\ {"type":"function","function":{"name":"lookup","arguments":"{\"query\":\"Paris\""}},
+        \\ {"id":"legitimate","type":"function","function":{"name":"lookup","arguments":"{\"partial_json\":\"{bad\"}"}}
+        \\]}}]}
+    );
+    const calls = completions[0].tool_calls;
+    try testing.expectEqualStrings("{\"query\": \"Paris\"}", calls[0].arguments);
+    try testing.expectEqualStrings("call_1", calls[1].id);
+    try testing.expectEqualStrings("{\"partial_json\": \"{\\\"query\\\":\\\"Paris\\\"\"}", calls[1].arguments);
+    try testing.expectEqualStrings("{\"partial_json\": \"{bad\"}", calls[2].arguments);
+}
+
+test "native provider calls reject unnamed functions" {
     var out: std.heap.ArenaAllocator = .init(testing.allocator);
     defer out.deinit();
     const arena = out.allocator();
     for ([_][]const u8{
-        "{\"choices\":[{\"message\":{\"content\":null,\"tool_calls\":[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]}}]}",
         "{\"choices\":[{\"message\":{\"content\":null,\"tool_calls\":[{\"id\":\"call\",\"type\":\"function\",\"function\":{\"arguments\":\"{}\"}}]}}]}",
-        "{\"choices\":[{\"message\":{\"content\":null,\"tool_calls\":[{\"id\":\"call\",\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}]}}]}",
-        "{\"choices\":[{\"message\":{\"content\":null,\"tool_calls\":[{\"id\":\"call\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":{}}}]}}]}",
-        "{\"choices\":[{\"message\":{\"content\":null,\"tool_calls\":[{\"id\":\"\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]}}]}",
     }) |invalid| {
         try testing.expectError(error.LMFailure, dszig.lm.OpenAI.parseCompletions(arena, invalid));
     }

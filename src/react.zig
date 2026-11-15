@@ -492,6 +492,12 @@ fn TypedValidator(comptime T: type) type {
 }
 
 fn strictAccepts(comptime T: type, input: Value) bool {
+    if (comptime @import("code.zig").isCode(T) or T == signature.Reasoning or
+        T == @import("file.zig").File or T == @import("bounding_box.zig").BoundingBox)
+    {
+        _ = T.fromValue(input) catch return false;
+        return true;
+    }
     if (T == []const u8) return input == .string;
     if (T == bool) return input == .bool;
     if (T == Record) return input == .object;
@@ -531,7 +537,12 @@ fn strictAccepts(comptime T: type, input: Value) bool {
 /// JSON schemas describe Python integers, whereas native callbacks/output
 /// structs can use narrower integer storage. Reject overflow before submission.
 fn nativeFits(comptime T: type, input: Value) bool {
-    if (comptime @import("code.zig").isCode(T)) return input == .string;
+    if (comptime @import("code.zig").isCode(T) or T == signature.Reasoning or
+        T == @import("file.zig").File or T == @import("bounding_box.zig").BoundingBox)
+    {
+        _ = T.fromValue(input) catch return false;
+        return true;
+    }
     if (T == []const u8 or T == bool or T == Record or T == signature.StrDict) return true;
     if (comptime types.isDict(T)) {
         for (input.object.values()) |item| if (!nativeFits(T.dszig_dict_value, item)) return false;
@@ -682,7 +693,6 @@ test "ReAct submit validates Code models but retains custom string results" {
     const out = try value.fromRecord(arena, Sig.Output, &prediction.outputs);
     try testing.expectEqualStrings("run()", out.result.code);
     try testing.expectEqualStrings("x", out.snippets[0].code);
-    try testing.expectEqualStrings("run()", prediction.outputs.get("result").?.string);
     try testing.expectEqual(TerminationReason.submit, prediction.termination_reason);
     const invalid = try std.json.parseFromSliceLeaky(Value, arena, "{\"result\":{\"code\":7},\"snippets\":[]}", .{});
     const submit: Tool = comptime .{

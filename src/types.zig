@@ -188,10 +188,12 @@ fn hasDefault(comptime S: type, comptime i: usize) bool {
 fn modelEntries(comptime S: type, comptime ordered_properties: bool) []const Entry {
     comptime {
         const info = @typeInfo(S).@"struct";
-        var props: [info.field_names.len]Entry = undefined;
+        var props: [if (code.isCode(S)) 1 else info.field_names.len]Entry = undefined;
+        var n_props = 0;
         var required: []const u8 = "[";
         var n_required = 0;
         for (info.field_names, info.field_types, 0..) |name, FT, i| {
+            if (code.isCode(S) and !std.mem.eql(u8, name, "code")) continue;
             var e: []const Entry = entriesOf(FT) ++ &[_]Entry{.{ .key = "title", .val = quote(title(name)) }};
             if (isModel(FT) or (@typeInfo(FT) == .optional and isModel(@typeInfo(FT).optional.child))) e = entriesOf(FT);
             if (S == BoundingBox) e = e ++ &[_]Entry{.{ .key = "description", .val = quote(BoundingBox.edge_descriptions[i]) }};
@@ -204,7 +206,8 @@ fn modelEntries(comptime S: type, comptime ordered_properties: bool) []const Ent
                 required = required ++ (if (n_required > 0) ", " else "") ++ quote(name);
                 n_required += 1;
             }
-            props[i] = .{ .key = name, .val = render(e) };
+            props[n_props] = .{ .key = name, .val = render(e) };
+            n_props += 1;
         }
         const final = props;
         const description: []const Entry = if (code.isCode(S) and S.schema_description_json.len > 0)
@@ -237,6 +240,7 @@ fn collectDefs(comptime T: type, comptime seen: []const type) []const type {
             .@"struct" => |s| {
                 for (out) |t| if (t == T) return out;
                 out = out ++ &[_]type{T};
+                if (code.isCode(T)) return out;
                 for (s.field_types) |FT| out = collectDefs(FT, out);
             },
             else => {},

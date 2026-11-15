@@ -30,12 +30,8 @@ pub fn pyStrip(s: []const u8) []const u8 {
 
 /// `format_field_value(field_info, value)`.
 pub fn formatFieldValue(w: *Writer, field: Field, v: Value) pyjson.Error!void {
-    if (field.reasoning_type and v == .object) {
-        if (v.object.get("content")) |content| {
-            if (content == .string) return w.writeAll(content.string);
-        }
-    }
-    if (v == .array and field.kind == .str) return formatListBlobs(w, v.array.items);
+    if (v == .array and field.kind == .str and !field.reasoning_type and
+        !field.code_type and !field.optional_str) return formatListBlobs(w, v.array.items);
     switch (v) {
         .array, .object => try pyjson.writeJson(w, v, .compact),
         else => try pyjson.writeStr(w, v),
@@ -390,7 +386,7 @@ pub fn toRecord(arena: Allocator, comptime T: type, value: T) Allocator.Error!Re
 }
 
 pub fn toValue(arena: Allocator, comptime T: type, v: T) Allocator.Error!Value {
-    if (comptime code.isCode(T)) return v.toValue();
+    if (comptime code.isCode(T)) return v.toRuntime(arena);
     if (T == @import("file.zig").File or T == @import("bounding_box.zig").BoundingBox or T == signature.Reasoning)
         return v.toRuntime(arena);
     if (T == @import("tool.zig").ToolCalls) return v.toValue(arena);
@@ -737,6 +733,33 @@ test "Python numeric equality preserves integer precision" {
     try testing.expect(pyEqual(.{ .integer = std.math.minInt(i64) }, .{ .float = -9_223_372_036_854_775_808.0 }));
     try testing.expect(pyEqual(.{ .bool = true }, .{ .float = 1.0 }));
     try testing.expect(!pyEqual(.{ .string = "1" }, .{ .integer = 1 }));
+}
+
+test "field annotations do not turn dictionaries or class-annotated lists into text blobs" {
+    var scratch: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    var dictionary: Record = .empty;
+    try dictionary.put(arena, "content", .{ .string = "not a class" });
+    var list: @import("runtime_value.zig").Array = .init(arena);
+    try list.append(.{ .string = "first" });
+    try list.append(.{ .string = "second" });
+    var fields: [4]Field = @splat(testField(.str));
+    fields[0].reasoning_type = true;
+    fields[1].code_type = true;
+    fields[2].optional_str = true;
+    var output: Writer.Allocating = .init(arena);
+    for (fields, 0..) |field, index| {
+        output.clearRetainingCapacity();
+        try formatFieldValue(&output.writer, field, .{ .object = dictionary });
+        try std.testing.expectEqualStrings("{\"content\": \"not a class\"}", output.written());
+        output.clearRetainingCapacity();
+        try formatFieldValue(&output.writer, field, .{ .array = list });
+        try std.testing.expectEqualStrings(
+            if (index == 3) "[1] «first»\n[2] «second»" else "[\"first\", \"second\"]",
+            output.written(),
+        );
+    }
 }
 
 fn testField(kind: signature.Kind) Field {

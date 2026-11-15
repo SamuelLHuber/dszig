@@ -52,8 +52,10 @@ fn replacement(arena: Allocator, comptime T: type, v: Value, depth: u32, comptim
         }
         return .{ .string = try std.fmt.allocPrint(arena, "<non-serializable: {s}>", .{custom.vtable.model_name}) };
     }
-    if (T == signature.Reasoning or T == signature.StrDict) return null;
-    if (comptime code.isCode(T)) return .{ .string = "<non-serializable: " ++ T.model_name ++ ">" };
+    if (T == signature.StrDict) return null;
+    if (T == signature.Reasoning or T == @import("file.zig").File or
+        T == @import("bounding_box.zig").BoundingBox or comptime code.isCode(T))
+        return replacement(arena, Value, v, depth, reasoning_as_text);
     if (T == Value) return switch (v) {
         .array => arrayReplacement(arena, Value, v, depth, reasoning_as_text),
         .object => objectReplacement(arena, Value, v, depth, reasoning_as_text),

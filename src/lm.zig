@@ -1102,15 +1102,24 @@ pub const OpenAI = struct {
             if (message.object.get("tool_calls")) |calls| {
                 if (calls != .array) return error.LMFailure;
                 const native = try arena.alloc(ToolCall, calls.array.items.len);
+                var part_index: usize = 0;
+                for ([_][]const u8{ "reasoning_content", "content", "refusal" }) |key| {
+                    if (message.object.get(key)) |part| {
+                        if (part == .string and part.string.len != 0) part_index += 1;
+                    }
+                }
                 for (calls.array.items, native) |call, *copy| {
                     if (call != .object or !stringEquals(call.object.get("type") orelse return error.LMFailure, "function")) return error.LMFailure;
                     const function = call.object.get("function") orelse return error.LMFailure;
                     if (function != .object) return error.LMFailure;
+                    const raw_id = call.object.get("id");
+                    const call_id = try responseText(arena, raw_id);
                     copy.* = .{
-                        .id = try responseString(call, "id", true),
+                        .id = if (call_id.len != 0) call_id else try std.fmt.allocPrint(arena, "call_{d}", .{part_index}),
                         .name = try responseString(function, "name", true),
-                        .arguments = try responseString(function, "arguments", false),
+                        .arguments = try responseArguments(arena, function.object.get("arguments"), call_id.len != 0 and raw_id != null and raw_id.? == .string),
                     };
+                    part_index += 1;
                 }
                 completion.tool_calls = native;
             }
@@ -1187,7 +1196,10 @@ pub const OpenAI = struct {
                 try calls.append(arena, .{
                     .id = if (call_id.len != 0) call_id else if (item_id.len != 0) item_id else try std.fmt.allocPrint(arena, "call_{d}", .{part_count}),
                     .name = try responseString(item, "name", true),
-                    .arguments = try responseArguments(arena, item.object.get("arguments")),
+                    .arguments = try responseArguments(arena, item.object.get("arguments"), blk: {
+                        const raw_id = if (call_id.len != 0) item.object.get("call_id") else item.object.get("id");
+                        break :blk raw_id != null and raw_id.? == .string and (call_id.len != 0 or item_id.len != 0);
+                    }),
                 });
                 part_count += 1;
             } else if (stringEquals(kind, "message")) {
@@ -1247,15 +1259,26 @@ pub const OpenAI = struct {
         return out.toOwnedSlice();
     }
 
-    fn responseArguments(arena: Allocator, input: ?@import("runtime_value.zig").Value) Error![]const u8 {
+    fn responseArguments(arena: Allocator, input: ?@import("runtime_value.zig").Value, correlated_raw_id: bool) Error![]const u8 {
         const Value = @import("runtime_value.zig").Value;
         var normalized: Value = .{ .object = .empty };
         if (input) |raw| {
             if (raw == .object) {
                 normalized = raw;
             } else if (raw == .string and raw.string.len != 0) {
-                const decoded = std.json.parseFromSliceLeaky(Value, arena, raw.string, .{}) catch |err| blk: {
+                const repair = @import("json_repair.zig");
+                const decoded = repair.parseJson(arena, raw.string) catch |err| blk: {
                     if (err == error.OutOfMemory) return error.OutOfMemory;
+                    // DSPy's repair boundary rechecks the original JSON and only
+                    // catches JSONDecodeError, not CPython's integer-size error.
+                    if (correlated_raw_id and err == error.IntegerTooLong) return error.LMFailure;
+                    if (correlated_raw_id and err == error.ParseValue) {
+                        const repaired = repair.loads(arena, raw.string) catch |failure| return switch (failure) {
+                            error.OutOfMemory => error.OutOfMemory,
+                            else => error.LMFailure,
+                        };
+                        if (repaired == .object) break :blk repaired;
+                    }
                     var partial: @import("runtime_value.zig").ObjectMap = .empty;
                     try partial.put(arena, "partial_json", raw);
                     break :blk Value{ .object = partial };
@@ -1267,6 +1290,7 @@ pub const OpenAI = struct {
                 }
             }
         }
+        if (!finiteToolArguments(normalized)) return error.LMFailure;
         if (normalized.object.count() == 0) return "{}";
         var out: Writer.Allocating = .init(arena);
         defer out.deinit();
@@ -1275,6 +1299,21 @@ pub const OpenAI = struct {
             else => error.LMFailure,
         };
         return out.toOwnedSlice();
+    }
+
+    // ToolCallPart's JSON-value invariant rejects nonfinite decoded numbers.
+    fn finiteToolArguments(value: @import("runtime_value.zig").Value) bool {
+        switch (value) {
+            .float => |number| return std.math.isFinite(number),
+            .array => |items| for (items.items) |item| {
+                if (!finiteToolArguments(item)) return false;
+            },
+            .object => |object| for (object.values()) |item| {
+                if (!finiteToolArguments(item)) return false;
+            },
+            else => {},
+        }
+        return true;
     }
 
     fn reasoningText(arena: Allocator, item: @import("runtime_value.zig").Value) Error!?[]const u8 {

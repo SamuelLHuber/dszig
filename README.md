@@ -108,7 +108,7 @@ retain the actual continuation and raw provider response independently.
 | DSPy surface | Native Zig surface and coverage |
 |---|---|
 | Class-style signatures and typed fields | `Signature`, `Dict`, `Code`, `CodeWithLanguage`, `BoundingBox`, `File`, scalar/string/list/optional/model fields, literal enums, field descriptions/defaults, compile-time rejection of invalid signatures |
-| Runtime values and documents | `Value`, `Array`, `ObjectMap`, boxed native File/Reasoning/BoundingBox identity, recursive typed-class serialization, text/canonical-document content union and bounded Responses `input_file` translation |
+| Runtime values and documents | `Value`, `Array`, `ObjectMap`, boxed native Code/File/Reasoning/BoundingBox identity, recursive typed-class serialization, text/canonical-document content union and bounded Responses `input_file` translation |
 | Chat, JSON, XML and two-stage adapters | `Adapter.chat`, `.json`, `.xml`, `.two_step`; `TwoStepAdapter` with a separate extraction LM; independent prompt/parse fixtures, strict response-schema construction, JSON fallback, typed XML and Unicode key handling |
 | Prediction and reasoning | `Predict`, `ChainOfThought`, `BestOfN`, `Refine`, `MultiChainComparison`, explicit `Context`, typed outputs, serialized `Trace`, named predictor/parameter discovery |
 | Retrieval and embeddings | `Retrieve`, lexical `InMemoryRetriever`, HTTP `ColBERTv2` with shared mutable-graph memory caching, custom/OpenAI/Azure `Embedder`, float32 `KNN`, per-query `KNNFewShot`, and brute-force `Embeddings`/`EmbeddingsWithScores` with NumPy persistence |
@@ -141,7 +141,23 @@ Refusal-only, reasoning-only and tool-only responses have absent text;
 provider error objects fail. Missing tool-call IDs fall back to the item ID
 or a canonical-part-index ID. Arguments are normalized to an object and
 serialized with Python JSON spacing and ASCII escaping; malformed argument
-text can remain a `partial_json` object. This is not general JSON repair.
+text can remain a `partial_json` object. Chat and Responses apply DSPy's
+provenance-sensitive repair: only malformed original argument strings correlated
+with a real provider ID can replace the fallback, and only dictionary repairs
+are accepted. Legitimate `partial_json` parameters and synthesized-ID fallbacks
+are retained. Nonfinite tool input numbers and CPython's oversized-integer
+failure propagate as `LMFailure`, not silently repaired values.
+
+The zero-dependency `json_repair` module exposes `parseJson` (CPython-style
+whole-input parsing) and `loads` (the pinned `json_repair` 0.64.2 default repair
+behavior). A native executable matched **390 comparisons over 195 actual Python
+parser observations**, including ordered object pairs, exact integers, binary64
+bits and lone-surrogate WTF-8 strings. Another matched **26 actual DSPy LM HTTP
+observations**, including exact canonical argument JSON, nullable text, real and
+synthesized IDs, legitimate `partial_json` objects and failure categories.
+The development oracle is `tools/dspy_reference/tool_argument_repair_oracle.py`.
+This does not prove every malformed input, optional upstream parser setting or
+Python exception identity; the native parser has a 512-level nesting bound.
 
 Pinned native parser consumers matched **42 Responses and 4 Chat actual DSPy
 3.5 localhost HTTP observations**, comparing visible text, reasoning and tool
@@ -400,6 +416,19 @@ the first multiline fenced match before considering inline fences; unfenced
 source remains untrimmed. Native typed predictions, nested collections, adapters,
 provider schemas, state demos and ReAct submit preserve Code's raw-string wire
 representation while retaining its model validation.
+Erased records retain genuine boxed Code classes rather than ordinary strings
+or annotation-based reconstructions. `CodeWithLanguageIdentity("JAVA", Tag)`
+permits distinct same-language classes using separate explicit type tags;
+`CodeWithLanguage` alone remains canonical for the same language. Validating a
+specialized box as base Code preserves the box and concrete class; validating
+it as a different specialized class fails. Ordinary and round-trip dumps remain
+strings, while Python-style `str` is `code='…'` and nested repr includes the
+concrete model name. Owning clones copy the code and retain its class.
+A native consumer matched **281 actual DSPy validations, 210 class/rendering/
+serialization/hashability comparisons and 75 symmetric equality cases** from
+`code_identity_oracle.py`.
+Automatic fresh runtime class creation, Python constructor calling conventions
+and generic memoized deepcopy graphs are not provided by these explicit Zig APIs.
 A native executable also exercised a typed Code prediction, fenced output,
 language-specialized instance preservation through the base validator,
 raw-string traces and saved-demo restoration.
@@ -729,9 +758,11 @@ The following prevent a claim that DSZig can do everything DSPy can:
   colliding names fail closed; equivalent definitions can share a name.
   Python's identity-dependent automatic renaming is not reproduced. Tagged
   unions beyond optional types and some
-  Pydantic model defaults are not native signature types. JSON repair is not
-  implemented; strict JSON and the existing limited Python-literal parser are
-  not equivalent to `json_repair` for malformed output. XML golden cases that
+  Pydantic model defaults are not native signature types. JSON repair covers the
+  pinned default parser and correlated Chat/Responses tool arguments, not every
+  upstream option or every adapter parsing path. Its nesting bound is 512 and
+  Python exception classes/messages are not reconstructed (for example, some
+  fenced nonstring-key assertion failures become `ParseValue`). XML golden cases that
   use a schema-backed runtime view do not prove a native Zig union type exists.
   Python-style rendering recovers declared native type metadata and retained
   native custom classes, not arbitrary Python objects erased into ordinary

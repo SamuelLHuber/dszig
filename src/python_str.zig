@@ -40,6 +40,7 @@ pub fn renderer(comptime T: type) ?Render {
 /// True only for declared types whose Python `str`/`repr` differs from the
 /// JSON-lowered `Value` rendering: models, Code, and containers of them.
 fn needsRendering(comptime T: type) bool {
+    if (comptime code.isCode(T)) return false;
     if (T == signature.Reasoning or T == @import("file.zig").File or
         T == @import("bounding_box.zig").BoundingBox or T == signature.StrDict or T == Value or
         T == @import("runtime_value.zig").ObjectMap or T == []const u8 or T == []u8) return false;
@@ -66,7 +67,6 @@ fn write(comptime T: type, w: *Writer, v: Value, mode: Mode, depth: u32) WriteEr
         return pyjson.writeRepr(w, v, depth);
     }
     if (v == .null) return w.writeAll("None");
-    if (comptime code.isCode(T)) return writeCode(T, w, v, mode, depth);
     if (comptime types.isDict(T)) return writeDict(T.dszig_dict_value, w, v, depth);
     return switch (@typeInfo(T)) {
         .optional => |o| write(o.child, w, v, mode, depth),
@@ -75,20 +75,6 @@ fn write(comptime T: type, w: *Writer, v: Value, mode: Mode, depth: u32) WriteEr
         .@"struct" => writeModel(T, w, v, mode, depth),
         else => pyjson.writeRepr(w, v, depth),
     };
-}
-
-/// `Code.__str__` and `__repr__` both show the `code` field as a repr string.
-/// Specialized Code types keep their declared model name in repr.
-fn writeCode(comptime T: type, w: *Writer, v: Value, mode: Mode, depth: u32) pyjson.Error!void {
-    const content = if (v == .object) v.object.get("code") orelse v else v;
-    if (content != .string) return pyjson.writeRepr(w, v, depth);
-    if (mode == .repr) {
-        try w.writeAll(comptime T.model_name);
-        try w.writeByte('(');
-    }
-    try w.writeAll("code=");
-    try pyjson.writeRepr(w, content, depth + 1);
-    if (mode == .repr) try w.writeByte(')');
 }
 
 fn writeList(comptime Child: type, w: *Writer, v: Value, depth: u32) WriteError!void {
@@ -139,7 +125,7 @@ fn writeModel(comptime T: type, w: *Writer, v: Value, mode: Mode, depth: u32) Wr
     if (mode == .repr) try w.writeByte(')');
 }
 
-test "python str preserves declared model and Code representations in nested lists" {
+test "python str preserves declared model representations in nested lists" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -159,13 +145,6 @@ test "python str preserves declared model and Code representations in nested lis
     var models: @import("runtime_value.zig").Array = .init(arena);
     try models.append(payload);
     try std.testing.expectEqualStrings("[Payload(name=\"O'Reilly\\n\", count=3)]", try renderer([]const Payload).?(arena, .{ .array = models }));
-
-    const Code = code.Code;
-    const source: Value = .{ .string = "x = 1" };
-    try std.testing.expectEqualStrings("code='x = 1'", try renderer(Code).?(arena, source));
-    var snippets: @import("runtime_value.zig").Array = .init(arena);
-    try snippets.append(source);
-    try std.testing.expectEqualStrings("[Code(code='x = 1')]", try renderer([]const Code).?(arena, .{ .array = snippets }));
 }
 
 /// `str(list[dspy.Tool])`: Python's list `str` applies `Tool.__repr__`, which
