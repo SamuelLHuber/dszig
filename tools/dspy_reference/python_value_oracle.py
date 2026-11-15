@@ -86,6 +86,8 @@ def enc(value):
         return {"string_codepoints": [ord(char) for char in value]}
     if type(value) is bytes:
         return {"bytes_hex": value.hex()}
+    if type(value) is bytearray:
+        return {"bytearray_hex": value.hex()}
     if type(value) in (list, tuple, set, frozenset):
         return {type(value).__name__: [enc(item) for item in value]}
     if type(value) is dict:
@@ -191,10 +193,88 @@ def cases():
     yield "integer/wide", 10**100
 
 
+def bytearray_receipt():
+    """New genuine-value slice; never reinterprets bytearray as JSON text."""
+    from dspy.evaluate import metrics
+
+    samples = [
+        ("empty", b""), ("ascii", b"plain"), ("integer", b"1"),
+        ("boolean", b"true"), ("quotes", b"'\"\\"),
+        ("utf8", "snow \u96ea".encode()), ("invalid_utf8", b"\xff\xfe\xc0\x80"),
+        ("all_octets", bytes(range(256))), ("nul", b"a\x00b"),
+    ] + [(f"octet/{index}", bytes([index])) for index in range(256)]
+    rows = []
+    for name, data in samples:
+        value = bytearray(data)
+        row = {"id": name, **observe(value)}
+        row["validations"] = {
+            name: attempt(lambda annotation=annotation: TypeAdapter(annotation).validate_python(value))
+            for name, annotation in [("str", str), ("int", int), ("float", float),
+                                     ("bool", bool), ("list_int", list[int])]
+        }
+        row["nested"] = attempt(lambda: utils.serialize_for_json([value]))
+        row["dictionary_value"] = attempt(lambda: utils.serialize_for_json({"x": value}))
+        row["equals_bytes"] = value == data
+        row["bytes_equal"] = data == value
+        row["equals_string"] = value == data.decode("utf-8", errors="replace")
+        row["iteration"] = enc(list(value))
+        row["set"] = attempt(lambda: set([value]))
+        row["dictionary_key"] = attempt(lambda: dict([(value, 1)]))
+        row["file_fields"] = {
+            name: attempt(lambda name=name: getattr(dspy.File(**{name: value}), name))
+            for name in ("file_data", "file_id", "filename")
+        }
+        rows.append(row)
+
+    mutations = []
+    for name, data in samples[:9]:
+        value = bytearray(data)
+        alias = value
+        deep = copy.deepcopy(value)
+        steps = []
+        def step(name, action):
+            result = attempt(action)
+            steps.append({"operation": name, "result": result, "value": enc(value),
+                          "alias": enc(alias), "deep": enc(deep),
+                          "alias_is_value": alias is value, "deep_is_value": deep is value})
+        step("append", lambda: value.append(255))
+        step("extend_self", lambda: value.extend(value))
+        step("set_last", lambda: value.__setitem__(-1, 0))
+        step("pop_last", lambda: value.pop())
+        step("reverse", lambda: value.reverse())
+        step("clear", lambda: value.clear())
+        step("pop_empty", lambda: value.pop())
+        step("set_empty", lambda: value.__setitem__(0, 1))
+        mutations.append({"id": name, "input": enc(bytearray(data)), "steps": steps})
+
+    iterables = [
+        ("bytearray_empty", bytearray()), ("bytearray_nonempty", bytearray(b"x")),
+        ("bytes_empty", b""), ("bytes_nonempty", b"x"),
+        ("tuple", ("x",)), ("set", {"x"}), ("frozenset", frozenset(["x"])),
+        ("dictionary", {1: "x"}), ("empty_dictionary", {}),
+    ]
+    iteration = [{"id": name, "input": enc(value),
+                  "result": attempt(lambda value=value: metrics._passage_match(value, ["x"]))}
+                 for name, value in iterables]
+    return {"evidence_kind": "actual_cpython_bytearray_and_dspy_calls",
+            "python": sys.version, "dspy": dspy.__version__, "pydantic": pydantic.__version__,
+            "cases": rows, "mutations": mutations, "passage_iteration": iteration}
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--bytearray-only", action="store_true",
+                        help="Observe the new bytearray slice without rerunning historical builtin proofs")
     args = parser.parse_args()
+    if args.bytearray_only:
+        text = json.dumps(bytearray_receipt(), ensure_ascii=True, indent=2) + "\n"
+        if args.output:
+            args.output.write_text(text)
+            print(f"Observed genuine bytearray slice; sha256={hashlib.sha256(text.encode()).hexdigest()}")
+        else:
+            print(text, end="")
+        return
     rows = []
     for name, value in cases():
         row = {"id": name, **observe(value),

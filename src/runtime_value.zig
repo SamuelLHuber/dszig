@@ -28,6 +28,7 @@ pub const EnumValue = struct {
 pub const PythonEntry = struct { key: Value, value: Value };
 pub const PythonValue = union(enum) {
     bytes: []const u8,
+    bytearray: []const u8,
     tuple: []const Value,
     set: []const Value,
     frozen_set: []const Value,

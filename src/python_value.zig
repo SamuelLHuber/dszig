@@ -8,6 +8,9 @@
 //! allocator. Owning clone preserves observed container order; it is an
 //! ownership operation, not Python copy.deepcopy (which can reorder a set).
 //! Borrowed buffers and item/key positions must remain immutable and alive.
+//! Bytearrays instead copy and own their mutable storage. Mutate them only
+//! through bytearray functions with their original allocator. Borrowed views
+//! and serialized leaves must not be retained across a bytearray mutation.
 //! Raw/serialized projections borrow leaves, like Code/File dumps. Use an arena
 //! for mixed-borrowed serialization projections; clone to obtain deep ownership.
 //! Raw identity and root Ellipsis projections alias the original box: do not
@@ -38,12 +41,19 @@ const SipHash = std.crypto.auth.siphash.SipHash64(1, 3);
 
 pub const Error = runtime.CustomError;
 
+/// Python's hash protocol, including refusal of mutable/unhashable values.
+/// Address-based hashes necessarily use this native process's identities.
+pub fn pythonHash(value: Value, seed: u32) error{ParseValue}!i64 {
+    return @bitCast(try hashValue(value, seed));
+}
+
 const absent = std.math.maxInt(usize);
 const Slot = struct { index: usize = absent, hash: u64 = 0 };
 const Box = struct {
     payload: PythonValue,
     vtable: *const runtime.CustomVTable,
     owns_storage: bool = false,
+    bytearray_capacity: usize = 0,
     table: []const Slot = &.{},
     owns_table: bool = false,
     hash_seed: u32 = 0,
@@ -58,6 +68,82 @@ pub fn view(v: Value) ?PythonValue {
 
 pub fn bytes(a: Allocator, data: []const u8) Error!Value {
     return boxed(a, .{ .bytes = data }, &bytes_vtable);
+}
+
+/// A genuine mutable bytearray; unlike bytes(), this copies the input buffer.
+pub fn bytearray(a: Allocator, data: []const u8) Error!Value {
+    const storage = try a.dupe(u8, data);
+    errdefer a.free(storage);
+    const result = try boxed(a, .{ .bytearray = storage }, &bytearray_vtable);
+    const box = runtimeBox(result.custom.ptr);
+    box.owns_storage = true;
+    box.bytearray_capacity = storage.len;
+    return result;
+}
+
+fn mutableBytearray(value: Value) Error!*Box {
+    const box = ownBox(value) orelse return error.ParseValue;
+    if (box.payload != .bytearray) return error.ParseValue;
+    return @constCast(box);
+}
+
+fn bytearrayIndex(length: usize, index: isize) Error!usize {
+    const position = if (index < 0) blk: {
+        const magnitude = @abs(index);
+        if (magnitude > length) return error.ParseValue;
+        break :blk length - magnitude;
+    } else @as(usize, @intCast(index));
+    return if (position < length) position else error.ParseValue;
+}
+
+pub fn bytearraySet(value: Value, index: isize, byte: u8) Error!void {
+    const box = try mutableBytearray(value);
+    const position = try bytearrayIndex(box.payload.bytearray.len, index);
+    @constCast(box.payload.bytearray)[position] = byte;
+}
+
+pub fn bytearrayAppend(a: Allocator, value: Value, byte: u8) Error!void {
+    return bytearrayExtend(a, value, &.{byte});
+}
+
+/// Supports extending a bytearray with itself or a subslice of its own buffer,
+/// even when growing reallocates the buffer. Allocation failure leaves it intact.
+pub fn bytearrayExtend(a: Allocator, value: Value, data: []const u8) Error!void {
+    const box = try mutableBytearray(value);
+    const original = box.payload.bytearray;
+    if (data.len == 0) return;
+    const start = @intFromPtr(original.ptr);
+    const source = @intFromPtr(data.ptr);
+    const offset: ?usize = if (source >= start and source - start <= original.len and
+        data.len <= original.len - (source - start)) source - start else null;
+    var storage: std.ArrayList(u8) = .empty;
+    storage.items = @constCast(original);
+    storage.capacity = box.bytearray_capacity;
+    try storage.ensureUnusedCapacity(a, data.len);
+    const input = if (offset) |index| storage.items[index..][0..data.len] else data;
+    storage.appendSliceAssumeCapacity(input);
+    box.payload = .{ .bytearray = storage.items };
+    box.bytearray_capacity = storage.capacity;
+}
+
+pub fn bytearrayPop(value: Value, index: isize) Error!u8 {
+    const box = try mutableBytearray(value);
+    const position = try bytearrayIndex(box.payload.bytearray.len, index);
+    const data = @constCast(box.payload.bytearray);
+    const result = data[position];
+    std.mem.copyForwards(u8, data[position .. data.len - 1], data[position + 1 ..]);
+    box.payload.bytearray = data[0 .. data.len - 1];
+    return result;
+}
+
+pub fn bytearrayClear(value: Value) Error!void {
+    const box = try mutableBytearray(value);
+    box.payload.bytearray = box.payload.bytearray[0..0];
+}
+
+pub fn bytearrayReverse(value: Value) Error!void {
+    const box = try mutableBytearray(value);
+    std.mem.reverse(u8, @constCast(box.payload.bytearray));
 }
 
 /// Immutable, allocation-free bytes for comptime annotations. Ordinary owning
@@ -198,6 +284,7 @@ fn ownBox(v: Value) ?*const Box {
 fn makeVTable(comptime kind: Kind, comptime hashable: bool) runtime.CustomVTable {
     const name = switch (kind) {
         .bytes => "bytes",
+        .bytearray => "bytearray",
         .tuple => "tuple",
         .set => "set",
         .frozen_set => "frozenset",
@@ -226,6 +313,7 @@ fn makeVTable(comptime kind: Kind, comptime hashable: bool) runtime.CustomVTable
 }
 
 const bytes_vtable = makeVTable(.bytes, true);
+const bytearray_vtable = makeVTable(.bytearray, false);
 const tuple_vtable = makeVTable(.tuple, true);
 const unhashable_tuple_vtable = makeVTable(.tuple, false);
 const set_vtable = makeVTable(.set, false);
@@ -240,7 +328,7 @@ fn pythonView(ptr: *const anyopaque) PythonValue {
 
 fn truthy(ptr: *const anyopaque) bool {
     return switch (pythonView(ptr)) {
-        .bytes => |data| data.len != 0,
+        .bytes, .bytearray => |data| data.len != 0,
         .tuple, .set, .frozen_set => |items| items.len != 0,
         .dictionary => |pairs| pairs.len != 0,
         .complex => |c| c.real != 0 or c.imag != 0,
@@ -252,7 +340,7 @@ fn hashAdmissible(v: Value) bool {
     return switch (v) {
         .array, .object => false,
         .custom => |custom| if (view(v)) |python| switch (python) {
-            .set, .dictionary => false,
+            .bytearray, .set, .dictionary => false,
             .tuple => |items| for (items) |item| {
                 if (!hashAdmissible(item)) break false;
             } else true,
@@ -521,7 +609,7 @@ fn hashValue(v: Value, seed: u32) error{ParseValue}!u64 {
         },
         .complex => |c| validHash(floatHash(c.real, v.custom.ptr) +% 1000003 *% floatHash(c.imag, v.custom.ptr)),
         .ellipsis => pointerHash(&ellipsis_identity),
-        .set, .dictionary => error.ParseValue,
+        .bytearray, .set, .dictionary => error.ParseValue,
     };
     return switch (v) {
         .null => pointerHash(&none_identity),
@@ -591,7 +679,10 @@ fn equalValue(ptr: *const anyopaque, other: Value) bool {
     if (other == .custom and other.custom.ptr == ptr and self.payload != .complex) return true;
     const b = view(other);
     return switch (self.payload) {
-        .bytes => |data| if (b) |python| python == .bytes and std.mem.eql(u8, data, python.bytes) else false,
+        .bytes, .bytearray => |data| if (b) |python| switch (python) {
+            .bytes, .bytearray => |other_data| std.mem.eql(u8, data, other_data),
+            else => false,
+        } else false,
         .tuple => |items| blk: {
             const python = b orelse break :blk false;
             if (python != .tuple or items.len != python.tuple.len) break :blk false;
@@ -703,6 +794,11 @@ fn clone(a: Allocator, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
     copy.* = .{ .payload = source.payload, .vtable = source.vtable, .hash_seed = source.hash_seed };
     switch (source.payload) {
         .bytes => |data| copy.payload = .{ .bytes = try a.dupe(u8, data) },
+        .bytearray => |data| {
+            copy.payload = .{ .bytearray = try a.dupe(u8, data) };
+            copy.bytearray_capacity = data.len;
+            copy.owns_storage = true;
+        },
         .tuple, .set, .frozen_set => |items| {
             const children = try cloneItems(a, items);
             errdefer {
@@ -753,6 +849,12 @@ fn deinit(a: Allocator, ptr: *const anyopaque, owns_data: bool) void {
     const box = runtimeBox(ptr);
     switch (box.payload) {
         .bytes => |data| if (owns_data) a.free(data),
+        .bytearray => |data| {
+            var storage: std.ArrayList(u8) = .empty;
+            storage.items = @constCast(data);
+            storage.capacity = box.bytearray_capacity;
+            storage.deinit(a);
+        },
         .tuple, .set, .frozen_set => |items| {
             if (owns_data) for (items) |item| ownership.freeJsonValue(a, item);
             if (box.owns_storage) a.free(items);
@@ -816,7 +918,12 @@ fn writeValueRepr(w: *Writer, v: Value, depth: usize) runtime.CustomWriteError!v
 fn writePythonRepr(w: *Writer, python: PythonValue, depth: usize) runtime.CustomWriteError!void {
     if (depth >= pyjson.max_depth) return error.JsonTooDeep;
     switch (python) {
-        .bytes => |data| try writeBytesRepr(w, data),
+        .bytes => |data| try writeBytesRepr(w, data, false),
+        .bytearray => |data| {
+            try w.writeAll("bytearray(");
+            try writeBytesRepr(w, data, true);
+            try w.writeByte(')');
+        },
         .tuple => |items| {
             try w.writeByte('(');
             for (items, 0..) |item, index| {
@@ -861,13 +968,15 @@ fn writePythonRepr(w: *Writer, python: PythonValue, depth: usize) runtime.Custom
     }
 }
 
-fn writeBytesRepr(w: *Writer, data: []const u8) Writer.Error!void {
+fn writeBytesRepr(w: *Writer, data: []const u8, escape_single: bool) Writer.Error!void {
     const quote: u8 = if (std.mem.indexOfScalar(u8, data, '\'') != null and std.mem.indexOfScalar(u8, data, '"') == null) '"' else '\'';
     try w.writeByte('b');
     try w.writeByte(quote);
     const hex = "0123456789abcdef";
     for (data) |byte| {
-        if (byte == quote or byte == '\\') {
+        // CPython bytearray escapes apostrophes even when repr chose double
+        // quotes. Ordinary bytes does not perform that additional escaping.
+        if (byte == quote or byte == '\\' or (escape_single and byte == '\'')) {
             try w.writeByte('\\');
             try w.writeByte(byte);
         } else switch (byte) {
@@ -937,7 +1046,9 @@ fn serialized(a: Allocator, ptr: *const anyopaque, depth: u32) runtime.Serializa
     if (depth >= pyjson.max_depth) return error.ParseValue;
     const self = runtimeBox(ptr);
     return switch (self.payload) {
-        .bytes => |data| if (std.unicode.utf8ValidateSlice(data))
+        .bytes, .bytearray => |data| if (self.payload == .bytearray and depth == 0)
+            error.PythonSerializeFallback
+        else if (std.unicode.utf8ValidateSlice(data))
             .{ .string = data }
         else
             error.PythonSerializeFallback,
@@ -1081,7 +1192,7 @@ const KeyIterator = struct {
                         return fixed.buffered();
                     },
                     .ellipsis => return "Ellipsis",
-                    .set, .frozen_set, .dictionary => return error.PythonSerializeFallback,
+                    .bytearray, .set, .frozen_set, .dictionary => return error.PythonSerializeFallback,
                 };
                 return switch (key) {
                     .string => |text| text,
@@ -1272,7 +1383,8 @@ fn writeSerializedItems(w: *Writer, items: []const Value, style: runtime.JsonSty
 fn writePythonSerialized(w: *Writer, python: PythonValue, style: runtime.JsonStyle, depth: usize) SerializedWriteError!void {
     if (depth >= pyjson.max_depth) return error.JsonTooDeep;
     switch (python) {
-        .bytes => |data| {
+        .bytes, .bytearray => |data| {
+            if (python == .bytearray and depth == 0) return error.PythonSerializeFallback;
             if (!std.unicode.utf8ValidateSlice(data)) return error.PythonSerializeFallback;
             try pyjson.writeJsonString(w, data);
         },
@@ -1949,6 +2061,12 @@ test "Native containers cannot reset boxed builtin representation depth" {
 }
 
 fn exerciseBuiltinOwnership(a: Allocator) !void {
+    const mutable = try bytearray(a, "mutable");
+    defer mutable.custom.deinit(a);
+    try bytearrayExtend(a, mutable, view(mutable).?.bytearray);
+    const mutable_copy = try ownership.cloneJsonValue(a, mutable);
+    defer ownership.freeJsonValue(a, mutable_copy);
+    try testing.expect(value_ops.pyEqual(mutable, mutable_copy));
     const binary = try bytes(a, "borrowed 雪");
     defer binary.custom.deinit(a);
     const point = try complex(a, -0.0, std.math.inf(f64));
@@ -1990,6 +2108,43 @@ fn exerciseBuiltinOwnership(a: Allocator) !void {
 test "Builtin construction and recursive clone release all partial allocations" {
     var stable = testing.FailingAllocator.init(testing.allocator, .{ .resize_fail_index = 0 });
     try testing.checkAllAllocationFailures(stable.allocator(), exerciseBuiltinOwnership, .{});
+}
+
+test "bytearray growth retains aliases while clones and validated text remain independent" {
+    const copied = blk: {
+        var source: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer source.deinit();
+        const arena = source.allocator();
+        var original = [_]u8{ ' ', 'a', 'b', 'c', ' ' };
+        const mutable = try bytearray(arena, &original);
+        original[1] = 'z';
+        try testing.expectEqualStrings(" abc ", view(mutable).?.bytearray);
+        const alias = mutable;
+        const text = try @import("types.zig").validate([]const u8, arena, mutable);
+        var fields: runtime.ObjectMap = .empty;
+        try fields.put(arena, "file_id", mutable);
+        const file = try @import("file.zig").File.fromValue(arena, .{ .object = fields });
+        const copy = try mutable.custom.clone(testing.allocator);
+        errdefer copy.deinit(testing.allocator);
+
+        try bytearrayExtend(arena, mutable, view(mutable).?.bytearray);
+        try bytearraySet(mutable, -1, '!');
+        try testing.expectEqualStrings(" abc  abc!", view(alias).?.bytearray);
+        try testing.expectEqualStrings(" abc ", text.string);
+        try testing.expectEqualStrings("abc", file.file_id.?);
+        try testing.expectEqual(@as(u8, '!'), try bytearrayPop(alias, -1));
+        try bytearrayClear(alias);
+        try testing.expect(!mutable.custom.truthy());
+        try testing.expectError(error.ParseValue, bytearrayPop(mutable, -1));
+        try testing.expectError(error.ParseValue, bytearraySet(mutable, 0, 'x'));
+        break :blk copy;
+    };
+    defer copied.deinit(testing.allocator);
+    const value: Value = .{ .custom = copied };
+    try testing.expectEqualStrings(" abc ", view(value).?.bytearray);
+    try bytearrayExtend(testing.allocator, value, view(value).?.bytearray[1..4]);
+    try testing.expectEqualStrings(" abc abc", view(value).?.bytearray);
+    try testing.expectError(error.ParseValue, pythonHash(value, 0));
 }
 
 test "owned tuple storage borrows members while its clone owns independent fields" {

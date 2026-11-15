@@ -80,9 +80,9 @@ pub const File = struct {
         }
         if (!present[0] and !present[1] and !present[2]) return error.InvalidFile;
         return .{
-            .file_data = try field(values[0]),
-            .file_id = try field(values[1]),
-            .filename = try field(values[2]),
+            .file_data = try runtimeField(arena, values[0]),
+            .file_id = try runtimeField(arena, values[1]),
+            .filename = try runtimeField(arena, values[2]),
         };
     }
 
@@ -122,9 +122,9 @@ pub const File = struct {
         }
         if (!found) return error.InvalidFile;
         return .{
-            .file_data = try field(input.object.get("file_data") orelse .null),
-            .file_id = try field(input.object.get("file_id") orelse .null),
-            .filename = try field(input.object.get("filename") orelse .null),
+            .file_data = try runtimeField(arena, input.object.get("file_data") orelse .null),
+            .file_id = try runtimeField(arena, input.object.get("file_id") orelse .null),
+            .filename = try runtimeField(arena, input.object.get("filename") orelse .null),
         };
     }
 
@@ -411,6 +411,12 @@ fn optionalString(text: ?[]const u8) Value {
 }
 
 fn field(input: Value) File.Error!?[]const u8 {
+    if (@import("python_value.zig").view(input)) |builtin| {
+        return switch (builtin) {
+            .bytes => |data| field(.{ .string = data }),
+            else => error.InvalidFile,
+        };
+    }
     return switch (input) {
         .null => null,
         .string => |text| blk: {
@@ -419,6 +425,16 @@ fn field(input: Value) File.Error!?[]const u8 {
         },
         else => error.InvalidFile,
     };
+}
+
+fn runtimeField(arena: Allocator, input: Value) (File.Error || Allocator.Error)!?[]const u8 {
+    if (@import("python_value.zig").view(input)) |builtin| {
+        if (builtin == .bytearray) {
+            const text = (try field(.{ .string = builtin.bytearray })).?;
+            return try arena.dupe(u8, text);
+        }
+    }
+    return field(input);
 }
 
 fn ownedFilename(arena: Allocator, filename: ?[]const u8) (File.Error || Allocator.Error)!?[]const u8 {

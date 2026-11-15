@@ -222,12 +222,36 @@ construction and shared NaN identity remain unsupported.
 
 The zero-dependency `python_literal` parser implements the supported CPython
 3.11 literal grammar without execution, and `python_value` retains genuine
-bytes, tuples, sets, frozensets, complex values, Ellipsis and arbitrary-key
+bytes, mutable bytearrays, tuples, sets, frozensets, complex values, Ellipsis and arbitrary-key
 dictionaries rather than replacing them with JSON lookalikes. Native comparison
 against **175,826 actual `ast.literal_eval` calls** matched 175,820 and differed
 on six near-recursion-limit cases. Python's cutoff depends on its caller frame
 depth; the native AST-depth ceiling is deterministic. This is a real parity
 limit, not a passing check. Generic Python execution is still unsupported.
+
+`python_value.bytearray(allocator, data)` copies its input into a genuine,
+unhashable mutable builtin box. `bytearraySet`, `bytearrayAppend`,
+`bytearrayExtend`, `bytearrayPop`, `bytearrayClear` and `bytearrayReverse` operate
+on that box: copied `Value` handles remain aliases, while an owning clone has
+independent storage. Self-extension and subslices remain valid when growth
+reallocates. Use the original allocator for mutation/deinitialization; do not
+retain borrowed views or serialized leaves across mutation. Text validation
+copies valid UTF-8 into an immutable snapshot, including File fields. Numeric,
+bool and typed-list validation reject bytearrays rather than treating them as
+bytes.
+
+DSPy root serialization uses `str(bytearray)`, while nested valid UTF-8 becomes
+text; invalid nested UTF-8 falls back to the whole original container's string.
+An independent actual-source receipt covers 265 inputs, including all 256 octets,
+plus mutable aliases, growth, copying, hashing refusal and metric iteration.
+Four further source cases exercise immutable text/File snapshots. Native Debug
+and ReleaseSafe each matched **7,893 observations with zero mismatches**.
+The initial run exposed three apostrophe-representation mismatches, fixed by
+matching CPython's bytearray-specific escaping rather than changing expectations.
+Error comparisons cover acceptance/refusal, not Python exception identity or
+identical `TypeAdapter(bytearray)` schema-error timing. This is not the complete
+Python bytearray method/buffer/memoryview API. `python_value_oracle.py
+--bytearray-only` regenerates the primary development receipt.
 
 After these cutovers, including Literal and native citation integration, the
 pinned Debug and ReleaseSafe gates each passed all 344 tests and 28 build steps,
@@ -746,16 +770,18 @@ coverage; their entries/observations overlap and must not be added together:
 
 | Independent consumer | Fully supported entries | Unsupported entries | Unconsumed entries | Compared observations | Mismatches |
 |---|---:|---:|---:|---:|---:|
-| Decision models and views | 8,056 | 1,338 | 5,841 | 81,109 | 0 |
-| Evidence/state/Predict pipeline | 1,838 | 542 | 12,838 | 15,693 | 0 |
+| Decision models and views | 8,216 | 1,152 | 5,867 | 81,843 | 0 |
+| Evidence/state/Predict pipeline | 1,879 | 501 | 12,838 | 15,751 | 0 |
 
 Both consumers deliberately **exit nonzero for incomplete coverage**.
 Partially compared unsupported rows contribute observations, not a claim that
 their entire operation is supported. Six candidate-client rollout observations
 are unobserved: the source engine receipt does not capture those client-only
-options. Decimal, bytearray, dynamic subclasses, arbitrary forged model state
-and other unsupported operations remain in the receipt, not replaced with JSON
-lookalikes. Bare Score/Choice evidence refusal also differs in failure timing:
+options. Decimal, dynamic subclasses, arbitrary forged model state (including
+bytearray values in statically typed Noul/Score fields) and other unsupported
+operations remain in the receipt, not replaced with JSON lookalikes. ScriptedLM
+now refuses non-JSON provider data at response construction, before adapter
+decoding or evidence recording; this is not a complete SDK response-object API. Bare Score/Choice evidence refusal also differs in failure timing:
 native compile-time rejection versus Python runtime rejection. These results
 do not establish complete decision-model or DSPy equivalence.
 
@@ -771,8 +797,8 @@ probability refusal were exercised. This is HTTP/codec/prediction evidence,
 **not authenticated homelab inference**.
 
 Both decision consumers produced the same counts in Debug and ReleaseSafe,
-including the deliberate incomplete-coverage failures. The decision change also
-passed pinned **353/353 tests and 28/28 build steps in each mode**, actual
+including the deliberate incomplete-coverage failures. The bytearray change also
+passed pinned **355/355 tests and 28/28 build steps in each mode**, actual
 RAG/bootstrap execution, the complete 687-request native replay and the
 independent Python fixture/artifact/reference gate. Unicode and DPR tables
 regenerated unchanged.
@@ -1048,8 +1074,10 @@ The following prevent a claim that DSZig can do everything DSPy can:
 - **File and DocumentPart boundaries:** the constructor smoke explicitly leaves
   606 successful source Python DocumentPart object/repr/bytes operations
   unimplemented; canonical document dictionaries do not replace those
-  operations. Constructor evidence still excludes bytearray/memoryview/buffer
-  and tuple dispatch, bytes-valued field coercion, nonstring helper parameters,
+  operations. The bytearray slice now exercises valid/invalid UTF-8 field
+  coercion and immutable snapshots (also accepting immutable bytes fields).
+  The older constructor receipt still excludes bytearray/memoryview/buffer
+  and tuple dispatch, nonstring helper parameters,
   bytes-path/PathLike dispatch, duplicate arguments and positional arity.
   The nine File-instance construction/validation/copy cases are now exercised,
   but do not close those remaining dispatch gaps.

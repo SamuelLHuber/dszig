@@ -473,6 +473,10 @@ fn validateMode(comptime T: type, arena: Allocator, input: Value, comptime xml_l
                 if (T == []const u8 and !std.unicode.utf8ValidateSlice(data)) return error.ParseValue;
                 break :blk .{ .string = data };
             },
+            .bytearray => |data| blk: {
+                if (T != []const u8 or !std.unicode.utf8ValidateSlice(data)) return error.ParseValue;
+                break :blk .{ .string = try arena.dupe(u8, data) };
+            },
             else => return error.ParseValue,
         };
     }

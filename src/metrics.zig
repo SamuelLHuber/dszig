@@ -213,6 +213,8 @@ const RuntimeIterator = struct {
     value: Value,
     index: usize = 0,
     custom_items: []const Value = &.{},
+    byte_items: ?[]const u8 = null,
+    dictionary_items: ?[]const @import("runtime_value.zig").PythonEntry = null,
     invalid: Error,
 
     fn init(arena: Allocator, iterable: Value, invalid: Error) Error!RuntimeIterator {
@@ -220,11 +222,20 @@ const RuntimeIterator = struct {
         switch (iterable) {
             .array, .object, .string => {},
             .custom => {
-                const iterate = iterable.custom.vtable.iterate orelse return invalid;
-                result.custom_items = iterate(arena, iterable.custom.ptr) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => return invalid,
-                };
+                if (iterable.custom.vtable.python) |inspect| {
+                    switch (inspect(iterable.custom.ptr)) {
+                        .bytes, .bytearray => |data| result.byte_items = data,
+                        .tuple, .set, .frozen_set => |items| result.custom_items = items,
+                        .dictionary => |items| result.dictionary_items = items,
+                        else => return invalid,
+                    }
+                } else {
+                    const iterate = iterable.custom.vtable.iterate orelse return invalid;
+                    result.custom_items = iterate(arena, iterable.custom.ptr) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return invalid,
+                    };
+                }
             },
             else => return invalid,
         }
@@ -232,6 +243,18 @@ const RuntimeIterator = struct {
     }
 
     fn next(self: *RuntimeIterator) Error!?Value {
+        if (self.byte_items) |data| {
+            if (self.index == data.len) return null;
+            const result: Value = .{ .integer = data[self.index] };
+            self.index += 1;
+            return result;
+        }
+        if (self.dictionary_items) |items| {
+            if (self.index == items.len) return null;
+            const result = items[self.index].key;
+            self.index += 1;
+            return result;
+        }
         switch (self.value) {
             .array, .custom => {
                 const items = if (self.value == .array) self.value.array.items else self.custom_items;

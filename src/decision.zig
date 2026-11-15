@@ -685,7 +685,8 @@ fn bareChoiceValue(arena: Allocator, input: Value, mode: ValidationMode) runtime
     if (input == .custom) {
         if (input.custom.vtable.enumeration != null) return types.validate([]const u8, arena, input);
         if (python.view(input)) |view| {
-            if (view == .bytes and mode != .strict) return types.validate([]const u8, arena, input);
+            if ((view == .bytes or view == .bytearray) and mode != .strict)
+                return types.validate([]const u8, arena, input);
         }
     }
     if (mode == .strict) return error.ParseValue;

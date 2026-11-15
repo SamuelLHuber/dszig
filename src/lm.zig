@@ -103,6 +103,30 @@ pub const Completion = struct {
     provider_data: ?@import("runtime_value.zig").Value = null,
 };
 
+/// lm15 Response.provider_data permits only an optional JSON object, without
+/// coercing builtin classes into JSON. Like the other runtime traversals this
+/// native check is bounded by pyjson.max_depth; SDK exception classes differ.
+fn providerJsonValue(input: @import("runtime_value.zig").Value, depth: usize) bool {
+    if (depth >= pyjson.max_depth) return false;
+    return switch (input) {
+        .null, .bool, .integer, .string => true,
+        .float => |number| std.math.isFinite(number),
+        .number_string => |text| if (std.json.isNumberFormattedLikeAnInteger(text))
+            true
+        else
+            std.math.isFinite(std.fmt.parseFloat(f64, text) catch return false),
+        .array => |items| blk: {
+            for (items.items) |item| if (!providerJsonValue(item, depth + 1)) break :blk false;
+            break :blk true;
+        },
+        .object => |object| blk: {
+            for (object.values()) |item| if (!providerJsonValue(item, depth + 1)) break :blk false;
+            break :blk true;
+        },
+        .custom => false,
+    };
+}
+
 /// Owning clones for long-lived histories and caches. Completion cloning also
 /// unwinds partial allocations, so `freeCompletion` works with a general GPA.
 pub fn cloneCompletion(allocator: Allocator, completion: Completion) Allocator.Error!Completion {
@@ -431,13 +455,17 @@ pub const ScriptedLM = struct {
         const out = try arena.alloc(Completion, n);
         for (out, self.responses[self.index..][0..n], self.index..) |*o, r, i| {
             const reasoning = if (self.reasonings.len != 0) self.reasonings[i] else null;
+            const provider_data = if (self.provider_data.len != 0) self.provider_data[i] else null;
+            if (provider_data) |data| {
+                if (data != .null and (data != .object or !providerJsonValue(data, 0))) return error.LMFailure;
+            }
             o.* = try cloneCompletion(arena, .{
                 .text = r,
                 .reasoning = reasoning,
                 .tool_calls = if (self.tool_calls.len != 0) self.tool_calls[i] else &.{},
                 .citations = if (self.citations.len != 0) self.citations[i] else &.{},
                 .continuation = if (self.continuation.len != 0) self.continuation[i] else &.{},
-                .provider_data = if (self.provider_data.len != 0) self.provider_data[i] else null,
+                .provider_data = provider_data,
             });
         }
         self.index += n;
@@ -1592,6 +1620,30 @@ pub const OpenAI = struct {
 };
 
 const testing = std.testing;
+
+test "scripted response construction rejects non JSON provider data" {
+    var state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+    const Value = @import("runtime_value.zig").Value;
+    const python = @import("python_value.zig");
+    const messages = [_]Message{.{ .role = .user, .content = .{ .text = "question" } }};
+    const invalid = [_]Value{
+        try python.bytearray(arena, "1"),
+        try python.tuple(arena, &.{.{ .string = "1" }}),
+        .{ .float = std.math.nan(f64) },
+    };
+    for (invalid) |child| {
+        var object: @import("runtime_value.zig").ObjectMap = .empty;
+        try object.put(arena, "nested", child);
+        const metadata = [_]?Value{.{ .object = object }};
+        var scripted: ScriptedLM = .{ .responses = &.{"answer"}, .provider_data = &metadata };
+        try testing.expectError(error.LMFailure, scripted.lm().complete(arena, .{ .messages = &messages }));
+    }
+    const null_metadata = [_]?Value{.null};
+    var with_null: ScriptedLM = .{ .responses = &.{"answer"}, .provider_data = &null_metadata };
+    try testing.expectEqualStrings("answer", try with_null.lm().complete(arena, .{ .messages = &messages }));
+}
 
 test "keyword LM scopes and Chat completion order" {
     var kw: KeywordLM = .{
