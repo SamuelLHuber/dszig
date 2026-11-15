@@ -60,6 +60,30 @@ pub fn bytes(a: Allocator, data: []const u8) Error!Value {
     return boxed(a, .{ .bytes = data }, &bytes_vtable);
 }
 
+/// Immutable, allocation-free bytes for comptime annotations. Ordinary owning
+/// clones still use the heap-backed bytes protocol and can be freed normally.
+pub fn staticBytes(comptime data: []const u8) Value {
+    const Storage = struct {
+        const vtable: runtime.CustomVTable = blk: {
+            var result = bytes_vtable;
+            result.clone = cloneStaticBytes;
+            result.deinit = deinitStaticBytes;
+            break :blk result;
+        };
+        const box: Box = .{ .payload = .{ .bytes = data }, .vtable = &vtable };
+    };
+    return .{ .custom = .{ .ptr = &Storage.box, .vtable = &Storage.vtable } };
+}
+
+fn cloneStaticBytes(a: Allocator, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+    var result = try clone(a, ptr);
+    result.vtable = &bytes_vtable;
+    runtimeBox(result.ptr).vtable = &bytes_vtable;
+    return result;
+}
+
+fn deinitStaticBytes(_: Allocator, _: *const anyopaque, _: bool) void {}
+
 pub fn tuple(a: Allocator, items: []const Value) Error!Value {
     const hashable = for (items) |item| {
         if (!hashAdmissible(item)) break false;

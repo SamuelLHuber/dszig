@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Observe actual scalar/Enum Literal validation, schemas and DSPy calls."""
+"""Observe actual scalar/Enum/bytes Literal validation, schemas and DSPy calls."""
 import argparse
 import enum
 import json
@@ -91,6 +91,46 @@ def enum_observations():
     return rows, schemas, predictions
 
 
+def bytes_observations():
+    arguments = [(b"hi",), (b"hi", "hi"), ("hi", b"hi"),
+                 (b"", b"\x00", b"\xc3\xa9"), (b"a'b", b'a"b', b"\\"),
+                 (b"\xff",), (b"\xff", b"hi"), (b"hi", b"hi")]
+    inputs = [None, False, True, 0, 1, [], {}, b"", b"hi", b"HI", b"\x00",
+              b"\xc3\xa9", b"\xff", b"a'b", b'a"b', b"\\", "", "hi", " hi ",
+              "b'hi'", 'b"hi"', "Literal[b'hi']", "str[b'hi']", "'b\\'hi\\''",
+              "b'\\xff'", "b'\\x00'", "é", "b'\\xc3\\xa9'", "[]", "{}"]
+    rows, schemas = [], []
+    for index, values in enumerate(arguments):
+        annotation = Literal[values]
+        adapter = TypeAdapter(annotation)
+        try:
+            schema = {"ok": True, "value": adapter.json_schema()}
+        except Exception as exc:
+            schema = {"ok": False, "error": type(exc).__name__}
+        schemas.append({"index": index, "name": get_annotation_name(annotation), "schema": schema})
+        for x in inputs:
+            rows.append({"index": index, "input": enc(x),
+                         "pydantic": observe(adapter.validate_python, x),
+                         "dspy": observe(lambda v: parse_value(v, annotation), x)})
+
+    class Typed(dspy.Signature):
+        question: str = dspy.InputField()
+        choice: Literal[b"hi"] = dspy.OutputField()
+
+    predictions = []
+    for adapter, response in [
+        (dspy.ChatAdapter(), "[[ ## choice ## ]]\nb'hi'\n[[ ## completed ## ]]"),
+        (dspy.JSONAdapter(), '{"choice":"b\\u0027hi\\u0027"}'),
+        (dspy.XMLAdapter(), "<choice>b'hi'</choice>"),
+    ]:
+        lm = ref.KeywordLM([], response)
+        with dspy.context(lm=lm, adapter=adapter):
+            result = dspy.Predict(Typed)(question="Decode bytes")
+        predictions.append({"adapter": type(adapter).__name__, "response": response,
+                            "outputs": enc(result.toDict()), "requests": lm.calls})
+    return rows, schemas, predictions
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
@@ -122,13 +162,17 @@ def main():
         predictions.append({"adapter": type(adapter).__name__, "response": response,
                             "outputs": enc(result.toDict()), "requests": lm.calls})
     enum_rows, enum_schemas, enum_predictions = enum_observations()
+    bytes_rows, bytes_schemas, bytes_predictions = bytes_observations()
     receipt = {"evidence_kind": "actual_dspy_literal_calls", "provenance": repair.provenance(),
                "rows": rows, "schemas": schemas, "predictions": predictions,
                "enum_rows": enum_rows, "enum_schemas": enum_schemas,
-               "enum_predictions": enum_predictions}
+               "enum_predictions": enum_predictions,
+               "bytes_rows": bytes_rows, "bytes_schemas": bytes_schemas,
+               "bytes_predictions": bytes_predictions}
     args.output.write_text(json.dumps(receipt, ensure_ascii=True, allow_nan=False, indent=2) + "\n")
     print(f"Observed {len(rows)*2} scalar Literal calls, {len(schemas)} schemas and {len(predictions)} typed predictions")
     print(f"Observed {len(enum_rows)*2} Enum Literal calls and {len(enum_schemas)} schemas/names")
+    print(f"Observed {len(bytes_rows)*2} bytes Literal calls, {len(bytes_schemas)} schemas/names and {len(bytes_predictions)} typed predictions")
 
 
 if __name__ == "__main__":

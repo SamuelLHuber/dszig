@@ -218,7 +218,12 @@ fn literalJsonType(comptime v: Value) ?[]const u8 {
         .float => "number",
         .string => "string",
         .array => "array",
-        .custom => |c| literalJsonType(c.vtable.enumeration.?(c.ptr).value),
+        .custom => |c| if (c.vtable.enumeration) |inspect|
+            literalJsonType(inspect(c.ptr).value)
+        else if (@import("python_value.zig").view(v)) |builtin|
+            if (builtin == .bytes) "string" else null
+        else
+            null,
         else => null,
     };
 }
@@ -270,8 +275,16 @@ fn enumSchemaValue(comptime v: Value) []const u8 {
             },
             .custom => |c| if (c.vtable.enumeration) |inspect|
                 enumSchemaValue(inspect(c.ptr).value)
-            else
-                @compileError("dszig: enum JSON schema requires serializable native values"),
+            else blk: {
+                if (@import("python_value.zig").view(v)) |builtin| {
+                    if (builtin == .bytes) {
+                        if (!std.unicode.utf8ValidateSlice(builtin.bytes))
+                            @compileError("dszig: non-UTF-8 bytes cannot produce a JSON schema");
+                        break :blk quote(builtin.bytes);
+                    }
+                }
+                @compileError("dszig: enum JSON schema requires serializable native values");
+            },
         };
     }
 }

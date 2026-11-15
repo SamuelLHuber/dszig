@@ -107,7 +107,7 @@ retain the actual continuation and raw provider response independently.
 
 | DSPy surface | Native Zig surface and coverage |
 |---|---|
-| Class-style signatures and typed fields | `Signature`, `Dict`, `Code`, `CodeWithLanguage`, `BoundingBox`, `File`, scalar/string/list/optional/model fields, string literal enums and mixed scalar/Enum `Literal`, field descriptions/defaults, compile-time rejection of invalid signatures |
+| Class-style signatures and typed fields | `Signature`, `Dict`, `Code`, `CodeWithLanguage`, `BoundingBox`, `File`, scalar/string/list/optional/model fields, string literal enums and mixed scalar/Enum/bytes `Literal`, field descriptions/defaults, compile-time rejection of invalid signatures |
 | Runtime values and documents | `Value`, `Array`, `ObjectMap`, boxed native Code/File/Reasoning/BoundingBox identity, recursive typed-class serialization, text/canonical-document content union and bounded Responses `input_file` translation |
 | Chat, JSON, XML and two-stage adapters | `Adapter.chat`, `.json`, `.xml`, `.two_step`; `TwoStepAdapter` with a separate extraction LM; independent prompt/parse fixtures, strict response-schema construction, JSON fallback, typed XML and Unicode key handling |
 | Prediction and reasoning | `Predict`, `ChainOfThought`, `BestOfN`, `Refine`, `MultiChainComparison`, explicit `Context`, typed outputs, serialized `Trace`, named predictor/parameter discovery |
@@ -200,7 +200,20 @@ type. Schemas project Enum values recursively, but parsing does not erase their
 identity. Another native smoke matched **753 Enum-literal observations**:
 720 actual validation/parse calls, 12 schemas, 12 annotation names, three typed
 Predict outputs/call counts and six exact adapter prompt messages. It also
-replayed the scalar observations unchanged. Bytes arguments, dynamic annotation
+replayed the scalar observations unchanged.
+
+Bytes arguments use `Literal(&.{python_value.staticBytes("hi")})`. These
+allocation-free immutable values retain bytes identity, not string identity;
+`Literal[b"hi", "hi"]` keeps both alternatives even though its JSON schema
+contains two `"hi"` entries. Owning clones copy the byte buffer and free normally.
+Another actual native executable matched **503 bytes-literal observations**:
+480 DSPy/Pydantic validation/parse calls, eight annotation names, six valid
+schemas, three typed Predict outputs/call counts and six exact Chat/JSON/XML
+prompt messages. It also replayed all previous scalar/Enum observations unchanged.
+Non-UTF-8 bytes validate, but cannot generate a JSON schema: native schema
+generation rejects them at compile time, whereas Python raises
+`UnicodeDecodeError` when schema generation is requested. Both refusal paths
+were exercised; their failure timing is not identical. Dynamic annotation
 construction and shared NaN identity remain unsupported.
 
 The zero-dependency `python_literal` parser implements the supported CPython
@@ -212,8 +225,8 @@ on six near-recursion-limit cases. Python's cutoff depends on its caller frame
 depth; the native AST-depth ceiling is deterministic. This is a real parity
 limit, not a passing check. Generic Python execution is still unsupported.
 
-After these cutovers, including scalar and Enum Literal integration, the pinned
-Debug and ReleaseSafe gates each passed all 328 tests and 28 build steps,
+After these cutovers, including scalar, Enum and bytes Literal integration, the pinned
+Debug and ReleaseSafe gates each passed all 329 tests and 28 build steps,
 including actual RAG/bootstrap executions. Native
 687-request replay and the pinned Python fixture/artifact/replay gate also
 passed. These gates do not erase the literal-recursion and NaN-identity
@@ -821,8 +834,10 @@ The following prevent a claim that DSZig can do everything DSPy can:
   Python's identity-dependent automatic renaming is not reproduced. Tagged
   unions beyond optional types and some
   Pydantic model defaults are not native signature types. `Literal` supports
-  null/bool/int/float/string and genuine Enum-member arguments, not bytes
-  arguments or dynamic annotation construction. Enum factories are
+  null/bool/int/float/string, genuine Enum-member and bytes arguments, not
+  dynamic annotation construction. Non-UTF-8 bytes validate, but schema
+  generation fails at compile time rather than Python's deferred
+  `UnicodeDecodeError`. Enum factories are
   comptime class definitions, not arbitrary runtime class creation or Enum
   mixins. Python literal lexical nesting is bounded at 200; its separate native
   AST-depth ceiling is 3,000, not Python's caller-stack-dependent recursion

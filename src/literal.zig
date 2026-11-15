@@ -1,5 +1,5 @@
 //! Explicit typing.Literal annotations. These retain the allowed scalar or
-//! genuine Enum member, and DSPy's membership shortcut preserves input type.
+//! genuine Enum member or bytes, and DSPy's membership shortcut preserves input type.
 const std = @import("std");
 const runtime = @import("runtime_value.zig");
 const value = @import("value.zig");
@@ -15,8 +15,11 @@ fn repr(comptime v: Value, comptime as_str: bool) []const u8 {
         const size = switch (v) {
             .string, .number_string => |s| s.len * 10 + 64,
             .custom => |c| blk: {
-                const member = c.vtable.enumeration.?(c.ptr);
-                break :blk member.class_name.len + member.member_name.len + 1;
+                if (c.vtable.enumeration) |inspect| {
+                    const member = inspect(c.ptr);
+                    break :blk member.class_name.len + member.member_name.len + 1;
+                }
+                break :blk @import("python_value.zig").view(v).?.bytes.len * 4 + 3;
             },
             else => 128,
         };
@@ -44,7 +47,8 @@ fn primitive(v: Value) bool {
 /// Literal arguments are flattened explicitly. Equal values of different
 /// Python types remain separate (Literal[1, True] has distinct fast buckets).
 /// Enum members retain their class identity rather than becoming their values.
-/// Bytes arguments and dynamically constructed annotations are unsupported.
+/// Bytes arguments use python_value.staticBytes. Dynamic annotations remain
+/// unsupported; non-UTF-8 bytes validate but cannot produce a JSON schema.
 pub fn Literal(comptime arguments: []const Value) type {
     const allowed = comptime blk: {
         @setEvalBranchQuota(100_000);
@@ -55,9 +59,15 @@ pub fn Literal(comptime arguments: []const Value) type {
                 .null, .bool, .integer, .float, .string => {},
                 .number_string => |s| if (!std.json.isNumberFormattedLikeAnInteger(s))
                     @compileError("dszig: Literal number_string must be an integer"),
-                .custom => |c| if (c.vtable.enumeration == null)
-                    @compileError("dszig: Literal custom arguments must be genuine Enum members"),
-                else => @compileError("dszig: Literal supports scalars and Enum members only"),
+                .custom => |c| {
+                    if (c.vtable.enumeration == null) {
+                        const builtin = @import("python_value.zig").view(v) orelse
+                            @compileError("dszig: Literal custom arguments must be genuine Enum members or bytes");
+                        if (builtin != .bytes)
+                            @compileError("dszig: Literal custom arguments must be genuine Enum members or bytes");
+                    }
+                },
+                else => @compileError("dszig: Literal supports scalars, Enum members and bytes only"),
             }
             for (result[0..len]) |previous| {
                 const same_kind = (smallInt(v) != null and smallInt(previous) != null) or std.meta.activeTag(v) == std.meta.activeTag(previous);
@@ -166,6 +176,30 @@ pub fn parseValues(arena: Allocator, allowed: []const Value, input: Value) runti
         .name = "literal", .kind = .json, .type_name = "Literal", .desc = "", .prefix = "", .validate = identity,
     }, text);
     return validateValues(allowed, candidate);
+}
+
+test "Bytes Literal keeps bytes distinct from text and owning clones free normally" {
+    const python = @import("python_value.zig");
+    const a = std.testing.allocator;
+    const binary = comptime python.staticBytes("hi");
+    const Binary = Literal(&.{binary});
+    try std.testing.expectError(error.ParseValue, Binary.validate(a, .{ .string = "hi" }));
+    var scratch: std.heap.ArenaAllocator = .init(a);
+    defer scratch.deinit();
+    const parsed = try Binary.parseValue(scratch.allocator(), .{ .string = "b'hi'" });
+    try std.testing.expectEqualStrings("hi", python.view(parsed).?.bytes);
+    const Mixed = Literal(&.{ binary, .{ .string = "hi" } });
+    try std.testing.expectEqualStrings("hi", (try Mixed.validate(a, .{ .string = "hi" })).string);
+    try std.testing.expectEqualStrings("{\"type\": \"string\", \"enum\": [\"hi\", \"hi\"]}", @import("types.zig").schema(Mixed));
+    const Invalid = Literal(&.{comptime python.staticBytes("\xff")});
+    try std.testing.expectEqualStrings("\xff", python.view(try Invalid.validate(a, comptime python.staticBytes("\xff"))).?.bytes);
+    const owned = try @import("inference.zig").cloneJsonValue(a, binary);
+    defer @import("inference.zig").freeJsonValue(a, owned);
+    binary.custom.deinit(a);
+    try std.testing.expectEqualStrings("hi", python.view(owned).?.bytes);
+    const copied = try @import("inference.zig").cloneJsonValue(a, owned);
+    defer @import("inference.zig").freeJsonValue(a, copied);
+    try std.testing.expectEqualStrings("hi", python.view(copied).?.bytes);
 }
 
 test "Enum Literal preserves member identity and rejects equal projected values" {
