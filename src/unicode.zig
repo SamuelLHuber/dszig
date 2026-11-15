@@ -89,7 +89,8 @@ pub fn strip(text: []const u8, pydantic: bool) []const u8 {
     return text[start..end];
 }
 
-/// UTF-8 to code points; invalid bytes become U+FFFD.
+/// UTF-8/WTF-8 to Python code points, preserving lone surrogates.
+/// Other malformed bytes become U+FFFD.
 pub fn decode(arena: Allocator, s: []const u8) Allocator.Error![]u21 {
     var out: std.ArrayList(u21) = .empty;
     try out.ensureTotalCapacity(arena, s.len);
@@ -105,7 +106,7 @@ pub fn decode(arena: Allocator, s: []const u8) Allocator.Error![]u21 {
             i += 1;
             continue;
         }
-        const cp = std.unicode.utf8Decode(s[i..][0..n]) catch {
+        const cp = std.unicode.wtf8Decode(s[i..][0..n]) catch {
             out.appendAssumeCapacity(0xFFFD);
             i += 1;
             continue;
@@ -121,7 +122,7 @@ pub fn encode(arena: Allocator, cps: []const u21) Allocator.Error![]const u8 {
     try out.ensureTotalCapacity(arena, cps.len * 4);
     for (cps) |cp| {
         var buf: [4]u8 = undefined;
-        const n = std.unicode.utf8Encode(cp, &buf) catch std.unicode.utf8Encode(0xFFFD, &buf) catch unreachable;
+        const n = std.unicode.wtf8Encode(cp, &buf) catch std.unicode.utf8Encode(0xFFFD, &buf) catch unreachable;
         out.appendSliceAssumeCapacity(buf[0..n]);
     }
     return out.items;
@@ -237,6 +238,7 @@ test "NFD, lower and final sigma" {
         .{ "İ", "i\u{307}" },
         .{ "한", "\u{1112}\u{1161}\u{11ab}" },
         .{ "x\u{301}\u{323}", "x\u{323}\u{301}" },
+        .{ "A\xed\xa0\x80Σ", "a\xed\xa0\x80σ" },
     };
     for (cases) |c| {
         const got = try encode(arena, try lower(arena, try nfd(arena, try decode(arena, c[0]))));

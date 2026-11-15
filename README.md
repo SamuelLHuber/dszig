@@ -116,6 +116,7 @@ retain the actual continuation and raw provider response independently.
 | Instruction optimization | `InferRules`; `MIPROv2`, its program-aware proposer and an Optuna 4.5.0 TPE port; `COPRO`; `SIMBA`; supported instance-frontier `GEPA` paths against gepa 0.1.4 |
 | Agents and tools | `ReAct`, comptime `Tool`, `History`, `ToolCalls`, tool results, native declarations and text tool calls, typed submit, retained history |
 | Voting | `Ensemble`, `ensemble.majority`, Unicode text normalization; exact Python numeric equality, NaN object identity and source-order fallback behavior |
+| Answer metrics | `metrics.emScore`, `f1Score`, `hotpotF1Score`, `precisionScore`, multi-reference `em`/`f1`/`hotpotF1`, thresholded and record-based answer matching, DPR-token passage matching |
 | LM boundary | `LM`, native `lm.OpenAI` Chat Completions/Responses, shared bounded `http.Transport`, scripted/keyword LMs, recording/replay wrappers and typed native protocol metadata |
 | Cache | `CachedLM`, per-candidate/request identity, LRU eviction, rich-response JSON dump/load; failed calls are not cached |
 | State | `state.save`, `saveAlloc`, `load`, with DSPy 3.5.0 dependency metadata and program JSON artifact comparisons |
@@ -228,7 +229,7 @@ depth; the native AST-depth ceiling is deterministic. This is a real parity
 limit, not a passing check. Generic Python execution is still unsupported.
 
 After these cutovers, including scalar, Enum and bytes Literal integration, the pinned
-Debug and ReleaseSafe gates each passed all 330 tests and 28 build steps,
+Debug and ReleaseSafe gates each passed all 334 tests and 28 build steps,
 including actual RAG/bootstrap executions. Native
 687-request replay and the pinned Python fixture/artifact/replay gate also
 passed. These gates do not erase the literal-recursion and NaN-identity
@@ -594,6 +595,68 @@ Bootstrap mapping checks the live student/teacher instructions, descriptions and
 prefixes before reporting an empty training neighborhood.
 Both optimizers and embedding output arenas must outlive the values borrowing
 them. NumPy sorting/BLAS portability limits are explicit below.
+
+### Answer metrics and passage boundaries
+
+`dszig.metrics` shares DSPy's NFD/lowercase, ASCII punctuation, English article
+and whitespace normalization with `ensemble.majority`. `emScore` treats two
+empty normalized answers as equal; token F1 and precision return zero instead.
+Repeated tokens use multiset intersection, not set intersection. `hotpotF1Score`
+preserves the special `yes`, `no` and `noanswer` mismatch rule.
+
+Each metric takes an arena allocator first. `em`, `f1` and `hotpotF1` accept a
+prediction and a reference slice and return `error.EmptyAnswers` for an empty
+reference list. `answerMatch(arena, prediction, answers, frac)` uses exact match
+when `frac >= 1`, including thresholds above one; lower thresholds compare the
+best token F1. NaN thresholds compare false after normal reference validation.
+
+`passageMatch(arena, passages, answers)` accepts string slices and searches
+contiguous DPR token sequences, not byte substrings. Thus `Paris` does not match
+`Parisian`. `passageMatchValue` is the runtime-value counterpart: both arguments
+follow Python iteration, so a direct answer string is iterated as characters and
+a dictionary as keys. An answer normalized
+to no tokens matches any passage, including an empty one, but an empty passage
+list never matches. `dszig.dpr.normalize` exposes the underlying DPR tokenization:
+NFD followed by runs of Unicode letters/numbers/marks or individual nonseparator,
+noncontrol characters, then lowercase **per token**. The character classes come
+from the locked `regex` package, not CPython's older Unicode category tables;
+both still use CPython's NFD and lowercase data.
+
+`answerExactMatch(arena, &example, &prediction, frac)` and
+`answerPassageMatch(arena, &example, &prediction)` accept native `Example` and
+`Record` values. The latter retains Python's context iteration and laziness:
+a string context is iterated as characters, a dictionary as keys, and an empty
+context does not inspect individual elements of an answer list. Unicode helpers
+preserve Python lone-surrogate code points using WTF-8 rather than replacing
+each encoded byte.
+
+These are native typed APIs, not Python's dynamic argument/exception model.
+F1/precision return numeric results without DSPy's ambient timestamped stdout
+diagnostic for two empty token lists. Python exception classes/messages, implicit
+printing and arbitrary Python iterators are not claimed identical.
+
+The independent `answer_metrics_oracle.py` observed **2,832 actual DSPy calls**
+across all 13 metric/tokenization functions. Native executables in both Debug
+and ReleaseSafe matched every accepted value and error acceptance result,
+including 391 source errors. The source records 73 diagnostic stdout messages;
+these were not compared or counted as reproduced side effects. An initial
+31 passage-iteration mismatches were fixed in the production runtime-value API
+without filtering cases or changing source expectations.
+
+A separate exhaustive sweep over all **1,114,112 Python code points**, including
+lone surrogates, matched both actual-source hashes. Each normalized output is
+encoded as a u32 little-endian byte length plus UTF-8/WTF-8 bytes; each DPR output
+starts with its u32 token count and then the same length/byte encoding per token:
+
+- `normalize_text`: `104e026eca607a2e5ec6d9e3980220d8afbd36f42a89b15f8a128e085c50aa1d`
+- `DPR_normalize`: `94bb69feba0d503671fda76e3b43b3c99345c295f69e2ed9fb2dd65a72eb256d`
+
+This is exhaustive single-code-point evidence, not proof for every string or
+every DSPy capability. The shared WTF-8 repair first failed three actual-source
+surrogate comparisons and then passed the same unchanged expectations.
+Pinned Debug/ReleaseSafe each passed **334/334 tests and 28/28 build steps**,
+actual RAG/bootstrap, native **687-request replay** and the Python
+fixture/artifact/reference gate, including regeneration of the DPR tables.
 
 ## Cross-runtime verification
 
