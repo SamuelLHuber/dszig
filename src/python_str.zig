@@ -40,7 +40,7 @@ pub fn renderer(comptime T: type) ?Render {
 /// True only for declared types whose Python `str`/`repr` differs from the
 /// JSON-lowered `Value` rendering: models, Code, and containers of them.
 fn needsRendering(comptime T: type) bool {
-    if (comptime code.isCode(T)) return false;
+    if (comptime code.isCode(T) or @import("enum.zig").isEnum(T) or @import("literal.zig").isLiteral(T) or T == @import("integer.zig").Integer) return false;
     if (T == signature.Reasoning or T == @import("file.zig").File or
         T == @import("bounding_box.zig").BoundingBox or T == signature.StrDict or T == Value or
         T == @import("runtime_value.zig").ObjectMap or T == []const u8 or T == []u8) return false;

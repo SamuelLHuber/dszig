@@ -230,7 +230,7 @@ fn isDefaultDesc(f: Field) bool {
 /// TypeAdapter(field.annotation).json_schema(), shared by typed XML and
 /// provider response schemas. The XML schema variant retains model field order.
 pub fn fieldSchema(arena: Allocator, field: Field) Error!Value {
-    if (field.kind == .json or field.code_type) {
+    if (field.kind == .json or field.code_type or (field.kind == .literal and field.schema.len > 0)) {
         const source = if (field.xml_schema.len > 0) field.xml_schema else field.schema;
         return @import("json_repair.zig").parseJson(arena, source) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,

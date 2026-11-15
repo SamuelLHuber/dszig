@@ -165,7 +165,7 @@ pub fn ReActIters(comptime Sig: type, comptime user_tools: []const Tool, comptim
             fields[index].nullable = true;
             fields[index].code_type = false;
             fields[index].dspy_type = false;
-            fields[index].enum_parse = null;
+            fields[index].parse_value = null;
             fields[index].native_reasoning = false;
             fields[index].schema_definition_name = "";
             fields[index].xml_literal = field.xml_literal or Optional == ?signature.Reasoning;

@@ -419,7 +419,7 @@ pub fn writeReprString(w: *Writer, s: []const u8) Writer.Error!void {
         if (c >= 0x80) {
             const width = std.unicode.utf8ByteSequenceLength(c) catch 1;
             if (width <= s.len - index) {
-                const codepoint = std.unicode.wtf8Decode(s[index..][0..width]) catch null;
+                const codepoint: ?u21 = std.unicode.wtf8Decode(s[index..][0..width]) catch null;
                 if (codepoint) |cp| {
                     if (python_unicode.isPrintable(cp)) {
                         try w.writeAll(s[index..][0..width]);

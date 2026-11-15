@@ -328,21 +328,11 @@ fn groupNamed(arena: Allocator, nodes: []const Node, name: []const u8) Error![]c
 fn literalValue(arena: Allocator, text: []const u8, schema: Value) Error!Value {
     const members = get(schema, "enum");
     const constant = get(schema, "const");
-    const cleaned = unicode.strip(text);
-    var unwrapped = cleaned;
-    if ((std.mem.startsWith(u8, unwrapped, "Literal[") or std.mem.startsWith(u8, unwrapped, "str[")) and std.mem.endsWith(u8, unwrapped, "]")) {
-        unwrapped = unwrapped[(std.mem.indexOfScalar(u8, unwrapped, '[').? + 1) .. unwrapped.len - 1];
-    }
-    if (unwrapped.len > 1 and (unwrapped[0] == '\'' or unwrapped[0] == '"') and unwrapped[unwrapped.len - 1] == unwrapped[0]) unwrapped = unwrapped[1 .. unwrapped.len - 1];
     const candidates: []const Value = if (members == .array) members.array.items else &.{constant};
-    for (candidates) |member| if (member == .string and std.mem.eql(u8, member.string, unwrapped)) return member;
-    const decoded = std.json.parseFromSliceLeaky(Value, arena, unwrapped, .{}) catch return .{ .string = text };
-    for (candidates) |member| {
-        if (member == .integer and decoded == .integer and member.integer == decoded.integer) return member;
-        if (member == .bool and decoded == .bool and member.bool == decoded.bool) return member;
-        if (member == .null and decoded == .null) return member;
-    }
-    return .{ .string = text };
+    return @import("literal.zig").parseValues(arena, candidates, .{ .string = text }) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.ParseValue => .{ .string = text },
+    };
 }
 
 fn elementsValue(arena: Allocator, nodes: []const Node, input_schema: Value, definitions: Value, depth: usize) Error!Value {

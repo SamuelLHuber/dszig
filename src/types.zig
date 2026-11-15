@@ -39,7 +39,7 @@ pub fn isDict(comptime T: type) bool {
 
 /// A struct typed as a Pydantic model (not a dict).
 fn isModel(comptime T: type) bool {
-    return @typeInfo(T) == .@"struct" and T != Integer and T != @import("runtime_value.zig").ObjectMap and !isDict(T) and !@hasField(T, "map");
+    return @typeInfo(T) == .@"struct" and T != Integer and !@import("literal.zig").isLiteral(T) and T != @import("runtime_value.zig").ObjectMap and !isDict(T) and !@hasField(T, "map");
 }
 
 /// Types that need the JSON-typed field kind.
@@ -73,6 +73,7 @@ pub fn pyName(comptime T: type) []const u8 {
         if (T == []const u8 or T == @import("signature.zig").Reasoning) return "str";
         if (T == bool) return "bool";
         if (T == Integer) return "int";
+        if (@import("literal.zig").isLiteral(T)) return T.annotation_name;
         if (T == Value) return "Any";
         if (T == @import("runtime_value.zig").ObjectMap) return "dict[str, Any]";
         if (isDict(T)) return "dict[str, " ++ pyName(T.dszig_dict_value) ++ "]";
@@ -170,6 +171,7 @@ fn entriesOf(comptime T: type) []const Entry {
         if (T == []const u8) return &.{.{ .key = "type", .val = quote("string") }};
         if (T == bool) return &.{.{ .key = "type", .val = quote("boolean") }};
         if (T == Integer) return &.{.{ .key = "type", .val = quote("integer") }};
+        if (@import("literal.zig").isLiteral(T)) return literalEntries(T);
         if (T == Value) return &.{};
         if (T == @import("runtime_value.zig").ObjectMap) return &.{ .{ .key = "type", .val = quote("object") }, .{ .key = "additionalProperties", .val = "true" } };
         if (isDict(T)) return &.{ .{ .key = "type", .val = quote("object") }, .{ .key = "additionalProperties", .val = if (T.dszig_dict_value == Value) "true" else render(entriesOf(T.dszig_dict_value)) } };
@@ -187,6 +189,32 @@ fn entriesOf(comptime T: type) []const Entry {
             else => @compileError("dszig: unsupported nested type " ++ @typeName(T)),
         };
     }
+}
+
+fn literalEntries(comptime T: type) []const Entry {
+    comptime {
+        const values = T.dszig_literal_values;
+        var encoded: []const u8 = if (values.len == 1) enumSchemaValue(values[0]) else "[";
+        if (values.len > 1) {
+            for (values, 0..) |v, i| encoded = encoded ++ (if (i == 0) "" else ", ") ++ enumSchemaValue(v);
+            encoded = encoded ++ "]";
+        }
+        const fields: []const Entry = &.{.{ .key = if (values.len == 1) "const" else "enum", .val = encoded }};
+        const first = literalJsonType(values[0]);
+        for (values[1..]) |v| if (!std.mem.eql(u8, first, literalJsonType(v))) return fields;
+        return &[_]Entry{.{ .key = "type", .val = quote(first) }} ++ fields;
+    }
+}
+
+fn literalJsonType(comptime v: Value) []const u8 {
+    return switch (v) {
+        .null => "null",
+        .bool => "boolean",
+        .integer, .number_string => "integer",
+        .float => "number",
+        .string => "string",
+        else => unreachable,
+    };
 }
 
 fn enumEntries(comptime T: type) []const Entry {
@@ -289,7 +317,7 @@ fn modelEntries(comptime S: type, comptime ordered_properties: bool) []const Ent
 fn collectDefs(comptime T: type, comptime seen: []const type) []const type {
     comptime {
         var out = seen;
-        if (T == Value or T == Integer or T == @import("runtime_value.zig").ObjectMap) return out;
+        if (T == Value or T == Integer or @import("literal.zig").isLiteral(T) or T == @import("runtime_value.zig").ObjectMap) return out;
         if (isDict(T)) return collectDefs(T.dszig_dict_value, out);
         switch (@typeInfo(T)) {
             .optional => |o| out = collectDefs(o.child, out),
@@ -346,7 +374,7 @@ pub fn validate(comptime T: type, arena: Allocator, v: Value) Error!Value {
 fn validateMode(comptime T: type, arena: Allocator, input: Value, comptime xml_lax: bool) Error!Value {
     var v = input;
     if (T == Value) return input;
-    if (comptime code.isCode(T) or @import("enum.zig").isEnum(T)) return T.validate(arena, v);
+    if (comptime code.isCode(T) or @import("enum.zig").isEnum(T) or @import("literal.zig").isLiteral(T)) return T.validate(arena, v);
     if (T == Integer) return @import("value.zig").coerceInteger(arena, v);
     if (T == File) {
         const file = File.fromValue(arena, v) catch |err| return switch (err) {

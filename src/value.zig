@@ -78,7 +78,7 @@ fn formatBlob(w: *Writer, v: Value) pyjson.Error!void {
 
 /// `parse_value(value, annotation)` for a value taken from a chat section.
 pub fn parseText(arena: Allocator, field: Field, text: []const u8) ParseError!Value {
-    if (field.enum_parse) |parse| return parse(arena, .{ .string = text });
+    if (field.parse_value) |parse| return parse(arena, .{ .string = text });
     if (field.kind == .str and !field.reasoning_type and !field.code_type)
         return .{ .string = text };
     if (field.optional_str) return .{ .string = text };
@@ -110,7 +110,7 @@ pub fn parseText(arena: Allocator, field: Field, text: []const u8) ParseError!Va
 /// `parse_value(value, annotation)` preserves the original Python type until
 /// the annotation's validator chooses a conversion.
 pub fn parseJsonValue(arena: Allocator, field: Field, v: Value) ParseError!Value {
-    if (field.enum_parse) |parse| return parse(arena, v);
+    if (field.parse_value) |parse| return parse(arena, v);
     if (field.kind == .str and !field.reasoning_type and !field.code_type) {
         if (v == .string) return v;
         var out: Writer.Allocating = .init(arena);
@@ -310,7 +310,7 @@ pub fn toRecord(arena: Allocator, comptime T: type, value: T) Allocator.Error!Re
 }
 
 pub fn toValue(arena: Allocator, comptime T: type, v: T) Allocator.Error!Value {
-    if (comptime code.isCode(T) or @import("enum.zig").isEnum(T) or T == @import("integer.zig").Integer) return v.toRuntime(arena);
+    if (comptime code.isCode(T) or @import("enum.zig").isEnum(T) or @import("literal.zig").isLiteral(T) or T == @import("integer.zig").Integer) return v.toRuntime(arena);
     if (T == @import("file.zig").File or T == @import("bounding_box.zig").BoundingBox or T == signature.Reasoning)
         return v.toRuntime(arena);
     if (T == @import("tool.zig").ToolCalls) return v.toValue(arena);
@@ -370,7 +370,7 @@ pub fn fromValue(arena: Allocator, comptime T: type, v: Value) ConvertError!T {
     };
     if (T == Value) return v;
     if (T == @import("integer.zig").Integer) return T.fromValue(v);
-    if (comptime @import("enum.zig").isEnum(T)) return T.fromValue(v) catch error.TypeMismatch;
+    if (comptime @import("enum.zig").isEnum(T) or @import("literal.zig").isLiteral(T)) return T.fromValue(v) catch error.TypeMismatch;
     if (T == @import("tool.zig").ToolCalls) return T.fromValue(arena, v) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.TypeMismatch,

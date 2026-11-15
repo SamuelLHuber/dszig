@@ -107,7 +107,7 @@ retain the actual continuation and raw provider response independently.
 
 | DSPy surface | Native Zig surface and coverage |
 |---|---|
-| Class-style signatures and typed fields | `Signature`, `Dict`, `Code`, `CodeWithLanguage`, `BoundingBox`, `File`, scalar/string/list/optional/model fields, literal enums, field descriptions/defaults, compile-time rejection of invalid signatures |
+| Class-style signatures and typed fields | `Signature`, `Dict`, `Code`, `CodeWithLanguage`, `BoundingBox`, `File`, scalar/string/list/optional/model fields, string literal enums and mixed scalar `Literal`, field descriptions/defaults, compile-time rejection of invalid signatures |
 | Runtime values and documents | `Value`, `Array`, `ObjectMap`, boxed native Code/File/Reasoning/BoundingBox identity, recursive typed-class serialization, text/canonical-document content union and bounded Responses `input_file` translation |
 | Chat, JSON, XML and two-stage adapters | `Adapter.chat`, `.json`, `.xml`, `.two_step`; `TwoStepAdapter` with a separate extraction LM; independent prompt/parse fixtures, strict response-schema construction, JSON fallback, typed XML and Unicode key handling |
 | Prediction and reasoning | `Predict`, `ChainOfThought`, `BestOfN`, `Refine`, `MultiChainComparison`, explicit `Context`, typed outputs, serialized `Trace`, named predictor/parameter discovery |
@@ -183,6 +183,17 @@ storage for an int annotation's actual validated result: Pydantic's lax Enum
 path can return a noninteger member value without revalidating it. Native
 fixed-width integer types still impose their explicit representational limits.
 
+Mixed scalar annotations use `Literal(&.{ .{ .integer = 1 }, .{ .bool = true },
+.{ .string = "ready" }, .null })`; the typed result's `.value` retains its actual
+runtime primitive. Direct DSPy membership preserves the input's type (for
+example, `True` for `Literal[1]`), while Pydantic validation chooses exact
+bool/int/string buckets before numeric equality fallbacks. Nested lists and
+optionals use the Pydantic path. A native executable matched **1,164 Source
+observations**: 1,140 validation/parse calls, 15 schemas, three actual typed
+Predict outputs/call counts and all six exact Chat/JSON/XML prompt messages.
+The scalar factory does not yet support bytes/Enum literal arguments, dynamic
+annotation construction or shared NaN identity.
+
 The zero-dependency `python_literal` parser implements the supported CPython
 3.11 literal grammar without execution, and `python_value` retains genuine
 bytes, tuples, sets, frozensets, complex values, Ellipsis and arbitrary-key
@@ -192,8 +203,9 @@ on six near-recursion-limit cases. Python's cutoff depends on its caller frame
 depth; the native AST-depth ceiling is deterministic. This is a real parity
 limit, not a passing check. Generic Python execution is still unsupported.
 
-After this cutover, the pinned Debug and ReleaseSafe gates each passed all
-324 tests and 28 build steps, including actual RAG/bootstrap executions. Native
+After these cutovers, including mixed scalar Literal integration, the pinned
+Debug and ReleaseSafe gates each passed all 327 tests and 28 build steps,
+including actual RAG/bootstrap executions. Native
 687-request replay and the pinned Python fixture/artifact/replay gate also
 passed. These gates do not erase the literal-recursion and NaN-identity
 differences, or replace authenticated inference proof.
@@ -799,7 +811,9 @@ The following prevent a claim that DSZig can do everything DSPy can:
   colliding names fail closed; equivalent definitions can share a name.
   Python's identity-dependent automatic renaming is not reproduced. Tagged
   unions beyond optional types and some
-  Pydantic model defaults are not native signature types. Enum factories are
+  Pydantic model defaults are not native signature types. Scalar `Literal`
+  supports null/bool/int/float/string arguments, not bytes/Enum arguments or
+  dynamic annotation construction. Enum factories are
   comptime class definitions, not arbitrary runtime class creation or Enum
   mixins. Python literal lexical nesting is bounded at 200; its separate native
   AST-depth ceiling is 3,000, not Python's caller-stack-dependent recursion

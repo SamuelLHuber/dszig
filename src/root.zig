@@ -7,6 +7,7 @@ pub const Enum = @import("enum.zig").Enum;
 pub const EnumWithIdentity = @import("enum.zig").EnumWithIdentity;
 pub const EnumEntry = @import("enum.zig").Entry;
 pub const Integer = @import("integer.zig").Integer;
+pub const Literal = @import("literal.zig").Literal;
 pub const Value = runtime_value.Value;
 pub const Array = runtime_value.Array;
 pub const ObjectMap = runtime_value.ObjectMap;

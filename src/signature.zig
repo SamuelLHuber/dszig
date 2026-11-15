@@ -70,15 +70,16 @@ pub const Field = struct {
     code_type: bool = false,
     /// Only a direct DSPy Type annotation retries validation against raw text.
     dspy_type: bool = false,
-    /// DSPy resolves a direct Enum before string repair or TypeAdapter.
-    enum_parse: ?*const fn (std.mem.Allocator, @import("runtime_value.zig").Value) nested.Error!@import("runtime_value.zig").Value = null,
+    /// Direct Enum/Literal annotations have pre-validation dispatch semantics.
+    parse_value: ?*const fn (std.mem.Allocator, @import("runtime_value.zig").Value) nested.Error!@import("runtime_value.zig").Value = null,
     /// Custom class names can differ from Pydantic's safe definition keys.
     schema_definition_name: []const u8 = "",
     /// `desc` as stored by DSPy: user text, or `${name}` when none given.
     desc: []const u8,
     /// `prefix` as stored by DSPy: `infer_prefix(name) + ":"`.
     prefix: []const u8,
-    /// Allowed values for `.literal`, in declaration order.
+    /// Display strings for `.literal`, in declaration order. Scalar Literal
+    /// annotations carry their actual values in parse_value and schema.
     literals: []const []const u8 = &.{},
     /// `.json`: the Pydantic JSON schema, its validator, and whether the
     /// type is `Optional[str]` (whose text DSPy keeps unparsed).
@@ -226,9 +227,9 @@ fn fieldsOf(comptime T: type, comptime role: []const u8, comptime descriptions: 
                 .type_name = typeName(FT, kind),
                 .desc = descriptionFor(name, descriptions) orelse "${" ++ name ++ "}",
                 .prefix = inferPrefix(name) ++ ":",
-                .literals = if (kind == .literal) std.meta.fieldNames(FT) else &.{},
-                .schema = if (FT == History) History.schema else if (FT == ToolCalls) ToolCalls.schema else if (kind == .json or code.isCode(FT)) nested.schema(FT) else "",
-                .xml_schema = if (FT == History) History.schema else if (FT == ToolCalls) ToolCalls.schema else if (kind == .json or code.isCode(FT)) nested.schemaXml(FT) else "",
+                .literals = if (@import("literal.zig").isLiteral(FT)) &FT.display_values else if (kind == .literal) std.meta.fieldNames(FT) else &.{},
+                .schema = if (FT == History) History.schema else if (FT == ToolCalls) ToolCalls.schema else if (kind == .json or code.isCode(FT) or @import("literal.zig").isLiteral(FT)) nested.schema(FT) else "",
+                .xml_schema = if (FT == History) History.schema else if (FT == ToolCalls) ToolCalls.schema else if (kind == .json or code.isCode(FT) or @import("literal.zig").isLiteral(FT)) nested.schemaXml(FT) else "",
                 .validate = if (FT == History) History.validate else if (FT == ToolCalls) ToolCalls.validate else if (kind == .json or code.isCode(FT)) nested.Validator(FT) else null,
                 .xml_validate = if (FT == History) History.validate else if (FT == ToolCalls) ToolCalls.validate else if (kind == .json) nested.XmlValidator(FT) else null,
                 .python_str = python_str.renderer(FT),
@@ -242,7 +243,7 @@ fn fieldsOf(comptime T: type, comptime role: []const u8, comptime descriptions: 
                 .type_description_name = if (code.annotationType(FT)) |C| C.model_name else "",
                 .code_type = code.isCode(FT),
                 .dspy_type = code.isCode(FT) or FT == Reasoning or FT == BoundingBox or FT == File or FT == History or FT == ToolCalls,
-                .enum_parse = if (@import("enum.zig").isEnum(FT)) FT.parseValue else null,
+                .parse_value = if (@import("enum.zig").isEnum(FT) or @import("literal.zig").isLiteral(FT)) FT.parseValue else null,
                 .schema_definition_name = if (code.isCode(FT)) FT.schema_name else "",
                 .nullable = @typeInfo(FT) == .optional,
                 .default_value = if (info.field_attrs[i].default_value_ptr) |raw| defaultProvider(FT, raw) else null,
@@ -271,6 +272,7 @@ fn descriptionFor(comptime name: []const u8, comptime descriptions: []const Desc
 
 /// Map a Zig field type onto a supported DSPy annotation.
 pub fn kindOf(comptime T: type, comptime name: []const u8) Kind {
+    if (@import("literal.zig").isLiteral(T)) return .literal;
     if (T == []const u8 or T == Reasoning or code.isCode(T)) return .str;
     if (T == []const []const u8) return .str_list;
     if (T == bool) return .boolean;
@@ -299,6 +301,7 @@ pub fn kindOf(comptime T: type, comptime name: []const u8) Kind {
 }
 
 fn typeName(comptime T: type, comptime kind: Kind) []const u8 {
+    if (@import("literal.zig").isLiteral(T)) return T.annotation_name;
     if (code.isCode(T)) return T.model_name;
     return switch (kind) {
         .str => "str",
@@ -334,7 +337,7 @@ fn validate(comptime inputs: []const Field, comptime outputs: []const Field, com
                 @compileError("dszig: field `" ++ f.name ++ "` is declared as both input and output");
             }
         }
-        if (f.kind == .literal) {
+        if (f.kind == .literal and f.parse_value == null) {
             for (f.literals) |tag| {
                 if (std.mem.indexOfScalar(u8, tag, '\'') != null) {
                     @compileError("dszig: literal value `" ++ tag ++ "` of field `" ++ f.name ++ "` must not contain a quote");
