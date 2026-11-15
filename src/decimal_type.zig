@@ -65,6 +65,15 @@ pub const Decimal = struct {
         };
     }
 
+    /// TypeAdapter(Decimal).validate_python(..., strict=True). Reject other
+    /// runtime kinds before attempting conversion, including invalid text that
+    /// would otherwise signal InvalidOperation in the lax constructor.
+    pub fn validateStrict(allocator: Allocator, input: Value) runtime.CustomError!Value {
+        const builtin = python.view(input) orelse return error.ParseValue;
+        if (builtin != .decimal) return error.ParseValue;
+        return validate(allocator, input);
+    }
+
     /// TypeAdapter(Decimal).validate_json. Decimal accepts JSON strings and
     /// numbers even in strict mode. JSON float coercion uses shortest plain
     /// decimal text, unlike validate_python's Python float repr.
@@ -314,6 +323,35 @@ test "Decimal lax bool uses float rounding and underflow rather than truthiness"
             try std.testing.expectError(error.ParseValue, types.validate(bool, a, input));
         }
     }
+}
+
+test "strict Decimal validation preserves genuine identity and refuses coercion without signaling" {
+    const environment = @import("decimal_environment.zig");
+    var local: environment.LocalContext = .{};
+    local.enter(null);
+    defer local.deinit();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const genuine = try python.decimal(a, "1.2300");
+    const nonfinite = try python.decimal(a, "sNaN");
+    local.context.clearFlags();
+    local.context.flags.insert(.inexact);
+    try std.testing.expect((try Decimal.validateStrict(a, genuine)).custom.ptr == genuine.custom.ptr);
+    try std.testing.expectError(error.ParseValue, Decimal.validateStrict(a, nonfinite));
+    for ([_]Value{
+        .{ .string = "1.2300" },
+        .{ .string = "not-a-decimal" },
+        .{ .integer = 1 },
+        .{ .number_string = "9007199254740993" },
+        .{ .float = 1.25 },
+        .{ .bool = true },
+        .null,
+    }) |input| {
+        try std.testing.expectError(error.ParseValue, Decimal.validateStrict(a, input));
+    }
+    try std.testing.expectEqual(@as(usize, 1), local.context.flags.count());
+    try std.testing.expect(local.context.flags.contains(.inexact));
 }
 
 test "Decimal malformed strings signal InvalidOperation with either trap setting" {

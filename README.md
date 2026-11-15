@@ -304,6 +304,8 @@ lookalike dictionary. `python_value.decimal(allocator, text)` constructs an exac
 coefficient/exponent value, preserving signed zero, trailing-zero quantum and
 NaN payloads. Typed Decimal validation is finite-only and distinct from the
 constructor. `Decimal.validate` follows Python-input coercion;
+`Decimal.validateStrict` accepts only genuine finite Decimal instances, retaining
+their identity and rejecting other kinds before conversion or signaling.
 `Decimal.validateJson` follows JSON-input coercion, including its different
 shortest plain float spelling. Quoted JSON text retains its original quantum.
 
@@ -335,12 +337,14 @@ genuine-Decimal container probe went from six mismatches to zero across
 This is finite evidence, not complete Decimal or DSPy parity. Other Decimal
 operators, general Python numeric protocols, arbitrary mutable alias graphs,
 full Pydantic policies and Python exception reconstruction are not established
-by those runs. The separate validation consumer matched **17,631 of 21,837
-Source rows** and **24,752 actual dump calls**, with 1,510,018 observations and
-zero remaining mismatches. It still exits nonzero for incomplete coverage:
-3,505 rows are unsupported, 701 are unconsumed (including 699 preserved
+by those runs. The separate validation consumer matched **17,685 of 21,837
+Source rows** and **24,752 actual dump calls**, with 1,511,530 observations and
+zero remaining mismatches. This includes 54 additional strict-Decimal refusals
+checked through the actual native validator, not synthetic consumer refusals.
+It still exits nonzero for incomplete coverage:
+3,451 rows are unsupported, 701 are unconsumed (including 699 preserved
 invalid-baseline cases), and 35,392 Source dump frames are unobserved. Warning
-emission, 1,258 identity frames and 11,012 normalized exception classes remain
+emission, 1,258 identity frames and 11,066 normalized exception classes remain
 unobserved. Those gaps are not passing observations.
 
 A separate integer-division consumer matched 679 actual CPython rows through
