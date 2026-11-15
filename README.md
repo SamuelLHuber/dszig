@@ -1174,6 +1174,37 @@ relabeled or used as evidence that the new 3.5 protocol matches an old protocol.
 Fresh 3.5 live recordings must identify their actual model, capabilities and
 `target_dspy` before either runtime replays them.
 
+### DSPy 3.5.0 real-model parity (gpt-4o-mini)
+
+`tests/fixtures/live/dspy_3.5.0_gpt-4o-mini.json` (DSPy 3.5.0, 684 real calls)
+and `tests/fixtures/live/dszig_3.5.0_gpt-4o-mini.json` (DSZig, 685 real calls)
+were each recorded against the public OpenAI API through the Responses API, with
+response-schema and function-calling capabilities enabled. Each recording is
+replayed through the other runtime: every request must byte-match a recorded
+request, every recorded call must be consumed, and case outputs, scores,
+artifacts and optimizer traces must be equal. `check.sh` runs both directions
+for every committed `*_3.5.0*.json` transcript without a key.
+
+| Pipeline | DSPy 3.5.0 | DSZig |
+|---|---|---|
+| RAG + BootstrapFewShot | 100% → 100% | 100% → 100% |
+| Dates + BootstrapFewShot | 0% → 100% | 0% → 100% |
+| Dates + BootstrapFewShotWithRandomSearch | 0% → 100% | 0% → 100% |
+| Dates + MIPROv2 | 0% → 100% | 0% → 100% |
+| Dates + MIPROv2 (program-aware proposer) | 0% → 100% | 0% → 100% |
+| RAG ReAct + BootstrapFewShot | 100% → 100% | 100% → 100% |
+| Dates + COPRO | 0% → 0% | 0% → 0% |
+| Dates + SIMBA (small configuration) | 0% → 0% | 0% → 0% |
+| Dates + GEPA | 0% → 100% | 0% → 100% |
+
+Accuracy is at par on the same model: equal scores in both independent runs and
+identical results when either runtime replays the other's completions. The one
+call-count difference comes from sampling, not protocol: the replay checks
+prove each runtime makes exactly the other's requests given the same completions.
+DSPy 3.5 routes `openai/*` models through the Responses API, so `dz-live` records
+DSZig with `DSZIG_LIVE_API=responses`; a Chat Completions recording returns native
+tool calls where Responses returns text and does not cross-replay.
+
 ## Real inference
 
 The live executable reads `OPENAI_API_KEY`, or `CODEX_LB_API_KEY` for the local

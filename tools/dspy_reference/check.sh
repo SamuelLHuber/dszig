@@ -52,4 +52,5 @@ if ((${#live_transcripts[@]} == 0)); then
 fi
 for transcript in "${live_transcripts[@]}"; do
   uv run --locked check_live.py "$transcript"
+  (cd "$root" && zig build replay -- "$transcript")
 done

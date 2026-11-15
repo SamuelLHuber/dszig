@@ -75,11 +75,16 @@ in
     # Re-record real-model transcripts (needs OPENAI_API_KEY; not run by CI).
     dz-live.exec = ''
       set -euo pipefail
+      model="''${DSZIG_LIVE_MODEL:-gpt-4o-mini}"
       (cd tools/dspy_reference && uv run --locked live.py \
-        ../../tests/fixtures/live/dspy_3.5.0.json "openai/''${DSZIG_LIVE_MODEL:-gpt-4o-mini}")
-      zig build replay -- tests/fixtures/live/dspy_3.5.0.json
-      zig build live -- tests/fixtures/live/dszig_3.5.0.json
-      (cd tools/dspy_reference && uv run --locked check_live.py ../../tests/fixtures/live/dszig_3.5.0.json)
+        "../../tests/fixtures/live/dspy_3.5.0_$model.json" "openai/$model")
+      zig build replay -- "tests/fixtures/live/dspy_3.5.0_$model.json"
+      # DSPy 3.5 sends openai/* through the Responses API; record DSZig on the same route.
+      DSZIG_LIVE_API="''${DSZIG_LIVE_API:-responses}" \
+        DSZIG_LIVE_RESPONSE_SCHEMA="''${DSZIG_LIVE_RESPONSE_SCHEMA:-1}" \
+        DSZIG_LIVE_FUNCTION_CALLING="''${DSZIG_LIVE_FUNCTION_CALLING:-1}" \
+        zig build live -- "tests/fixtures/live/dszig_3.5.0_$model.json"
+      (cd tools/dspy_reference && uv run --locked check_live.py "../../tests/fixtures/live/dszig_3.5.0_$model.json")
       tools/dspy_reference/check.sh
     '';
     dz-check.exec = ''
