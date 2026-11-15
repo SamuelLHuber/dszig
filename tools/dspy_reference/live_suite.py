@@ -262,7 +262,7 @@ def request_metadata(request, rollout):
     """Shared Zig/Python text/native metadata; canonical request stays separate."""
     messages = normalized_messages(request)
     format_ = request.config.response_format
-    if format_ is not None and format_.get("type") == "json_schema":
+    if format_ is not None and format_.get("type") == "json_schema" and "json_schema" in format_:
         format_ = {"type": "json_schema", **format_["json_schema"]}
     choice = request.config.tool_choice
     tools = []
@@ -402,7 +402,7 @@ class ReplayLM(ref.ReferenceLM):
                                  for c in citations[0])
                 if not parts:
                     parts.append(TextPart(text))
-                return replace(ref.text_response(self.model, text), message=Message.assistant(parts), provider_data=raw)
+                return replace(ref.text_response(self.model, text or ""), message=Message.assistant(parts), provider_data=raw)
             return ref.text_response(self.model, text)
         self.misses.append(want)
         raise RuntimeError("replay: request has no recorded twin")
