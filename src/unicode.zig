@@ -225,6 +225,57 @@ pub fn lowerComptime(comptime text: []const u8) []const u8 {
     };
 }
 
+/// Pydantic's `name.title().replace("_", " ").strip()`, without allocation.
+/// The caller supplies Python code points, including any lone surrogates.
+pub fn writeSchemaTitle(writer: *std.Io.Writer, cps: []const u21) std.Io.Writer.Error!void {
+    var start: usize = 0;
+    var end = cps.len;
+    while (start < end and (cps[start] == '_' or isSpace(cps[start]))) start += 1;
+    while (end > start and (cps[end - 1] == '_' or isSpace(cps[end - 1]))) end -= 1;
+    var previous_cased = false;
+    for (cps[start..end], start..) |cp, i| {
+        const fallback = [_]u21{if (cp == '_') ' ' else cp};
+        const sigma = [_]u21{if (finalSigma(cps, i)) 0x3c2 else 0x3c3};
+        const converted = if (!previous_cased)
+            mapped(&tables.title, &tables.title_pool, cp) orelse &fallback
+        else if (cp == capital_sigma)
+            &sigma
+        else
+            mapped(&tables.lower, &tables.lower_pool, cp) orelse &fallback;
+        for (converted) |result| {
+            var buffer: [4]u8 = undefined;
+            const len = std.unicode.wtf8Encode(result, &buffer) catch unreachable;
+            try writer.writeAll(buffer[0..len]);
+        }
+        previous_cased = inRanges(&tables.title_cased, cp);
+    }
+}
+
+/// Compile-time schema titles share the runtime Unicode mapping and context.
+pub fn schemaTitleComptime(comptime text: []const u8) []const u8 {
+    return comptime result: {
+        @setEvalBranchQuota(1_000_000);
+        var cps: [text.len]u21 = undefined;
+        var count: usize = 0;
+        var offset: usize = 0;
+        while (offset < text.len) {
+            const len = std.unicode.utf8ByteSequenceLength(text[offset]) catch
+                @compileError("dszig: schema title must be UTF-8/WTF-8");
+            if (len > text.len - offset) @compileError("dszig: schema title must be UTF-8/WTF-8");
+            cps[count] = std.unicode.wtf8Decode(text[offset..][0..len]) catch
+                @compileError("dszig: schema title must be UTF-8/WTF-8");
+            count += 1;
+            offset += len;
+        }
+        var buffer: [text.len * 3 + 8]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        writeSchemaTitle(&writer, cps[0..count]) catch
+            @compileError("dszig: schema title expansion exceeded Unicode bound");
+        const output = writer.buffered().*;
+        break :result &output;
+    };
+}
+
 fn finalSigma(cps: []const u21, i: usize) bool {
     var j = i;
     while (j > 0 and inRanges(&tables.case_ignorable, cps[j - 1])) j -= 1;

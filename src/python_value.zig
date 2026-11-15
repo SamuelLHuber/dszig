@@ -207,6 +207,7 @@ fn makeVTable(comptime kind: Kind, comptime hashable: bool) runtime.CustomVTable
     };
     return .{
         .type_name = "python.builtins." ++ name,
+        .type_identity = runtime.typeIdentity(Box),
         .model_name = name,
         .hashable = hashable,
         .bool_value = truthy,
@@ -1159,7 +1160,7 @@ fn keyTextEqual(a: Value, b: Value) KeyError!bool {
     }
 }
 
-fn writeQuotedKey(w: *Writer, key: Value) (Writer.Error || KeyError)!void {
+pub fn writeQuotedKey(w: *Writer, key: Value) (Writer.Error || KeyError)!void {
     try w.writeByte('"');
     var escaped: pyjson.StringContentsWriter = .{ .destination = w };
     try writeKeyText(&escaped.writer, key);
@@ -1350,6 +1351,7 @@ const SourceStringKey = struct {
 
     const vtable: runtime.CustomVTable = .{
         .type_name = @typeName(SourceStringKey),
+        .type_identity = runtime.typeIdentity(SourceStringKey),
         .model_name = "StringKey",
         .hashable = true,
         .python_hash = hash,

@@ -197,7 +197,7 @@ fn writeStripped(
     w.writeAll(value.pyStrip(aw.written())) catch return error.OutOfMemory;
 }
 
-fn mapWriteError(err: pyjson.Error) Error {
+pub fn mapWriteError(err: pyjson.Error) Error {
     return switch (err) {
         error.WriteFailed => error.OutOfMemory,
         error.JsonTooDeep => error.JsonTooDeep,

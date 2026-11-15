@@ -320,6 +320,7 @@ pub const Citations = struct {
 
         const runtime_vtable: runtime.CustomVTable = .{
             .type_name = @typeName(Citation),
+            .type_identity = runtime.typeIdentity(Citation),
             .model_name = Citation.model_name,
             .is_type = true,
             .iterate = Citation.iterateRuntime,
@@ -640,6 +641,7 @@ pub const Citations = struct {
 
     const runtime_vtable: runtime.CustomVTable = .{
         .type_name = @typeName(Citations),
+        .type_identity = runtime.typeIdentity(Citations),
         .model_name = model_name,
         .is_type = true,
         .bool_value = runtimeTruthy,
@@ -719,6 +721,7 @@ pub const Citations = struct {
 
         const vtable: runtime.CustomVTable = .{
             .type_name = @typeName(StreamObject),
+            .type_identity = runtime.typeIdentity(StreamObject),
             .model_name = "SimpleNamespace",
             .bool_value = boolValue,
             .iterate = iterate,

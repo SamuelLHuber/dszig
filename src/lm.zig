@@ -18,6 +18,8 @@ pub const CitationPart = inference.CitationPart;
 pub const Continuation = inference.Continuation;
 pub const ResponseFormat = inference.ResponseFormat;
 pub const ToolChoice = inference.ToolChoice;
+/// TypeSafe System One decision backend (`POST /v1/systemone`).
+pub const TypeSafe = @import("typesafe.zig").TypeSafe;
 
 pub const Options = struct {
     temperature: ?f64 = null,
@@ -35,11 +37,57 @@ pub const Options = struct {
     reasoning_effort_present: bool = false,
 };
 
+/// A typed System One judgment request. `state` is the provider state value,
+/// `questions` the native question objects, and `response_schema` the JSON
+/// schema whose top-level properties declare the judgments' answer spaces.
+pub const DecisionRequest = struct {
+    state: @import("runtime_value.zig").Value,
+    questions: @import("runtime_value.zig").Value,
+    response_schema: @import("runtime_value.zig").Value,
+};
+
 pub const Request = struct {
+    /// Empty only for a decision request whose state is `decision.state`.
     messages: []const Message,
     options: Options = .{},
     tools: []const FunctionTool = &.{},
+    /// Present only for LMs advertising `supports_decision_requests`.
+    decision: ?DecisionRequest = null,
 };
+
+pub fn cloneDecision(arena: Allocator, decision: DecisionRequest) Allocator.Error!DecisionRequest {
+    return .{
+        .state = try inference.cloneJsonValue(arena, decision.state),
+        .questions = try inference.cloneJsonValue(arena, decision.questions),
+        .response_schema = try inference.cloneJsonValue(arena, decision.response_schema),
+    };
+}
+
+pub fn decisionEqual(a: ?DecisionRequest, b: ?DecisionRequest) bool {
+    const x = a orelse return b == null;
+    const y = b orelse return false;
+    return inference.jsonEqual(x.state, y.state) and inference.jsonEqual(x.questions, y.questions) and
+        inference.jsonEqual(x.response_schema, y.response_schema);
+}
+
+/// Borrowed metadata view; callers own `decision` for the view's lifetime.
+pub fn decisionValue(arena: Allocator, decision: DecisionRequest) Allocator.Error!@import("runtime_value.zig").Value {
+    var object: @import("runtime_value.zig").ObjectMap = .empty;
+    try object.put(arena, "state", decision.state);
+    try object.put(arena, "questions", decision.questions);
+    try object.put(arena, "response_schema", decision.response_schema);
+    return .{ .object = object };
+}
+
+/// Owning reader; all three keys are required, though any may be JSON null.
+pub fn decisionFromValue(arena: Allocator, input: @import("runtime_value.zig").Value) inference.MetadataError!DecisionRequest {
+    if (input != .object) return error.BadMetadata;
+    return cloneDecision(arena, .{
+        .state = input.object.get("state") orelse return error.BadMetadata,
+        .questions = input.object.get("questions") orelse return error.BadMetadata,
+        .response_schema = input.object.get("response_schema") orelse return error.BadMetadata,
+    });
+}
 
 pub const Error = error{ LMFailure, ScriptExhausted } || Allocator.Error;
 
@@ -142,6 +190,8 @@ pub fn requestValue(arena: Allocator, request: Request) Allocator.Error!@import(
     try object.put(arena, "messages", .{ .array = messages });
     try object.put(arena, "options", try optionsValue(arena, request.options));
     try object.put(arena, "tools", try inference.toolsValue(arena, request.tools));
+    // Absent for ordinary requests, keeping historical metadata unchanged.
+    if (request.decision) |decision| try object.put(arena, "decision", try decisionValue(arena, decision));
     return .{ .object = object };
 }
 
@@ -223,10 +273,14 @@ pub fn messageFromValue(arena: Allocator, input: @import("runtime_value.zig").Va
 pub fn requestFromValue(arena: Allocator, input: @import("runtime_value.zig").Value) inference.MetadataError!Request {
     if (input != .object) return error.BadMetadata;
     const raw_messages = input.object.get("messages") orelse return error.BadMetadata;
-    if (raw_messages != .array or raw_messages.array.items.len == 0) return error.BadMetadata;
+    const decision: ?DecisionRequest = if (input.object.get("decision")) |raw|
+        if (raw == .null) null else try decisionFromValue(arena, raw)
+    else
+        null;
+    if (raw_messages != .array or (raw_messages.array.items.len == 0 and decision == null)) return error.BadMetadata;
     const messages = try arena.alloc(Message, raw_messages.array.items.len);
     for (raw_messages.array.items, messages) |message, *copy| copy.* = try messageFromValue(arena, message);
-    var out: Request = .{ .messages = messages };
+    var out: Request = .{ .messages = messages, .decision = decision };
     if (input.object.get("options")) |options| {
         if (options != .null) out.options = try optionsFromValue(arena, options);
     }
@@ -275,6 +329,8 @@ pub const LM = struct {
     supports_response_format: bool = false,
     supports_response_schema: bool = false,
     supports_function_calling: bool = false,
+    /// Accepts `Request.decision` System One judgments instead of chat prompts.
+    supports_decision_requests: bool = false,
 
     pub const VTable = struct {
         /// Returns `request.options.n` completions, allocated in `arena`.
@@ -297,8 +353,12 @@ pub const LM = struct {
     /// All `request.options.n` completions; a provider that returns another
     /// count fails with `LMFailure`.
     pub fn completeResponses(lm: LM, arena: Allocator, request: Request) Error![]const Completion {
-        assert(request.messages.len > 0);
+        assert(request.messages.len > 0 or request.decision != null);
         assert(request.options.n >= 1);
+        if (request.decision != null) {
+            // System One has no canonical multiple-response representation.
+            if (!lm.supports_decision_requests or request.options.n != 1) return error.LMFailure;
+        }
         if (request.options.n == 1) {
             const completions = try lm.vtable.complete(lm.ptr, arena, request);
             if (completions.len != 1) return error.LMFailure;
@@ -340,6 +400,7 @@ pub const ScriptedLM = struct {
     supports_response_format: bool = false,
     supports_response_schema: bool = false,
     supports_function_calling: bool = false,
+    supports_decision_requests: bool = false,
     index: usize = 0,
     /// Optional transcript of every request (deep-copied into its arena).
     history: ?*History = null,
@@ -352,6 +413,7 @@ pub const ScriptedLM = struct {
             .supports_response_format = self.supports_response_format,
             .supports_response_schema = self.supports_response_schema,
             .supports_function_calling = self.supports_function_calling,
+            .supports_decision_requests = self.supports_decision_requests,
         };
     }
 
@@ -421,6 +483,7 @@ pub const KeywordLM = struct {
     /// `n` copies of the matching rule's response.
     fn complete(ptr: *anyopaque, arena: Allocator, request: Request) Error![]const Completion {
         const self: *KeywordLM = @ptrCast(@alignCast(ptr));
+        if (request.decision != null) return error.LMFailure;
         if (self.history) |h| try h.record(request);
         const out = try arena.alloc(Completion, request.options.n);
         const response = try arena.dupe(u8, self.respond(request.messages));
@@ -445,12 +508,14 @@ pub const ReplayLM = struct {
     supports_response_format: bool = false,
     supports_response_schema: bool = false,
     supports_function_calling: bool = false,
+    supports_decision_requests: bool = false,
 
     pub const Call = struct {
         messages: []const Message,
         /// Null only for historical transcripts that did not record options.
         options: ?Options = null,
         tools: []const FunctionTool = &.{},
+        decision: ?DecisionRequest = null,
         completion: ?[]const u8,
         /// Every completion of an `n > 1` call (`completion` is the first);
         /// empty for single-completion calls. Null entries preserve absent text.
@@ -484,6 +549,7 @@ pub const ReplayLM = struct {
             .supports_response_format = self.supports_response_format,
             .supports_response_schema = self.supports_response_schema,
             .supports_function_calling = self.supports_function_calling,
+            .supports_decision_requests = self.supports_decision_requests,
         };
     }
 
@@ -504,6 +570,7 @@ pub const ReplayLM = struct {
             offset += recorded.len;
             if (!sameMessages(call.messages, request.messages)) continue;
             if (!inference.toolsEqual(call.tools, request.tools)) continue;
+            if (!decisionEqual(call.decision, request.decision)) continue;
             if (call.options) |options| {
                 if (!sameOptions(options, request.options)) continue;
             }
@@ -578,6 +645,7 @@ pub const RecordingLM = struct {
             .supports_response_format = self.inner.supports_response_format,
             .supports_response_schema = self.inner.supports_response_schema,
             .supports_function_calling = self.inner.supports_function_calling,
+            .supports_decision_requests = self.inner.supports_decision_requests,
         };
     }
 
@@ -624,6 +692,7 @@ pub const RecordingLM = struct {
             .messages = messages,
             .options = try cloneOptions(self.arena, request.options),
             .tools = try inference.cloneTools(self.arena, request.tools),
+            .decision = if (request.decision) |decision| try cloneDecision(self.arena, decision) else null,
             .completion = kept[0],
             .completions = if (kept.len > 1) kept else &.{},
             .reasonings = reasonings,
@@ -648,6 +717,7 @@ pub const History = struct {
             .messages = messages,
             .options = try cloneOptions(h.arena, request.options),
             .tools = try inference.cloneTools(h.arena, request.tools),
+            .decision = if (request.decision) |decision| try cloneDecision(h.arena, decision) else null,
         });
     }
 
@@ -701,6 +771,7 @@ pub const OpenAI = struct {
     /// A Responses request represents one completion; `complete` issues
     /// independent requests for `n > 1`, since Responses has no `n` parameter.
     pub fn requestBody(self: *const OpenAI, arena: Allocator, request: Request) Error![]const u8 {
+        if (request.decision != null) return error.LMFailure;
         const has_system = self.api == .responses and request.messages.len != 0 and request.messages[0].role == .system;
         const messages = try self.wireMessages(arena, request.messages[@intFromBool(has_system)..]);
         var body: @import("runtime_value.zig").ObjectMap = .empty;
@@ -1052,6 +1123,8 @@ pub const OpenAI = struct {
 
     fn complete(ptr: *anyopaque, arena: Allocator, request: Request) Error![]const Completion {
         const self: *OpenAI = @ptrCast(@alignCast(ptr));
+        // Chat dialects have no System One judgment wire; never drop it silently.
+        if (request.decision != null) return error.LMFailure;
         const body = try self.requestBody(arena, request);
         const path = if (self.api == .responses) "responses" else "chat/completions";
         const url = try std.fmt.allocPrint(arena, "{s}/{s}", .{ std.mem.trimEnd(u8, self.base_url, "/"), path });

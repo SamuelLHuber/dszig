@@ -44,6 +44,7 @@ pub const CachedLM = struct {
             .supports_response_format = self.inner.supports_response_format,
             .supports_response_schema = self.inner.supports_response_schema,
             .supports_function_calling = self.inner.supports_function_calling,
+            .supports_decision_requests = self.inner.supports_decision_requests,
         };
     }
 
@@ -148,6 +149,12 @@ pub fn key(arena: Allocator, request: Request) Allocator.Error!Key {
 fn writeCanonical(w: *Writer, request: Request) Writer.Error!void {
     // Stream every typed field, including native tools and structured schemas.
     // Cache hashes are local to DSZig and are not DSPy's diskcache format.
+    // Ordinary requests keep their historical key bytes; decisions add a key.
+    if (request.decision == null) return std.json.Stringify.value(.{
+        .messages = request.messages,
+        .options = request.options,
+        .tools = request.tools,
+    }, .{}, w);
     try std.json.Stringify.value(request, .{}, w);
 }
 

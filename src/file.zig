@@ -214,6 +214,7 @@ pub const File = struct {
 
     const runtime_vtable: runtime.CustomVTable = .{
         .type_name = @typeName(File),
+        .type_identity = runtime.typeIdentity(File),
         .model_name = "File",
         .is_type = true,
         .hashable = true,

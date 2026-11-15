@@ -1,8 +1,9 @@
 //! Field values: DSPy's `format_field_value` / `parse_value`, and the bridge
-//! between typed Zig structs and dynamic `std.json.Value` records.
+//! between typed Zig structs and native runtime values, including genuine
+//! boxed model and builtin identities.
 //!
-//! Records (inputs, outputs, demos, examples) are `std.json.ObjectMap`s, which
-//! preserve insertion order exactly like Python dicts do.
+//! Records (inputs, outputs, demos, examples) preserve insertion order exactly
+//! like Python dicts do.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -16,6 +17,7 @@ const signature = @import("signature.zig");
 const types = @import("types.zig");
 const code = @import("code.zig");
 const citation = @import("citation.zig");
+const decision = @import("decision.zig");
 const Field = signature.Field;
 
 pub const Record = ObjectMap;
@@ -31,6 +33,8 @@ pub fn pyStrip(s: []const u8) []const u8 {
 
 /// `format_field_value(field_info, value)`.
 pub fn formatFieldValue(w: *Writer, field: Field, v: Value) pyjson.Error!void {
+    if (v == .custom and v.custom.vtable.decision != null)
+        return v.custom.writeSerializedJson(w, .compact, 0);
     if (v == .array and field.kind == .str and !field.reasoning_type and
         !field.code_type and !field.optional_str) return formatListBlobs(w, v.array.items);
     switch (v) {
@@ -312,7 +316,7 @@ pub fn toRecord(arena: Allocator, comptime T: type, value: T) Allocator.Error!Re
 
 pub fn toValue(arena: Allocator, comptime T: type, v: T) Allocator.Error!Value {
     if (comptime code.isCode(T) or @import("enum.zig").isEnum(T) or @import("literal.zig").isLiteral(T) or T == @import("integer.zig").Integer) return v.toRuntime(arena);
-    if (comptime citation.isCitation(T) or T == @import("file.zig").File or T == @import("bounding_box.zig").BoundingBox or T == signature.Reasoning)
+    if (comptime decision.isDecision(T) or citation.isCitation(T) or T == @import("file.zig").File or T == @import("bounding_box.zig").BoundingBox or T == signature.Reasoning)
         return v.toRuntime(arena);
     if (T == @import("tool.zig").ToolCalls) return v.toValue(arena);
     if (T == Value) return v;
@@ -363,6 +367,10 @@ pub fn fromRecord(arena: Allocator, comptime T: type, record: *const Record) Con
 }
 
 pub fn fromValue(arena: Allocator, comptime T: type, v: Value) ConvertError!T {
+    if (comptime decision.isDecision(T)) return T.fromValue(arena, v) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.TypeMismatch,
+    };
     if (comptime citation.isCitation(T)) return T.fromValue(arena, v) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.TypeMismatch,
@@ -451,8 +459,7 @@ pub fn fromValue(arena: Allocator, comptime T: type, v: Value) ConvertError!T {
 /// `1 == 1.0` and `True == 1` as in Python).
 pub fn pyEqual(a: Value, b: Value) bool {
     if (std.meta.activeTag(a) != std.meta.activeTag(b) or
-        (a == .custom and b == .custom and
-            !std.mem.eql(u8, a.custom.vtable.type_name, b.custom.vtable.type_name)))
+        (a == .custom and b == .custom and !a.custom.sameType(b.custom)))
     {
         if (a == .custom) {
             if (a.custom.vtable.eql_value) |equal| return equal(a.custom.ptr, b);
@@ -519,6 +526,24 @@ const IntegerText = struct {
     fn eql(a: IntegerText, b: IntegerText) bool {
         return a.negative == b.negative and std.mem.eql(u8, a.digits, b.digits);
     }
+
+    fn fromValue(v: Value, buffer: *[20]u8) ?IntegerText {
+        return parse(switch (v) {
+            .bool => |b| if (b) "1" else "0",
+            .integer => |i| std.fmt.bufPrint(buffer, "{d}", .{i}) catch unreachable,
+            .number_string => |text| text,
+            else => return null,
+        });
+    }
+
+    fn order(a: IntegerText, b: IntegerText) std.math.Order {
+        if (a.negative != b.negative) return if (a.negative) .lt else .gt;
+        const magnitude = if (a.digits.len == b.digits.len)
+            std.mem.order(u8, a.digits, b.digits)
+        else
+            std.math.order(a.digits.len, b.digits.len);
+        return if (a.negative) magnitude.invert() else magnitude;
+    }
 };
 
 fn integerStringEqualsValue(text: []const u8, v: Value) bool {
@@ -566,15 +591,107 @@ pub fn floatAtLeast(f: f64, threshold: Value) error{InvalidNumber}!bool {
             if (std.math.isInf(f)) break :blk f > 0;
             var buffer: [310]u8 = undefined;
             const floor = IntegerText.parse(integralFloatText(@floor(f), &buffer).?).?;
-            if (floor.negative != integer.negative) break :blk !floor.negative;
-            const magnitude_order = if (floor.digits.len == integer.digits.len)
-                std.mem.order(u8, floor.digits, integer.digits)
-            else
-                std.math.order(floor.digits.len, integer.digits.len);
-            break :blk if (floor.negative) magnitude_order != .gt else magnitude_order != .lt;
+            break :blk floor.order(integer) != .lt;
         },
         else => error.InvalidNumber,
     };
+}
+
+/// Python arithmetic's implicit float conversion, including integer overflow.
+pub fn numericFloat(v: Value) error{InvalidNumber}!f64 {
+    return switch (v) {
+        .bool => |b| if (b) 1 else 0,
+        .integer => |i| @floatFromInt(i),
+        .float => |f| f,
+        .number_string => |text| blk: {
+            const f = std.fmt.parseFloat(f64, text) catch return error.InvalidNumber;
+            if (IntegerText.parse(text) != null and !std.math.isFinite(f)) return error.InvalidNumber;
+            break :blk f;
+        },
+        else => error.InvalidNumber,
+    };
+}
+
+/// Python numeric ordering. NaNs are unordered; integers never round to float.
+pub fn numericOrder(a: Value, b: Value) error{InvalidNumber}!?std.math.Order {
+    var a_buffer: [20]u8 = undefined;
+    var b_buffer: [20]u8 = undefined;
+    const a_integer = IntegerText.fromValue(a, &a_buffer);
+    const b_integer = IntegerText.fromValue(b, &b_buffer);
+    if (a_integer) |integer| {
+        if (b_integer) |other| return integer.order(other);
+        const f = try numericFloat(b);
+        if (std.math.isNan(f)) return null;
+        if (pyEqual(a, .{ .float = f })) return .eq;
+        return if (try floatAtLeast(f, a)) .lt else .gt;
+    }
+    const f = try numericFloat(a);
+    if (b_integer != null) {
+        if (std.math.isNan(f)) return null;
+        if (pyEqual(.{ .float = f }, b)) return .eq;
+        return if (try floatAtLeast(f, b)) .gt else .lt;
+    }
+    const g = try numericFloat(b);
+    if (std.math.isNan(f) or std.math.isNan(g)) return null;
+    return std.math.order(f, g);
+}
+
+/// Python numeric multiplication. Integer-only products remain exact; float
+/// products first convert BOTH operands, even when the other operand is zero.
+/// Zero/one integer products borrow unchanged numeric text without allocation.
+pub fn numericProduct(arena: Allocator, a: Value, b: Value) (Allocator.Error || error{InvalidNumber})!Value {
+    var a_buffer: [20]u8 = undefined;
+    var b_buffer: [20]u8 = undefined;
+    if (IntegerText.fromValue(a, &a_buffer)) |a_integer| {
+        if (IntegerText.fromValue(b, &b_buffer)) |b_integer| {
+            if (std.mem.eql(u8, a_integer.digits, "0") or std.mem.eql(u8, b_integer.digits, "0"))
+                return .{ .integer = 0 };
+            if (!a_integer.negative and std.mem.eql(u8, a_integer.digits, "1"))
+                return if (b == .bool) .{ .integer = @intFromBool(b.bool) } else b;
+            if (!b_integer.negative and std.mem.eql(u8, b_integer.digits, "1"))
+                return if (a == .bool) .{ .integer = @intFromBool(a.bool) } else a;
+            const a_small: ?i64 = switch (a) {
+                .integer => |i| i,
+                .number_string => |text| std.fmt.parseInt(i64, text, 10) catch null,
+                else => null,
+            };
+            const b_small: ?i64 = switch (b) {
+                .integer => |i| i,
+                .number_string => |text| std.fmt.parseInt(i64, text, 10) catch null,
+                else => null,
+            };
+            if (a_small != null and b_small != null) {
+                const product = @as(i128, a_small.?) * @as(i128, b_small.?);
+                if (std.math.cast(i64, product)) |i| return .{ .integer = i };
+                return .{ .number_string = try std.fmt.allocPrint(arena, "{d}", .{product}) };
+            }
+            var left = try std.math.big.int.Managed.init(arena);
+            defer left.deinit();
+            var right = try std.math.big.int.Managed.init(arena);
+            defer right.deinit();
+            var product = try std.math.big.int.Managed.init(arena);
+            defer product.deinit();
+            try setBigInteger(&left, a);
+            try setBigInteger(&right, b);
+            try product.mul(&left, &right);
+            return .{ .number_string = try product.toConst().toStringAlloc(arena, 10, .lower) };
+        }
+    }
+    const left = try numericFloat(a);
+    const right = try numericFloat(b);
+    return .{ .float = left * right };
+}
+
+fn setBigInteger(out: *std.math.big.int.Managed, v: Value) (Allocator.Error || error{InvalidNumber})!void {
+    switch (v) {
+        .integer => |i| try out.set(i),
+        .bool => |b| try out.set(@intFromBool(b)),
+        .number_string => |text| out.setString(10, text) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.InvalidNumber,
+        },
+        else => return error.InvalidNumber,
+    }
 }
 
 fn floatEqualsInt(f: f64, i: i64) bool {

@@ -22,6 +22,7 @@ const ToolCalls = @import("tool.zig").ToolCalls;
 const BoundingBox = @import("bounding_box.zig").BoundingBox;
 const File = @import("file.zig").File;
 const citation = @import("citation.zig");
+const decision = @import("decision.zig");
 const code = @import("code.zig");
 const python_str = @import("python_str.zig");
 const assert = std.debug.assert;
@@ -101,6 +102,10 @@ pub const Field = struct {
     /// Only direct Citations annotations consume canonical provider citations.
     /// Adaptation remains a no-op: the field is still requested as text.
     native_citations: bool = false,
+    /// Direct rich decisions, or native bool/Literal answer spaces when configured.
+    decision: ?@import("decision_evidence.zig").Binding = null,
+    /// System One treats only the exact native box annotation as geometry.
+    native_bounding_box: bool = false,
     /// Default CoT uses this wire name only when native reasoning is unavailable.
     reasoning_fallback: ?[]const u8 = null,
     /// Custom DSPy content types keep their JSON conventions inside XML leaves.
@@ -129,7 +134,12 @@ fn defaultProvider(comptime T: type, comptime raw: *const anyopaque) *const fn (
     }.get;
 }
 
-pub const Description = struct { name: []const u8, text: []const u8 };
+pub const Description = struct {
+    name: []const u8,
+    text: []const u8,
+    /// Compile-time Annotated metadata, without wrapping native field values.
+    metadata: []const type = &.{},
+};
 
 pub const reserved_names = [_][]const u8{"completed"};
 
@@ -159,8 +169,17 @@ fn descriptionList(comptime descriptions: anytype) []const Description {
         const names = @typeInfo(D).@"struct".field_names;
         var list: [names.len]Description = undefined;
         for (names, 0..) |name, i| {
-            const text: []const u8 = @field(descriptions, name);
-            list[i] = .{ .name = name, .text = text };
+            const entry = @field(descriptions, name);
+            if (@typeInfo(@TypeOf(entry)) == .@"struct") {
+                list[i] = .{
+                    .name = name,
+                    .text = entry.text,
+                    .metadata = if (@hasField(@TypeOf(entry), "metadata")) entry.metadata else &.{},
+                };
+            } else {
+                const text: []const u8 = entry;
+                list[i] = .{ .name = name, .text = text };
+            }
         }
         const final = list;
         return &final;
@@ -212,9 +231,9 @@ pub fn isSignature(comptime T: type) bool {
 /// list item. Recursive custom-type discovery is a separate description rule.
 fn customXmlLiteral(comptime T: type) bool {
     const annotation = if (@typeInfo(T) == .optional) @typeInfo(T).optional.child else T;
-    if (code.isCode(annotation) or annotation == BoundingBox or annotation == File or citation.isCitation(annotation)) return true;
+    if (code.isCode(annotation) or annotation == BoundingBox or annotation == File or citation.isCitation(annotation) or decision.isDecision(annotation)) return true;
     return switch (@typeInfo(annotation)) {
-        .pointer => |p| p.size == .slice and (code.isCode(p.child) or p.child == BoundingBox or p.child == File or citation.isCitation(p.child)),
+        .pointer => |p| p.size == .slice and (code.isCode(p.child) or p.child == BoundingBox or p.child == File or citation.isCitation(p.child) or decision.isDecision(p.child)),
         else => false,
     };
 }
@@ -225,6 +244,12 @@ fn fieldsOf(comptime T: type, comptime role: []const u8, comptime descriptions: 
         var out: [info.field_names.len]Field = undefined;
         for (info.field_names, info.field_types, 0..) |name, FT, i| {
             const kind = kindOf(FT, name);
+            const decision_description: ?type = decision.annotationType(FT) orelse metadata: {
+                for (metadataFor(name, descriptions)) |M| {
+                    if (decision.annotationType(M)) |D| break :metadata D;
+                }
+                break :metadata null;
+            };
             out[i] = .{
                 .name = name,
                 .kind = kind,
@@ -242,14 +267,16 @@ fn fieldsOf(comptime T: type, comptime role: []const u8, comptime descriptions: 
                 // DSPy adapts direct Reasoning annotations, not Optional unions.
                 .native_reasoning = FT == Reasoning,
                 .native_citations = FT == citation.Citations,
+                .decision = @import("decision_evidence.zig").annotation(FT, metadataFor(name, descriptions)),
+                .native_bounding_box = FT == BoundingBox,
                 .xml_literal = FT == History or FT == ToolCalls or FT == ?Reasoning or customXmlLiteral(FT),
                 .native_tool_calls = FT == ToolCalls,
-                .type_description = if (code.annotationType(FT)) |C| C.description else if (citation.annotationType(FT)) |C| C.description else if (FT == ToolCalls) ToolCalls.description else "",
-                .type_description_name = if (code.annotationType(FT)) |C| C.model_name else if (citation.annotationType(FT)) |C| C.model_name else "",
+                .type_description = if (code.annotationType(FT)) |C| C.description else if (citation.annotationType(FT)) |C| C.description else if (decision_description) |C| C.description else if (FT == ToolCalls) ToolCalls.description else "",
+                .type_description_name = if (code.annotationType(FT)) |C| C.model_name else if (citation.annotationType(FT)) |C| C.model_name else if (decision_description) |C| C.model_name else "",
                 .code_type = code.isCode(FT),
-                .dspy_type = code.isCode(FT) or citation.isCitation(FT) or FT == Reasoning or FT == BoundingBox or FT == File or FT == History or FT == ToolCalls,
+                .dspy_type = code.isCode(FT) or citation.isCitation(FT) or decision.isDecision(FT) or FT == Reasoning or FT == BoundingBox or FT == File or FT == History or FT == ToolCalls,
                 .parse_value = if (@import("enum.zig").isEnum(FT) or @import("literal.zig").isLiteral(FT)) FT.parseValue else null,
-                .schema_definition_name = if (code.isCode(FT)) FT.schema_name else "",
+                .schema_definition_name = if (code.isCode(FT) or decision.isDecision(FT)) FT.schema_name else "",
                 .nullable = @typeInfo(FT) == .optional,
                 .default_value = if (info.field_attrs[i].default_value_ptr) |raw| defaultProvider(FT, raw) else null,
                 .refine_mask = @import("feedback.zig").masker(FT),
@@ -266,6 +293,13 @@ fn fieldCount(comptime T: type, comptime role: []const u8) usize {
     const info = @typeInfo(T).@"struct";
     if (info.is_tuple) @compileError("dszig: signature `" ++ role ++ "` must not be a tuple");
     return info.field_names.len;
+}
+
+fn metadataFor(comptime name: []const u8, comptime descriptions: []const Description) []const type {
+    for (descriptions) |description| {
+        if (std.mem.eql(u8, description.name, name)) return description.metadata;
+    }
+    return &.{};
 }
 
 fn descriptionFor(comptime name: []const u8, comptime descriptions: []const Description) ?[]const u8 {

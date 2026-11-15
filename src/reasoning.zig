@@ -58,6 +58,7 @@ pub const Reasoning = struct {
 
     const runtime_vtable: runtime.CustomVTable = .{
         .type_name = @typeName(Reasoning),
+        .type_identity = runtime.typeIdentity(Reasoning),
         .model_name = "Reasoning",
         // The actual tool boundary emits a Type's serialized string bare;
         // nested containers still JSON-encode that same serialized content.

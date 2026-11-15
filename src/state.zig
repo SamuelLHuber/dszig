@@ -69,6 +69,13 @@ fn dumpPredict(arena: Allocator, s: *const predict.PredictState) SaveError!Value
     try sig.put(arena, "fields", .{ .array = fields });
     try obj.put(arena, "signature", .{ .object = sig });
     try obj.put(arena, "lm", .null);
+    if (s.hasDecisionFields()) {
+        _ = @import("decision_state.zig").State.init(arena, try s.view(arena), s.decision_fields, false, null) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.InvalidValue,
+        };
+        try obj.put(arena, "fields", try value.cloneValue(arena, s.decision_fields));
+    }
     return .{ .object = obj };
 }
 
@@ -89,12 +96,11 @@ pub fn saveAlloc(arena: Allocator, program: anytype) (error{JsonTooDeep} || Save
     return aw.written();
 }
 
-/// `module.load_state(state)`: all-or-nothing (validated on a copy first).
+/// `module.load_state(state)`: parameters commit in traversal order.
 /// Loaded strings and demos are copied into `arena`.
 pub fn loadState(arena: Allocator, program: anytype, state: Value) LoadError!void {
     if (state != .object) return error.InvalidState;
-    var trial = program.*;
-    for (try predict.namedParameters(arena, &trial)) |p| {
+    for (try predict.namedParameters(arena, program)) |p| {
         const saved = state.object.get(p.name) orelse return error.MissingState;
         if (saved != .object) return error.InvalidState;
         switch (p.param) {
@@ -105,7 +111,6 @@ pub fn loadState(arena: Allocator, program: anytype, state: Value) LoadError!voi
             },
         }
     }
-    program.* = trial;
 }
 
 pub fn load(arena: Allocator, program: anytype, json: []const u8) (LoadError || error{InvalidJson})!void {
@@ -117,16 +122,17 @@ pub fn load(arena: Allocator, program: anytype, json: []const u8) (LoadError || 
 }
 
 fn loadPredict(arena: Allocator, s: *predict.PredictState, saved: *const Record) LoadError!void {
+    var restored = s.*;
     const sig = saved.get("signature") orelse return error.MissingState;
     if (sig != .object) return error.InvalidState;
     const instructions = sig.object.get("instructions") orelse return error.MissingState;
     if (instructions != .string) return error.InvalidState;
-    s.instructions = try arena.dupe(u8, instructions.string);
+    restored.instructions = try arena.dupe(u8, instructions.string);
     const fields = sig.object.get("fields") orelse return error.MissingState;
     if (fields != .array) return error.InvalidState;
-    const descs = try arena.dupe([]const u8, s.descs);
-    const prefixes = try arena.dupe([]const u8, s.prefixes);
-    const n = @min(fields.array.items.len, s.fields.len);
+    const descs = try arena.dupe([]const u8, restored.descs);
+    const prefixes = try arena.dupe([]const u8, restored.prefixes);
+    const n = @min(fields.array.items.len, restored.fields.len);
     for (fields.array.items[0..n], 0..) |f, i| {
         if (f != .object) return error.InvalidState;
         const prefix = f.object.get("prefix") orelse return error.MissingState;
@@ -135,9 +141,15 @@ fn loadPredict(arena: Allocator, s: *predict.PredictState, saved: *const Record)
         prefixes[i] = try arena.dupe(u8, prefix.string);
         descs[i] = try arena.dupe(u8, desc.string);
     }
-    try s.forkSignatureClass(arena);
-    s.descs = descs;
-    s.prefixes = prefixes;
+    try restored.forkSignatureClass(arena);
+    restored.descs = descs;
+    restored.prefixes = prefixes;
+    const decision_fields: Value = saved.get("fields") orelse .{ .object = .empty };
+    _ = @import("decision_state.zig").State.init(arena, try restored.view(arena), decision_fields, false, null) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidState,
+    };
+    restored.decision_fields = try value.cloneValue(arena, decision_fields);
     const demos = saved.get("demos") orelse return error.MissingState;
     if (demos != .array) return error.InvalidState;
     const out = try arena.alloc(Record, demos.array.items.len);
@@ -145,5 +157,7 @@ fn loadPredict(arena: Allocator, s: *predict.PredictState, saved: *const Record)
         if (d != .object) return error.InvalidState;
         o.* = try value.cloneRecord(arena, &d.object);
     }
-    s.demos = out;
+    restored.demos = out;
+    s.* = restored;
+    if (saved.contains("extended_signature")) return error.InvalidState;
 }

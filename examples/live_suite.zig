@@ -430,6 +430,10 @@ pub fn parseCalls(arena: Allocator, transcript: Value) ![]const Call {
             try dszig.inference.toolsFromValue(arena, raw)
         else
             &.{};
+        const decision: ?dszig.lm.DecisionRequest = if (item.object.get("decision")) |raw|
+            if (raw == .null) null else try dszig.lm.decisionFromValue(arena, raw)
+        else
+            null;
         call.* = .{
             .messages = messages,
             .completion = switch (item.object.get("completion") orelse return error.BadTranscript) {
@@ -441,6 +445,7 @@ pub fn parseCalls(arena: Allocator, transcript: Value) ![]const Call {
             .reasonings = reasonings,
             .options = options,
             .tools = tools,
+            .decision = decision,
             .tool_calls = tool_calls,
             .citations = citations,
             .continuation = continuation,
@@ -460,6 +465,8 @@ pub fn writeTranscript(arena: Allocator, runtime: []const u8, model: []const u8,
         var obj: dszig.ObjectMap = .empty;
         try obj.put(arena, "messages", .{ .array = messages });
         try obj.put(arena, "tools", try dszig.inference.toolsValue(arena, call.tools));
+        // Ordinary rows retain the historical layout written by live.py.
+        if (call.decision) |decision| try obj.put(arena, "decision", try dszig.lm.decisionValue(arena, decision));
         try obj.put(arena, "completion", if (call.completion) |text| .{ .string = text } else .null);
         if (call.completions.len > 0) {
             var all: dszig.Array = .init(arena);
@@ -496,6 +503,7 @@ pub fn writeTranscript(arena: Allocator, runtime: []const u8, model: []const u8,
     try root.put(arena, "supports_response_format", .{ .bool = lm.supports_response_format });
     try root.put(arena, "supports_response_schema", .{ .bool = lm.supports_response_schema });
     try root.put(arena, "supports_function_calling", .{ .bool = lm.supports_function_calling });
+    if (lm.supports_decision_requests) try root.put(arena, "supports_decision_requests", .{ .bool = true });
     try root.put(arena, "calls", .{ .array = call_values });
     try appendResult(arena, &root, result);
     var aw: std.Io.Writer.Allocating = .init(arena);

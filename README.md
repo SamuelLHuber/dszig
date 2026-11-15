@@ -108,16 +108,17 @@ retain the actual continuation and raw provider response independently.
 | DSPy surface | Native Zig surface and coverage |
 |---|---|
 | Class-style signatures and typed fields | `Signature`, `Dict`, `Code`, `CodeWithLanguage`, `BoundingBox`, `File`, `Citations` and `Citations.Citation`, scalar/string/list/optional/model fields, string literal enums and mixed scalar/Enum/bytes `Literal`, field descriptions/defaults, compile-time rejection of invalid signatures |
-| Runtime values and documents | `Value`, `Array`, `ObjectMap`, boxed native Code/File/Reasoning/BoundingBox/Citations identity, recursive typed-class serialization, text/canonical-document content union and bounded Responses `input_file` translation |
+| Runtime values and documents | `Value`, `Array`, `ObjectMap`, boxed native Code/File/Reasoning/BoundingBox/Citations/decision/evidence identity, recursive typed-class serialization, text/canonical-document content union and bounded Responses `input_file` translation |
 | Chat, JSON, XML and two-stage adapters | `Adapter.chat`, `.json`, `.xml`, `.two_step`; `TwoStepAdapter` with a separate extraction LM; independent prompt/parse fixtures, strict response-schema construction, JSON fallback, typed XML and Unicode key handling |
 | Prediction and reasoning | `Predict`, `ChainOfThought`, `BestOfN`, `Refine`, `MultiChainComparison`, explicit `Context`, typed outputs, serialized `Trace`, named predictor/parameter discovery |
+| Typed decisions | `Noul`, configured `Score`/`Choice`, generative evidence classes, criteria/state snapshots, native Annotated metadata, owning evidence collectors and TypeSafe SystemOne prediction; finite coverage and unsupported rows below |
 | Retrieval and embeddings | `Retrieve`, lexical `InMemoryRetriever`, HTTP `ColBERTv2` with shared mutable-graph memory caching, custom/OpenAI/Azure `Embedder`, float32 `KNN`, per-query `KNNFewShot`, and brute-force `Embeddings`/`EmbeddingsWithScores` with NumPy persistence |
 | Evaluation and few-shot search | `optimize.evaluate`, `LabeledFewShot`, `BootstrapFewShot`, `BootstrapFewShotWithRandomSearch`, `BootstrapFewShotWithOptuna`, teacher context, zero thresholds and positional multi-use trace selection |
 | Instruction optimization | `InferRules`; `MIPROv2`, its program-aware proposer and an Optuna 4.5.0 TPE port; `COPRO`; `SIMBA`; supported instance-frontier `GEPA` paths against gepa 0.1.4 |
 | Agents and tools | `ReAct`, comptime `Tool`, `History`, `ToolCalls`, tool results, native declarations and text tool calls, typed submit, retained history |
 | Voting | `Ensemble`, `ensemble.majority`, Unicode text normalization; exact Python numeric equality, NaN object identity and source-order fallback behavior |
 | Answer metrics | `metrics.emScore`, `f1Score`, `hotpotF1Score`, `precisionScore`, multi-reference `em`/`f1`/`hotpotF1`, thresholded and record-based answer matching, DPR-token passage matching |
-| LM boundary | `LM`, native `lm.OpenAI` Chat Completions/Responses, shared bounded `http.Transport`, scripted/keyword LMs, recording/replay wrappers and typed native protocol metadata |
+| LM boundary | `LM`, native `lm.OpenAI` Chat Completions/Responses and `lm.TypeSafe` SystemOne, shared bounded `http.Transport`, scripted/keyword LMs, recording/replay wrappers and typed native protocol metadata |
 | Cache | `CachedLM`, per-candidate/request identity, LRU eviction, rich-response JSON dump/load; failed calls are not cached |
 | State | `state.save`, `saveAlloc`, `load`, with DSPy 3.5.0 dependency metadata and program JSON artifact comparisons |
 
@@ -255,7 +256,11 @@ with `dszig.Value`; parsing JSON creates ordinary values, never class identity.
 A custom value exposes its type through `custom.get(dszig.File)`,
 `custom.get(dszig.Reasoning)`, `custom.get(dszig.BoundingBox)` or
 `custom.get(dszig.Citations)` and retains class-specific validation, formatting,
-equality, truthiness and cloning.
+equality, truthiness and cloning. Typed boxes use nominal per-type identity
+tokens, not `@typeName` display strings, which can elide different generic
+configurations. Custom vtables that support typed `get(T)` provide
+`type_identity = runtime_value.typeIdentity(T)`; opaque callback objects do not
+acquire a typed identity from their display name.
 
 Typed conversion boxes the supported native model families; parsing ordinary JSON does
 not. A raw lookalike dictionary remains a dictionary until explicit typed
@@ -518,6 +523,14 @@ schema prompts also matched exactly. Provider schemas reject unequal colliding
 definitions rather than silently aliasing them; equivalent definitions share
 the same source-matching schema.
 
+Schema field titles share Pydantic's Unicode-aware
+`name.title().replace("_", " ").strip()` behavior, including expanding title
+mappings, Greek final sigma and lone surrogates. An independent native executable
+matched the actual pinned Pydantic helper across all 1,114,112 Python code points
+(SHA-256 `df75e4398df1eecf9e9a9a6e091e1cfb7074d205448e0b4624cf6bca52e2dbe5`)
+and 22 runtime/compile-time context cases. This is finite single-code-point and
+context evidence, not proof for every possible string.
+
 `Embeddings` and `EmbeddingsWithScores` embed the corpus once, normalize float32
 vectors when requested and expose explicit batched queries. Their signed `k`
 follows `[:k]`, including empty results for zero, rather than KNN's reverse
@@ -658,6 +671,111 @@ surrogate comparisons and then passed the same unchanged expectations.
 Pinned Debug/ReleaseSafe each passed **334/334 tests and 28/28 build steps**,
 actual RAG/bootstrap, native **687-request replay** and the Python
 fixture/artifact/reference gate, including regeneration of the DPR tables.
+
+### Typed decisions, evidence and SystemOne
+
+`Noul`, `Score` and `Choice` are genuine native model classes. Configure graded
+and categorical decisions with `ScoreWithLevels` and `ChoiceWithOptions`;
+`NoulWithCriteria` configures boolean criteria. Descriptions are JSON values,
+not a text-only approximation of DSPy's criteria:
+
+```zig
+const Quality = dszig.ScoreWithLevels("[\"poor\",\"fair\",\"excellent\"]");
+const Category = dszig.ChoiceWithOptions(&.{
+    .{ .value = .{ .string = "billing" }, .description_json = "\"Payment issue\"" },
+    .{ .value = .{ .string = "technical" }, .description_json = "\"Product bug\"" },
+});
+const Judge = dszig.Signature(struct {
+    pub const Input = struct { text: []const u8 };
+    pub const Output = struct {
+        flag: dszig.Noul,
+        rating: Quality,
+        category: Category,
+    };
+    pub const instructions = "Judge the supplied input.";
+});
+```
+
+`Predict(Judge)` selects decision adaptation automatically. Its typed outputs
+retain boolean/score/typed-choice values, confidence and model-specific
+probability/level fields. Generative decisions work through the ordinary
+Chat/JSON/XML LM path. Labeled task examples are incorporated into decision
+instructions rather than passed to the evidence signature as ordinary demos.
+Completion extras and their insertion order survive decoding.
+
+Plain `bool` and scalar `Literal` outputs are not automatically decisions.
+Explicit compatible metadata uses the existing description declaration:
+`.flag = .{ .text = "Evaluate flag.", .metadata = &.{ConfiguredNoul} }`.
+A matching configured Choice can similarly annotate a Literal output. These
+native Annotated forms produce the primitive output while retaining the
+configured decision model for evidence and criteria. Float/Score metadata and
+arbitrary runtime annotations are not implemented.
+
+`Predict.state.decision_fields` is the mutable decision configuration, separate
+from signature-field metadata. `getCriteria(arena, name)` returns an owning
+copy; `setCriteria(arena, name, value)` validates before committing an owning
+copy. State dump/load retains decision settings and DSPy's partial-commit
+behavior when a later legacy signature restore fails. Direct
+`decision_state.State.decode` consumes integer-keyed Python dictionaries for
+Score distributions; the generative Predict path validates string aliases and
+converts them before recording and decoding.
+
+`decision_evidence.evidenceType(Model)` and `probabilitiesType(Model)` expose
+the genuine generated evidence classes. They provide strict/lax/JSON
+validation, nominal class identity, field metadata, raw attributes,
+`toAliasedValue(arena)` wire projection, schemas, iteration and owning clones.
+Raw probability attributes are named `option_0`, `option_1`, etc.; wire aliases
+retain the actual labels. `Context.decision_evidence` can point to an initialized
+`DecisionEvidence` collector (`.arena` and `.io` required). Recording takes
+locked owning snapshots before model decoding. Native SystemOne validates all
+BoundingBoxes first and records boxes before decisions; invalid geometry
+records neither.
+
+`lm.TypeSafe` / `TypeSafe` uses the existing bounded native HTTP transport for
+`POST /v1/systemone`. Its LM advertises decision-request capability, retaining
+structured state, questions and response schema through recording/replay/cache
+wrappers. OpenAI refuses direct native decision requests rather than silently
+dropping them. The TypeSafe box route sends the experimental images header;
+this is **not** an Image/assets implementation or the complete provider SDK.
+Usage/request-id/convenience views, Python exception identity, asynchronous
+execution and streaming remain outside this native decision implementation.
+
+The frozen independent DSPy 3.5 source receipt contains **15,218 actual rows
+and 17 model definitions**. Two separate consumers report the following finite
+coverage; their entries/observations overlap and must not be added together:
+
+| Independent consumer | Fully supported entries | Unsupported entries | Unconsumed entries | Compared observations | Mismatches |
+|---|---:|---:|---:|---:|---:|
+| Decision models and views | 8,056 | 1,338 | 5,841 | 81,109 | 0 |
+| Evidence/state/Predict pipeline | 1,838 | 542 | 12,838 | 15,693 | 0 |
+
+Both consumers deliberately **exit nonzero for incomplete coverage**.
+Partially compared unsupported rows contribute observations, not a claim that
+their entire operation is supported. Six candidate-client rollout observations
+are unobserved: the source engine receipt does not capture those client-only
+options. Decimal, bytearray, dynamic subclasses, arbitrary forged model state
+and other unsupported operations remain in the receipt, not replaced with JSON
+lookalikes. Bare Score/Choice evidence refusal also differs in failure timing:
+native compile-time rejection versus Python runtime rejection. These results
+do not establish complete decision-model or DSPy equivalence.
+
+A focused actual-source/native smoke reproduced seven mismatches in 15 Choice
+weight cases before repair and zero afterward, including adjacent integers above
+`2^53`/`2^100` and integer `0 * 10^400` versus float `0.0 * 10^400` overflow.
+Another 13 actual Python products and 14 numeric comparisons exercise the shared
+exact-integer arithmetic. A real localhost TypeSafe HTTP/Predict smoke matched
+all three request bodies **byte-for-byte** against the actual SDK provider,
+including route, fixture authorization, JSON and experimental box headers.
+Typed valid output, geometry refusal before evidence recording and boolean
+probability refusal were exercised. This is HTTP/codec/prediction evidence,
+**not authenticated homelab inference**.
+
+Both decision consumers produced the same counts in Debug and ReleaseSafe,
+including the deliberate incomplete-coverage failures. The decision change also
+passed pinned **353/353 tests and 28/28 build steps in each mode**, actual
+RAG/bootstrap execution, the complete 687-request native replay and the
+independent Python fixture/artifact/reference gate. Unicode and DPR tables
+regenerated unchanged.
 
 ### Citations and provider references
 
@@ -910,8 +1028,9 @@ The following prevent a claim that DSZig can do everything DSPy can:
   class identity; Refine shares this boundary. Mid-bootstrap mutation of a
   borrowed teacher-settings object is not reflected after Bootstrap's entry
   snapshot.
-- **Runtime model identity:** Code, File, Reasoning, BoundingBox and Citations
-  have genuine boxed classes, not a complete Python object runtime. Other model
+- **Runtime model identity:** Code, File, Reasoning, BoundingBox, Citations,
+  Noul/Score/Choice and generated decision evidence have genuine boxed classes,
+  not a complete Python object runtime. Other model
   families still use their existing representations. Generic arrays/maps do not
   preserve shared container/class aliases through memoized deepcopy. Complete
   Python builtin identity/dispatch, NaN float-object identity across distinct or

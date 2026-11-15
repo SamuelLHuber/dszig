@@ -131,6 +131,7 @@ fn smokeTranscript(
         .messages = call.messages,
         .options = call.options orelse return error.InvalidSmokeTranscript,
         .tools = call.tools,
+        .decision = call.decision,
     })).object;
     try row.put(arena, "completion", if (call.completion) |text| .{ .string = text } else .null);
     var reasonings: dszig.Array = .init(arena);
@@ -163,6 +164,7 @@ fn smokeTranscript(
     try root.put(arena, "supports_response_format", .{ .bool = lm.supports_response_format });
     try root.put(arena, "supports_response_schema", .{ .bool = lm.supports_response_schema });
     try root.put(arena, "supports_function_calling", .{ .bool = lm.supports_function_calling });
+    if (lm.supports_decision_requests) try root.put(arena, "supports_decision_requests", .{ .bool = true });
     try root.put(arena, "question", .{ .string = smoke_question });
     try root.put(arena, "answer", .{ .string = answer });
     try root.put(arena, "calls", .{ .array = calls });

@@ -36,8 +36,27 @@ pub const PythonValue = union(enum) {
     dictionary: []const PythonEntry,
 };
 
+/// Concrete decision model metadata, not a JSON-shape discriminator.
+pub const DecisionKind = enum { noul, score, choice };
+pub const DecisionMetadata = struct {
+    kind: DecisionKind,
+    field: *const fn (*const anyopaque, []const u8) ?Value,
+};
+
+/// Nominal identity cannot use @typeName: Zig elides struct-valued generic
+/// arguments in that display string. Mutable per-type storage cannot be merged.
+pub fn typeIdentity(comptime T: type) *const anyopaque {
+    const Identity = struct {
+        pub const Type = T;
+        var token: u8 = 0;
+    };
+    return &Identity.token;
+}
+
 pub const CustomVTable = struct {
     type_name: []const u8,
+    /// Null is an opaque callback object, never admissible to typed get().
+    type_identity: ?*const anyopaque = null,
     model_name: []const u8,
     /// DSPy Type objects can supply bare text for a native tool result;
     /// ordinary models whose JSON serializer returns a string stay JSON-quoted.
@@ -48,6 +67,9 @@ pub const CustomVTable = struct {
     /// Classes with cross-value equality must supply a compatible Python hash.
     python_hash: ?*const fn (*const anyopaque, u32) error{ParseValue}!i64 = null,
     bool_value: ?*const fn (*const anyopaque) bool = null,
+    /// Python __float__, without numeric identity or numeric equality.
+    float_value: ?*const fn (*const anyopaque) CustomError!f64 = null,
+    decision: ?DecisionMetadata = null,
     code: ?CodeMetadata = null,
     python: ?*const fn (*const anyopaque) PythonValue = null,
     /// Python iteration of actual classes, separate from builtin identity.
@@ -79,8 +101,13 @@ pub const Custom = struct {
     owns_data: bool = false,
 
     pub fn get(self: Custom, comptime T: type) ?*const T {
-        if (!std.mem.eql(u8, self.vtable.type_name, @typeName(T))) return null;
+        if (self.vtable.type_identity != typeIdentity(T)) return null;
         return @ptrCast(@alignCast(self.ptr));
+    }
+
+    pub fn sameType(self: Custom, other: Custom) bool {
+        if (self.vtable.type_identity) |identity| return other.vtable.type_identity == identity;
+        return self.vtable == other.vtable;
     }
 
     pub fn truthy(self: Custom) bool {
@@ -110,7 +137,7 @@ pub const Custom = struct {
     pub fn clone(self: Custom, allocator: Allocator) Allocator.Error!Custom {
         const result = try self.vtable.clone(allocator, self.ptr);
         std.debug.assert(result.owns_data);
-        std.debug.assert(std.mem.eql(u8, self.vtable.type_name, result.vtable.type_name));
+        std.debug.assert(self.sameType(result));
         return result;
     }
 
@@ -119,7 +146,7 @@ pub const Custom = struct {
     }
 
     pub fn eql(self: Custom, other: Custom) bool {
-        if (!std.mem.eql(u8, self.vtable.type_name, other.vtable.type_name)) return false;
+        if (!self.sameType(other)) return false;
         return self.vtable.eql(self.ptr, other.ptr);
     }
 };

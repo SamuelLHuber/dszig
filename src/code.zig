@@ -150,6 +150,7 @@ fn CodeType(comptime language_name: []const u8, comptime is_default: bool, compt
 
         const runtime_vtable: runtime.CustomVTable = .{
             .type_name = @typeName(Self),
+            .type_identity = runtime.typeIdentity(Self),
             .model_name = model_name,
             .is_type = true,
             .hashable = false,

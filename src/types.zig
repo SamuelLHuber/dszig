@@ -12,6 +12,7 @@ const code = @import("code.zig");
 const BoundingBox = @import("bounding_box.zig").BoundingBox;
 const File = @import("file.zig").File;
 const citation = @import("citation.zig");
+const decision = @import("decision.zig");
 const Integer = @import("integer.zig").Integer;
 
 pub const Error = error{ ParseValue, OutOfMemory };
@@ -148,22 +149,12 @@ fn quote(comptime s: []const u8) []const u8 {
 }
 
 fn definitionName(comptime T: type) []const u8 {
-    return if (code.isCode(T)) T.schema_name else modelName(T);
+    return if (code.isCode(T) or decision.isDecision(T)) T.schema_name else modelName(T);
 }
 
-/// Python `name.replace("_", " ").title()`.
-fn title(comptime name: []const u8) []const u8 {
-    comptime {
-        var out: [name.len]u8 = undefined;
-        var prev_cased = false;
-        for (name, 0..) |c0, i| {
-            const c = if (c0 == '_') ' ' else c0;
-            out[i] = if (std.ascii.isAlphabetic(c)) (if (prev_cased) std.ascii.toLower(c) else std.ascii.toUpper(c)) else c;
-            prev_cased = std.ascii.isAlphabetic(c);
-        }
-        const final = out;
-        return std.mem.trim(u8, &final, " ");
-    }
+/// Pydantic's `name.title().replace("_", " ").strip()`.
+pub fn title(comptime name: []const u8) []const u8 {
+    return @import("unicode.zig").schemaTitleComptime(name);
 }
 
 /// Schema of `T` where it is used (a struct is a `$ref`).
@@ -297,6 +288,7 @@ fn hasDefault(comptime S: type, comptime i: usize) bool {
 fn modelEntries(comptime S: type, comptime ordered_properties: bool) []const Entry {
     comptime {
         if (@import("enum.zig").isEnum(S)) return enumEntries(S);
+        if (decision.isDecision(S)) return decisionEntries(S, ordered_properties);
         const info = @typeInfo(S).@"struct";
         var props: [if (code.isCode(S) or S == citation.Citations) 1 else if (S == citation.Citations.Citation) 8 else info.field_names.len]Entry = undefined;
         var n_props = 0;
@@ -342,6 +334,41 @@ fn modelEntries(comptime S: type, comptime ordered_properties: bool) []const Ent
     }
 }
 
+fn decisionEntries(comptime S: type, comptime ordered_properties: bool) []const Entry {
+    comptime {
+        const confidence = render(&.{
+            .{ .key = "type", .val = "\"number\"" },
+            .{ .key = "description", .val = "\"Confidence in the value, from 0 to 1.\"" },
+            .{ .key = "maximum", .val = "1" },
+            .{ .key = "minimum", .val = "0" },
+            .{ .key = "title", .val = "\"Confidence\"" },
+        });
+        const member: []const Entry = switch (S.kind) {
+            .noul => entriesOf(bool),
+            .score => entriesOf(f64) ++ (if (S.configured) &[_]Entry{
+                .{ .key = "maximum", .val = std.fmt.comptimePrint("{d}", .{S.members.len - 1}) },
+                .{ .key = "minimum", .val = "0" },
+            } else &[_]Entry{}),
+            .choice => if (S.configured) literalEntries(S.LiteralType) else &.{
+                .{ .key = "anyOf", .val = "[{\"type\": \"string\"}, {\"type\": \"integer\"}, {\"type\": \"boolean\"}, {\"type\": \"null\"}]" },
+            },
+        };
+        const properties: []const Entry = &.{
+            .{ .key = "confidence", .val = confidence },
+            .{ .key = "value", .val = render(member ++ &[_]Entry{.{ .key = "title", .val = "\"Value\"" }}) },
+        };
+        return &[_]Entry{
+            .{ .key = "type", .val = "\"object\"" },
+            .{ .key = "additionalProperties", .val = "false" },
+            .{ .key = "properties", .val = if (ordered_properties) renderOrdered(properties) else render(properties) },
+            .{ .key = "required", .val = "[\"confidence\", \"value\"]" },
+            .{ .key = "title", .val = quote(S.model_name) },
+        } ++ (if (S.schema_description_json.len != 0) &[_]Entry{
+            .{ .key = "description", .val = S.schema_description_json },
+        } else &[_]Entry{});
+    }
+}
+
 fn collectDefs(comptime T: type, comptime seen: []const type) []const type {
     comptime {
         var out = seen;
@@ -355,7 +382,7 @@ fn collectDefs(comptime T: type, comptime seen: []const type) []const type {
             .@"struct" => |s| {
                 for (out) |t| if (t == T) return out;
                 out = out ++ &[_]type{T};
-                if (code.isCode(T) or @import("enum.zig").isEnum(T)) return out;
+                if (code.isCode(T) or decision.isDecision(T) or @import("enum.zig").isEnum(T)) return out;
                 for (s.field_names, s.field_types) |name, FT| {
                     if (citation.isCitation(T) and std.mem.eql(u8, name, "runtime_origin")) continue;
                     out = collectDefs(FT, out);
@@ -408,6 +435,7 @@ fn validateMode(comptime T: type, arena: Allocator, input: Value, comptime xml_l
     if (comptime code.isCode(T) or @import("enum.zig").isEnum(T) or @import("literal.zig").isLiteral(T)) return T.validate(arena, v);
     if (T == Integer) return @import("value.zig").coerceInteger(arena, v);
     if (comptime citation.isCitation(T)) return T.validate(arena, v);
+    if (comptime decision.isDecision(T)) return if (xml_lax) T.validateLax(arena, v) else T.validate(arena, v);
     if (T == File) {
         const file = File.fromValue(arena, v) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
@@ -434,6 +462,9 @@ fn validateMode(comptime T: type, arena: Allocator, input: Value, comptime xml_l
             };
             return .{ .string = out.written() };
         }
+    }
+    if (v == .custom and comptime @typeInfo(T) == .float) {
+        if (v.custom.vtable.float_value) |convert| return .{ .float = try convert(v.custom.ptr) };
     }
     if (v == .custom and (T == []const u8 or T == bool or @typeInfo(T) == .float)) {
         const inspect = v.custom.vtable.python orelse return error.ParseValue;

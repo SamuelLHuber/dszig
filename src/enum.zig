@@ -211,6 +211,7 @@ pub fn EnumWithIdentity(comptime name: []const u8, comptime entries: []const Ent
 
         const vtable: runtime.CustomVTable = .{
             .type_name = @typeName(Self),
+            .type_identity = runtime.typeIdentity(Self),
             .model_name = name,
             .hashable = true,
             .enumeration = inspect,
@@ -225,7 +226,9 @@ pub fn EnumWithIdentity(comptime name: []const u8, comptime entries: []const Ent
             .eql = equal,
         };
 
-        fn instance(ptr: *const anyopaque) *const Self { return @ptrCast(@alignCast(ptr)); }
+        fn instance(ptr: *const anyopaque) *const Self {
+            return @ptrCast(@alignCast(ptr));
+        }
         fn inspect(ptr: *const anyopaque) runtime.EnumValue {
             const entry = entries[instance(ptr).index];
             return .{ .class_identity = @typeName(Self), .class_name = name, .member_name = entry.name, .value = entry.value };

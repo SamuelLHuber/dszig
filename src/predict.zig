@@ -20,7 +20,7 @@ const Adapter = adapter_mod.Adapter;
 const Field = signature.Field;
 const Record = value.Record;
 
-pub const Error = adapter_mod.Error || lm_mod.Error || value.ConvertError || error{NoRetriever};
+pub const Error = adapter_mod.Error || lm_mod.Error || value.ConvertError || @import("decision_state.zig").Error || error{NoRetriever};
 
 pub const Context = struct {
     /// Per-call scratch: prompts, completions, parsed outputs.
@@ -39,6 +39,35 @@ pub const Context = struct {
     use_native_function_calling: ?bool = null,
     /// Scoped adapter wrappers prepare a signature and kwargs before formatting.
     preparation: ?Preparation = null,
+    /// Independent scoped evidence collectors share this handle with workers.
+    decision_evidence: ?*DecisionEvidence = null,
+};
+
+/// Source record_evidence entries are captured before decision decoding.
+/// The collector and its allocator must outlive every context using it.
+pub const DecisionEvidence = struct {
+    arena: Allocator,
+    io: std.Io,
+    mutex: std.Io.Mutex = .init,
+    items: std.ArrayList(Entry) = .empty,
+
+    pub const Entry = struct {
+        predictor: *const PredictState,
+        output: []const u8,
+        evidence: @import("runtime_value.zig").Value,
+    };
+
+    fn record(self: *DecisionEvidence, predictor: *const PredictState, answers: *const Record) Allocator.Error!void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (answers.keys(), answers.values()) |name, answer| {
+            try self.items.append(self.arena, .{
+                .predictor = predictor,
+                .output = try self.arena.dupe(u8, name),
+                .evidence = try value.cloneValue(self.arena, answer),
+            });
+        }
+    }
 };
 
 /// DSPy 3.5's two-stage adapter (deprecated upstream, but still supported).
@@ -174,6 +203,41 @@ pub const PredictState = struct {
     descs: []const []const u8,
     prefixes: []const []const u8,
     demos: []const Record = &.{},
+    /// Persisted Predict.fields overrides, distinct from signature metadata.
+    decision_fields: @import("runtime_value.zig").Value = .{ .object = .empty },
+
+    pub fn hasDecisionFields(state: *const PredictState) bool {
+        return switch (state.decision_fields) {
+            .null => false,
+            .bool => |b| b,
+            .integer => |n| n != 0,
+            .float => |n| n != 0,
+            .number_string => |text| (std.fmt.parseFloat(f64, text) catch return true) != 0,
+            .string => |text| text.len != 0,
+            .array => |items| items.items.len != 0,
+            .object => |items| items.count() != 0,
+            .custom => |custom| custom.truthy(),
+        };
+    }
+
+    pub fn getCriteria(state: *const PredictState, arena: Allocator, name: []const u8) Error!@import("runtime_value.zig").Value {
+        var configs = try value.cloneValue(arena, state.decision_fields);
+        if (configs != .object) return error.InvalidDecision;
+        if (!configs.object.contains(name)) try configs.object.put(arena, name, .{ .object = .empty });
+        const snapshot = try @import("decision_state.zig").State.init(arena, try state.view(arena), configs, false, null);
+        return snapshot.getCriteria(arena, name);
+    }
+
+    pub fn setCriteria(state: *PredictState, arena: Allocator, name: []const u8, criteria: @import("runtime_value.zig").Value) Error!void {
+        var configs = try value.cloneValue(arena, state.decision_fields);
+        if (configs != .object) return error.InvalidDecision;
+        if (!configs.object.contains(name)) try configs.object.put(arena, name, .{ .object = .empty });
+        const config = configs.object.getPtr(name).?;
+        if (config.* != .object) return error.InvalidDecision;
+        try config.object.put(arena, "criteria", try value.cloneValue(arena, criteria));
+        _ = try @import("decision_state.zig").State.init(arena, try state.view(arena), configs, false, null);
+        state.decision_fields = configs;
+    }
 
     pub fn view(state: *const PredictState, arena: Allocator) Allocator.Error!adapter_mod.View {
         assert(state.descs.len == state.fields.len);
@@ -204,13 +268,7 @@ pub const PredictState = struct {
     /// Run one LM call: format, complete, parse (with JSON fallback), trace.
     pub fn call(state: *const PredictState, ctx: Context, inputs: *const Record) Error!Record {
         const prepared = try state.prepare(ctx, inputs);
-        const outputs = runAdapter(ctx, ctx.adapter, prepared.view, state.demos, prepared.inputs) catch |err| switch (err) {
-            error.AdapterParse => if ((ctx.adapter == .chat or ctx.adapter == .xml) and ctx.json_fallback)
-                try runAdapter(ctx, .json, prepared.view, state.demos, prepared.inputs)
-            else
-                return err,
-            else => return err,
-        };
+        const outputs = (try runPredict(state, ctx, prepared))[0];
         if (ctx.trace) |t| try t.record(state, prepared.inputs, &outputs);
         return outputs;
     }
@@ -224,13 +282,7 @@ pub const PredictState = struct {
         ctx.lm_options.n = n;
         if (n > 1 and (ctx.lm_options.temperature orelse 0) <= 0.15) ctx.lm_options.temperature = 0.7;
         const prepared = try state.prepare(ctx, inputs);
-        const outputs = runAdapterMany(ctx, ctx.adapter, prepared.view, state.demos, prepared.inputs) catch |err| switch (err) {
-            error.AdapterParse => if ((ctx.adapter == .chat or ctx.adapter == .xml) and ctx.json_fallback)
-                try runAdapterMany(ctx, .json, prepared.view, state.demos, prepared.inputs)
-            else
-                return err,
-            else => return err,
-        };
+        const outputs = try runPredict(state, ctx, prepared);
         if (ctx.trace) |t| try t.record(state, prepared.inputs, &outputs[0]);
         return outputs;
     }
@@ -244,6 +296,257 @@ pub const PredictState = struct {
         return if (ctx.preparation) |wrapper| wrapper.apply(ctx.arena, call_) else call_;
     }
 };
+
+fn runWithFallback(ctx: Context, view_: adapter_mod.View, demos: []const Record, inputs: *const Record) Error![]const Record {
+    return runAdapterMany(ctx, ctx.adapter, view_, demos, inputs) catch |err| switch (err) {
+        error.AdapterParse => if ((ctx.adapter == .chat or ctx.adapter == .xml) and ctx.json_fallback)
+            try runAdapterMany(ctx, .json, view_, demos, inputs)
+        else
+            return err,
+        else => return err,
+    };
+}
+
+fn runPredict(predictor: *const PredictState, ctx: Context, prepared: PreparedCall) Error![]const Record {
+    const native = ctx.lm.supports_decision_requests;
+    var active = native or predictor.decision_fields != .object;
+    if (predictor.decision_fields == .object) active = active or predictor.decision_fields.object.count() != 0;
+    for (prepared.view.outputs) |field| {
+        if (field.decision) |binding| active = active or binding.automatic;
+    }
+    if (!active) return runWithFallback(ctx, prepared.view, predictor.demos, prepared.inputs);
+    const declared = if (predictor.decision_fields == .object and predictor.decision_fields.object.count() != 0)
+        try predictor.view(ctx.arena)
+    else
+        null;
+    const snapshot = try @import("decision_state.zig").State.init(ctx.arena, prepared.view, predictor.decision_fields, native, declared);
+    var questions: Record = .empty;
+    for (snapshot.types) |entry| try questions.put(ctx.arena, entry.field.name, try snapshot.question(ctx.arena, entry.field.name));
+    const completions = if (native)
+        try runSystemOne(ctx, prepared, predictor.demos, snapshot, &questions)
+    else blk: {
+        var wire = prepared.view;
+        const fields = try ctx.arena.dupe(Field, wire.outputs);
+        for (fields) |*field| {
+            const binding = field.decision orelse continue;
+            if (!questions.contains(field.name)) continue;
+            var description: std.Io.Writer.Allocating = .init(ctx.arena);
+            description.writer.writeByte('\n') catch return error.OutOfMemory;
+            @import("pyjson.zig").writeJson(&description.writer, questions.get(field.name).?, .indent2) catch |err| return adapter_mod.mapWriteError(err);
+            field.* = .{
+                .name = field.name,
+                .kind = .json,
+                .type_name = binding.evidence_name,
+                .desc = description.written(),
+                .prefix = field.prefix,
+                .schema = binding.evidence_schema,
+                .xml_schema = binding.evidence_schema,
+                .validate = binding.validate_evidence,
+                .xml_validate = binding.validate_evidence,
+                .xml_literal = true,
+                .type_description = if (binding.rich) "" else field.type_description,
+                .type_description_name = if (binding.rich) "" else field.type_description_name,
+            };
+        }
+        wire.outputs = fields;
+        if (predictor.demos.len != 0) {
+            const examples = try decisionDemos(ctx.arena, prepared.view, predictor.demos);
+            var instructions: std.Io.Writer.Allocating = .init(ctx.arena);
+            instructions.writer.writeAll(wire.instructions) catch return error.OutOfMemory;
+            instructions.writer.writeAll("\n\nTask examples (labels or evidence):\n") catch return error.OutOfMemory;
+            @import("pyjson.zig").writeJsonAscii(&instructions.writer, .{ .array = examples }) catch |err| return adapter_mod.mapWriteError(err);
+            wire.instructions = instructions.written();
+        }
+        break :blk try runWithFallback(ctx, wire, &.{}, prepared.inputs);
+    };
+    const outputs = try ctx.arena.alloc(Record, completions.len);
+    for (completions, outputs) |completion, *output| {
+        var answers: Record = .empty;
+        output.* = .empty;
+        try output.ensureTotalCapacity(ctx.arena, completion.count());
+        // Retain completion order and extras without cloning evidence that the
+        // typed decision/box result immediately replaces.
+        for (completion.keys(), completion.values()) |name, raw| {
+            var replaced = false;
+            for (snapshot.types) |entry| {
+                if (std.mem.eql(u8, name, entry.field.name)) {
+                    replaced = true;
+                    break;
+                }
+            }
+            if (native and !replaced) {
+                if (prepared.view.findOutput(name)) |field| replaced = field.native_bounding_box;
+            }
+            output.putAssumeCapacity(try ctx.arena.dupe(u8, name), if (replaced) .null else try value.cloneValue(ctx.arena, raw));
+        }
+        if (native) for (prepared.view.outputs) |field| {
+            if (!field.native_bounding_box) continue;
+            const answer = completion.get(field.name) orelse return error.InvalidDecision;
+            if (answer != .object) return error.InvalidDecision;
+            const raw_box = answer.object.get("box") orelse return error.InvalidDecision;
+            const parsed_box = @import("types.zig").validate(@import("bounding_box.zig").BoundingBox, ctx.arena, raw_box) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.AdapterParse,
+            };
+            try output.put(ctx.arena, field.name, parsed_box);
+            try answers.put(ctx.arena, field.name, try value.cloneValue(ctx.arena, answer));
+        };
+        for (snapshot.types) |entry| {
+            const raw_answer = completion.get(entry.field.name) orelse return error.InvalidDecision;
+            const answer = if (native) raw_answer else entry.binding.evidence_value(ctx.arena, raw_answer) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.AdapterParse,
+            };
+            if (entry.binding.model.kind == .score) {
+                if (answer != .object) return error.InvalidDecision;
+                const probabilities = answer.object.get("probabilities") orelse return error.InvalidDecision;
+                if (probabilities != .object or probabilities.object.count() != entry.binding.model.labels.len) return error.InvalidDecision;
+                for (probabilities.object.keys()) |label| {
+                    var found = false;
+                    for (entry.binding.model.labels) |expected| found = found or std.mem.eql(u8, label, expected);
+                    if (!found) return error.InvalidDecision;
+                }
+            }
+            var copy = try value.cloneValue(ctx.arena, answer);
+            if (entry.binding.model.kind == .score) {
+                const probabilities = copy.object.get("probabilities").?;
+                const pairs = try ctx.arena.alloc(@import("runtime_value.zig").PythonEntry, probabilities.object.count());
+                for (probabilities.object.keys(), probabilities.object.values(), pairs) |label, probability_, *pair| {
+                    pair.* = .{ .key = .{ .integer = std.fmt.parseInt(i64, label, 10) catch return error.InvalidDecision }, .value = probability_ };
+                }
+                const dictionary = @import("python_value.zig").dictionary(ctx.arena, pairs) catch |err| return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    else => error.InvalidDecision,
+                };
+                try copy.object.put(ctx.arena, "probabilities", dictionary);
+            }
+            try answers.put(ctx.arena, entry.field.name, copy);
+        }
+        if (ctx.decision_evidence) |collector| try collector.record(predictor, &answers);
+        const decoded = try snapshot.decode(ctx.arena, &answers);
+        for (decoded.keys(), decoded.values()) |name, result| try output.put(ctx.arena, name, result);
+    }
+    return outputs;
+}
+
+fn decisionDemos(arena: Allocator, view_: adapter_mod.View, demos: []const Record) Error!@import("runtime_value.zig").Array {
+    var examples: @import("runtime_value.zig").Array = .init(arena);
+    try examples.ensureTotalCapacity(demos.len);
+    for (demos) |demo| {
+        var filtered: Record = .empty;
+        for (demo.keys(), demo.values()) |name, entry| {
+            if (view_.hasField(name)) try filtered.put(arena, name, entry);
+        }
+        try examples.append(value.serializedValue(arena, .{ .object = filtered }) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.InvalidDecision,
+        });
+    }
+    return examples;
+}
+
+fn runSystemOne(ctx: Context, prepared: PreparedCall, demos: []const Record, snapshot: @import("decision_state.zig").State, questions: *Record) Error![]const Record {
+    const options = ctx.lm_options;
+    if (options.temperature != null or options.rollout_id != null or options.n != 1 or
+        options.reasoning_effort != null or options.reasoning_effort_present or options.response_format != null or
+        options.tool_choice != null or options.parallel_tool_calls != null) return error.InvalidDecision;
+    var state: Record = .empty;
+    try state.put(ctx.arena, "instructions", .{ .string = prepared.view.instructions });
+    try state.put(ctx.arena, "input_fields", .{ .string = try adapter_mod.fieldDescriptionString(ctx.arena, prepared.view.inputs) });
+    var inputs: Record = .empty;
+    for (prepared.inputs.keys(), prepared.inputs.values()) |name, entry| {
+        if (prepared.view.findInput(name) != null) try inputs.put(ctx.arena, name, entry);
+    }
+    try state.put(ctx.arena, "inputs", .{ .object = inputs });
+    if (demos.len != 0) try state.put(ctx.arena, "demos", .{ .array = try decisionDemos(ctx.arena, prepared.view, demos) });
+    var properties: Record = .empty;
+    for (snapshot.types) |entry| {
+        var property: Record = .empty;
+        const kind = entry.binding.model.kind;
+        try property.put(ctx.arena, "type", .{ .string = switch (kind) {
+            .noul => "boolean",
+            .score => "integer",
+            .choice => "string",
+        } });
+        try property.put(ctx.arena, "description", .{ .string = entry.field.name });
+        if (kind == .score) {
+            var branches: @import("runtime_value.zig").Array = .init(ctx.arena);
+            for (entry.binding.model.labels, 0..) |label, i| {
+                var branch: Record = .empty;
+                try branch.put(ctx.arena, "const", .{ .integer = @intCast(i) });
+                try branch.put(ctx.arena, "description", .{ .string = label });
+                try branches.append(.{ .object = branch });
+            }
+            try property.put(ctx.arena, "anyOf", .{ .array = branches });
+        } else if (kind == .choice) {
+            const question = questions.get(entry.field.name).?;
+            const criteria = question.object.get("criteria") orelse return error.InvalidDecision;
+            if (criteria != .object) return error.InvalidDecision;
+            var labels: @import("runtime_value.zig").Array = .init(ctx.arena);
+            for (criteria.object.keys()) |label| {
+                if (label.len == 0) return error.InvalidDecision;
+                try labels.append(.{ .string = label });
+            }
+            try property.put(ctx.arena, "enum", .{ .array = labels });
+        }
+        try properties.put(ctx.arena, entry.field.name, .{ .object = property });
+    }
+    for (prepared.view.outputs) |field| {
+        if (!field.native_bounding_box) continue;
+        const default_description = try std.fmt.allocPrint(ctx.arena, "${{{s}}}", .{field.name});
+        const description = if (field.desc.len == 0 or std.mem.eql(u8, field.desc, default_description)) field.name else field.desc;
+        var question: Record = .empty;
+        try question.put(ctx.arena, "type", .{ .string = "box" });
+        try question.put(ctx.arena, "instructions", .{ .string = description });
+        try questions.put(ctx.arena, field.name, .{ .object = question });
+        var property: Record = .empty;
+        try property.put(ctx.arena, "type", .{ .string = "object" });
+        try property.put(ctx.arena, "description", .{ .string = description });
+        var edges: Record = .empty;
+        var required: @import("runtime_value.zig").Array = .init(ctx.arena);
+        const edge_descriptions = [_][]const u8{
+            "Top edge, as a fraction of the image's height from the top, from 0 to 1",
+            "Bottom edge, as a fraction of the image's height from the top, from 0 to 1",
+            "Left edge, as a fraction of the image's width from the left, from 0 to 1",
+            "Right edge, as a fraction of the image's width from the left, from 0 to 1",
+        };
+        for ([_][]const u8{ "top", "bottom", "left", "right" }, edge_descriptions) |edge, edge_description| {
+            var schema: Record = .empty;
+            try schema.put(ctx.arena, "type", .{ .string = "number" });
+            try schema.put(ctx.arena, "description", .{ .string = edge_description });
+            try edges.put(ctx.arena, edge, .{ .object = schema });
+            try required.append(.{ .string = edge });
+        }
+        try property.put(ctx.arena, "properties", .{ .object = edges });
+        try property.put(ctx.arena, "required", .{ .array = required });
+        try property.put(ctx.arena, "additionalProperties", .{ .bool = false });
+        try properties.put(ctx.arena, field.name, .{ .object = property });
+    }
+    var response_schema: Record = .empty;
+    try response_schema.put(ctx.arena, "type", .{ .string = "object" });
+    try response_schema.put(ctx.arena, "properties", .{ .object = properties });
+    const completions = try ctx.lm.completeResponses(ctx.arena, .{
+        .messages = &.{},
+        .decision = .{
+            .state = value.serializedValue(ctx.arena, .{ .object = state }) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.InvalidDecision,
+            },
+            .questions = .{ .object = questions.* },
+            .response_schema = .{ .object = response_schema },
+        },
+    });
+    if (completions.len != 1) return error.InvalidDecision;
+    const provider_data = completions[0].provider_data orelse return error.InvalidDecision;
+    if (provider_data != .object) return error.InvalidDecision;
+    const typesafe = provider_data.object.get("typesafe") orelse return error.InvalidDecision;
+    if (typesafe != .object) return error.InvalidDecision;
+    const answers = typesafe.object.get("answers") orelse return error.InvalidDecision;
+    if (answers != .object) return error.InvalidDecision;
+    const result = try ctx.arena.alloc(Record, 1);
+    result[0] = answers.object;
+    return result;
+}
 
 fn runAdapterMany(ctx: Context, adapter: Adapter, original: adapter_mod.View, demos: []const Record, inputs: *const Record) Error![]const Record {
     if (adapter == .two_step and ctx.two_step == null) return error.AdapterParse;
@@ -391,11 +694,6 @@ fn fallbackName(arena: Allocator, view_: adapter_mod.View, f: Field) Allocator.E
     unreachable;
 }
 
-fn runAdapter(ctx: Context, adapter: Adapter, view_: adapter_mod.View, demos: []const Record, inputs: *const Record) Error!Record {
-    assert(ctx.lm_options.n == 1);
-    return (try runAdapterMany(ctx, adapter, view_, demos, inputs))[0];
-}
-
 /// `dspy.Predict(Signature)`.
 pub fn Predict(comptime Sig: type) type {
     comptime assert(signature.isSignature(Sig));
@@ -428,6 +726,14 @@ pub fn Predict(comptime Sig: type) type {
             .prefixes = &default_prefixes,
         },
         compiled: bool = false,
+
+        pub fn getCriteria(self: *const Self, arena: Allocator, name: []const u8) Error!@import("runtime_value.zig").Value {
+            return self.state.getCriteria(arena, name);
+        }
+
+        pub fn setCriteria(self: *Self, arena: Allocator, name: []const u8, criteria: @import("runtime_value.zig").Value) Error!void {
+            try self.state.setCriteria(arena, name, criteria);
+        }
 
         pub fn forward(self: *const Self, ctx: Context, input: Input) Error!Output {
             const inputs = try value.toRecord(ctx.arena, Input, input);

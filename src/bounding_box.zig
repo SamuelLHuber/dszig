@@ -96,6 +96,7 @@ pub const BoundingBox = struct {
 
     const runtime_vtable: runtime.CustomVTable = .{
         .type_name = @typeName(BoundingBox),
+        .type_identity = runtime.typeIdentity(BoundingBox),
         .model_name = "BoundingBox",
         .is_type = true,
         .hashable = true,
