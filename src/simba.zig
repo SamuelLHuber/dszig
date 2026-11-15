@@ -31,7 +31,7 @@ const Context = predict.Context;
 const Example = optimize.Example;
 const Metric = optimize.Metric;
 const Record = value.Record;
-const Value = std.json.Value;
+const Value = @import("runtime_value.zig").Value;
 
 const program_desc = "The outputs of the program that we are analyzing";
 const trajectory_desc = "The trajectory of the program's execution, showing each module's I/O";
@@ -437,7 +437,7 @@ pub const SIMBA = struct {
             if (good.score.? > p90) try mask(out, bad) else try mask(out, good);
         }
         const preds = try predict.namedPredictors(out, system);
-        var module_names: std.json.Array = .init(out);
+        var module_names: @import("runtime_value.zig").Array = .init(out);
         for (preds) |p| try module_names.append(.{ .string = p.name });
         const example = good.example;
         var labels: Record = .empty;
@@ -514,7 +514,7 @@ fn reward(out: Allocator, score: ?f64) Allocator.Error!Value {
 
 /// `[{"module_name", "inputs", "outputs"}]` for the run's trace steps.
 fn trajectory(out: Allocator, run: anytype) Allocator.Error!Value {
-    var list: std.json.Array = .init(out);
+    var list: @import("runtime_value.zig").Array = .init(out);
     for (run.steps) |step| {
         const name = nameOf(run.names, step.predictor) orelse continue;
         var item: Record = .empty;

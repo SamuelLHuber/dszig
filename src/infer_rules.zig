@@ -369,7 +369,7 @@ pub fn getPredictorDemos(out: Allocator, trainset: []const Example, predictor: *
     return demos;
 }
 
-pub fn formatExamples(out: Allocator, demos: []const Record, predictor: *const predict.PredictState) (Allocator.Error || error{JsonTooDeep})![]const u8 {
+pub fn formatExamples(out: Allocator, demos: []const Record, predictor: *const predict.PredictState) (Allocator.Error || error{ JsonTooDeep, AdapterParse })![]const u8 {
     var text: Writer.Allocating = .init(out);
     for (demos) |demo| {
         text.writer.writeAll("Input Fields:\n") catch return error.OutOfMemory;
@@ -390,7 +390,7 @@ fn hasField(fields: []const signature.Field, key: []const u8) bool {
     return false;
 }
 
-fn writeFields(writer: *Writer, demo: Record, fields: []const signature.Field) (Allocator.Error || error{JsonTooDeep})!void {
+fn writeFields(writer: *Writer, demo: Record, fields: []const signature.Field) (Allocator.Error || error{ JsonTooDeep, AdapterParse })!void {
     var it = demo.iterator();
     var first = true;
     while (it.next()) |entry| {
@@ -401,6 +401,7 @@ fn writeFields(writer: *Writer, demo: Record, fields: []const signature.Field) (
         pyjson.writeStr(writer, entry.value_ptr.*) catch |err| return switch (err) {
             error.WriteFailed => error.OutOfMemory,
             error.JsonTooDeep => error.JsonTooDeep,
+            error.ParseValue => error.AdapterParse,
         };
     }
 }
@@ -549,7 +550,7 @@ const TestLM = struct {
         const state = self.state;
         try state.history.record(request);
         try state.teacher_calls.append(state.history.arena, self.teacher);
-        const system = request.messages[0].content;
+        const system = request.messages[0].content.text;
         const text: []const u8 = if (isInduction(request)) blk: {
             if (state.failure_index < state.failures.len) {
                 const failure = state.failures[state.failure_index];
@@ -563,7 +564,7 @@ const TestLM = struct {
             state.induction_count += 1;
             break :blk try std.fmt.allocPrint(arena, "<plan>Use the examples.</plan>\n<natural_language_rules>\n\u{2003} rule-{d} \u{a0}\n</natural_language_rules>", .{index});
         } else if (std.mem.indexOf(u8, system, "`answer`") == null) blk: {
-            const user = request.messages[request.messages.len - 1].content;
+            const user = request.messages[request.messages.len - 1].content.text;
             const question = between(user, "<question>", "</question>");
             break :blk try std.fmt.allocPrint(arena, "<draft>generated:{s}</draft>", .{question});
         } else blk: {
@@ -580,7 +581,7 @@ const TestLM = struct {
 };
 
 fn isInduction(request: lm_mod.Request) bool {
-    return std.mem.indexOf(u8, request.messages[0].content, "natural_language_rules") != null;
+    return std.mem.indexOf(u8, request.messages[0].content.text, "natural_language_rules") != null;
 }
 fn between(text: []const u8, opening: []const u8, closing: []const u8) []const u8 {
     const start = (std.mem.indexOf(u8, text, opening) orelse return "") + opening.len;
@@ -640,11 +641,11 @@ test "InferRules real-source CoT prompts teacher options runtime count persisten
     // Byte-identical actual Python XMLAdapter prompt from infer_rules_oracle.py.
     try testing.expectEqualStrings(
         "Your input fields are:\n1. `examples_text` (str): Text containing examples\nYour output fields are:\n1. `plan` (str): A short plan for solving the task.\n2. `natural_language_rules` (str): Induced natural language rules\nOutput format (replace placeholders):\n<plan>\n{plan}\n</plan>\n\n<natural_language_rules>\n{natural_language_rules}\n</natural_language_rules>\nIn adhering to this structure, your objective is: \n        Given a set of examples, extract a list of 7 concise and non-redundant natural language rules that provide clear guidance for performing the task. All rules should be actionable for a well-specified scope of examples of this general kind of task.",
-        state.history.requests.items[0].messages[0].content,
+        state.history.requests.items[0].messages[0].content.text,
     );
     try testing.expectEqualStrings(
         "<examples_text>\nfirst\n</examples_text>\n\nOutput format (replace placeholders):\n<plan>\n{plan}\n</plan>\n\n<natural_language_rules>\n{natural_language_rules}\n</natural_language_rules>\n\nUse this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping.",
-        state.history.requests.items[0].messages[1].content,
+        state.history.requests.items[0].messages[1].content.text,
     );
     try testing.expectEqualStrings("x\u{200b}", stripRules("\u{85}\u{a0}\u{1680}\u{2003}x\u{200b}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}\x1f"));
     const source_spaces = [_]u21{ 9, 10, 11, 12, 13, 28, 29, 30, 31, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288 };
@@ -738,7 +739,7 @@ test "InferRules splits once bootstraps once snapshots resets strict ties and fi
     const rollouts = [_]i64{ 906691059, 413653999, 813847339, 955892128, 451585301, 43469773 };
     for (state.history.requests.items, state.teacher_calls.items) |request, teacher| {
         if (!isInduction(request)) continue;
-        const user = request.messages[request.messages.len - 1].content;
+        const user = request.messages[request.messages.len - 1].content.text;
         try testing.expectEqual(@as(usize, 2), occurrenceCount(user, "Input Fields:"));
         try testing.expect(std.mem.indexOf(u8, user, "labeled:0") != null);
         try testing.expect(std.mem.indexOf(u8, user, "generated:") == null);
@@ -806,7 +807,7 @@ test "InferRules eagerly captures persistent rules metadata settings binding and
         try testing.expectEqual(index < 4, teacher);
         try testing.expectEqual(rollouts[index], request.options.rollout_id.?.integer);
         const expected: []const u8 = if (index < 2) "a list of 7 concise" else "Caller-owned induction instructions.";
-        try testing.expect(std.mem.indexOf(u8, request.messages[0].content, expected) != null);
+        try testing.expect(std.mem.indexOf(u8, request.messages[0].content.text, expected) != null);
         index += 1;
     }
     try testing.expectEqual(@as(usize, 6), index);
@@ -909,7 +910,7 @@ test "InferRules explicit validation empty failure timing negative candidates em
     var optimizer = try InferRules.init(a, .{ .metric = testMetric, .num_candidates = 1, .max_bootstrapped_demos = 0, .max_labeled_demos = 0 });
     var student: TestProgram = .{};
     _ = try optimizer.compile(TestProgram, a, testing.allocator, ctx, &student, null, try testExamples(a, 3), try testExamples(a, 1));
-    try testing.expectEqual(@as(usize, 3), occurrenceCount(state.history.requests.items[0].messages[1].content, "Input Fields:"));
+    try testing.expectEqual(@as(usize, 3), occurrenceCount(state.history.requests.items[0].messages[1].content.text, "Input Fields:"));
     const before = state.history.requests.items.len;
     student = .{};
     try testing.expectError(error.EmptyValidationSet, optimizer.compile(TestProgram, a, testing.allocator, ctx, &student, null, try testExamples(a, 2), &.{}));
@@ -975,10 +976,10 @@ test "InferRules only classified source errors shrink the final training example
     const rules = try optimizer.induceNaturalLanguageRules(a, testing.allocator, ctx, &predictor.state, try testExamples(a, 4));
     try testing.expectEqualStrings("rule-0", rules);
     for (state.history.requests.items, [_]usize{ 4, 3, 2, 1 }, [_]i64{ 906691059, 413653999, 813847339, 955892128 }) |request, count, rollout| {
-        try testing.expectEqual(count, occurrenceCount(request.messages[1].content, "Input Fields:"));
+        try testing.expectEqual(count, occurrenceCount(request.messages[1].content.text, "Input Fields:"));
         try testing.expectEqual(rollout, request.options.rollout_id.?.integer);
         try testing.expectEqual(@as(?f64, 1), request.options.temperature);
-        if (count < 4) try testing.expect(std.mem.indexOf(u8, request.messages[1].content, "q3") == null);
+        if (count < 4) try testing.expect(std.mem.indexOf(u8, request.messages[1].content.text, "q3") == null);
     }
     for ([_]usize{ 0, 1 }) |count| {
         state.failures = &.{.value_error};

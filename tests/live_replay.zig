@@ -8,7 +8,7 @@ const std = @import("std");
 const dszig = @import("dszig");
 const suite = @import("live_suite");
 const testing = std.testing;
-const Value = std.json.Value;
+const Value = dszig.Value;
 
 const transcript_json = @embedFile("fixtures/dspy_3_5_0_mock_suite.json");
 
@@ -54,7 +54,7 @@ test "DSZig reproduces DSPy 3.5.0's independently recorded deterministic suite" 
         }
     }
     const mine_json = try suite.writeTranscript(arena, "dszig", "replay", replay.lm(), calls, result);
-    const mine_root = try std.json.parseFromSliceLeaky(std.json.Value, arena, mine_json, .{});
+    const mine_root = try std.json.parseFromSliceLeaky(dszig.Value, arena, mine_json, .{});
     inline for (suite.pipeline_names) |name| {
         const want = transcript.object.get(name).?.object;
         const got = @field(result, name);

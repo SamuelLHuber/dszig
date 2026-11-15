@@ -15,7 +15,7 @@ const value = @import("value.zig");
 
 const Context = predict.Context;
 const Record = value.Record;
-const Value = std.json.Value;
+const Value = @import("runtime_value.zig").Value;
 
 /// `dspy.evaluate.normalize_text`: NFD, `str.lower`, drop
 /// `string.punctuation`, replace the words a/an/the (re's Unicode `\b`)

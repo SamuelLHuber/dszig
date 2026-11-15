@@ -192,12 +192,12 @@ pub const COPRO = struct {
 
     /// The best `breadth` attempts, lowest score first, as
     /// `Instruction #k`, `Prefix #k`, `Resulting Score #k` lines.
-    fn attempts(self: COPRO, out: Allocator, evaluated: anytype) !std.json.Array {
+    fn attempts(self: COPRO, out: Allocator, evaluated: anytype) !@import("runtime_value.zig").Array {
         const E = @TypeOf(evaluated[0]);
         const sorted = try out.dupe(E, evaluated);
         std.sort.insertion(E, sorted, {}, E.greater);
         const shortest = @min(sorted.len, self.breadth);
-        var list: std.json.Array = .init(out);
+        var list: @import("runtime_value.zig").Array = .init(out);
         var i = shortest;
         while (i > 0) {
             i -= 1;

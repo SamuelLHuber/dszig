@@ -132,23 +132,23 @@ fn smokeTranscript(
         .options = call.options orelse return error.InvalidSmokeTranscript,
         .tools = call.tools,
     })).object;
-    try row.put(arena, "completion", .{ .string = call.completion });
-    var reasonings: std.json.Array = .init(arena);
+    try row.put(arena, "completion", if (call.completion) |text| .{ .string = text } else .null);
+    var reasonings: dszig.Array = .init(arena);
     for (call.reasonings) |reasoning| try reasonings.append(if (reasoning) |text| .{ .string = text } else .null);
     try row.put(arena, "reasonings", .{ .array = reasonings });
-    var tool_calls: std.json.Array = .init(arena);
+    var tool_calls: dszig.Array = .init(arena);
     for (call.tool_calls) |native_calls| try tool_calls.append(try dszig.inference.toolCallsValue(arena, native_calls));
     try row.put(arena, "tool_calls", .{ .array = tool_calls });
-    var continuation: std.json.Array = .init(arena);
+    var continuation: dszig.Array = .init(arena);
     for (call.continuation) |state| try continuation.append(try dszig.inference.continuationsValue(arena, state));
     try row.put(arena, "continuation", .{ .array = continuation });
-    var provider_data: std.json.Array = .init(arena);
+    var provider_data: dszig.Array = .init(arena);
     for (call.provider_data) |data| try provider_data.append(data orelse .null);
     try row.put(arena, "provider_data", .{ .array = provider_data });
-    var calls: std.json.Array = .init(arena);
+    var calls: dszig.Array = .init(arena);
     try calls.append(.{ .object = row });
 
-    var root: std.json.ObjectMap = .empty;
+    var root: dszig.ObjectMap = .empty;
     try root.put(arena, "runtime", .{ .string = "dszig" });
     try root.put(arena, "target_dspy", .{ .string = suite.target_dspy });
     try root.put(arena, "scenario", .{ .string = "cot_smoke" });

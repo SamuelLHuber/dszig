@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Value = std.json.Value;
+const Value = @import("runtime_value.zig").Value;
 const Writer = std.Io.Writer;
 
 const predict = @import("predict.zig");
@@ -19,10 +19,11 @@ pub const dependency_versions = [_][2][]const u8{
 };
 
 pub const LoadError = error{ MissingState, InvalidState } || Allocator.Error;
+pub const SaveError = error{InvalidValue} || Allocator.Error;
 
 /// `module.dump_state()` plus the `metadata` key added by `save`.
 /// Read-only: `program` may be a const pointer.
-pub fn dumpState(arena: Allocator, program: anytype) Allocator.Error!Value {
+pub fn dumpState(arena: Allocator, program: anytype) SaveError!Value {
     var root: Record = .empty;
     // The parameter walk yields mutable pointers; nothing here writes through them.
     for (try predict.namedParameters(arena, @constCast(program))) |p| {
@@ -43,14 +44,20 @@ pub fn dumpState(arena: Allocator, program: anytype) Allocator.Error!Value {
     return .{ .object = root };
 }
 
-fn dumpPredict(arena: Allocator, s: *const predict.PredictState) Allocator.Error!Value {
+fn dumpPredict(arena: Allocator, s: *const predict.PredictState) SaveError!Value {
     var obj: Record = .empty;
     try obj.put(arena, "traces", .{ .array = .init(arena) });
     try obj.put(arena, "train", .{ .array = .init(arena) });
-    var demos: std.json.Array = .init(arena);
-    for (s.demos) |d| try demos.append(.{ .object = d });
+    var demos: @import("runtime_value.zig").Array = .init(arena);
+    for (s.demos) |demo| {
+        const serialized = value.serializedValue(arena, .{ .object = demo }) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.ParseValue => error.InvalidValue,
+        };
+        try demos.append(serialized);
+    }
     try obj.put(arena, "demos", .{ .array = demos });
-    var fields: std.json.Array = .init(arena);
+    var fields: @import("runtime_value.zig").Array = .init(arena);
     for (s.prefixes, s.descs) |prefix, desc| {
         var f: Record = .empty;
         try f.put(arena, "prefix", .{ .string = prefix });
@@ -66,16 +73,17 @@ fn dumpPredict(arena: Allocator, s: *const predict.PredictState) Allocator.Error
 }
 
 /// Write the state exactly as DSPy's `orjson` OPT_INDENT_2 | OPT_APPEND_NEWLINE.
-pub fn save(arena: Allocator, program: anytype, w: *Writer) (pyjson.Error || Allocator.Error)!void {
+pub fn save(arena: Allocator, program: anytype, w: *Writer) (pyjson.Error || SaveError)!void {
     try pyjson.writeJson(w, try dumpState(arena, program), .indent2);
     try w.writeByte('\n');
 }
 
-pub fn saveAlloc(arena: Allocator, program: anytype) error{ JsonTooDeep, OutOfMemory }![]const u8 {
+pub fn saveAlloc(arena: Allocator, program: anytype) (error{JsonTooDeep} || SaveError)![]const u8 {
     var aw: Writer.Allocating = .init(arena);
     save(arena, program, &aw.writer) catch |err| return switch (err) {
         // The allocating writer only fails when its allocator does.
         error.WriteFailed => error.OutOfMemory,
+        error.ParseValue => error.InvalidValue,
         else => |e| e,
     };
     return aw.written();

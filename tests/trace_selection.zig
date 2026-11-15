@@ -12,7 +12,7 @@ test "BootstrapFewShot positional trace picks match actual DSPy 3.5" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const fixture = (try std.json.parseFromSliceLeaky(std.json.Value, arena, fixture_json, .{})).object;
+    const fixture = (try std.json.parseFromSliceLeaky(dszig.Value, arena, fixture_json, .{})).object;
     try testing.expectEqualStrings("3.5.0", fixture.get("dspy").?.string);
     const cases = fixture.get("cases").?.array.items;
     try testing.expectEqual(@as(usize, 144), cases.len);

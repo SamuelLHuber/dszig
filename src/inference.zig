@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Value = std.json.Value;
+const Value = @import("runtime_value.zig").Value;
 
 pub const MetadataError = error{BadMetadata} || Allocator.Error;
 
@@ -102,10 +102,11 @@ pub fn freeToolCalls(allocator: Allocator, calls: []const ToolCall) void {
 /// clone. Completion caches cannot rely on a surrounding arena to recover it.
 pub fn cloneJsonValue(allocator: Allocator, input: Value) Allocator.Error!Value {
     return switch (input) {
+        .custom => |custom| .{ .custom = try custom.clone(allocator) },
         .string => |text| .{ .string = try allocator.dupe(u8, text) },
         .number_string => |text| .{ .number_string = try allocator.dupe(u8, text) },
         .array => |array| blk: {
-            var out: std.json.Array = .init(allocator);
+            var out: @import("runtime_value.zig").Array = .init(allocator);
             errdefer {
                 for (out.items) |item| freeJsonValue(allocator, item);
                 out.deinit();
@@ -115,7 +116,7 @@ pub fn cloneJsonValue(allocator: Allocator, input: Value) Allocator.Error!Value 
             break :blk .{ .array = out };
         },
         .object => |object| blk: {
-            var out: std.json.ObjectMap = .empty;
+            var out: @import("runtime_value.zig").ObjectMap = .empty;
             errdefer {
                 var iterator = out.iterator();
                 while (iterator.next()) |entry| {
@@ -140,6 +141,7 @@ pub fn cloneJsonValue(allocator: Allocator, input: Value) Allocator.Error!Value 
 
 pub fn freeJsonValue(allocator: Allocator, input: Value) void {
     switch (input) {
+        .custom => |custom| custom.deinit(allocator),
         .string => |text| allocator.free(text),
         .number_string => |text| allocator.free(text),
         .array => |array| {
@@ -191,10 +193,10 @@ pub fn freeContinuations(allocator: Allocator, input: []const Continuation) void
 }
 
 pub fn continuationsValue(arena: Allocator, input: []const Continuation) Allocator.Error!Value {
-    var out: std.json.Array = .init(arena);
+    var out: @import("runtime_value.zig").Array = .init(arena);
     try out.ensureTotalCapacity(input.len);
     for (input) |state| {
-        var object: std.json.ObjectMap = .empty;
+        var object: @import("runtime_value.zig").ObjectMap = .empty;
         try object.put(arena, "provider", .{ .string = state.provider });
         try object.put(arena, "kind", .{ .string = state.kind });
         try object.put(arena, "data", state.data);
@@ -258,7 +260,7 @@ pub fn cloneToolChoice(arena: Allocator, choice: ToolChoice) Allocator.Error!Too
 /// Provider-neutral form, before Chat's json_schema wrapper or Responses'
 /// text.format wrapper is applied. Used by caches and faithful transcripts.
 pub fn responseFormatValue(arena: Allocator, format: ResponseFormat) Allocator.Error!Value {
-    var out: std.json.ObjectMap = .empty;
+    var out: @import("runtime_value.zig").ObjectMap = .empty;
     try out.put(arena, "type", .{ .string = @tagName(format) });
     if (format == .json_schema) {
         const schema = format.json_schema;
@@ -273,8 +275,8 @@ pub fn responseFormatValue(arena: Allocator, format: ResponseFormat) Allocator.E
 /// Canonical choice semantics; a forced function is required + one allowed
 /// name, not an auto choice that the model is permitted to ignore.
 pub fn toolChoiceValue(arena: Allocator, choice: ToolChoice) Allocator.Error!Value {
-    var out: std.json.ObjectMap = .empty;
-    var allowed: std.json.Array = .init(arena);
+    var out: @import("runtime_value.zig").ObjectMap = .empty;
+    var allowed: @import("runtime_value.zig").Array = .init(arena);
     const mode: []const u8 = switch (choice) {
         .auto => "auto",
         .none => "none",
@@ -294,10 +296,10 @@ pub fn toolChoiceValue(arena: Allocator, choice: ToolChoice) Allocator.Error!Val
 }
 
 pub fn toolsValue(arena: Allocator, tools: []const FunctionTool) Allocator.Error!Value {
-    var out: std.json.Array = .init(arena);
+    var out: @import("runtime_value.zig").Array = .init(arena);
     try out.ensureTotalCapacity(tools.len);
     for (tools) |tool| {
-        var object: std.json.ObjectMap = .empty;
+        var object: @import("runtime_value.zig").ObjectMap = .empty;
         try object.put(arena, "name", .{ .string = tool.name });
         try object.put(arena, "description", .{ .string = tool.description });
         try object.put(arena, "parameters", tool.parameters);
@@ -308,10 +310,10 @@ pub fn toolsValue(arena: Allocator, tools: []const FunctionTool) Allocator.Error
 }
 
 pub fn toolCallsValue(arena: Allocator, calls: []const ToolCall) Allocator.Error!Value {
-    var out: std.json.Array = .init(arena);
+    var out: @import("runtime_value.zig").Array = .init(arena);
     try out.ensureTotalCapacity(calls.len);
     for (calls) |call| {
-        var object: std.json.ObjectMap = .empty;
+        var object: @import("runtime_value.zig").ObjectMap = .empty;
         try object.put(arena, "id", .{ .string = call.id });
         try object.put(arena, "name", .{ .string = call.name });
         try object.put(arena, "arguments", .{ .string = call.arguments });
@@ -461,6 +463,7 @@ pub fn jsonEqual(a: Value, b: Value) bool {
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
     return switch (a) {
         .null => true,
+        .custom => |custom| custom.eql(b.custom),
         .bool => |x| x == b.bool,
         .integer => |x| x == b.integer,
         .float => |x| x == b.float,

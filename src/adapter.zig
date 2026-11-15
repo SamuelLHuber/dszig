@@ -5,7 +5,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
-const Value = std.json.Value;
+const Value = @import("runtime_value.zig").Value;
 const Writer = std.Io.Writer;
 const inference = @import("inference.zig");
 const tool = @import("tool.zig");
@@ -29,9 +29,11 @@ pub const Role = enum {
     }
 };
 
+pub const Content = @import("message_content.zig").Content;
+
 pub const Message = struct {
     role: Role,
-    content: []const u8,
+    content: Content,
     reasoning: ?[]const u8 = null,
     tool_calls: []const inference.ToolCall = &.{},
     tool_call_id: ?[]const u8 = null,
@@ -63,6 +65,15 @@ pub const View = struct {
 
 pub const Error = error{ AdapterParse, JsonTooDeep } || Allocator.Error;
 
+/// Expand media where DSPy constructs user/tool parts; assistant/system stay text.
+pub fn renderedContent(arena: Allocator, rendered: []const u8) Error!Content {
+    return Content.fromRendered(arena, rendered) catch |err| return switch (err) {
+        error.InvalidContent => error.AdapterParse,
+        error.JsonTooDeep => error.JsonTooDeep,
+        error.OutOfMemory => error.OutOfMemory,
+    };
+}
+
 pub const Adapter = enum {
     chat,
     json,
@@ -71,10 +82,10 @@ pub const Adapter = enum {
 
     pub fn format(adapter: Adapter, arena: Allocator, view: View, demos: []const Record, inputs: *const Record) Error![]Message {
         var messages: std.ArrayList(Message) = .empty;
-        try messages.append(arena, .{ .role = .system, .content = try systemMessage(adapter, arena, view) });
+        try messages.append(arena, .{ .role = .system, .content = .{ .text = try systemMessage(adapter, arena, view) } });
         try formatDemos(adapter, arena, view, demos, &messages);
         if (adapter == .two_step) {
-            try messages.append(arena, .{ .role = .user, .content = try twoStepFields(arena, view.inputs, inputs, "") });
+            try messages.append(arena, .{ .role = .user, .content = try renderedContent(arena, try twoStepFields(arena, view.inputs, inputs, "")) });
             return messages.items;
         }
         var current_view = view;
@@ -94,7 +105,7 @@ pub const Adapter = enum {
             try messages.appendSlice(arena, try history.format(adapter, arena, current_view));
         }
         const content = try userMessage(adapter, arena, current_view, inputs, "", true);
-        if (content.len > 0) try messages.append(arena, .{ .role = .user, .content = content });
+        if (content.len > 0) try messages.append(arena, .{ .role = .user, .content = try renderedContent(arena, content) });
         return messages.items;
     }
 
@@ -190,6 +201,7 @@ fn mapWriteError(err: pyjson.Error) Error {
     return switch (err) {
         error.WriteFailed => error.OutOfMemory,
         error.JsonTooDeep => error.JsonTooDeep,
+        error.ParseValue => error.AdapterParse,
     };
 }
 
@@ -238,7 +250,7 @@ pub fn fieldSchema(arena: Allocator, field: Field) Error!Value {
             if (field.literals.len == 1) {
                 try out.put(arena, "const", .{ .string = field.literals[0] });
             } else {
-                var members: std.json.Array = .init(arena);
+                var members: @import("runtime_value.zig").Array = .init(arena);
                 for (field.literals) |member| try members.append(.{ .string = member });
                 try out.put(arena, "enum", .{ .array = members });
             }
@@ -352,7 +364,7 @@ fn enforceRequired(arena: Allocator, schema: *Value, depth: usize) Error!void {
         if (!schema.object.contains("properties")) try schema.object.put(arena, "properties", .{ .object = .empty });
         const props = schema.object.get("properties").?;
         if (props == .object) {
-            var required: std.json.Array = .init(arena);
+            var required: @import("runtime_value.zig").Array = .init(arena);
             for (props.object.keys()) |name| try required.append(.{ .string = name });
             try schema.object.put(arena, "required", .{ .array = required });
             try schema.object.put(arena, "additionalProperties", .{ .bool = false });
@@ -370,17 +382,23 @@ fn enforceRequired(arena: Allocator, schema: *Value, depth: usize) Error!void {
     }
 }
 
-/// DSPy custom tool fields retain their own literal JSON conventions.
-fn formattedValue(arena: Allocator, field: Field, input: Value) Error!Value {
+/// Serialize custom values without discarding their round-trip model fields.
+pub fn formattedValue(arena: Allocator, field: Field, input: Value) Error!Value {
     if (field.native_tools and input == .array) return tool.formatCatalogValue(arena, input);
     if (field.native_tool_calls and input == .object) {
         const calls = tool.ToolCalls.fromValue(arena, input) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.ParseValue => error.AdapterParse,
         };
-        return calls.formatValue(arena);
+        return value.serializedValue(arena, try calls.formatValue(arena)) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.ParseValue => error.AdapterParse,
+        };
     }
-    return input;
+    return value.serializedValue(arena, input) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.ParseValue => error.AdapterParse,
+    };
 }
 
 pub fn writeFieldValue(arena: Allocator, w: *Writer, field: Field, input: Value) Error!void {
@@ -538,8 +556,8 @@ fn formatDemos(adapter: Adapter, arena: Allocator, view: View, demos: []const Re
             if (!complete and !(hasAny(view.inputs, demo) and hasAny(view.outputs, demo))) continue;
             const prefix = if (complete) "" else incomplete_demo_prefix;
             const missing = if (complete) missing_complete else missing_incomplete;
-            try messages.append(arena, .{ .role = .user, .content = try userMessage(adapter, arena, view, demo, prefix, false) });
-            try messages.append(arena, .{ .role = .assistant, .content = try assistantMessage(adapter, arena, view, demo, missing) });
+            try messages.append(arena, .{ .role = .user, .content = try renderedContent(arena, try userMessage(adapter, arena, view, demo, prefix, false)) });
+            try messages.append(arena, .{ .role = .assistant, .content = .{ .text = try assistantMessage(adapter, arena, view, demo, missing) } });
         }
     }
 }

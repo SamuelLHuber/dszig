@@ -47,7 +47,7 @@ pub const Kind = enum {
 };
 
 /// A `dict[str, str]` field value: every value is a `.string`.
-pub const StrDict = struct { map: std.json.ObjectMap };
+pub const StrDict = struct { map: @import("runtime_value.zig").ObjectMap };
 
 /// DSPy native reasoning. Its custom serializer emits the content string.
 pub const Reasoning = struct { content: []const u8 };
@@ -81,9 +81,9 @@ pub const Field = struct {
     schema: []const u8 = "",
     /// TypeAdapter schemas preserve model field order for XML/native output.
     xml_schema: []const u8 = "",
-    validate: ?*const fn (std.mem.Allocator, std.json.Value) nested.Error!std.json.Value = null,
+    validate: ?*const fn (std.mem.Allocator, @import("runtime_value.zig").Value) nested.Error!@import("runtime_value.zig").Value = null,
     /// XML decoded containers override a model's configured strictness.
-    xml_validate: ?*const fn (std.mem.Allocator, std.json.Value) nested.Error!std.json.Value = null,
+    xml_validate: ?*const fn (std.mem.Allocator, @import("runtime_value.zig").Value) nested.Error!@import("runtime_value.zig").Value = null,
     /// Python `str(value)` for declared types whose JSON lowering loses the
     /// Pydantic repr (models, Code, containers of them). Null uses `pyjson.writeStr`.
     python_str: ?python_str.Render = null,
@@ -100,20 +100,20 @@ pub const Field = struct {
     native_tool_calls: bool = false,
     nullable: bool = false,
     /// Lazily encode a declared Zig field default into the per-call arena.
-    default_value: ?*const fn (std.mem.Allocator) std.mem.Allocator.Error!std.json.Value = null,
+    default_value: ?*const fn (std.mem.Allocator) std.mem.Allocator.Error!@import("runtime_value.zig").Value = null,
     /// Refine masks Python objects before serialization, not their wire forms.
     refine_mask: ?@import("feedback.zig").Mask = null,
 };
 
 /// An absent field differs from an explicit null value.
-pub fn outputDefault(arena: std.mem.Allocator, field: Field) std.mem.Allocator.Error!?std.json.Value {
+pub fn outputDefault(arena: std.mem.Allocator, field: Field) std.mem.Allocator.Error!?@import("runtime_value.zig").Value {
     if (field.default_value) |get| return try get(arena);
-    return if (field.nullable) @as(std.json.Value, .null) else null;
+    return if (field.nullable) @as(@import("runtime_value.zig").Value, .null) else null;
 }
 
-fn defaultProvider(comptime T: type, comptime raw: *const anyopaque) *const fn (std.mem.Allocator) std.mem.Allocator.Error!std.json.Value {
+fn defaultProvider(comptime T: type, comptime raw: *const anyopaque) *const fn (std.mem.Allocator) std.mem.Allocator.Error!@import("runtime_value.zig").Value {
     return struct {
-        fn get(arena: std.mem.Allocator) std.mem.Allocator.Error!std.json.Value {
+        fn get(arena: std.mem.Allocator) std.mem.Allocator.Error!@import("runtime_value.zig").Value {
             const v: T = @as(*const T, @ptrCast(@alignCast(raw))).*;
             return @import("value.zig").toValue(arena, T, v);
         }
@@ -204,9 +204,10 @@ pub fn isSignature(comptime T: type) bool {
 fn customXmlLiteral(comptime T: type) bool {
     const annotation = if (@typeInfo(T) == .optional) @typeInfo(T).optional.child else T;
     const BoundingBox = @import("bounding_box.zig").BoundingBox;
-    if (code.isCode(annotation) or annotation == BoundingBox) return true;
+    const File = @import("file.zig").File;
+    if (code.isCode(annotation) or annotation == BoundingBox or annotation == File) return true;
     return switch (@typeInfo(annotation)) {
-        .pointer => |p| p.size == .slice and (code.isCode(p.child) or p.child == BoundingBox),
+        .pointer => |p| p.size == .slice and (code.isCode(p.child) or p.child == BoundingBox or p.child == File),
         else => false,
     };
 }
@@ -270,7 +271,7 @@ pub fn kindOf(comptime T: type, comptime name: []const u8) Kind {
     if (T == []const u8 or T == Reasoning or code.isCode(T)) return .str;
     if (T == []const []const u8) return .str_list;
     if (T == bool) return .boolean;
-    if (T == std.json.ObjectMap) return .json_object;
+    if (T == @import("runtime_value.zig").ObjectMap) return .json_object;
     if (T == StrDict) return .str_dict;
     if (nested.isNested(T)) return .json;
     switch (@typeInfo(T)) {

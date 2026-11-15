@@ -8,7 +8,7 @@ const signature = @import("signature.zig");
 const types = @import("types.zig");
 const code = @import("code.zig");
 const Allocator = std.mem.Allocator;
-const Value = std.json.Value;
+const Value = @import("runtime_value.zig").Value;
 pub const Error = Allocator.Error || error{JsonTooDeep};
 /// Null means no replacement; consumers can preserve the original container.
 pub const Mask = *const fn (Allocator, Value) Error!?Value;
@@ -24,7 +24,7 @@ pub fn masker(comptime T: type) ?Mask {
 
 fn needsMask(comptime T: type) bool {
     if (T == signature.Reasoning or T == signature.StrDict or T == []const u8 or T == []u8) return false;
-    if (T == Value or T == std.json.ObjectMap) return true;
+    if (T == Value or T == @import("runtime_value.zig").ObjectMap) return true;
     if (comptime types.isDict(T)) return needsMask(T.dszig_dict_value);
     return switch (@typeInfo(T)) {
         .optional => |o| needsMask(o.child),
@@ -42,12 +42,13 @@ fn replacement(arena: Allocator, comptime T: type, v: Value, depth: u32) Error!?
     if (T == signature.Reasoning or T == signature.StrDict) return null;
     if (comptime code.isCode(T)) return .{ .string = "<non-serializable: " ++ T.model_name ++ ">" };
     if (T == Value) return switch (v) {
+        .custom => |custom| .{ .string = try std.fmt.allocPrint(arena, "<non-serializable: {s}>", .{custom.vtable.model_name}) },
         .array => arrayReplacement(arena, Value, v, depth),
         .object => objectReplacement(arena, Value, v, depth),
         .number_string => integerReplacement(v),
         else => null,
     };
-    if (T == std.json.ObjectMap) return objectReplacement(arena, Value, v, depth);
+    if (T == @import("runtime_value.zig").ObjectMap) return objectReplacement(arena, Value, v, depth);
     if (comptime types.isDict(T)) return objectReplacement(arena, T.dszig_dict_value, v, depth);
     return switch (@typeInfo(T)) {
         .optional => |o| replacement(arena, o.child, v, depth),
@@ -73,7 +74,7 @@ fn integerReplacement(v: Value) ?Value {
 
 fn arrayReplacement(arena: Allocator, comptime Child: type, v: Value, depth: u32) Error!?Value {
     if (v != .array) return null;
-    var copied: ?std.json.Array = null;
+    var copied: ?@import("runtime_value.zig").Array = null;
     for (v.array.items, 0..) |item, i| {
         if (try replacement(arena, Child, item, depth + 1)) |changed| {
             if (copied == null) {
@@ -88,7 +89,7 @@ fn arrayReplacement(arena: Allocator, comptime Child: type, v: Value, depth: u32
 
 fn objectReplacement(arena: Allocator, comptime Child: type, v: Value, depth: u32) Error!?Value {
     if (v != .object) return null;
-    var copied: ?std.json.ObjectMap = null;
+    var copied: ?@import("runtime_value.zig").ObjectMap = null;
     for (v.object.keys(), v.object.values()) |key, item| {
         if (try replacement(arena, Child, item, depth + 1)) |changed| {
             if (copied == null) copied = try v.object.clone(arena);

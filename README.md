@@ -6,8 +6,10 @@ allocators and execution context are explicit.
 
 **This is not a feature-complete or fully identical implementation of DSPy.** The
 cross-runtime gates cover the behaviors below, not every DSPy capability. In
-particular, the Python-executing RLM/Flex stack, fine-tuning,
-multimodal content, and streaming are not implemented. See [Compatibility limits](#compatibility-limits).
+particular, the Python-executing RLM/Flex stack, fine-tuning, images/audio,
+full provider SDK coverage, and streaming are not implemented. Native File and
+bounded Responses document support are implemented, not general multimodal
+parity. See [Compatibility limits](#compatibility-limits).
 
 ## Example
 
@@ -105,7 +107,8 @@ retain the actual continuation and raw provider response independently.
 
 | DSPy surface | Native Zig surface and coverage |
 |---|---|
-| Class-style signatures and typed fields | `Signature`, `Dict`, `Code`, `CodeWithLanguage`, `BoundingBox`, scalar/string/list/optional/model fields, literal enums, field descriptions/defaults, compile-time rejection of invalid signatures |
+| Class-style signatures and typed fields | `Signature`, `Dict`, `Code`, `CodeWithLanguage`, `BoundingBox`, `File`, scalar/string/list/optional/model fields, literal enums, field descriptions/defaults, compile-time rejection of invalid signatures |
+| Runtime values and documents | `Value`, `Array`, `ObjectMap`, boxed native File identity, recursive typed-class serialization, text/canonical-document content union and bounded Responses `input_file` translation |
 | Chat, JSON, XML and two-stage adapters | `Adapter.chat`, `.json`, `.xml`, `.two_step`; `TwoStepAdapter` with a separate extraction LM; independent prompt/parse fixtures, strict response-schema construction, JSON fallback, typed XML and Unicode key handling |
 | Prediction and reasoning | `Predict`, `ChainOfThought`, `BestOfN`, `Refine`, `MultiChainComparison`, explicit `Context`, typed outputs, serialized `Trace`, named predictor/parameter discovery |
 | Retrieval and embeddings | `Retrieve`, lexical `InMemoryRetriever`, HTTP `ColBERTv2` with shared mutable-graph memory caching, custom/OpenAI/Azure `Embedder`, float32 `KNN`, per-query `KNNFewShot`, and brute-force `Embeddings`/`EmbeddingsWithScores` with NumPy persistence |
@@ -119,6 +122,130 @@ retain the actual continuation and raw provider response independently.
 
 A named surface in this table is not a claim that every Python option or provider
 route is implemented. The limits below are part of the compatibility contract.
+
+### LM text and non-text results
+
+`lm.Completion.text` is `?[]const u8`: `null` means that no text part was
+returned, not an empty answer. Use `LM.completeResponses` to retain that
+distinction together with reasoning, tool calls, continuation and raw provider
+data. Recording/replay entries and completion JSON metadata retain nullable
+text. The text-only `complete`, `completeMany` and `OpenAI.parseResponse`
+helpers return `LMFailure` for an absent text result rather than inventing `""`.
+Chat's no-tool empty/null/missing content fallback is separately normalized to
+`""`, as in the source; a Chat tool-only result retains `null`.
+
+The Responses parser follows the observed lm15 behavior: root/item statuses
+and message roles do not discard returned text, `output_text` and `text`
+blocks concatenate, and an empty output can use the top-level text fallback.
+Refusal-only, reasoning-only and tool-only responses have absent text;
+provider error objects fail. Missing tool-call IDs fall back to the item ID
+or a canonical-part-index ID. Arguments are normalized to an object and
+serialized with Python JSON spacing and ASCII escaping; malformed argument
+text can remain a `partial_json` object. This is not general JSON repair.
+
+Pinned native parser consumers matched **42 Responses and 4 Chat actual DSPy
+3.5 localhost HTTP observations**, comparing visible text, reasoning and tool
+calls, including null versus empty text, summary coercion, Unicode argument
+escaping, normalization and fallback IDs. The repeatable development oracle is
+`tools/dspy_reference/lm_response_oracle.py`. This is protocol-fixture evidence,
+not authenticated model inference, provider streaming or complete lm15
+compatibility.
+
+### Native runtime values and File
+
+Public runtime records, tool results and JSON-shaped APIs use **`dszig.Value`**,
+not `std.json.Value`. `dszig.Array` is the managed list of these values;
+`dszig.ObjectMap` is their ordered string-keyed map. The familiar `.null`, `.bool`,
+`.integer`, `.float`, `.number_string`, `.string`, `.array` and `.object` tags
+are joined by `.custom`, which retains a boxed native class instead of erasing
+it into a lookalike dictionary. `std.json` parsing and Stringify work directly
+with `dszig.Value`; parsing JSON creates ordinary values, never class identity.
+A custom value exposes its type through `custom.get(dszig.File)` and retains
+class-specific validation, formatting, equality and cloning.
+
+`File` has three nullable UTF-8 fields: `file_data`, `file_id` and `filename`.
+Its constructors are explicit:
+
+- `File.init(source, keywords)` constructs a fresh typed File without allocating.
+  `source` is an optional runtime value; `keywords` is an ordinary object.
+  Positional File instances omit null fields before keyword merging, unlike
+  dictionaries, which retain explicit null keys. Overlapping fields are
+  rejected. Copying an all-null instance with no keywords fails construction,
+  whereas validating that same instance preserves it.
+- `File.fromValue(input)` accepts a data-URI string, an object with recognized
+  File fields, or an actual runtime File. It borrows validated/stripped strings;
+  it does not read paths or fetch URLs. Unknown object fields and invalid field
+  types are rejected. Runtime class validation preserves an existing File box,
+  whereas explicitly converting a raw object to a typed File constructs a File.
+- `File.fromFileId(id, filename)` accepts nullable strings and borrows their
+  validated/stripped contents.
+- `File.fromBytes(arena, bytes, .{ .mime_type = ..., .filename = ... })` allocates
+  an encoded data URI and optional filename in the arena. Its default MIME type
+  is `application/octet-stream`.
+- `File.fromPath(arena, io, path, options)` reads a regular file, following
+  symlinks; it uses the basename and MIME guess unless overridden, with
+  `application/octet-stream` as the unknown-type fallback. The resulting data URI
+  and filename belong to the arena.
+
+Construction validates fields, **not usable media**. Nullable/empty fields and
+malformed inline data can construct successfully, then fail in `format`,
+`serialize` or adapter rendering. Empty byte input likewise encodes successfully
+but fails at formatting. A nonempty `file_id` takes precedence over inline data
+and formats as an `application/pdf` document; otherwise formatting validates a
+nonempty base64 data URI. The filename is not included in that canonical part.
+
+`file.toRuntime(arena)` allocates a File box but **borrows its field strings**;
+`value.toValue(arena, dszig.File, file)` uses this identity-preserving path too.
+`file.toValue(arena)` instead returns the raw model dump: an ordinary object
+containing all three nullable fields, with borrowed strings and no media marker.
+Generic `std.json` Stringify also emits that raw File object. DSPy-style
+`pyjson` serialization emits the custom-type marker. These are intentionally
+different representations.
+
+```zig
+// arena and owner are caller-provided allocators with suitable lifetimes.
+const file = try dszig.File.fromFileId("file-report", "report.pdf");
+const runtime = try file.toRuntime(arena); // .custom; strings remain borrowed
+const raw = try file.toValue(arena);       // .object; not an actual File
+const owned = try dszig.inference.cloneJsonValue(owner, runtime);
+defer dszig.inference.freeJsonValue(owner, owned);
+// owned retains a File class and owns copies of all non-null field strings.
+const serialized = try dszig.value.serializedValue(arena, runtime); // marker string
+_ = raw;
+_ = serialized;
+```
+
+Copying a `Value` is not a deep clone. Keep borrowed fields, containers and the
+box allocator alive while using them. `inference.cloneJsonValue` makes an owning
+recursive copy, including the File box and its fields; release it with
+`inference.freeJsonValue` using the same allocator. `value.serializedValue`
+recursively serializes actual custom classes inside arrays/objects, copying
+containers only where changed. Unchanged subtrees remain borrowed. Ordinary
+dictionaries with identical File keys stay dictionaries and are not Python-equal
+to an actual File; they do not acquire class identity by serialization.
+
+`adapter.Message.content` is `adapter.Content`, a union of `.text` and `.parts`
+(canonical text/document dictionaries, not provider-specific blocks).
+`File.format(arena)` returns a canonical document array; `serialize(arena)`
+wraps it in `<<CUSTOM-TYPE-START-IDENTIFIER>>` / `<<CUSTOM-TYPE-END-IDENTIFIER>>`.
+Rendered adapter messages expand these markers once, including JSON-escaped
+payloads, into canonical content parts. This is a rendered-message boundary,
+not a general JSON decoder: `Content.fromValue` does not expand markers in a
+string. Literal marker text in a rendered message can trigger expansion even
+without an actual File. Missing closing markers stay text; payloads that are
+not lists remain text, while malformed canonical part dictionaries fail.
+Canonical documents require a media type and exactly one of `data`, `url`,
+`file_id` or `path`; this is not the full Python DocumentPart object API.
+
+The native OpenAI Responses transport translates supported non-assistant
+documents to `input_file` blocks using a file ID, URL, inline base64 data or a
+local path read at request construction. Assistant documents are rejected.
+Chat Completions rejects document content before HTTP, following the pinned
+source preflight rather than inventing an unsupported route. These implemented
+paths do not establish full provider/media parity or a completed post-cutover
+provider rerun.
+
+### Other native API contracts
 
 `BoundingBox.init(top, bottom, left, right)` constructs normalized image
 geometry with finite edges in `[0, 1]` and strictly positive width/height.
@@ -216,8 +343,10 @@ program trace. A native executable matched **14 actual DSPy cases and all
 outputs, outer traces and persistent failure budgets. Coverage includes distinct versus shared
 signature classes, missing/empty advice, null thresholds, NaN/infinite rewards,
 and small-decimal feedback serialization.
-Thresholds are nullable `std.json.Value` scalars: `.integer = 100` and
-`.float = 100` intentionally generate different feedback strings. Exact integer
+Thresholds are nullable `dszig.Value` scalars; for example,
+`const threshold: ?dszig.Value = .{ .integer = 100 };`.
+`.integer = 100` and `.float = 100` intentionally generate different feedback
+strings. Exact integer
 thresholds beyond machine widths use `.number_string`; reward comparisons do
 not round them to a floating-point threshold. Feedback retains DSPy's
 `<non-serializable: int>` masking beyond orjson's integer range.
@@ -366,11 +495,45 @@ scores, saved artifact bytes, instruction candidates, trial logs, candidate
 scores and SIMBA train scores. It is **mock-provider behavioral evidence**, not
 proof of real-model performance or complete DSPy equivalence.
 
-Local verification on 2026-11-15 passed **256/256 tests**
-in both Debug and ReleaseSafe. The actual replay executable consumed the entire
-fixture and matched every adapter case and pipeline. The independent real-DSPy
-reference gate also passed. These results establish only the coverage described
-above, not the missing capabilities listed below.
+Local verification on 2026-11-15 of the File/native runtime-value,
+nullable-completion and File-copy constructor cutover passed **261/261 tests**
+in both Debug and ReleaseSafe, with all 28 build steps, including the actual
+RAG/bootstrap examples. Its actual replay executable consumed all **687**
+deterministic mock calls and matched every adapter case and pipeline; the
+independent real-DSPy reference gate also passed.
+
+The actual `zig build live -- --smoke` CLI completed once through Chat
+Completions and once through Responses against an isolated localhost HTTP
+fixture, returning `4` and writing each protocol's transcript. A separate
+negative run exited before HTTP when a dummy `CODEX_LB_API_KEY` was supplied
+without `OPENAI_BASE_URL`. These are native CLI/transport/configuration checks,
+**not authenticated homelab inference or live-model parity**.
+
+Separate post-cutover pinned native consumer smokes matched the actual DSPy
+File oracle for **8 shapes, 64 exact prompts (including TwoStep), 198 parses,
+24 typed Predicts, 26 marker cases and 8 persistence/masking/loaded-demo
+behaviors**. An identity consumer matched six actual source/native tool-result
+cases: actual File versus plain lookalike dictionary, repeated nested instances
+of each, escaped file IDs and late invalid-File formatting. It also checked
+class-validation pointer identity, a deep-owned clone surviving source-arena
+destruction and allocator cleanup, and exact escaped streamed marker JSON.
+That last check exercises the JSON writer, not provider streaming.
+The post-cutover provider consumer also matched **all 14 actual HTTP request
+bodies byte-for-byte and all 17 typed predictions**, including cache behavior
+and retained provider JSON. It still reports six unresolved cross-API
+comparisons: five compare native replay text with the source's structured SDK
+output view, and one compares a private SDK Chat display serializer with public
+Chat preflight. Those are not successful SDK-equivalence checks.
+A separate constructor executable compared **393/429 constructor cases,
+47/51 filesystem cases and 5/6 constructor-I/O controls**, with **5,107 assertions
+and zero failures**. This includes nine actual File-instance construction,
+validation and copy cases: native instances are reconstructed as boxed Files,
+not substituted with lookalike dictionaries, and recorded same-instance
+validation checks compare native box identity. Across exercised cases it
+compared 3,671 source operations and 329 additional streaming-writer outputs.
+Explicitly skipped dispatches and Python DocumentPart operations remain limits.
+These smokes do not establish exhaustive constructor or DocumentPart coverage,
+full File parity or full provider/SDK compatibility.
 
 Additional native executable checks exercised hosted OpenAI/Azure embeddings,
 base64/index ordering, cache reuse, vector KNN, repeated KNNFewShot predictions
@@ -416,13 +579,16 @@ uv run --project tools/dspy_reference --locked tools/dspy_reference/refine_react
 uv run --project tools/dspy_reference --locked tools/dspy_reference/two_step_oracle.py
 uv run --project tools/dspy_reference --locked tools/dspy_reference/colbertv2_oracle.py
 uv run --project tools/dspy_reference --locked tools/dspy_reference/bounding_box_oracle.py
+uv run --project tools/dspy_reference --locked tools/dspy_reference/file_oracle.py
 ```
 
 These execute actual pinned DSPy/Optuna. They cover rule metadata/settings
 persistence, source alias mutations and failure timing, independent integer TPE
 suggestions and optimizer probes, Code validation/adapters, dense retrieval and
 NumPy persistence, Refine feedback/selection and ReAct object masking, and actual
-two-stage extraction/fallback. Native behavior tests preserve
+two-stage extraction/fallback. The File oracle additionally records constructor,
+filesystem, adapter, marker, persistence and provider observations; source
+observations alone are not native coverage. Native behavior tests preserve
 the corresponding source-backed consumer boundaries; the probes do not add
 real-model inference evidence.
 
@@ -486,9 +652,23 @@ The following prevent a claim that DSZig can do everything DSPy can:
   class identity; Refine shares this boundary. Mid-bootstrap mutation of a
   borrowed teacher-settings object is not reflected after Bootstrap's entry
   snapshot.
-- **Providers and media:** no complete lm15 provider catalog/routing/auth/error
-  taxonomy, embedding providers beyond OpenAI/Azure, Image/Audio/File,
-  rich media tool results, provider training lifecycle or native streaming.
+- **Providers and media:** native File construction, adapter/typed prediction
+  handling, File tool-result markers and bounded Responses document translation
+  are implemented as described above. There is still no complete lm15 provider
+  catalog/routing/auth/error taxonomy, full provider SDK, embedding providers
+  beyond OpenAI/Azure, Image/Audio, general rich-media tool results, provider
+  training lifecycle or native streaming. Document support is not general
+  multimodal support, and Chat Completions does not accept document parts.
+- **File and DocumentPart boundaries:** the constructor smoke explicitly leaves
+  606 successful source Python DocumentPart object/repr/bytes operations
+  unimplemented; canonical document dictionaries do not replace those
+  operations. Constructor evidence still excludes bytearray/memoryview/buffer
+  and tuple dispatch, bytes-valued field coercion, nonstring helper parameters,
+  bytes-path/PathLike dispatch, duplicate arguments and positional arity.
+  The nine File-instance construction/validation/copy cases are now exercised,
+  but do not close those remaining dispatch gaps.
+  Native errors do not reproduce Python exception classes/messages, and finite
+  constructor/formatting cases do not establish full File parity.
 - **ColBERT HTTP/cache boundaries:** no Python diskcache/key interoperability,
   requests cookie jar, proxy/netrc/IDNA/session behavior or complete Python
   exception type/message reconstruction. Native JSON rejects bare NaN/Infinity
@@ -509,9 +689,10 @@ The following prevent a claim that DSZig can do everything DSPy can:
   implemented; strict JSON and the existing limited Python-literal parser are
   not equivalent to `json_repair` for malformed output. XML golden cases that
   use a schema-backed runtime view do not prove a native Zig union type exists.
-  Python-style rendering recovers declared native type metadata, not arbitrary
-  objects already erased into `Value`/`Record`; a nested dynamic model inside
-  a History record therefore cannot retain its original Python class repr.
+  Python-style rendering recovers declared native type metadata and retained
+  native custom classes, not arbitrary Python objects erased into ordinary
+  `Value`/`Record` dictionaries; a nested dynamic model inside a History record
+  therefore cannot retain its original Python class repr merely from its keys.
 - **Optimizer options:** unsupported GEPA custom code/instruction proposers,
   Flex components, other frontier/selection policies, format-failure feedback,
   logging integrations, and some MIPROv2/SIMBA/COPRO statistics/logging options.

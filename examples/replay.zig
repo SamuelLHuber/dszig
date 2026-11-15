@@ -5,7 +5,7 @@ const std = @import("std");
 const dszig = @import("dszig");
 const suite = @import("live_suite");
 
-fn capability(transcript: std.json.Value, name: []const u8) !bool {
+fn capability(transcript: dszig.Value, name: []const u8) !bool {
     const value = transcript.object.get(name) orelse return error.MissingTranscriptCapabilities;
     if (value != .bool) return error.InvalidTranscript;
     return value.bool;
@@ -19,7 +19,7 @@ pub fn main(init: std.process.Init) !void {
         return error.InvalidArguments;
     }
     const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, args[1], arena, .limited(64 * 1024 * 1024));
-    const transcript = try std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{});
+    const transcript = try std.json.parseFromSliceLeaky(dszig.Value, arena, bytes, .{});
     if (transcript != .object) return error.InvalidTranscript;
     const target = transcript.object.get("target_dspy") orelse return error.MissingTranscriptTarget;
     if (target != .string or !std.mem.eql(u8, target.string, suite.target_dspy)) return error.IncompatibleTranscriptTarget;

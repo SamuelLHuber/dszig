@@ -236,11 +236,12 @@ fn isSpace(text: []const u8, i: usize) bool {
 }
 
 /// `order_input_keys_in_string(repr(examples))` for a list of `dspy.Example`.
-pub fn examplesRepr(arena: Allocator, examples: []const Example) Allocator.Error![]const u8 {
+pub fn examplesRepr(arena: Allocator, examples: []const Example) (Allocator.Error || error{ JsonTooDeep, AdapterParse })![]const u8 {
     var aw: Writer.Allocating = .init(arena);
-    writeExamplesRepr(arena, &aw.writer, examples) catch |err| switch (err) {
-        error.OutOfMemory, error.WriteFailed => return error.OutOfMemory,
-        error.JsonTooDeep => unreachable, // Examples come from parsed JSON.
+    writeExamplesRepr(arena, &aw.writer, examples) catch |err| return switch (err) {
+        error.OutOfMemory, error.WriteFailed => error.OutOfMemory,
+        error.JsonTooDeep => error.JsonTooDeep,
+        error.ParseValue => error.AdapterParse,
     };
     return aw.written();
 }

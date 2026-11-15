@@ -7,7 +7,7 @@ const std = @import("std");
 const dszig = @import("dszig");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
-const Value = std.json.Value;
+const Value = dszig.Value;
 const Record = dszig.value.Record;
 const rag = @import("rag_program");
 
@@ -42,7 +42,7 @@ const Indented = dszig.Signature(struct {
     pub const Output = struct { label: enum { pos, neg } };
 });
 
-fn findCase(arena: Allocator, name: []const u8) !std.json.ObjectMap {
+fn findCase(arena: Allocator, name: []const u8) !dszig.ObjectMap {
     const all = try std.json.parseFromSliceLeaky(Value, arena, format_cases, .{});
     for (all.array.items) |c| {
         if (std.mem.eql(u8, c.object.get("name").?.string, name)) return c.object;
@@ -207,7 +207,7 @@ test "BootstrapFewShot multi-hop artifact picks DSPy's same-predictor traces" {
 }
 
 fn reactSearch(ctx: dszig.Context, _: *const Record) dszig.react.ToolError!Value {
-    var list: std.json.Array = .init(ctx.arena);
+    var list: dszig.Array = .init(ctx.arena);
     try list.append(.{ .string = "Apollo 11 landed on the Moon in 1969." });
     try list.append(.{ .string = "multi\nline «x»" });
     return .{ .array = list };
@@ -377,11 +377,11 @@ const SimbaMock = struct {
 
     fn complete(ptr: *anyopaque, arena: Allocator, request: dszig.lm.Request) dszig.lm.Error![]const dszig.lm.Completion {
         const self: *SimbaMock = @ptrCast(@alignCast(ptr));
-        var list: std.json.Array = .init(arena);
+        var list: dszig.Array = .init(arena);
         for (request.messages) |m| {
             var o: Record = .empty;
             try o.put(arena, "role", .{ .string = m.role.name() });
-            try o.put(arena, "content", .{ .string = m.content });
+            try o.put(arena, "content", m.content.toValue(arena));
             try list.append(.{ .object = o });
         }
         var aw: std.Io.Writer.Allocating = .init(arena);
@@ -393,8 +393,8 @@ const SimbaMock = struct {
             .temperature = request.options.temperature,
             .digest = std.fmt.bytesToHex(hash, .lower),
         });
-        const system = request.messages[0].content;
-        const user = request.messages[request.messages.len - 1].content;
+        const system = request.messages[0].content.text;
+        const user = request.messages[request.messages.len - 1].content.text;
         const out = try arena.alloc(dszig.lm.Completion, 1);
         if (std.mem.indexOf(u8, system, "module_advice") != null) {
             out[0] = .{ .text = feedback };
@@ -667,11 +667,11 @@ const GepaMock = struct {
 
     fn complete(ptr: *anyopaque, arena: Allocator, request: dszig.lm.Request) dszig.lm.Error![]const dszig.lm.Completion {
         const self: *GepaMock = @ptrCast(@alignCast(ptr));
-        var list: std.json.Array = .init(arena);
+        var list: dszig.Array = .init(arena);
         for (request.messages) |m| {
             var o: Record = .empty;
             try o.put(arena, "role", .{ .string = m.role.name() });
-            try o.put(arena, "content", .{ .string = m.content });
+            try o.put(arena, "content", m.content.toValue(arena));
             try list.append(.{ .object = o });
         }
         var aw: std.Io.Writer.Allocating = .init(arena);
@@ -683,8 +683,8 @@ const GepaMock = struct {
             .temperature = request.options.temperature,
             .digest = std.fmt.bytesToHex(hash, .lower),
         });
-        const system = request.messages[0].content;
-        const user = request.messages[request.messages.len - 1].content;
+        const system = request.messages[0].content.text;
+        const user = request.messages[request.messages.len - 1].content.text;
         const out = try arena.alloc(dszig.lm.Completion, 1);
         const reflection = std.mem.indexOf(u8, system, "examples_with_feedback") != null;
         if (reflection and std.mem.indexOf(u8, user, "Restate the question.") != null) {

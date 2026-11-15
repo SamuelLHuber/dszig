@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Value = std.json.Value;
+const Value = @import("runtime_value.zig").Value;
 const value = @import("value.zig");
 const types = @import("types.zig");
 const Record = value.Record;
@@ -73,7 +73,7 @@ pub const ToolCall = struct {
         out.putAssumeCapacity("name", .{ .string = self.name });
         out.putAssumeCapacity("args", .{ .object = self.args });
         if (protocol_metadata and self.continuation.len > 0) {
-            var states: std.json.Array = .init(arena);
+            var states: @import("runtime_value.zig").Array = .init(arena);
             try states.ensureTotalCapacity(self.continuation.len);
             for (self.continuation) |state| states.appendAssumeCapacity(.{ .object = state });
             out.putAssumeCapacity("continuation", .{ .array = states });
@@ -145,7 +145,7 @@ pub const ToolCallResults = struct {
     }
 
     pub fn toValue(self: ToolCallResults, arena: Allocator) Allocator.Error!Value {
-        var results: std.json.Array = .init(arena);
+        var results: @import("runtime_value.zig").Array = .init(arena);
         try results.ensureTotalCapacity(self.tool_call_results.len);
         for (self.tool_call_results) |result| results.appendAssumeCapacity(try result.toValue(arena));
         var out: Record = .empty;
@@ -214,7 +214,7 @@ pub const ToolCalls = struct {
     }
 
     fn renderValue(self: ToolCalls, arena: Allocator, protocol_metadata: bool) Allocator.Error!Value {
-        var calls: std.json.Array = .init(arena);
+        var calls: @import("runtime_value.zig").Array = .init(arena);
         try calls.ensureTotalCapacity(self.tool_calls.len);
         for (self.tool_calls) |call| calls.appendAssumeCapacity(try call.toValue(arena, protocol_metadata));
         var out: Record = .empty;
@@ -265,7 +265,7 @@ pub fn formatCatalogValue(arena: Allocator, input: Value) adapter.Error!Value {
         }
     }
     if (!needs_formatting) return input;
-    var out: std.json.Array = .init(arena);
+    var out: @import("runtime_value.zig").Array = .init(arena);
     try out.ensureTotalCapacity(input.array.items.len);
     for (input.array.items) |item| out.appendAssumeCapacity(if (item == .string) item else .{ .string = try formatToolValue(arena, item) });
     return .{ .array = out };
@@ -308,7 +308,7 @@ pub fn functionToolsFromValue(arena: Allocator, input: Value) Error![]const infe
         if (name != .string or args != .object or desc != .string) return error.ParseValue;
         var properties: Record = .empty;
         try properties.ensureTotalCapacity(arena, args.object.count());
-        var required: std.json.Array = .init(arena);
+        var required: @import("runtime_value.zig").Array = .init(arena);
         try required.ensureTotalCapacity(args.object.count());
         for (args.object.keys(), args.object.values()) |arg_name, arg_schema| {
             if (arg_schema != .object) return error.ParseValue;
@@ -358,6 +358,7 @@ pub fn callsToNative(arena: Allocator, input: []const ToolCall) Error![]const in
         pyjson.writeJson(&arguments.writer, .{ .object = call.args }, .minified) catch |err| return switch (err) {
             error.WriteFailed => error.OutOfMemory,
             error.JsonTooDeep => error.JsonTooDeep,
+            error.ParseValue => error.ParseValue,
         };
         const continuation = try arena.alloc(inference.Continuation, call.continuation.len);
         for (call.continuation, continuation) |state, *out| {
@@ -418,7 +419,7 @@ fn rebaseRefs(arena: Allocator, input: Value, prefix: []const u8, depth: usize) 
     }) |key| {
         if (input.object.get(key)) |schema| {
             const rebased = if (schema == .array) blk: {
-                var items: std.json.Array = .init(arena);
+                var items: @import("runtime_value.zig").Array = .init(arena);
                 try items.ensureTotalCapacity(schema.array.items.len);
                 for (schema.array.items) |item| items.appendAssumeCapacity(try rebaseRefs(arena, item, prefix, depth + 1));
                 break :blk Value{ .array = items };
@@ -433,6 +434,7 @@ fn renderError(err: pyjson.Error) adapter.Error {
     return switch (err) {
         error.WriteFailed => error.OutOfMemory,
         error.JsonTooDeep => error.JsonTooDeep,
+        error.ParseValue => error.AdapterParse,
     };
 }
 
@@ -446,6 +448,7 @@ fn truthy(input: Value) bool {
         .string => |s| s.len > 0,
         .array => |a| a.items.len > 0,
         .object => |o| o.count() > 0,
+        .custom => true,
     };
 }
 

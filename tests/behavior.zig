@@ -28,7 +28,7 @@ const LearningLM = struct {
         for (messages) |m| if (m.role == .assistant) {
             demos += 1;
         };
-        const last = messages[messages.len - 1].content;
+        const last = messages[messages.len - 1].content.text;
         for (rag.train_rows, difficulty) |row, need| {
             if (std.mem.indexOf(u8, last, row[0]) == null) continue;
             const answer = if (demos >= need) row[1] else "unknown";
@@ -194,7 +194,7 @@ test "Evaluate matches DSPy scores for the RAG fixture" {
     var out: std.heap.ArenaAllocator = .init(testing.allocator);
     defer out.deinit();
     const eval_json = @embedFile("fixtures/bootstrap_rag_eval.json");
-    const expected = try std.json.parseFromSliceLeaky(std.json.Value, out.allocator(), eval_json, .{});
+    const expected = try std.json.parseFromSliceLeaky(dszig.Value, out.allocator(), eval_json, .{});
     var keyword = rag.keywordLM();
     const ctx: dszig.Context = .{ .arena = out.allocator(), .lm = keyword.lm(), .retriever = rag.corpus.retriever() };
     const trainset = try rag.trainset(out.allocator());
@@ -353,18 +353,17 @@ test "Chat Completions retain native reasoning without inventing absent summarie
     // Provider response buffers are released after parsing.
     @memset(body, 'x');
     try testing.expectEqual(@as(usize, 4), completions.len);
-    try testing.expectEqualStrings("first", completions[0].text);
+    try testing.expectEqualStrings("first", completions[0].text.?);
     try testing.expectEqualStrings("Actual summary.", completions[0].reasoning.?);
-    try testing.expectEqualStrings("second", completions[1].text);
+    try testing.expectEqualStrings("second", completions[1].text.?);
     try testing.expect(completions[1].reasoning == null);
-    try testing.expectEqualStrings("third", completions[2].text);
+    try testing.expectEqualStrings("third", completions[2].text.?);
     try testing.expect(completions[2].reasoning == null);
-    try testing.expectEqualStrings("fourth", completions[3].text);
+    try testing.expectEqualStrings("fourth", completions[3].text.?);
     try testing.expectEqualStrings("", completions[3].reasoning.?);
 
     for ([_][]const u8{
         "{\"choices\":[]}",
-        "{\"choices\":[{\"message\":{\"content\":null}}]}",
         "{\"choices\":[{\"message\":{\"content\":\"answer\",\"reasoning_content\":42}}]}",
         "{\"choices\":[{\"message\":{\"content\":\"answer\",\"reasoning_content\":[]}}]}",
     }) |invalid| {
@@ -392,7 +391,7 @@ test "Responses parse assistant output after reasoning and preserve real summary
     const body = try arena.dupe(u8, json);
     const completion = try dszig.lm.OpenAI.parseResponsesResponse(arena, body);
     @memset(body, 'x');
-    try testing.expectEqualStrings("<answer>\nParis\n</answer>", completion.text);
+    try testing.expectEqualStrings("<answer>\nParis\n</answer>", completion.text.?);
     try testing.expectEqualStrings("Locate the capital.\nUse the supplied fact.", completion.reasoning.?);
 
     const no_summary = try dszig.lm.OpenAI.parseResponsesResponse(arena,
@@ -401,7 +400,7 @@ test "Responses parse assistant output after reasoning and preserve real summary
         \\  {"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}
         \\]}
     );
-    try testing.expectEqualStrings("answer", no_summary.text);
+    try testing.expectEqualStrings("answer", no_summary.text.?);
     try testing.expect(no_summary.reasoning == null);
 
     const empty_summary = try dszig.lm.OpenAI.parseResponsesResponse(arena,
@@ -410,25 +409,32 @@ test "Responses parse assistant output after reasoning and preserve real summary
         \\  {"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}
         \\]}
     );
-    try testing.expectEqualStrings("", empty_summary.reasoning.?);
+    try testing.expect(empty_summary.reasoning == null);
 }
 
-test "Responses refuse failed incomplete refused and answerless provider output" {
+test "Responses distinguish absent text from empty output and retain fallback call identifiers" {
     var out: std.heap.ArenaAllocator = .init(testing.allocator);
     defer out.deinit();
     const arena = out.allocator();
-    for ([_][]const u8{
-        "{\"status\":\"failed\",\"output\":[]}",
-        "{\"status\":\"incomplete\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"partial\"}]}]}",
-        "{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"status\":\"incomplete\",\"content\":[{\"type\":\"output_text\",\"text\":\"partial\"}]}]}",
-        "{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"refusal\",\"refusal\":\"No.\"}]}]}",
-        "{\"status\":\"completed\",\"output\":[{\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Not an answer.\"}]}]}",
-        "{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"output_text\",\"text\":\"Not an assistant answer.\"}]}]}",
-        "{\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"\"}]}]}",
-        "{\"status\":\"completed\",\"output\":[]}",
-    }) |invalid| {
-        try testing.expectError(error.LMFailure, dszig.lm.OpenAI.parseResponsesResponse(arena, invalid));
+    // Actual DSPy 3.5 LM HTTP observations, not provider status assumptions.
+    const cases = [_]struct { body: []const u8, text: ?[]const u8 }{
+        .{ .body = "{\"output\":null}", .text = "" },
+        .{ .body = "{\"output\":[],\"output_text\":\"fallback\"}", .text = "fallback" },
+        .{ .body = "{\"status\":\"incomplete\",\"output\":[{\"type\":\"message\",\"role\":\"user\",\"status\":\"incomplete\",\"content\":[{\"type\":\"output_text\",\"text\":\"partial\"}]}]}", .text = "partial" },
+        .{ .body = "{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"refusal\",\"refusal\":\"No.\"}]}]}", .text = null },
+        .{ .body = "{\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"first\"},{\"type\":\"text\",\"text\":\"second\"}]}]}", .text = "firstsecond" },
+        .{ .body = "{\"output\":[{\"type\":\"function_call\",\"name\":\"probe\",\"arguments\":\"{}\"}]}", .text = null },
+    };
+    for (cases) |case| {
+        const completion = try dszig.lm.OpenAI.parseResponsesResponse(arena, case.body);
+        if (case.text) |text| try testing.expectEqualStrings(text, completion.text.?) else try testing.expect(completion.text == null);
+        const restored = try dszig.lm.completionFromValue(arena, try dszig.lm.completionValue(arena, completion));
+        if (case.text) |text| try testing.expectEqualStrings(text, restored.text.?) else try testing.expect(restored.text == null);
     }
+    const tool_only = try dszig.lm.OpenAI.parseResponsesResponse(arena, cases[cases.len - 1].body);
+    try testing.expectEqualStrings("call_0", tool_only.tool_calls[0].id);
+    try testing.expectError(error.LMFailure, dszig.lm.OpenAI.parseResponsesResponse(arena,
+        "{\"error\":{\"code\":\"fixture_error\",\"message\":\"source fixture error\"},\"output_text\":\"not a successful response\"}"));
 }
 
 test "provider request bodies select reasoning JSON and completion-count contracts" {
@@ -445,25 +451,27 @@ test "provider request bodies select reasoning JSON and completion-count contrac
         .supports_response_format = true,
     };
     const messages = [_]dszig.adapter.Message{
-        .{ .role = .system, .content = "Use the supplied fact." },
-        .{ .role = .user, .content = "Capital?" },
+        .{ .role = .system, .content = .{ .text = "Use the supplied fact." } },
+        .{ .role = .user, .content = .{ .text = "Capital?" } },
     };
     const request: dszig.lm.Request = .{
         .messages = &messages,
         .options = .{ .n = 3, .response_format = .json_object, .reasoning_effort = "low", .rollout_id = .{ .integer = 7 } },
     };
-    const responses = (try std.json.parseFromSliceLeaky(std.json.Value, arena, try provider.requestBody(arena, request), .{})).object;
+    const responses = (try std.json.parseFromSliceLeaky(dszig.Value, arena, try provider.requestBody(arena, request), .{})).object;
     try testing.expectEqualStrings("reasoning-model", responses.get("model").?.string);
     try testing.expectEqual(@as(i64, 1024), responses.get("max_output_tokens").?.integer);
-    try testing.expect(!responses.get("store").?.bool);
+    try testing.expect(!responses.contains("store"));
     try testing.expect(!responses.contains("messages") and !responses.contains("n"));
     try testing.expect(!responses.contains("rollout_id"));
+    try testing.expectEqualStrings(messages[0].content.text, responses.get("instructions").?.string);
     const input = responses.get("input").?.array.items;
-    try testing.expectEqual(messages.len, input.len);
-    for (messages, input) |message, got| {
-        try testing.expectEqualStrings(message.role.name(), got.object.get("role").?.string);
-        try testing.expectEqualStrings(message.content, got.object.get("content").?.string);
-    }
+    try testing.expectEqual(@as(usize, 1), input.len);
+    try testing.expectEqualStrings("user", input[0].object.get("role").?.string);
+    const content = input[0].object.get("content").?.array.items;
+    try testing.expectEqual(@as(usize, 1), content.len);
+    try testing.expectEqualStrings("input_text", content[0].object.get("type").?.string);
+    try testing.expectEqualStrings(messages[1].content.text, content[0].object.get("text").?.string);
     const reasoning = responses.get("reasoning").?.object;
     try testing.expectEqualStrings("low", reasoning.get("effort").?.string);
     try testing.expectEqualStrings("auto", reasoning.get("summary").?.string);
@@ -473,13 +481,13 @@ test "provider request bodies select reasoning JSON and completion-count contrac
     for ([_][]const u8{ "none", "off" }) |effort| {
         var disabled = request;
         disabled.options.reasoning_effort = effort;
-        const body = (try std.json.parseFromSliceLeaky(std.json.Value, arena, try provider.requestBody(arena, disabled), .{})).object;
+        const body = (try std.json.parseFromSliceLeaky(dszig.Value, arena, try provider.requestBody(arena, disabled), .{})).object;
         try testing.expectEqualStrings("none", body.get("reasoning").?.object.get("effort").?.string);
         try testing.expect(!body.get("reasoning").?.object.contains("summary"));
     }
 
     provider.api = .chat_completions;
-    const chat = (try std.json.parseFromSliceLeaky(std.json.Value, arena, try provider.requestBody(arena, request), .{})).object;
+    const chat = (try std.json.parseFromSliceLeaky(dszig.Value, arena, try provider.requestBody(arena, request), .{})).object;
     try testing.expectEqual(@as(i64, 3), chat.get("n").?.integer);
     try testing.expectEqual(@as(i64, 1024), chat.get("max_tokens").?.integer);
     try testing.expectEqualStrings("low", chat.get("reasoning_effort").?.string);
@@ -487,7 +495,7 @@ test "provider request bodies select reasoning JSON and completion-count contrac
     try testing.expectEqual(messages.len, chat.get("messages").?.array.items.len);
     try testing.expect(!chat.contains("input") and !chat.contains("store") and !chat.contains("rollout_id"));
 
-    const ordinary = (try std.json.parseFromSliceLeaky(std.json.Value, arena, try provider.requestBody(arena, .{ .messages = &messages }), .{})).object;
+    const ordinary = (try std.json.parseFromSliceLeaky(dszig.Value, arena, try provider.requestBody(arena, .{ .messages = &messages }), .{})).object;
     try testing.expect(!ordinary.contains("reasoning_effort"));
     try testing.expect(!ordinary.contains("response_format") and !ordinary.contains("n"));
 }
@@ -514,12 +522,12 @@ test "Chat replays assistant reasoning as text without dropping answers or nativ
     for (cases) |case| {
         const messages = [_]dszig.adapter.Message{.{
             .role = .assistant,
-            .content = case.content,
+            .content = .{ .text = case.content },
             .reasoning = case.reasoning,
             .tool_calls = case.calls,
         }};
         const body = try provider.requestBody(arena, .{ .messages = &messages });
-        const root = try std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{});
+        const root = try std.json.parseFromSliceLeaky(dszig.Value, arena, body, .{});
         const projected = root.object.get("messages").?.array.items;
         try testing.expectEqual(@as(usize, 1), projected.len);
         const message = projected[0].object;
@@ -546,10 +554,10 @@ test "recording metadata roundtrip and replay preserve rich completions and exac
     var out: std.heap.ArenaAllocator = .init(testing.allocator);
     defer out.deinit();
     const arena = out.allocator();
-    const parameters = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+    const parameters = try std.json.parseFromSliceLeaky(dszig.Value, arena,
         \\{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}
     , .{});
-    const output_schema = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+    const output_schema = try std.json.parseFromSliceLeaky(dszig.Value, arena,
         \\{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}
     , .{});
     const tool_calls = [_]dszig.lm.ToolCall{.{ .id = "call_lookup", .name = "lookup", .arguments = "{ \"query\": \"Paris\" }" }};
@@ -564,7 +572,7 @@ test "recording metadata roundtrip and replay preserve rich completions and exac
     };
     var recording: dszig.lm.RecordingLM = .{ .inner = scripted.lm(), .arena = arena };
     const request: dszig.lm.Request = .{
-        .messages = &.{.{ .role = .user, .content = "question" }},
+        .messages = &.{.{ .role = .user, .content = .{ .text = "question" } }},
         .tools = &.{.{ .name = "lookup", .description = "Look up a fact.", .parameters = parameters, .strict = true }},
         .options = .{
             .n = 2,
@@ -627,7 +635,7 @@ test "recording metadata roundtrip and replay preserve rich completions and exac
     try testing.expectEqual(@as(usize, 2), replayed.len);
     for (completed, replayed) |want, got| {
         const restored = try dszig.lm.completionFromValue(arena, try dszig.lm.completionValue(arena, want));
-        try testing.expectEqualStrings(restored.text, got.text);
+        if (restored.text) |text| try testing.expectEqualStrings(text, got.text.?) else try testing.expect(got.text == null);
         if (restored.reasoning) |summary| try testing.expectEqualStrings(summary, got.reasoning.?) else try testing.expect(got.reasoning == null);
         try testing.expectEqual(restored.tool_calls.len, got.tool_calls.len);
         for (restored.tool_calls, got.tool_calls) |want_call, got_call| {
@@ -640,7 +648,7 @@ test "recording metadata roundtrip and replay preserve rich completions and exac
     try testing.expectEqual(@as(usize, 5), replay.misses);
 }
 
-test "native function-only provider completions preserve identifiers and raw arguments" {
+test "native function-only completions preserve identifiers and normalize Responses arguments" {
     var out: std.heap.ArenaAllocator = .init(testing.allocator);
     defer out.deinit();
     const arena = out.allocator();
@@ -653,7 +661,7 @@ test "native function-only provider completions preserve identifiers and raw arg
     const chat = try dszig.lm.OpenAI.parseCompletions(arena, chat_body);
     @memset(chat_body, 'x');
     try testing.expectEqual(@as(usize, 1), chat.len);
-    try testing.expectEqualStrings("", chat[0].text);
+    try testing.expect(chat[0].text == null);
     try testing.expectEqualStrings("Look up the fact.", chat[0].reasoning.?);
     try testing.expectEqual(@as(usize, 1), chat[0].tool_calls.len);
     try testing.expectEqualStrings("call_chat", chat[0].tool_calls[0].id);
@@ -669,30 +677,30 @@ test "native function-only provider completions preserve identifiers and raw arg
     );
     const responses = try dszig.lm.OpenAI.parseResponsesResponse(arena, responses_body);
     @memset(responses_body, 'x');
-    try testing.expectEqualStrings("", responses.text);
+    try testing.expect(responses.text == null);
     try testing.expectEqualStrings("Look up the fact.", responses.reasoning.?);
     try testing.expectEqual(@as(usize, 1), responses.tool_calls.len);
     try testing.expectEqualStrings("call_responses", responses.tool_calls[0].id);
     try testing.expectEqualStrings("lookup", responses.tool_calls[0].name);
-    try testing.expectEqualStrings(arguments, responses.tool_calls[0].arguments);
+    try testing.expectEqualStrings("{\"query\": \"Paris\", \"limit\": 2}", responses.tool_calls[0].arguments);
 }
 
 test "native schemas tools choices and tool results use each provider's actual wire format" {
     var out: std.heap.ArenaAllocator = .init(testing.allocator);
     defer out.deinit();
     const arena = out.allocator();
-    const parameters = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+    const parameters = try std.json.parseFromSliceLeaky(dszig.Value, arena,
         \\{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}
     , .{});
-    const output_schema = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+    const output_schema = try std.json.parseFromSliceLeaky(dszig.Value, arena,
         \\{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}
     , .{});
     const arguments = "{ \"query\": \"Paris\" }";
     const calls = [_]dszig.lm.ToolCall{.{ .id = "call_lookup", .name = "lookup", .arguments = arguments }};
     const messages = [_]dszig.adapter.Message{
-        .{ .role = .user, .content = "Capital?" },
-        .{ .role = .assistant, .content = "", .tool_calls = &calls },
-        .{ .role = .tool, .content = "Paris", .tool_call_id = "call_lookup" },
+        .{ .role = .user, .content = .{ .text = "Capital?" } },
+        .{ .role = .assistant, .content = .{ .text = "" }, .tool_calls = &calls },
+        .{ .role = .tool, .content = .{ .text = "Paris" }, .tool_call_id = "call_lookup" },
     };
     const tools = [_]dszig.lm.FunctionTool{.{
         .name = "lookup",
@@ -721,7 +729,7 @@ test "native schemas tools choices and tool results use each provider's actual w
     try testing.expect(provider.lm().supports_response_schema);
     try testing.expect(provider.lm().supports_function_calling);
 
-    const chat = (try std.json.parseFromSliceLeaky(std.json.Value, arena, try provider.requestBody(arena, request), .{})).object;
+    const chat = (try std.json.parseFromSliceLeaky(dszig.Value, arena, try provider.requestBody(arena, request), .{})).object;
     const chat_tools = chat.get("tools").?.array.items;
     try testing.expectEqual(@as(usize, 1), chat_tools.len);
     try testing.expectEqualStrings("function", chat_tools[0].object.get("type").?.string);
@@ -757,7 +765,7 @@ test "native schemas tools choices and tool results use each provider's actual w
     try testing.expectEqualStrings("Paris", chat_messages[2].object.get("content").?.string);
 
     provider.api = .responses;
-    const responses = (try std.json.parseFromSliceLeaky(std.json.Value, arena, try provider.requestBody(arena, request), .{})).object;
+    const responses = (try std.json.parseFromSliceLeaky(dszig.Value, arena, try provider.requestBody(arena, request), .{})).object;
     const response_tools = responses.get("tools").?.array.items;
     try testing.expectEqual(@as(usize, 1), response_tools.len);
     try testing.expectEqualStrings("function", response_tools[0].object.get("type").?.string);
@@ -895,7 +903,7 @@ test "ReAct reuses structured History across calls without replacing prior event
     try testing.expectEqualStrings("Paris", first.outputs.get("answer").?.string);
     try testing.expectEqual(dszig.react.TerminationReason.submit, first.termination_reason);
     try testing.expectEqual(@as(usize, 1), history.messages.len);
-    const saved_first = try std.json.Stringify.valueAlloc(arena, std.json.Value{ .object = history.messages[0] }, .{});
+    const saved_first = try std.json.Stringify.valueAlloc(arena, dszig.Value{ .object = history.messages[0] }, .{});
 
     const second_inputs = try dszig.value.toRecord(arena, QA.Input, .{ .question = "Second question?" });
     const second = try agent.runWithOptions(ctx, &second_inputs, .{ .history = &history });
@@ -903,7 +911,7 @@ test "ReAct reuses structured History across calls without replacing prior event
     try testing.expectEqual(dszig.react.TerminationReason.submit, second.termination_reason);
     try testing.expectEqual(@as(usize, 2), history.messages.len);
     try testing.expectEqual(@as(usize, 1), first.history.messages.len);
-    try testing.expectEqualStrings(saved_first, try std.json.Stringify.valueAlloc(arena, std.json.Value{ .object = history.messages[0] }, .{}));
+    try testing.expectEqualStrings(saved_first, try std.json.Stringify.valueAlloc(arena, dszig.Value{ .object = history.messages[0] }, .{}));
     try testing.expectEqualStrings("First question?", history.messages[0].get("question").?.string);
     try testing.expectEqualStrings("Second question?", history.messages[1].get("question").?.string);
     try testing.expectEqualStrings("Paris", history.messages[0].get("answer").?.string);
@@ -918,9 +926,9 @@ test "ReAct reuses structured History across calls without replacing prior event
     var saw_second = false;
     var saw_first_answer = false;
     for (requests.requests.items[1].messages) |message| {
-        saw_first = saw_first or std.mem.indexOf(u8, message.content, "First question?") != null;
-        saw_second = saw_second or std.mem.indexOf(u8, message.content, "Second question?") != null;
-        saw_first_answer = saw_first_answer or std.mem.indexOf(u8, message.content, "Paris") != null;
+        saw_first = saw_first or message.content.contains("First question?");
+        saw_second = saw_second or message.content.contains("Second question?");
+        saw_first_answer = saw_first_answer or message.content.contains("Paris");
     }
     try testing.expect(saw_first and saw_second and saw_first_answer);
 }
@@ -929,16 +937,16 @@ test "LM fans out actual n1 candidate requests and replay preserves strict rollo
     var out: std.heap.ArenaAllocator = .init(testing.allocator);
     defer out.deinit();
     const arena = out.allocator();
-    const messages = [_]dszig.adapter.Message{.{ .role = .user, .content = "Look up the facts." }};
-    const parameters = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"type\":\"object\"}", .{});
+    const messages = [_]dszig.adapter.Message{.{ .role = .user, .content = .{ .text = "Look up the facts." } }};
+    const parameters = try std.json.parseFromSliceLeaky(dszig.Value, arena, "{\"type\":\"object\"}", .{});
     const tools = [_]dszig.lm.FunctionTool{.{ .name = "lookup", .parameters = parameters }};
     const texts = [_][]const u8{ "first", "second", "third" };
     const summaries = [_]?[]const u8{ "First summary.", null, "" };
     const first_calls = [_]dszig.lm.ToolCall{.{ .id = "call_first", .name = "lookup", .arguments = "{ \"query\": \"first\" }" }};
     const third_calls = [_]dszig.lm.ToolCall{.{ .id = "call_third", .name = "lookup", .arguments = "{\"query\":\"third\"}" }};
     const native_calls = [_][]const dszig.lm.ToolCall{ &first_calls, &.{}, &third_calls };
-    const array_rollout = try std.json.parseFromSliceLeaky(std.json.Value, arena, "[\"session\",7]", .{});
-    const bases = [_]?std.json.Value{ null, .{ .integer = 4 }, .{ .string = "base-run" }, array_rollout };
+    const array_rollout = try std.json.parseFromSliceLeaky(dszig.Value, arena, "[\"session\",7]", .{});
+    const bases = [_]?dszig.Value{ null, .{ .integer = 4 }, .{ .string = "base-run" }, array_rollout };
     for (bases) |base| {
         var scripted: dszig.lm.ScriptedLM = .{
             .responses = &texts,
@@ -972,8 +980,8 @@ test "LM fans out actual n1 candidate requests and replay preserves strict rollo
             );
             try testing.expectEqual(@as(i64, @intCast(index)), rollout[2].integer);
             try testing.expectEqual(@as(usize, 1), call.all().len);
-            try testing.expectEqualStrings(texts[index], call.completion);
-            try testing.expectEqualStrings(texts[index], generated[index].text);
+            try testing.expectEqualStrings(texts[index], call.completion.?);
+            try testing.expectEqualStrings(texts[index], generated[index].text.?);
         }
 
         var untagged_used = [_]bool{ false, false, false };
@@ -994,7 +1002,7 @@ test "LM fans out actual n1 candidate requests and replay preserves strict rollo
         const completions = try replay.lm().completeResponses(arena, request);
         try testing.expectEqual(@as(usize, 3), completions.len);
         for (completions, 0..) |got, index| {
-            try testing.expectEqualStrings(texts[index], got.text);
+            try testing.expectEqualStrings(texts[index], got.text.?);
             if (summaries[index]) |summary| try testing.expectEqualStrings(summary, got.reasoning.?) else try testing.expect(got.reasoning == null);
             try testing.expectEqual(native_calls[index].len, got.tool_calls.len);
             for (native_calls[index], got.tool_calls) |want_call, got_call| {
@@ -1021,15 +1029,5 @@ test "native provider calls require real identifiers names and argument strings"
         "{\"choices\":[{\"message\":{\"content\":null,\"tool_calls\":[{\"id\":\"\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{}\"}}]}}]}",
     }) |invalid| {
         try testing.expectError(error.LMFailure, dszig.lm.OpenAI.parseCompletions(arena, invalid));
-    }
-    for ([_][]const u8{
-        "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"name\":\"lookup\",\"arguments\":\"{}\"}]}",
-        "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"call\",\"arguments\":\"{}\"}]}",
-        "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"call\",\"name\":\"lookup\"}]}",
-        "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"call\",\"name\":\"lookup\",\"arguments\":{}}]}",
-        "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"\",\"name\":\"lookup\",\"arguments\":\"{}\"}]}",
-        "{\"status\":\"completed\",\"output\":[{\"type\":\"function_call\",\"call_id\":\"call\",\"name\":\"lookup\",\"arguments\":\"{}\",\"status\":\"incomplete\"}]}",
-    }) |invalid| {
-        try testing.expectError(error.LMFailure, dszig.lm.OpenAI.parseResponsesResponse(arena, invalid));
     }
 }

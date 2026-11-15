@@ -9,7 +9,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
-const Value = std.json.Value;
+const Value = @import("runtime_value.zig").Value;
 const adapter = @import("adapter.zig");
 const predict = @import("predict.zig");
 const signature = @import("signature.zig");
@@ -297,7 +297,7 @@ pub fn ReActIters(comptime Sig: type, comptime user_tools: []const Tool, comptim
         }
 
         fn toolCatalog(arena: Allocator) adapter.Error!Value {
-            var catalog: std.json.Array = .init(arena);
+            var catalog: @import("runtime_value.zig").Array = .init(arena);
             try catalog.ensureTotalCapacity(tools.len);
             inline for (tools) |tool| catalog.appendAssumeCapacity(try tool.toValue(arena));
             return .{ .array = catalog };

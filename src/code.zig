@@ -3,7 +3,7 @@
 //! the original string/JSON arena alive for as long as the value is used.
 
 const std = @import("std");
-const Value = std.json.Value;
+const Value = @import("runtime_value.zig").Value;
 const unicode = @import("unicode.zig");
 const strip = @import("xml_unicode.zig").strip;
 
@@ -497,7 +497,7 @@ test "Code typed Predict traces and saved demos remain consumer-visible raw stri
 
         fn complete(ptr: *anyopaque, arena: std.mem.Allocator, request: lm.Request) lm.Error![]const lm.Completion {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            const prompt = request.messages[request.messages.len - 1].content;
+            const prompt = request.messages[request.messages.len - 1].content.text;
             if (std.mem.indexOf(u8, prompt, "print(1)") == null or
                 std.mem.indexOf(u8, prompt, "\"code\":") != null or
                 std.mem.indexOf(u8, prompt, "<<CUSTOM-TYPE") != null) return error.LMFailure;

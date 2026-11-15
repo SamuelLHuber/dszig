@@ -27,7 +27,12 @@ pub fn main(init: std.process.Init) !void {
     var stdout = std.Io.File.stdout().writer(init.io, &buf);
     const w = &stdout.interface;
     for (history.requests.items[0].messages) |m| {
-        try w.print("--- {s} ---\n{s}\n", .{ m.role.name(), m.content });
+        try w.print("--- {s} ---\n", .{m.role.name()});
+        switch (m.content) {
+            .text => |text| try w.writeAll(text),
+            .parts => try dszig.pyjson.writeJson(w, m.content.toValue(arena), .indent2),
+        }
+        try w.writeByte('\n');
     }
     try w.print("=== reasoning: {s}\n=== answer: {s}\n=== trace steps: {d}\n", .{
         if (output.reasoning) |reasoning| reasoning.content else "(none)",

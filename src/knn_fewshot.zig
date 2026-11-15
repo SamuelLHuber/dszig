@@ -181,8 +181,8 @@ const TestLM = struct {
         var answers: std.ArrayList([]const u8) = .empty;
         for (request.messages) |message| {
             switch (message.role) {
-                .user => try questions.append(self.events.arena, try self.events.arena.dupe(u8, try xmlField(message.content, "<question>", "</question>"))),
-                .assistant => try answers.append(self.events.arena, try self.events.arena.dupe(u8, try xmlField(message.content, "<answer>", "</answer>"))),
+                .user => try questions.append(self.events.arena, try self.events.arena.dupe(u8, try xmlField(message.content.text, "<question>", "</question>"))),
+                .assistant => try answers.append(self.events.arena, try self.events.arena.dupe(u8, try xmlField(message.content.text, "<answer>", "</answer>"))),
                 else => {},
             }
         }

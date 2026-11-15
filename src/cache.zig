@@ -9,7 +9,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
-const Value = std.json.Value;
+const Value = @import("runtime_value.zig").Value;
 
 const adapter = @import("adapter.zig");
 const lm_mod = @import("lm.zig");
@@ -160,7 +160,7 @@ test "CachedLM serves repeats from memory and keys on options" {
     var scripted: lm_mod.ScriptedLM = .{ .responses = &.{ "a", "b", "c", "d", "e" } };
     var cache: CachedLM = .{ .gpa = testing.allocator, .inner = scripted.lm() };
     defer cache.deinit();
-    const messages = [_]adapter.Message{.{ .role = .user, .content = "hi" }};
+    const messages = [_]adapter.Message{.{ .role = .user, .content = .{ .text = "hi" } }};
     const base: Request = .{ .messages = &messages, .options = .{ .temperature = 0.0 } };
     const lm = cache.lm();
     try testing.expectEqualStrings("a", try lm.complete(arena, base));
@@ -191,9 +191,9 @@ test "CachedLM evicts the least recently used entry and round-trips dump/load" {
     var cache: CachedLM = .{ .gpa = testing.allocator, .inner = scripted.lm(), .max_entries = 2 };
     defer cache.deinit();
     const lm = cache.lm();
-    const m1 = [_]adapter.Message{.{ .role = .user, .content = "one" }};
-    const m2 = [_]adapter.Message{.{ .role = .user, .content = "two" }};
-    const m3 = [_]adapter.Message{.{ .role = .user, .content = "three" }};
+    const m1 = [_]adapter.Message{.{ .role = .user, .content = .{ .text = "one" } }};
+    const m2 = [_]adapter.Message{.{ .role = .user, .content = .{ .text = "two" } }};
+    const m3 = [_]adapter.Message{.{ .role = .user, .content = .{ .text = "three" } }};
     _ = try lm.complete(arena, .{ .messages = &m1 });
     _ = try lm.complete(arena, .{ .messages = &m2 });
     _ = try lm.complete(arena, .{ .messages = &m1 }); // m1 becomes most recent
@@ -235,7 +235,7 @@ test "CachedLM preserves native summaries and calls across eviction-independent 
         .inner = .{ .ptr = &native, .vtable = &.{ .complete = Native.complete }, .supports_function_calling = true },
     };
     defer cache.deinit();
-    const messages = [_]adapter.Message{.{ .role = .user, .content = "Find the capital." }};
+    const messages = [_]adapter.Message{.{ .role = .user, .content = .{ .text = "Find the capital." } }};
     const request: Request = .{ .messages = &messages, .options = .{ .reasoning_effort = "low" } };
     _ = try cache.lm().completeResponses(arena, request);
     const hit = (try cache.lm().completeResponses(arena, request))[0];
@@ -260,7 +260,7 @@ test "CachedLM preserves native summaries and calls across eviction-independent 
 }
 
 test "CachedLM survives every allocation failure" {
-    const messages = [_]adapter.Message{.{ .role = .user, .content = "hi" }};
+    const messages = [_]adapter.Message{.{ .role = .user, .content = .{ .text = "hi" } }};
     // In-place arena growth makes fault sites address-dependent on some allocators.
     var stable_backing = testing.FailingAllocator.init(testing.allocator, .{ .resize_fail_index = 0 });
     try testing.checkAllAllocationFailures(stable_backing.allocator(), struct {

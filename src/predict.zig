@@ -330,14 +330,15 @@ fn runAdapterMany(ctx: Context, adapter: Adapter, original: adapter_mod.View, de
     const outputs = try ctx.arena.alloc(Record, completions.len);
     for (completions, outputs) |c, *o| {
         const has_tool_calls = use_native_tools and c.tool_calls.len > 0;
-        if (adapter == .two_step and c.text.len == 0 and !has_tool_calls) return error.AdapterParse;
+        if (adapter == .two_step and !has_tool_calls and (c.text == null or c.text.?.len == 0)) return error.AdapterParse;
         const parsed = if (has_tool_calls) blk: {
-            if (c.text.len == 0 or processed.outputs.len == 0) break :blk Record.empty;
-            break :blk parseCompletion(ctx, adapter, processed, c.text) catch |err| switch (err) {
+            const text = c.text orelse break :blk Record.empty;
+            if (text.len == 0 or processed.outputs.len == 0) break :blk Record.empty;
+            break :blk parseCompletion(ctx, adapter, processed, text) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => Record.empty,
             };
-        } else try parseCompletion(ctx, adapter, processed, c.text);
+        } else try parseCompletion(ctx, adapter, processed, c.text orelse return error.AdapterParse);
         if (!needs_preprocess and !use_native_tools and adapter != .two_step) {
             o.* = parsed;
             continue;
@@ -351,11 +352,11 @@ fn runAdapterMany(ctx: Context, adapter: Adapter, original: adapter_mod.View, de
                     else => error.AdapterParse,
                 }
             else if (f.native_reasoning and native)
-                if (c.reasoning) |r| if (r.len > 0) std.json.Value{ .string = r } else .null else .null
+                if (c.reasoning) |r| if (r.len > 0) @import("runtime_value.zig").Value{ .string = r } else .null else .null
             else
                 parsed.get(if (f.native_reasoning) try fallbackName(ctx.arena, original, f) else f.name) orelse
                     (try signature.outputDefault(ctx.arena, f)) orelse
-                    if (has_tool_calls or f.native_tool_calls) @as(std.json.Value, .null) else return error.AdapterParse;
+                    if (has_tool_calls or f.native_tool_calls) @as(@import("runtime_value.zig").Value, .null) else return error.AdapterParse;
             o.putAssumeCapacity(f.name, v);
         }
     }
@@ -851,7 +852,7 @@ test "typed Predict retains wide integer inputs and outputs across adapters" {
 
         fn complete(ptr: *anyopaque, a: Allocator, request: lm_mod.Request) lm_mod.Error![]const lm_mod.Completion {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            const text = request.messages[request.messages.len - 1].content;
+            const text = request.messages[request.messages.len - 1].content.text;
             if (std.mem.indexOf(u8, text, "10000000000000000000") == null or
                 std.mem.indexOf(u8, text, "18446744073709551615") == null or
                 std.mem.indexOf(u8, text, "\"18446744073709551615\"") != null or
@@ -967,8 +968,8 @@ test "native reasoning preserves absent summaries and records actual content" {
             if (request.options.reasoning_effort == null or
                 !std.mem.eql(u8, request.options.reasoning_effort.?, "low")) return error.LMFailure;
             // Native reasoning must never be requested as a text output as well.
-            if (std.mem.indexOf(u8, request.messages[0].content, "`reasoning`") != null or
-                std.mem.indexOf(u8, request.messages[0].content, "`plan`") != null) return error.LMFailure;
+            if (std.mem.indexOf(u8, request.messages[0].content.text, "`reasoning`") != null or
+                std.mem.indexOf(u8, request.messages[0].content.text, "`plan`") != null) return error.LMFailure;
             const out = try a.alloc(lm_mod.Completion, 1);
             out[0] = .{ .text = "<answer>\nParis\n</answer>", .reasoning = self.summary };
             return out;

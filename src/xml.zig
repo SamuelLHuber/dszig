@@ -8,7 +8,7 @@ const pyjson = @import("pyjson.zig");
 const unicode = @import("xml_unicode.zig");
 const fieldSchema = adapter.fieldSchema;
 const Allocator = std.mem.Allocator;
-const Value = std.json.Value;
+const Value = @import("runtime_value.zig").Value;
 const Field = signature.Field;
 const Record = value.Record;
 const Error = adapter.Error;
@@ -41,6 +41,7 @@ fn writeError(err: pyjson.Error) Error {
     return switch (err) {
         error.WriteFailed => error.OutOfMemory,
         error.JsonTooDeep => error.JsonTooDeep,
+        error.ParseValue => error.AdapterParse,
     };
 }
 
@@ -140,7 +141,7 @@ fn example(arena: Allocator, node: Value, definitions: Value, seen: []const []co
         return .{ .string = out.written() };
     }
     if (isType(node, "array")) {
-        var items: std.json.Array = .init(arena);
+        var items: @import("runtime_value.zig").Array = .init(arena);
         const prefix = get(node, "prefixItems");
         if (prefix == .array) {
             for (prefix.array.items) |child| try items.append(try example(arena, child, definitions, seen, depth + 1));
@@ -235,7 +236,8 @@ pub const XmlAdapter = struct {
             if (!first) w.writeAll("\n\n") catch return error.OutOfMemory;
             first = false;
             if (output and (v == .null or ((v == .object or v == .array) and usesNested(field, try fieldSchema(arena, field))))) {
-                writeXml(w, v, field.name, null, 0) catch |err| return writeError(err);
+                const serialized = try adapter.formattedValue(arena, field, v);
+                writeXml(w, serialized, field.name, null, 0) catch |err| return writeError(err);
             } else {
                 w.print("<{s}>\n", .{field.name}) catch return error.OutOfMemory;
                 try adapter.writeFieldValue(arena, w, field, v);
@@ -390,7 +392,7 @@ fn elementsValue(arena: Allocator, nodes: []const Node, input_schema: Value, def
             if (group.len > 0) items = group;
         }
         const prefix = get(schema, "prefixItems");
-        var out: std.json.Array = .init(arena);
+        var out: @import("runtime_value.zig").Array = .init(arena);
         for (items, 0..) |item, i| {
             const child = if (prefix == .array and i < prefix.array.items.len) prefix.array.items[i] else get(schema, "items");
             try out.append(try elementsValue(arena, &.{item}, child, definitions, depth + 1));
@@ -406,7 +408,7 @@ fn elementsValue(arena: Allocator, nodes: []const Node, input_schema: Value, def
             if (coerce_literal and (get(schema, "enum") == .array or (schema == .object and schema.object.contains("const")))) return literalValue(arena, text, schema);
             return .{ .string = text };
         }
-        var values: std.json.Array = .init(arena);
+        var values: @import("runtime_value.zig").Array = .init(arena);
         for (nodes) |node| try values.append(.{ .string = node.text orelse "" });
         return .{ .array = values };
     }
@@ -620,7 +622,7 @@ const Parser = struct {
             var child_schema = schemas.items[0];
             if (schemas.len > 1) {
                 var object: Record = .empty;
-                var branches: std.json.Array = .init(parser.arena);
+                var branches: @import("runtime_value.zig").Array = .init(parser.arena);
                 try branches.appendSlice(schemas.items[0..schemas.len]);
                 try object.put(parser.arena, "anyOf", .{ .array = branches });
                 child_schema = .{ .object = object };
@@ -796,12 +798,12 @@ test "XML primitive prompts use literal tags and exact output reminder" {
         "Your input fields are:\n1. `question` (str):\nYour output fields are:\n1. `answer` (str):\n" ++
             "Output format (replace placeholders):\n<answer>\n{answer}\n</answer>\n" ++
             "In adhering to this structure, your objective is: \n        Answer the question.",
-        messages[0].content,
+        messages[0].content.text,
     );
     try testing.expectEqualStrings(
         "<question>\nA < B & C?\n</question>\n\nOutput format (replace placeholders):\n<answer>\n{answer}\n</answer>\n\n" ++
             "Use this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping.",
-        messages[1].content,
+        messages[1].content.text,
     );
     try testing.expectEqualStrings("XMLAdapter", adapter.Adapter.xml.className());
 }

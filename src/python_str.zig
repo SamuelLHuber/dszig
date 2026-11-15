@@ -12,10 +12,11 @@ const types = @import("types.zig");
 const code = @import("code.zig");
 const pyjson = @import("pyjson.zig");
 const Allocator = std.mem.Allocator;
-const Value = std.json.Value;
+const Value = @import("runtime_value.zig").Value;
 const Writer = std.Io.Writer;
 
-pub const Error = Allocator.Error || error{JsonTooDeep};
+pub const Error = Allocator.Error || error{ JsonTooDeep, AdapterParse };
+const WriteError = pyjson.Error || error{AdapterParse};
 pub const Render = *const fn (Allocator, Value) Error![]const u8;
 
 /// Returns null when the ordinary `pyjson.writeStr` already matches Python for
@@ -29,6 +30,7 @@ pub fn renderer(comptime T: type) ?Render {
             write(T, &out.writer, v, .str, 0) catch |err| return switch (err) {
                 error.WriteFailed => error.OutOfMemory,
                 error.JsonTooDeep => error.JsonTooDeep,
+                error.AdapterParse, error.ParseValue => error.AdapterParse,
             };
             return out.toOwnedSlice();
         }
@@ -39,7 +41,7 @@ pub fn renderer(comptime T: type) ?Render {
 /// JSON-lowered `Value` rendering: models, Code, and containers of them.
 fn needsRendering(comptime T: type) bool {
     if (T == signature.Reasoning or T == signature.StrDict or T == Value or
-        T == std.json.ObjectMap or T == []const u8 or T == []u8) return false;
+        T == @import("runtime_value.zig").ObjectMap or T == []const u8 or T == []u8) return false;
     if (comptime types.isDict(T)) return needsRendering(T.dszig_dict_value);
     return switch (@typeInfo(T)) {
         .optional => |o| needsRendering(o.child),
@@ -52,7 +54,7 @@ fn needsRendering(comptime T: type) bool {
 
 const Mode = enum { str, repr };
 
-fn write(comptime T: type, w: *Writer, v: Value, mode: Mode, depth: u32) pyjson.Error!void {
+fn write(comptime T: type, w: *Writer, v: Value, mode: Mode, depth: u32) WriteError!void {
     if (depth >= pyjson.max_depth) return error.JsonTooDeep;
     if (comptime !needsRendering(T)) {
         // `str(value)` of a bare str is raw text; everything else is repr.
@@ -61,6 +63,7 @@ fn write(comptime T: type, w: *Writer, v: Value, mode: Mode, depth: u32) pyjson.
     }
     if (v == .null) return w.writeAll("None");
     if (comptime code.isCode(T)) return writeCode(T, w, v, mode, depth);
+    if (T == @import("file.zig").File) return writeFile(w, v, mode, depth);
     if (comptime types.isDict(T)) return writeDict(T.dszig_dict_value, w, v, depth);
     return switch (@typeInfo(T)) {
         .optional => |o| write(o.child, w, v, mode, depth),
@@ -85,7 +88,11 @@ fn writeCode(comptime T: type, w: *Writer, v: Value, mode: Mode, depth: u32) pyj
     if (mode == .repr) try w.writeByte(')');
 }
 
-fn writeList(comptime Child: type, w: *Writer, v: Value, depth: u32) pyjson.Error!void {
+fn writeFile(w: *Writer, v: Value, mode: Mode, depth: u32) WriteError!void {
+    return if (mode == .str) pyjson.writeStr(w, v) else pyjson.writeRepr(w, v, depth);
+}
+
+fn writeList(comptime Child: type, w: *Writer, v: Value, depth: u32) WriteError!void {
     if (v != .array) return pyjson.writeRepr(w, v, depth);
     try w.writeByte('[');
     for (v.array.items, 0..) |item, i| {
@@ -95,7 +102,7 @@ fn writeList(comptime Child: type, w: *Writer, v: Value, depth: u32) pyjson.Erro
     try w.writeByte(']');
 }
 
-fn writeDict(comptime Child: type, w: *Writer, v: Value, depth: u32) pyjson.Error!void {
+fn writeDict(comptime Child: type, w: *Writer, v: Value, depth: u32) WriteError!void {
     if (v != .object) return pyjson.writeRepr(w, v, depth);
     try w.writeByte('{');
     for (v.object.keys(), v.object.values(), 0..) |key, item, i| {
@@ -110,7 +117,7 @@ fn writeDict(comptime Child: type, w: *Writer, v: Value, depth: u32) pyjson.Erro
 /// Pydantic prints every declared field. Lowering may omit defaulted members,
 /// so an absent optional renders as `None` and an absent slice as `[]`,
 /// matching the declared Zig defaults the pinned models mirror.
-fn writeModel(comptime T: type, w: *Writer, v: Value, mode: Mode, depth: u32) pyjson.Error!void {
+fn writeModel(comptime T: type, w: *Writer, v: Value, mode: Mode, depth: u32) WriteError!void {
     if (v != .object) return pyjson.writeRepr(w, v, depth);
     if (mode == .repr) {
         try w.writeAll(comptime types.modelName(T));
@@ -143,21 +150,21 @@ test "python str preserves declared model and Code representations in nested lis
         name: []const u8,
         count: i64,
     };
-    var obj: std.json.ObjectMap = .empty;
+    var obj: @import("runtime_value.zig").ObjectMap = .empty;
     try obj.put(arena, "name", .{ .string = "O'Reilly\n" });
     try obj.put(arena, "count", .{ .integer = 3 });
     const payload: Value = .{ .object = obj };
 
     const render = renderer(Payload).?;
     try std.testing.expectEqualStrings("name=\"O'Reilly\\n\" count=3", try render(arena, payload));
-    var models: std.json.Array = .init(arena);
+    var models: @import("runtime_value.zig").Array = .init(arena);
     try models.append(payload);
     try std.testing.expectEqualStrings("[Payload(name=\"O'Reilly\\n\", count=3)]", try renderer([]const Payload).?(arena, .{ .array = models }));
 
     const Code = code.Code;
     const source: Value = .{ .string = "x = 1" };
     try std.testing.expectEqualStrings("code='x = 1'", try renderer(Code).?(arena, source));
-    var snippets: std.json.Array = .init(arena);
+    var snippets: @import("runtime_value.zig").Array = .init(arena);
     try snippets.append(source);
     try std.testing.expectEqualStrings("[Code(code='x = 1')]", try renderer([]const Code).?(arena, .{ .array = snippets }));
 }
@@ -172,6 +179,7 @@ pub fn toolsRender(allocator: Allocator, v: Value) Error![]const u8 {
     writeTools(&out.writer, v, 0) catch |err| return switch (err) {
         error.WriteFailed => error.OutOfMemory,
         error.JsonTooDeep => error.JsonTooDeep,
+        error.ParseValue => error.AdapterParse,
     };
     return out.toOwnedSlice();
 }
@@ -200,7 +208,7 @@ fn writeToolRepr(w: *Writer, v: Value, depth: u32) pyjson.Error!void {
 
 /// `__repr__` interpolates `self.name`/`self.desc` with `{}`, so strings are
 /// written unquoted and unescaped.
-fn writeRawMember(w: *Writer, obj: std.json.ObjectMap, key: []const u8, depth: u32) pyjson.Error!void {
+fn writeRawMember(w: *Writer, obj: @import("runtime_value.zig").ObjectMap, key: []const u8, depth: u32) pyjson.Error!void {
     const member = obj.get(key) orelse return w.writeAll("None");
     if (member == .string) return w.writeAll(member.string);
     return pyjson.writeRepr(w, member, depth + 1);
@@ -211,15 +219,15 @@ test "python str renders dspy.Tool lists with raw name/desc and dict args" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var schema: std.json.ObjectMap = .empty;
+    var schema: @import("runtime_value.zig").ObjectMap = .empty;
     try schema.put(arena, "type", .{ .string = "string" });
-    var args: std.json.ObjectMap = .empty;
+    var args: @import("runtime_value.zig").ObjectMap = .empty;
     try args.put(arena, "q", .{ .object = schema });
-    var tool_obj: std.json.ObjectMap = .empty;
+    var tool_obj: @import("runtime_value.zig").ObjectMap = .empty;
     try tool_obj.put(arena, "name", .{ .string = "search" });
     try tool_obj.put(arena, "desc", .{ .string = "Search docs" });
     try tool_obj.put(arena, "args", .{ .object = args });
-    var catalog: std.json.Array = .init(arena);
+    var catalog: @import("runtime_value.zig").Array = .init(arena);
     try catalog.append(.{ .object = tool_obj });
 
     const rendered = try toolsRender(arena, .{ .array = catalog });

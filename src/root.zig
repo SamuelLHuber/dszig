@@ -1,5 +1,9 @@
 //! DSZig: DSPy in Zig.
 
+pub const runtime_value = @import("runtime_value.zig");
+pub const Value = runtime_value.Value;
+pub const Array = runtime_value.Array;
+pub const ObjectMap = runtime_value.ObjectMap;
 pub const pyjson = @import("pyjson.zig");
 pub const pyrandom = @import("pyrandom.zig");
 pub const nprandom = @import("nprandom.zig");
@@ -26,6 +30,7 @@ pub const Reasoning = signature.Reasoning;
 pub const Code = @import("code.zig").Code;
 pub const CodeWithLanguage = @import("code.zig").CodeWithLanguage;
 pub const BoundingBox = @import("bounding_box.zig").BoundingBox;
+pub const File = @import("file.zig").File;
 pub const History = @import("history.zig").History;
 pub const Retrieve = predict.Retrieve;
 pub const colbertv2 = @import("colbertv2.zig");

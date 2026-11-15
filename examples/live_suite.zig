@@ -7,7 +7,7 @@ const std = @import("std");
 const dszig = @import("dszig");
 const rag = @import("rag_program");
 const Allocator = std.mem.Allocator;
-const Value = std.json.Value;
+const Value = dszig.Value;
 const Record = dszig.value.Record;
 const Call = dszig.lm.ReplayLM.Call;
 
@@ -233,7 +233,7 @@ fn corpusSearch(ctx: dszig.Context, args: *const Record) dszig.react.ToolError!V
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.ToolFailed,
     };
-    var list: std.json.Array = .init(ctx.arena);
+    var list: dszig.Array = .init(ctx.arena);
     for (passages) |p| try list.append(.{ .string = p });
     return .{ .array = list };
 }
@@ -364,10 +364,15 @@ pub fn parseCalls(arena: Allocator, transcript: Value) ![]const Call {
         const message_values = item.object.get("messages").?.array.items;
         const messages = try arena.alloc(dszig.adapter.Message, message_values.len);
         for (message_values, messages) |m, *dst| dst.* = try dszig.lm.messageFromValue(arena, m);
-        var completions: []const []const u8 = &.{};
+        var completions: []const ?[]const u8 = &.{};
         if (item.object.get("completions")) |all| {
-            const list = try arena.alloc([]const u8, all.array.items.len);
-            for (all.array.items, list) |c, *dst| dst.* = c.string;
+            if (all != .array) return error.BadTranscript;
+            const list = try arena.alloc(?[]const u8, all.array.items.len);
+            for (all.array.items, list) |c, *dst| dst.* = switch (c) {
+                .null => null,
+                .string => |text| text,
+                else => return error.BadTranscript,
+            };
             completions = list;
         }
         var reasonings: []const ?[]const u8 = &.{};
@@ -419,7 +424,11 @@ pub fn parseCalls(arena: Allocator, transcript: Value) ![]const Call {
             &.{};
         call.* = .{
             .messages = messages,
-            .completion = item.object.get("completion").?.string,
+            .completion = switch (item.object.get("completion") orelse return error.BadTranscript) {
+                .null => null,
+                .string => |text| text,
+                else => return error.BadTranscript,
+            },
             .completions = completions,
             .reasonings = reasonings,
             .options = options,
@@ -435,37 +444,37 @@ pub fn parseCalls(arena: Allocator, transcript: Value) ![]const Call {
 /// Transcript JSON in the layout tools/dspy_reference/live.py writes.
 /// Capabilities are the actual LM's advertised native features.
 pub fn writeTranscript(arena: Allocator, runtime: []const u8, model: []const u8, lm: dszig.LM, calls: []const Call, result: Result) ![]const u8 {
-    var call_values: std.json.Array = .init(arena);
+    var call_values: dszig.Array = .init(arena);
     for (calls) |call| {
-        var messages: std.json.Array = .init(arena);
+        var messages: dszig.Array = .init(arena);
         for (call.messages) |m| try messages.append(try dszig.lm.messageValue(arena, m));
-        var obj: std.json.ObjectMap = .empty;
+        var obj: dszig.ObjectMap = .empty;
         try obj.put(arena, "messages", .{ .array = messages });
         try obj.put(arena, "tools", try dszig.inference.toolsValue(arena, call.tools));
-        try obj.put(arena, "completion", .{ .string = call.completion });
+        try obj.put(arena, "completion", if (call.completion) |text| .{ .string = text } else .null);
         if (call.completions.len > 0) {
-            var all: std.json.Array = .init(arena);
-            for (call.completions) |c| try all.append(.{ .string = c });
+            var all: dszig.Array = .init(arena);
+            for (call.completions) |c| try all.append(if (c) |text| .{ .string = text } else .null);
             try obj.put(arena, "completions", .{ .array = all });
         }
         if (call.reasonings.len > 0) {
-            var all: std.json.Array = .init(arena);
+            var all: dszig.Array = .init(arena);
             for (call.reasonings) |reasoning| try all.append(if (reasoning) |text| .{ .string = text } else .null);
             try obj.put(arena, "reasonings", .{ .array = all });
         }
-        var native_calls: std.json.Array = .init(arena);
+        var native_calls: dszig.Array = .init(arena);
         for (call.tool_calls) |calls_value| try native_calls.append(try dszig.inference.toolCallsValue(arena, calls_value));
         try obj.put(arena, "tool_calls", .{ .array = native_calls });
-        var continuation: std.json.Array = .init(arena);
+        var continuation: dszig.Array = .init(arena);
         for (call.continuation) |state| try continuation.append(try dszig.inference.continuationsValue(arena, state));
         try obj.put(arena, "continuation", .{ .array = continuation });
-        var provider_data: std.json.Array = .init(arena);
+        var provider_data: dszig.Array = .init(arena);
         for (call.provider_data) |data| try provider_data.append(data orelse .null);
         try obj.put(arena, "provider_data", .{ .array = provider_data });
         if (call.options) |options| try obj.put(arena, "options", try dszig.lm.optionsValue(arena, options));
         try call_values.append(.{ .object = obj });
     }
-    var root: std.json.ObjectMap = .empty;
+    var root: dszig.ObjectMap = .empty;
     try root.put(arena, "runtime", .{ .string = runtime });
     try root.put(arena, "target_dspy", .{ .string = target_dspy });
     try root.put(arena, "model", .{ .string = model });
@@ -482,10 +491,10 @@ pub fn writeTranscript(arena: Allocator, runtime: []const u8, model: []const u8,
 }
 
 /// Shared result representation for transcript writing and CLI verification.
-fn appendResult(arena: Allocator, root: *std.json.ObjectMap, result: Result) Allocator.Error!void {
-    var cases: std.json.Array = .init(arena);
+fn appendResult(arena: Allocator, root: *dszig.ObjectMap, result: Result) Allocator.Error!void {
+    var cases: dszig.Array = .init(arena);
     for (result.cases) |c| {
-        var obj: std.json.ObjectMap = .empty;
+        var obj: dszig.ObjectMap = .empty;
         try obj.put(arena, "name", .{ .string = c.name });
         if (c.outputs) |o| try obj.put(arena, "outputs", .{ .object = o });
         if (c.err) |e| try obj.put(arena, "error", .{ .string = @errorName(e) });
@@ -494,31 +503,31 @@ fn appendResult(arena: Allocator, root: *std.json.ObjectMap, result: Result) All
     try root.put(arena, "cases", .{ .array = cases });
     inline for (pipeline_names) |name| {
         const p = @field(result, name);
-        var obj: std.json.ObjectMap = .empty;
+        var obj: dszig.ObjectMap = .empty;
         try obj.put(arena, "baseline", .{ .float = p.baseline });
         try obj.put(arena, "optimized", .{ .float = p.optimized });
         try obj.put(arena, "artifact", .{ .string = p.artifact });
-        var candidates: std.json.Array = .init(arena);
+        var candidates: dszig.Array = .init(arena);
         for (p.candidates) |c| {
-            var pair: std.json.Array = .init(arena);
+            var pair: dszig.Array = .init(arena);
             try pair.append(.{ .integer = c.seed });
             try pair.append(.{ .float = c.score });
             try candidates.append(.{ .array = pair });
         }
         try obj.put(arena, "candidates", .{ .array = candidates });
-        var instructions: std.json.Array = .init(arena);
+        var instructions: dszig.Array = .init(arena);
         for (p.instructions) |list| {
-            var arr: std.json.Array = .init(arena);
+            var arr: dszig.Array = .init(arena);
             for (list) |text| try arr.append(.{ .string = text });
             try instructions.append(.{ .array = arr });
         }
         try obj.put(arena, "instructions", .{ .array = instructions });
-        var trials: std.json.Array = .init(arena);
+        var trials: dszig.Array = .init(arena);
         for (p.trials) |t| {
-            var row: std.json.Array = .init(arena);
+            var row: dszig.Array = .init(arena);
             try row.append(.{ .integer = @intCast(t.number) });
             if (t.params) |params| {
-                var arr: std.json.Array = .init(arena);
+                var arr: dszig.Array = .init(arena);
                 for (params) |i| try arr.append(.{ .integer = @intCast(i) });
                 try row.append(.{ .array = arr });
             } else try row.append(.null);
@@ -527,10 +536,10 @@ fn appendResult(arena: Allocator, root: *std.json.ObjectMap, result: Result) All
             try trials.append(.{ .array = row });
         }
         try obj.put(arena, "trials", .{ .array = trials });
-        var scores: std.json.Array = .init(arena);
+        var scores: dszig.Array = .init(arena);
         for (p.scores) |x| try scores.append(.{ .float = x });
         try obj.put(arena, "scores", .{ .array = scores });
-        var train_scores: std.json.Array = .init(arena);
+        var train_scores: dszig.Array = .init(arena);
         for (p.train_scores) |x| try train_scores.append(if (x) |f| .{ .float = f } else .null);
         try obj.put(arena, "train_scores", .{ .array = train_scores });
         try root.put(arena, name, .{ .object = obj });
@@ -565,7 +574,7 @@ pub fn verifyTranscript(arena: Allocator, expected: Value, result: Result) Verif
     if (expected_cases != .array) return error.BadTranscript;
     if (expected_cases.array.items.len != result.cases.len) return error.CaseCountMismatch;
 
-    var actual: std.json.ObjectMap = .empty;
+    var actual: dszig.ObjectMap = .empty;
     try appendResult(arena, &actual, result);
     const actual_cases = actual.get("cases").?.array.items;
     for (expected_cases.array.items, actual_cases) |want, got| {

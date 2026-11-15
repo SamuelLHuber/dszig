@@ -8,42 +8,42 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const python_unicode = @import("python_unicode.zig");
-const Value = std.json.Value;
+const Value = @import("runtime_value.zig").Value;
 const Writer = std.Io.Writer;
 
-pub const Style = enum {
-    /// `json.dumps(v, ensure_ascii=False)`.
-    compact,
-    /// Native tool arguments use separators "," and ":".
-    minified,
-    /// `json.dumps(v, indent=2, ensure_ascii=False)` and `orjson` OPT_INDENT_2.
-    indent2,
-};
+pub const Style = @import("runtime_value.zig").JsonStyle;
 
 /// Containers nested deeper than this are rejected rather than recursed.
 pub const max_depth = 64;
 
-pub const Error = Writer.Error || error{JsonTooDeep};
+pub const Error = Writer.Error || error{ JsonTooDeep, ParseValue };
 
 pub fn writeJson(w: *Writer, v: Value, style: Style) Error!void {
-    try writeJsonDepth(w, v, style, 0);
+    try writeJsonDepth(w, v, style, 0, false);
 }
 
-fn writeJsonDepth(w: *Writer, v: Value, style: Style, depth: u32) Error!void {
+/// Plain Python json.dumps defaults: ASCII escapes and spaced separators.
+/// Unlike DSPy's custom serializer, plain JSON rejects native class objects.
+pub fn writeJsonAscii(w: *Writer, v: Value) Error!void {
+    try writeJsonDepth(w, v, .compact, 0, true);
+}
+
+fn writeJsonDepth(w: *Writer, v: Value, style: Style, depth: u32, comptime ascii: bool) Error!void {
     if (depth >= max_depth) return error.JsonTooDeep;
     switch (v) {
         .null => try w.writeAll("null"),
         .bool => |b| try w.writeAll(if (b) "true" else "false"),
         .integer => |i| try w.print("{d}", .{i}),
-        .float => |f| try writeFloat(w, f, .json),
+        .float => |f| try writeFloat(w, f, if (style == .orjson_indent2) .orjson else .json),
         .number_string => |s| try w.writeAll(s),
-        .string => |s| try writeJsonString(w, s),
+        .string => |s| if (ascii) try std.json.Stringify.value(s, .{ .escape_unicode = true }, w) else try writeJsonString(w, s),
+        .custom => |custom| if (ascii) return error.ParseValue else try custom.writeSerializedJson(w, style, depth),
         .array => |a| {
             if (a.items.len == 0) return w.writeAll("[]");
             try w.writeByte('[');
             for (a.items, 0..) |item, i| {
                 try writeSeparator(w, style, depth + 1, i == 0);
-                try writeJsonDepth(w, item, style, depth + 1);
+                try writeJsonDepth(w, item, style, depth + 1, ascii);
             }
             try writeClose(w, style, depth, ']');
         },
@@ -55,9 +55,9 @@ fn writeJsonDepth(w: *Writer, v: Value, style: Style, depth: u32) Error!void {
             while (it.next()) |entry| {
                 try writeSeparator(w, style, depth + 1, first);
                 first = false;
-                try writeJsonString(w, entry.key_ptr.*);
+                if (ascii) try std.json.Stringify.value(entry.key_ptr.*, .{ .escape_unicode = true }, w) else try writeJsonString(w, entry.key_ptr.*);
                 try w.writeAll(if (style == .minified) ":" else ": ");
-                try writeJsonDepth(w, entry.value_ptr.*, style, depth + 1);
+                try writeJsonDepth(w, entry.value_ptr.*, style, depth + 1, ascii);
             }
             try writeClose(w, style, depth, '}');
         },
@@ -68,7 +68,7 @@ fn writeSeparator(w: *Writer, style: Style, depth: u32, first: bool) Writer.Erro
     switch (style) {
         .compact => if (!first) try w.writeAll(", "),
         .minified => if (!first) try w.writeByte(','),
-        .indent2 => {
+        .indent2, .orjson_indent2 => {
             if (!first) try w.writeByte(',');
             try w.writeByte('\n');
             try w.splatByteAll(' ', depth * 2);
@@ -77,7 +77,7 @@ fn writeSeparator(w: *Writer, style: Style, depth: u32, first: bool) Writer.Erro
 }
 
 fn writeClose(w: *Writer, style: Style, depth: u32, close: u8) Writer.Error!void {
-    if (style == .indent2) {
+    if (style == .indent2 or style == .orjson_indent2) {
         try w.writeByte('\n');
         try w.splatByteAll(' ', depth * 2);
     }
@@ -86,6 +86,11 @@ fn writeClose(w: *Writer, style: Style, depth: u32, close: u8) Writer.Error!void
 
 pub fn writeJsonString(w: *Writer, s: []const u8) Writer.Error!void {
     try w.writeByte('"');
+    try writeJsonStringContents(w, s);
+    try w.writeByte('"');
+}
+
+fn writeJsonStringContents(w: *Writer, s: []const u8) Writer.Error!void {
     var start: usize = 0;
     for (s, 0..) |c, i| {
         const escape: ?[]const u8 = switch (c) {
@@ -108,14 +113,37 @@ pub fn writeJsonString(w: *Writer, s: []const u8) Writer.Error!void {
         start = i + 1;
     }
     try w.writeAll(s[start..]);
-    try w.writeByte('"');
 }
 
-pub const FloatFlavor = enum { json, python };
+/// Unbuffered JSON string-content escaping. Callers own the surrounding quotes;
+/// the rendered input can be streamed without allocating a second large string.
+pub const StringContentsWriter = struct {
+    destination: *Writer,
+    writer: Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
+
+    fn drain(writer: *Writer, data: []const []const u8, splat: usize) Writer.Error!usize {
+        const self: *StringContentsWriter = @alignCast(@fieldParentPtr("writer", writer));
+        assert(writer.end == 0);
+        assert(data.len != 0);
+        var consumed: usize = 0;
+        for (data[0 .. data.len - 1]) |part| {
+            try writeJsonStringContents(self.destination, part);
+            consumed = std.math.add(usize, consumed, part.len) catch return error.WriteFailed;
+        }
+        const last = data[data.len - 1];
+        const repeated = std.math.mul(usize, last.len, splat) catch return error.WriteFailed;
+        const total = std.math.add(usize, consumed, repeated) catch return error.WriteFailed;
+        for (0..splat) |_| try writeJsonStringContents(self.destination, last);
+        return total;
+    }
+};
+
+pub const FloatFlavor = enum { json, python, orjson };
 
 /// Python `repr(float)`: shortest round-trip digits, positional notation for
 /// decimal exponents in [-4, 16), otherwise `d.ddde+XX`.
 pub fn writeFloat(w: *Writer, f: f64, flavor: FloatFlavor) Writer.Error!void {
+    if (flavor == .orjson and !std.math.isFinite(f)) return w.writeAll("null");
     if (std.math.isNan(f)) return w.writeAll(if (flavor == .json) "NaN" else "nan");
     if (std.math.isInf(f)) {
         if (f < 0) try w.writeByte('-');
@@ -140,7 +168,7 @@ pub fn writeFloat(w: *Writer, f: f64, flavor: FloatFlavor) Writer.Error!void {
     const digits = digits_buf[0..n_digits];
     assert(digits.len > 0);
     const decpt: i32 = exp + 1;
-    if (decpt > -4 and decpt <= 16) {
+    if (decpt > (if (flavor == .orjson) @as(i32, -5) else -4) and decpt <= 16) {
         if (decpt <= 0) {
             try w.writeAll("0.");
             try w.splatByteAll('0', @intCast(-decpt));
@@ -164,7 +192,11 @@ pub fn writeFloat(w: *Writer, f: f64, flavor: FloatFlavor) Writer.Error!void {
             try w.writeAll(digits[1..]);
         }
         const sign: u8 = if (exp < 0) '-' else '+';
-        try w.print("e{c}{d:0>2}", .{ sign, @abs(exp) });
+        if (flavor == .orjson) {
+            try w.print("e{c}{d}", .{ sign, @abs(exp) });
+        } else {
+            try w.print("e{c}{d:0>2}", .{ sign, @abs(exp) });
+        }
     }
 }
 
@@ -173,6 +205,7 @@ pub fn writeFloat(w: *Writer, f: f64, flavor: FloatFlavor) Writer.Error!void {
 pub fn writeStr(w: *Writer, v: Value) Error!void {
     switch (v) {
         .string => |s| try w.writeAll(s),
+        .custom => |custom| try custom.writeStr(w),
         else => try writeRepr(w, v, 0),
     }
 }
@@ -186,6 +219,7 @@ pub fn writeRepr(w: *Writer, v: Value, depth: u32) Error!void {
         .float => |f| try writeFloat(w, f, .python),
         .number_string => |s| try w.writeAll(s),
         .string => |s| try writeReprString(w, s),
+        .custom => |custom| try custom.writeRepr(w),
         .array => |a| {
             try w.writeByte('[');
             for (a.items, 0..) |item, i| {

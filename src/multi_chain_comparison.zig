@@ -16,7 +16,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Field = signature.Field;
-const Value = std.json.Value;
+const Value = @import("runtime_value.zig").Value;
 const Record = value.Record;
 
 const lm = @import("lm.zig");
@@ -243,6 +243,7 @@ fn truthy(v: Value) bool {
         .string => |s| s.len > 0,
         .array => |a| a.items.len > 0,
         .object => |o| o.count() > 0,
+        .custom => true,
     };
 }
 
@@ -274,6 +275,7 @@ fn firstLine(arena: Allocator, v: Value) Error![]const u8 {
         pyjson.writeStr(&rendered.writer, v) catch |err| switch (err) {
             error.WriteFailed => return error.OutOfMemory,
             error.JsonTooDeep => return error.JsonTooDeep,
+            error.ParseValue => return error.AdapterParse,
         };
         break :blk rendered.written();
     };
@@ -448,7 +450,7 @@ test "comparison uses typed Predict with captured upstream prompt temperature tr
             "<answer>\n{answer}\n</answer>\n" ++
             "In adhering to this structure, your objective is: \n" ++
             "        Preserve the exact task instructions.",
-        request.messages[0].content,
+        request.messages[0].content.text,
     );
     try testing.expectEqualStrings(
         "<question>\nQ\n</question>\n\n" ++
@@ -459,7 +461,7 @@ test "comparison uses typed Predict with captured upstream prompt temperature tr
             "<analysis>\n{analysis}\n</analysis>\n\n" ++
             "<answer>\n{answer}\n</answer>\n\n" ++
             "Use this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping.",
-        request.messages[1].content,
+        request.messages[1].content.text,
     );
     try testing.expectEqual(@as(usize, 1), trace.steps.items.len);
     const step = trace.steps.items[0];
@@ -518,7 +520,7 @@ test "comparison input collisions override attempts without coercion and retain 
     const inputs = trace.steps.items[0].inputs;
     try testing.expectEqual(@as(i64, 17), inputs.get("reasoning_attempt_1").?.integer);
     try testing.expectEqual(@as(i64, 11), inputs.get("rationale").?.integer);
-    const prompt = history.last().?.messages[1].content;
+    const prompt = history.last().?.messages[1].content.text;
     try testing.expect(std.mem.indexOf(u8, prompt, "<reasoning_attempt_1>\n17\n</reasoning_attempt_1>") != null);
     try testing.expect(std.mem.indexOf(u8, prompt, "generated") == null);
     try testing.expect(std.mem.indexOf(u8, prompt, "<rationale>\n11\n</rationale>") == null);
@@ -563,7 +565,7 @@ test "comparison output collisions preserve metadata and reproduce upstream reve
     const inputs = trace.steps.items[0].inputs;
     try testing.expectEqualStrings("«My prediction is a»", inputs.get("reasoning_attempt_1").?.string);
     try testing.expectEqualStrings("«My prediction is b»", inputs.get("reasoning_attempt_2").?.string);
-    const prompt = history.last().?.messages[1].content;
+    const prompt = history.last().?.messages[1].content.text;
     try testing.expect(std.mem.indexOf(u8, prompt, "«My prediction is a»") == null);
     try testing.expect(std.mem.indexOf(u8, prompt, "«My prediction is b»") == null);
     try testing.expect(std.mem.indexOf(u8, prompt, "«My prediction is c»") != null);
@@ -619,7 +621,7 @@ test "comparison selects original last output even when that output is promoted 
     }, &records, .{ .question = "Q" });
     try testing.expectEqual(@as(i64, 7), out.reasoning_attempt_1);
     try testing.expectEqualStrings("«My prediction is 42»", trace.steps.items[0].inputs.get("reasoning_attempt_1").?.string);
-    const prompt = history.last().?.messages[1].content;
+    const prompt = history.last().?.messages[1].content.text;
     try testing.expect(std.mem.indexOf(u8, prompt, "«My prediction is 42»") == null);
     try testing.expect(std.mem.indexOf(u8, prompt, "not the selected answer") == null);
 }
@@ -680,11 +682,11 @@ test "comparison state roundtrip preserves optimizer metadata demos and cheap-co
     try testing.expectEqualStrings("ok", out.answer);
     const messages = history.last().?.messages;
     try testing.expectEqual(@as(usize, 4), messages.len);
-    try testing.expect(std.mem.indexOf(u8, messages[0].content, "Optimizer instructions.") != null);
-    try testing.expect(std.mem.indexOf(u8, messages[1].content, "demo Q") != null);
-    try testing.expect(std.mem.indexOf(u8, messages[1].content, "demo attempt") != null);
+    try testing.expect(std.mem.indexOf(u8, messages[0].content.text, "Optimizer instructions.") != null);
+    try testing.expect(std.mem.indexOf(u8, messages[1].content.text, "demo Q") != null);
+    try testing.expect(std.mem.indexOf(u8, messages[1].content.text, "demo attempt") != null);
     try testing.expectEqual(@import("adapter.zig").Role.assistant, messages[2].role);
-    try testing.expect(std.mem.indexOf(u8, messages[2].content, "demo rationale") != null);
+    try testing.expect(std.mem.indexOf(u8, messages[2].content.text, "demo rationale") != null);
     try testing.expect(trace.steps.items[0].predictor == &restored.predict.state);
 
     var copy = restored;
@@ -711,7 +713,7 @@ test "comparison zero attempts accepts empty original input and retains output d
     compare.predict.state.prefixes = &.{ "Optimizer rationale:", "Optimizer answer:" };
     const out = try compare.forward(.{ .arena = arena, .lm = script.lm() }, &.{}, .{});
     try testing.expectEqualStrings("default", out.answer);
-    const system = history.last().?.messages[0].content;
+    const system = history.last().?.messages[0].content.text;
     try testing.expect(std.mem.indexOf(u8, system, "Optimizer instructions.") != null);
     try testing.expect(std.mem.indexOf(u8, system, "Optimizer rationale") != null);
     try testing.expect(std.mem.indexOf(u8, system, "Optimizer answer") != null);

@@ -25,7 +25,7 @@ const predict = @import("predict.zig");
 const value = @import("value.zig");
 const Context = predict.Context;
 const Trace = predict.Trace;
-const Value = std.json.Value;
+const Value = @import("runtime_value.zig").Value;
 const Allocator = std.mem.Allocator;
 
 /// The reward receives the original LM/options with the isolated attempt

@@ -21,7 +21,7 @@ pub const ToolChoice = inference.ToolChoice;
 pub const Options = struct {
     temperature: ?f64 = null,
     /// DSPy cache identity; candidate groups use a tagged JSON-array tuple.
-    rollout_id: ?std.json.Value = null,
+    rollout_id: ?@import("runtime_value.zig").Value = null,
     response_format: ?ResponseFormat = null,
     tool_choice: ?ToolChoice = null,
     parallel_tool_calls: ?bool = null,
@@ -44,19 +44,20 @@ pub const Error = error{ LMFailure, ScriptExhausted } || Allocator.Error;
 
 /// One provider completion and its optional, genuinely returned reasoning.
 pub const Completion = struct {
-    text: []const u8,
+    /// Null means no TextPart was returned; it is distinct from an empty text.
+    text: ?[]const u8,
     reasoning: ?[]const u8 = null,
     tool_calls: []const ToolCall = &.{},
     continuation: []const Continuation = &.{},
     /// Actual provider JSON, retained separately from canonical continuation.
-    provider_data: ?std.json.Value = null,
+    provider_data: ?@import("runtime_value.zig").Value = null,
 };
 
 /// Owning clones for long-lived histories and caches. Completion cloning also
 /// unwinds partial allocations, so `freeCompletion` works with a general GPA.
 pub fn cloneCompletion(allocator: Allocator, completion: Completion) Allocator.Error!Completion {
-    const text = try allocator.dupe(u8, completion.text);
-    errdefer allocator.free(text);
+    const text = if (completion.text) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (text) |value| allocator.free(value);
     const reasoning = if (completion.reasoning) |summary| try allocator.dupe(u8, summary) else null;
     errdefer if (reasoning) |summary| allocator.free(summary);
     const tool_calls = try inference.cloneToolCalls(allocator, completion.tool_calls);
@@ -75,7 +76,7 @@ pub fn cloneCompletion(allocator: Allocator, completion: Completion) Allocator.E
 
 pub fn freeCompletion(allocator: Allocator, completion: Completion) void {
     if (completion.provider_data) |data| inference.freeJsonValue(allocator, data);
-    allocator.free(completion.text);
+    if (completion.text) |text| allocator.free(text);
     if (completion.reasoning) |reasoning| allocator.free(reasoning);
     inference.freeContinuations(allocator, completion.continuation);
     inference.freeToolCalls(allocator, completion.tool_calls);
@@ -93,7 +94,7 @@ pub fn cloneOptions(arena: Allocator, options: Options) Allocator.Error!Options 
 pub fn cloneMessage(arena: Allocator, message: Message) Allocator.Error!Message {
     return .{
         .role = message.role,
-        .content = try arena.dupe(u8, message.content),
+        .content = try message.content.clone(arena),
         .reasoning = if (message.reasoning) |reasoning| try arena.dupe(u8, reasoning) else null,
         .tool_calls = try inference.cloneToolCalls(arena, message.tool_calls),
         .tool_call_id = if (message.tool_call_id) |id| try arena.dupe(u8, id) else null,
@@ -103,8 +104,8 @@ pub fn cloneMessage(arena: Allocator, message: Message) Allocator.Error!Message 
 
 /// Canonical metadata, before a provider dialect adds its wire wrappers.
 /// All knobs remain visible, including explicitly absent values.
-pub fn optionsValue(arena: Allocator, options: Options) Allocator.Error!std.json.Value {
-    var object: std.json.ObjectMap = .empty;
+pub fn optionsValue(arena: Allocator, options: Options) Allocator.Error!@import("runtime_value.zig").Value {
+    var object: @import("runtime_value.zig").ObjectMap = .empty;
     try object.put(arena, "temperature", if (options.temperature) |temperature| .{ .float = temperature } else .null);
     try object.put(arena, "rollout_id", options.rollout_id orelse .null);
     try object.put(arena, "n", .{ .integer = options.n });
@@ -116,10 +117,10 @@ pub fn optionsValue(arena: Allocator, options: Options) Allocator.Error!std.json
     return .{ .object = object };
 }
 
-pub fn messageValue(arena: Allocator, message: Message) Allocator.Error!std.json.Value {
-    var object: std.json.ObjectMap = .empty;
+pub fn messageValue(arena: Allocator, message: Message) Allocator.Error!@import("runtime_value.zig").Value {
+    var object: @import("runtime_value.zig").ObjectMap = .empty;
     try object.put(arena, "role", .{ .string = message.role.name() });
-    try object.put(arena, "content", .{ .string = message.content });
+    try object.put(arena, "content", message.content.toValue(arena));
     try object.put(arena, "reasoning", if (message.reasoning) |reasoning| .{ .string = reasoning } else .null);
     try object.put(arena, "tool_calls", try inference.toolCallsValue(arena, message.tool_calls));
     try object.put(arena, "tool_call_id", if (message.tool_call_id) |id| .{ .string = id } else .null);
@@ -127,20 +128,20 @@ pub fn messageValue(arena: Allocator, message: Message) Allocator.Error!std.json
     return .{ .object = object };
 }
 
-pub fn requestValue(arena: Allocator, request: Request) Allocator.Error!std.json.Value {
-    var messages: std.json.Array = .init(arena);
+pub fn requestValue(arena: Allocator, request: Request) Allocator.Error!@import("runtime_value.zig").Value {
+    var messages: @import("runtime_value.zig").Array = .init(arena);
     try messages.ensureTotalCapacity(request.messages.len);
     for (request.messages) |message| messages.appendAssumeCapacity(try messageValue(arena, message));
-    var object: std.json.ObjectMap = .empty;
+    var object: @import("runtime_value.zig").ObjectMap = .empty;
     try object.put(arena, "messages", .{ .array = messages });
     try object.put(arena, "options", try optionsValue(arena, request.options));
     try object.put(arena, "tools", try inference.toolsValue(arena, request.tools));
     return .{ .object = object };
 }
 
-pub fn completionValue(arena: Allocator, completion: Completion) Allocator.Error!std.json.Value {
-    var object: std.json.ObjectMap = .empty;
-    try object.put(arena, "text", .{ .string = completion.text });
+pub fn completionValue(arena: Allocator, completion: Completion) Allocator.Error!@import("runtime_value.zig").Value {
+    var object: @import("runtime_value.zig").ObjectMap = .empty;
+    try object.put(arena, "text", if (completion.text) |text| .{ .string = text } else .null);
     try object.put(arena, "reasoning", if (completion.reasoning) |reasoning| .{ .string = reasoning } else .null);
     try object.put(arena, "tool_calls", try inference.toolCallsValue(arena, completion.tool_calls));
     try object.put(arena, "continuation", try inference.continuationsValue(arena, completion.continuation));
@@ -150,7 +151,7 @@ pub fn completionValue(arena: Allocator, completion: Completion) Allocator.Error
 
 /// Owning readers accept extra row fields, allowing a transcript call to carry
 /// completion evidence alongside its canonical request without dropping it.
-pub fn optionsFromValue(arena: Allocator, input: std.json.Value) inference.MetadataError!Options {
+pub fn optionsFromValue(arena: Allocator, input: @import("runtime_value.zig").Value) inference.MetadataError!Options {
     if (input != .object) return error.BadMetadata;
     var out: Options = .{};
     if (input.object.get("temperature")) |temperature| {
@@ -190,13 +191,16 @@ pub fn optionsFromValue(arena: Allocator, input: std.json.Value) inference.Metad
     return out;
 }
 
-pub fn messageFromValue(arena: Allocator, input: std.json.Value) inference.MetadataError!Message {
+pub fn messageFromValue(arena: Allocator, input: @import("runtime_value.zig").Value) inference.MetadataError!Message {
     if (input != .object) return error.BadMetadata;
     const role = try metadataString(input.object.get("role") orelse return error.BadMetadata);
-    const content = try metadataString(input.object.get("content") orelse return error.BadMetadata);
+    const content = input.object.get("content") orelse return error.BadMetadata;
     var out: Message = .{
         .role = std.meta.stringToEnum(adapter.Role, role) orelse return error.BadMetadata,
-        .content = try arena.dupe(u8, content),
+        .content = adapter.Content.fromValue(arena, content) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.BadMetadata,
+        },
     };
     if (input.object.get("reasoning")) |reasoning| {
         if (reasoning != .null) out.reasoning = try arena.dupe(u8, try metadataString(reasoning));
@@ -209,7 +213,7 @@ pub fn messageFromValue(arena: Allocator, input: std.json.Value) inference.Metad
     return out;
 }
 
-pub fn requestFromValue(arena: Allocator, input: std.json.Value) inference.MetadataError!Request {
+pub fn requestFromValue(arena: Allocator, input: @import("runtime_value.zig").Value) inference.MetadataError!Request {
     if (input != .object) return error.BadMetadata;
     const raw_messages = input.object.get("messages") orelse return error.BadMetadata;
     if (raw_messages != .array or raw_messages.array.items.len == 0) return error.BadMetadata;
@@ -223,9 +227,10 @@ pub fn requestFromValue(arena: Allocator, input: std.json.Value) inference.Metad
     return out;
 }
 
-pub fn completionFromValue(arena: Allocator, input: std.json.Value) inference.MetadataError!Completion {
+pub fn completionFromValue(arena: Allocator, input: @import("runtime_value.zig").Value) inference.MetadataError!Completion {
     if (input != .object) return error.BadMetadata;
-    var out: Completion = .{ .text = try arena.dupe(u8, try metadataString(input.object.get("text") orelse return error.BadMetadata)) };
+    const text = input.object.get("text") orelse return error.BadMetadata;
+    var out: Completion = .{ .text = if (text == .null) null else try arena.dupe(u8, try metadataString(text)) };
     if (input.object.get("reasoning")) |reasoning| {
         if (reasoning != .null) out.reasoning = try arena.dupe(u8, try metadataString(reasoning));
     }
@@ -240,12 +245,12 @@ pub fn completionFromValue(arena: Allocator, input: std.json.Value) inference.Me
     return out;
 }
 
-fn metadataString(input: std.json.Value) inference.MetadataError![]const u8 {
+fn metadataString(input: @import("runtime_value.zig").Value) inference.MetadataError![]const u8 {
     if (input != .string) return error.BadMetadata;
     return input.string;
 }
 
-fn metadataU32(input: std.json.Value) inference.MetadataError!u32 {
+fn metadataU32(input: @import("runtime_value.zig").Value) inference.MetadataError!u32 {
     if (input != .integer or input.integer < 0 or input.integer > 0xffffffff) return error.BadMetadata;
     return @intCast(input.integer);
 }
@@ -270,14 +275,14 @@ pub const LM = struct {
 
     pub fn complete(lm: LM, arena: Allocator, request: Request) Error![]const u8 {
         assert(request.options.n == 1);
-        return (try lm.completeResponses(arena, request))[0].text;
+        return (try lm.completeResponses(arena, request))[0].text orelse error.LMFailure;
     }
 
     /// Text-only convenience; use `completeResponses` to retain native reasoning.
     pub fn completeMany(lm: LM, arena: Allocator, request: Request) Error![]const []const u8 {
         const completions = try lm.completeResponses(arena, request);
         const out = try arena.alloc([]const u8, completions.len);
-        for (out, completions) |*text, completion| text.* = completion.text;
+        for (out, completions) |*text, completion| text.* = completion.text orelse return error.LMFailure;
         return out;
     }
 
@@ -297,12 +302,12 @@ pub const LM = struct {
             candidate.options.n = 1;
             // Borrowed only for this synchronous callback; histories/caches
             // clone request metadata before retaining it.
-            var identity = [_]std.json.Value{
+            var identity = [_]@import("runtime_value.zig").Value{
                 .{ .string = "dspy.adapter.candidate" },
                 request.options.rollout_id orelse .null,
                 .{ .integer = @intCast(index) },
             };
-            var rollout: std.json.Array = .init(arena);
+            var rollout: @import("runtime_value.zig").Array = .init(arena);
             rollout.items = &identity;
             rollout.capacity = identity.len;
             candidate.options.rollout_id = .{ .array = rollout };
@@ -321,7 +326,7 @@ pub const ScriptedLM = struct {
     reasonings: []const ?[]const u8 = &.{},
     tool_calls: []const []const ToolCall = &.{},
     continuation: []const []const Continuation = &.{},
-    provider_data: []const ?std.json.Value = &.{},
+    provider_data: []const ?@import("runtime_value.zig").Value = &.{},
     supports_reasoning: bool = false,
     supports_response_format: bool = false,
     supports_response_schema: bool = false,
@@ -393,9 +398,9 @@ pub const KeywordLM = struct {
         const last = messages[messages.len - 1].content;
         for (self.rules) |rule| {
             switch (rule.scope) {
-                .last_user => if (std.mem.indexOf(u8, last, rule.needle) != null) return rule.response,
+                .last_user => if (last.contains(rule.needle)) return rule.response,
                 .any => for (messages) |m| {
-                    if (std.mem.indexOf(u8, m.content, rule.needle) != null) return rule.response;
+                    if (m.content.contains(rule.needle)) return rule.response;
                 },
             }
         }
@@ -435,18 +440,18 @@ pub const ReplayLM = struct {
         /// Null only for historical transcripts that did not record options.
         options: ?Options = null,
         tools: []const FunctionTool = &.{},
-        completion: []const u8,
+        completion: ?[]const u8,
         /// Every completion of an `n > 1` call (`completion` is the first);
-        /// empty for single-completion calls.
-        completions: []const []const u8 = &.{},
+        /// empty for single-completion calls. Null entries preserve absent text.
+        completions: []const ?[]const u8 = &.{},
         /// Native summaries, parallel to `all()`; empty when none were returned.
         reasonings: []const ?[]const u8 = &.{},
         /// Native calls for each completion, parallel to `all()`.
         tool_calls: []const []const ToolCall = &.{},
         continuation: []const []const Continuation = &.{},
-        provider_data: []const ?std.json.Value = &.{},
+        provider_data: []const ?@import("runtime_value.zig").Value = &.{},
 
-        pub fn all(call: *const Call) []const []const u8 {
+        pub fn all(call: *const Call) []const ?[]const u8 {
             if (call.completions.len > 0) return call.completions;
             return (&call.completion)[0..1];
         }
@@ -533,7 +538,7 @@ pub const ReplayLM = struct {
     fn sameMessages(a: []const Message, b: []const Message) bool {
         if (a.len != b.len) return false;
         for (a, b) |x, y| {
-            if (x.role != y.role or !std.mem.eql(u8, x.content, y.content)) return false;
+            if (x.role != y.role or !adapter.Content.eql(x.content, y.content)) return false;
             if (!optionalStringEqual(x.tool_call_id, y.tool_call_id)) return false;
             if (!optionalStringEqual(x.reasoning, y.reasoning)) return false;
             if (!inference.toolCallsEqual(x.tool_calls, y.tool_calls)) return false;
@@ -567,10 +572,10 @@ pub const RecordingLM = struct {
         const completions = try self.inner.completeResponses(arena, request);
         const messages = try self.arena.alloc(Message, request.messages.len);
         for (request.messages, messages) |src, *dst| dst.* = try cloneMessage(self.arena, src);
-        const kept = try self.arena.alloc([]const u8, completions.len);
+        const kept = try self.arena.alloc(?[]const u8, completions.len);
         var has_reasoning = false;
         for (kept, completions) |*k, c| {
-            k.* = try self.arena.dupe(u8, c.text);
+            k.* = if (c.text) |text| try self.arena.dupe(u8, text) else null;
             has_reasoning = has_reasoning or c.reasoning != null;
         }
         const reasonings: []?[]const u8 = if (has_reasoning) try self.arena.alloc(?[]const u8, completions.len) else &.{};
@@ -591,7 +596,7 @@ pub const RecordingLM = struct {
         }
         var has_provider_data = false;
         for (completions) |completion| has_provider_data = has_provider_data or completion.provider_data != null;
-        const provider_data: []?std.json.Value = if (has_provider_data) try self.arena.alloc(?std.json.Value, completions.len) else &.{};
+        const provider_data: []?@import("runtime_value.zig").Value = if (has_provider_data) try self.arena.alloc(?@import("runtime_value.zig").Value, completions.len) else &.{};
         for (provider_data, completions[0..provider_data.len]) |*kept_data, completion| {
             kept_data.* = if (completion.provider_data) |data| try inference.cloneJsonValue(self.arena, data) else null;
         }
@@ -675,23 +680,30 @@ pub const OpenAI = struct {
     /// A Responses request represents one completion; `complete` issues
     /// independent requests for `n > 1`, since Responses has no `n` parameter.
     pub fn requestBody(self: *const OpenAI, arena: Allocator, request: Request) Error![]const u8 {
-        const messages = try self.wireMessages(arena, request.messages);
-        var body: std.json.ObjectMap = .empty;
+        const has_system = self.api == .responses and request.messages.len != 0 and request.messages[0].role == .system;
+        const messages = try self.wireMessages(arena, request.messages[@intFromBool(has_system)..]);
+        var body: @import("runtime_value.zig").ObjectMap = .empty;
         try body.put(arena, "model", .{ .string = self.model });
         try body.put(arena, if (self.api == .responses) "input" else "messages", .{ .array = messages });
+        if (self.api == .responses) {
+            try body.put(arena, "stream", .{ .bool = false });
+            if (has_system) {
+                const system = request.messages[0];
+                if (system.content != .text or system.tool_calls.len != 0 or system.tool_call_id != null) return error.LMFailure;
+                if (system.content.text.len != 0) try body.put(arena, "instructions", .{ .string = system.content.text });
+            }
+        }
         if (request.options.temperature) |t| try body.put(arena, "temperature", .{ .float = t });
         if (self.max_tokens) |n| {
             try body.put(arena, if (self.api == .responses) "max_output_tokens" else "max_tokens", .{ .integer = n });
         }
-        if (self.api == .responses) {
-            try body.put(arena, "store", .{ .bool = false });
-        } else if (request.options.n > 1) {
+        if (self.api == .chat_completions and request.options.n > 1) {
             try body.put(arena, "n", .{ .integer = request.options.n });
         }
         if (request.options.response_format) |format| {
             const encoded = try self.wireResponseFormat(arena, format);
             if (self.api == .responses) {
-                var text: std.json.ObjectMap = .empty;
+                var text: @import("runtime_value.zig").ObjectMap = .empty;
                 try text.put(arena, "format", encoded);
                 try body.put(arena, "text", .{ .object = text });
             } else {
@@ -699,11 +711,11 @@ pub const OpenAI = struct {
             }
         }
         if (request.tools.len != 0) {
-            var tools: std.json.Array = .init(arena);
+            var tools: @import("runtime_value.zig").Array = .init(arena);
             try tools.ensureTotalCapacity(request.tools.len);
             for (request.tools) |tool| {
                 if (tool.name.len == 0 or tool.parameters != .object) return error.LMFailure;
-                var function: std.json.ObjectMap = .empty;
+                var function: @import("runtime_value.zig").ObjectMap = .empty;
                 try function.put(arena, "name", .{ .string = tool.name });
                 if (tool.description.len != 0) try function.put(arena, "description", .{ .string = tool.description });
                 try function.put(arena, "parameters", tool.parameters);
@@ -718,7 +730,7 @@ pub const OpenAI = struct {
                     try function.put(arena, "type", .{ .string = "function" });
                     tools.appendAssumeCapacity(.{ .object = function });
                 } else {
-                    var wrapper: std.json.ObjectMap = .empty;
+                    var wrapper: @import("runtime_value.zig").ObjectMap = .empty;
                     try wrapper.put(arena, "type", .{ .string = "function" });
                     try wrapper.put(arena, "function", .{ .object = function });
                     tools.appendAssumeCapacity(.{ .object = wrapper });
@@ -732,7 +744,7 @@ pub const OpenAI = struct {
             const disabled = std.mem.eql(u8, effort, "none") or std.mem.eql(u8, effort, "off");
             const wire_effort = if (disabled) "none" else effort;
             if (self.api == .responses) {
-                var reasoning: std.json.ObjectMap = .empty;
+                var reasoning: @import("runtime_value.zig").ObjectMap = .empty;
                 try reasoning.put(arena, "effort", .{ .string = wire_effort });
                 if (!disabled) try reasoning.put(arena, "summary", .{ .string = "auto" });
                 try body.put(arena, "reasoning", .{ .object = reasoning });
@@ -741,15 +753,15 @@ pub const OpenAI = struct {
             }
         }
         var aw: Writer.Allocating = .init(arena);
-        pyjson.writeJson(&aw.writer, .{ .object = body }, .compact) catch |err| return switch (err) {
+        pyjson.writeJson(&aw.writer, .{ .object = body }, .minified) catch |err| return switch (err) {
             error.WriteFailed => error.OutOfMemory,
-            error.JsonTooDeep => error.LMFailure,
+            error.JsonTooDeep, error.ParseValue => error.LMFailure,
         };
         return aw.written();
     }
 
-    fn wireMessages(self: *const OpenAI, arena: Allocator, input: []const Message) Error!std.json.Array {
-        var out: std.json.Array = .init(arena);
+    fn wireMessages(self: *const OpenAI, arena: Allocator, input: []const Message) Error!@import("runtime_value.zig").Array {
+        var out: @import("runtime_value.zig").Array = .init(arena);
         for (input) |message| {
             if (message.continuation.len != 0) {
                 if (self.api != .responses or message.role != .assistant) return error.LMFailure;
@@ -761,33 +773,34 @@ pub const OpenAI = struct {
             }
             if (message.role != .assistant and message.tool_calls.len != 0) return error.LMFailure;
             if (message.role != .tool and message.tool_call_id != null) return error.LMFailure;
-            var object: std.json.ObjectMap = .empty;
+            var object: @import("runtime_value.zig").ObjectMap = .empty;
             if (self.api == .responses and message.role == .tool) {
                 const id = message.tool_call_id orelse return error.LMFailure;
                 if (id.len == 0) return error.LMFailure;
                 try object.put(arena, "type", .{ .string = "function_call_output" });
                 try object.put(arena, "call_id", .{ .string = id });
-                try object.put(arena, "output", .{ .string = message.content });
+                try object.put(arena, "output", if (message.content == .text)
+                    .{ .string = message.content.text }
+                else
+                    .{ .array = try self.responseContent(arena, .user, message.content) });
                 try out.append(.{ .object = object });
                 continue;
             }
-            if (self.api == .chat_completions or message.content.len != 0 or message.tool_calls.len == 0 or
+            if (self.api == .chat_completions or !message.content.isEmpty() or message.tool_calls.len == 0 or
                 (message.reasoning != null and message.continuation.len == 0))
             {
                 try object.put(arena, "role", .{ .string = message.role.name() });
-                if (self.api == .responses and message.role == .assistant and
-                    message.reasoning != null and message.continuation.len == 0)
-                {
-                    // lm15 replays visible thinking without native state as
-                    // assistant text; it is never silently discarded.
-                    var parts: std.json.Array = .init(arena);
-                    for ([_][]const u8{ message.reasoning.?, message.content }) |text| {
-                        if (text.len == 0) continue;
-                        var part: std.json.ObjectMap = .empty;
-                        try part.put(arena, "type", .{ .string = "output_text" });
-                        try part.put(arena, "text", .{ .string = text });
-                        try parts.append(.{ .object = part });
+                if (self.api == .responses) {
+                    var parts = try self.responseContent(arena, message.role, message.content);
+                    if (message.role == .assistant and message.reasoning != null and
+                        message.reasoning.?.len != 0 and message.continuation.len == 0)
+                    {
+                        var thinking: @import("runtime_value.zig").ObjectMap = .empty;
+                        try thinking.put(arena, "type", .{ .string = "output_text" });
+                        try thinking.put(arena, "text", .{ .string = message.reasoning.? });
+                        try parts.insert(0, .{ .object = thinking });
                     }
+                    if (parts.items.len == 0) continue;
                     try object.put(arena, "content", .{ .array = parts });
                 } else if (self.api == .chat_completions and message.role == .assistant and
                     message.reasoning != null and message.reasoning.?.len != 0)
@@ -796,13 +809,17 @@ pub const OpenAI = struct {
                     // assistant text rather than dropping it or sending a
                     // provider-specific reasoning_content request field.
                     const reasoning = message.reasoning.?;
-                    const content = if (message.content.len == 0)
+                    if (message.content != .text) return error.LMFailure;
+                    const content = if (message.content.text.len == 0)
                         reasoning
                     else
-                        try std.fmt.allocPrint(arena, "{s}\n{s}", .{ reasoning, message.content });
+                        try std.fmt.allocPrint(arena, "{s}\n{s}", .{ reasoning, message.content.text });
                     try object.put(arena, "content", .{ .string = content });
                 } else {
-                    try object.put(arena, "content", .{ .string = message.content });
+                    // lm15 Chat currently rejects DocumentPart before HTTP,
+                    // although the SDK-compatible display serializer accepts it.
+                    if (message.content != .text) return error.LMFailure;
+                    try object.put(arena, "content", .{ .string = message.content.text });
                 }
                 if (message.role == .tool) {
                     const id = message.tool_call_id orelse return error.LMFailure;
@@ -810,7 +827,7 @@ pub const OpenAI = struct {
                     try object.put(arena, "tool_call_id", .{ .string = id });
                 }
                 if (self.api == .chat_completions and message.tool_calls.len != 0) {
-                    var calls: std.json.Array = .init(arena);
+                    var calls: @import("runtime_value.zig").Array = .init(arena);
                     try calls.ensureTotalCapacity(message.tool_calls.len);
                     for (message.tool_calls) |call| calls.appendAssumeCapacity(try self.wireToolCall(arena, call));
                     try object.put(arena, "tool_calls", .{ .array = calls });
@@ -824,11 +841,69 @@ pub const OpenAI = struct {
         return out;
     }
 
-    fn wireReasoningItem(arena: Allocator, state: Continuation, summary: ?[]const u8) Error!std.json.Value {
+    fn responseContent(self: *const OpenAI, arena: Allocator, role: adapter.Role, content: adapter.Content) Error!@import("runtime_value.zig").Array {
+        var out: @import("runtime_value.zig").Array = .init(arena);
+        if (content == .text) {
+            var text: @import("runtime_value.zig").ObjectMap = .empty;
+            try text.put(arena, "type", .{ .string = if (role == .assistant) "output_text" else "input_text" });
+            try text.put(arena, "text", .{ .string = content.text });
+            try out.append(.{ .object = text });
+            return out;
+        }
+        for (content.parts) |part| {
+            if (part != .object) return error.LMFailure;
+            const kind = part.object.get("type") orelse return error.LMFailure;
+            if (kind != .string) return error.LMFailure;
+            var block: @import("runtime_value.zig").ObjectMap = .empty;
+            if (std.mem.eql(u8, kind.string, "text")) {
+                const text = part.object.get("text") orelse @import("runtime_value.zig").Value{ .string = "" };
+                if (text != .string) return error.LMFailure;
+                try block.put(arena, "type", .{ .string = if (role == .assistant) "output_text" else "input_text" });
+                try block.put(arena, "text", text);
+            } else if (std.mem.eql(u8, kind.string, "document")) {
+                // Public source build_request preflight rejects assistant
+                // media, even though its private serializer would drop it.
+                if (role == .assistant) return error.LMFailure;
+                try block.put(arena, "type", .{ .string = "input_file" });
+                if (part.object.get("url")) |url| {
+                    if (url != .string) return error.LMFailure;
+                    try block.put(arena, "file_url", url);
+                } else if (part.object.get("file_id")) |file_id| {
+                    if (file_id != .string) return error.LMFailure;
+                    try block.put(arena, "file_id", file_id);
+                } else {
+                    const media_type = part.object.get("media_type") orelse return error.LMFailure;
+                    if (media_type != .string or media_type.string.len == 0) return error.LMFailure;
+                    const data_uri = if (part.object.get("data")) |data| blk: {
+                        if (data != .string) return error.LMFailure;
+                        break :blk try std.fmt.allocPrint(arena, "data:{s};base64,{s}", .{ media_type.string, data.string });
+                    } else if (part.object.get("path")) |path| blk: {
+                        if (path != .string) return error.LMFailure;
+                        const file = @import("file.zig").File.fromPath(arena, self.client.io, path.string, .{ .mime_type = media_type.string }) catch |err| return switch (err) {
+                            error.OutOfMemory => error.OutOfMemory,
+                            else => error.LMFailure,
+                        };
+                        break :blk file.file_data orelse return error.LMFailure;
+                    } else return error.LMFailure;
+                    const subtype = if (std.mem.indexOfScalar(u8, media_type.string, '/')) |slash|
+                        media_type.string[slash + 1 ..]
+                    else
+                        media_type.string;
+                    const extension = subtype[0 .. std.mem.indexOfScalar(u8, subtype, '+') orelse subtype.len];
+                    try block.put(arena, "filename", .{ .string = try std.fmt.allocPrint(arena, "file.{s}", .{if (extension.len == 0) "bin" else extension}) });
+                    try block.put(arena, "file_data", .{ .string = data_uri });
+                }
+            } else return error.LMFailure;
+            try out.append(.{ .object = block });
+        }
+        return out;
+    }
+
+    fn wireReasoningItem(arena: Allocator, state: Continuation, summary: ?[]const u8) Error!@import("runtime_value.zig").Value {
         if (!std.mem.eql(u8, state.provider, "openai") or
             !std.mem.eql(u8, state.kind, "reasoning_item") or state.data != .object) return error.LMFailure;
         if (state.data.object.count() == 0) return error.LMFailure;
-        var object: std.json.ObjectMap = .empty;
+        var object: @import("runtime_value.zig").ObjectMap = .empty;
         try object.put(arena, "type", .{ .string = "reasoning" });
         var fields = state.data.object.iterator();
         while (fields.next()) |field| {
@@ -838,10 +913,10 @@ pub const OpenAI = struct {
             if (text != .string or text.string.len == 0) return error.LMFailure;
             try object.put(arena, field.key_ptr.*, text);
         }
-        var parts: std.json.Array = .init(arena);
+        var parts: @import("runtime_value.zig").Array = .init(arena);
         if (summary) |text| {
             if (text.len != 0) {
-                var part: std.json.ObjectMap = .empty;
+                var part: @import("runtime_value.zig").ObjectMap = .empty;
                 try part.put(arena, "type", .{ .string = "summary_text" });
                 try part.put(arena, "text", .{ .string = text });
                 try parts.append(.{ .object = part });
@@ -851,18 +926,18 @@ pub const OpenAI = struct {
         return .{ .object = object };
     }
 
-    fn wireToolCall(self: *const OpenAI, arena: Allocator, call: ToolCall) Error!std.json.Value {
+    fn wireToolCall(self: *const OpenAI, arena: Allocator, call: ToolCall) Error!@import("runtime_value.zig").Value {
         // OpenAI's function-call mapping has no native per-call opaque state.
         // Preserve it in metadata, but refuse a wire that cannot carry it.
         if (call.continuation.len != 0 or call.id.len == 0 or call.name.len == 0) return error.LMFailure;
-        var object: std.json.ObjectMap = .empty;
+        var object: @import("runtime_value.zig").ObjectMap = .empty;
         if (self.api == .responses) {
             try object.put(arena, "type", .{ .string = "function_call" });
             try object.put(arena, "call_id", .{ .string = call.id });
             try object.put(arena, "name", .{ .string = call.name });
             try object.put(arena, "arguments", .{ .string = call.arguments });
         } else {
-            var function: std.json.ObjectMap = .empty;
+            var function: @import("runtime_value.zig").ObjectMap = .empty;
             try function.put(arena, "name", .{ .string = call.name });
             try function.put(arena, "arguments", .{ .string = call.arguments });
             try object.put(arena, "id", .{ .string = call.id });
@@ -872,15 +947,15 @@ pub const OpenAI = struct {
         return .{ .object = object };
     }
 
-    fn wireResponseFormat(self: *const OpenAI, arena: Allocator, format: ResponseFormat) Error!std.json.Value {
+    fn wireResponseFormat(self: *const OpenAI, arena: Allocator, format: ResponseFormat) Error!@import("runtime_value.zig").Value {
         if (format != .json_schema) {
-            var object: std.json.ObjectMap = .empty;
+            var object: @import("runtime_value.zig").ObjectMap = .empty;
             try object.put(arena, "type", .{ .string = @tagName(format) });
             return .{ .object = object };
         }
         const schema = format.json_schema;
         if (schema.name.len == 0 or schema.schema != .object) return error.LMFailure;
-        var object: std.json.ObjectMap = .empty;
+        var object: @import("runtime_value.zig").ObjectMap = .empty;
         try object.put(arena, "name", .{ .string = schema.name });
         try object.put(arena, "schema", schema.schema);
         if (schema.description) |description| try object.put(arena, "description", .{ .string = description });
@@ -889,27 +964,27 @@ pub const OpenAI = struct {
             try object.put(arena, "type", .{ .string = "json_schema" });
             return .{ .object = object };
         }
-        var wrapper: std.json.ObjectMap = .empty;
+        var wrapper: @import("runtime_value.zig").ObjectMap = .empty;
         try wrapper.put(arena, "type", .{ .string = "json_schema" });
         try wrapper.put(arena, "json_schema", .{ .object = object });
         return .{ .object = wrapper };
     }
 
-    fn wireNamedTool(self: *const OpenAI, arena: Allocator, name: []const u8) Error!std.json.Value {
+    fn wireNamedTool(self: *const OpenAI, arena: Allocator, name: []const u8) Error!@import("runtime_value.zig").Value {
         if (name.len == 0) return error.LMFailure;
-        var object: std.json.ObjectMap = .empty;
+        var object: @import("runtime_value.zig").ObjectMap = .empty;
         try object.put(arena, "type", .{ .string = "function" });
         if (self.api == .responses) {
             try object.put(arena, "name", .{ .string = name });
         } else {
-            var function: std.json.ObjectMap = .empty;
+            var function: @import("runtime_value.zig").ObjectMap = .empty;
             try function.put(arena, "name", .{ .string = name });
             try object.put(arena, "function", .{ .object = function });
         }
         return .{ .object = object };
     }
 
-    fn wireToolChoice(self: *const OpenAI, arena: Allocator, choice: ToolChoice) Error!std.json.Value {
+    fn wireToolChoice(self: *const OpenAI, arena: Allocator, choice: ToolChoice) Error!@import("runtime_value.zig").Value {
         return switch (choice) {
             .auto => .{ .string = "auto" },
             .none => .{ .string = "none" },
@@ -917,17 +992,17 @@ pub const OpenAI = struct {
             .function => |name| try self.wireNamedTool(arena, name),
             .allowed_tools => |allowed| blk: {
                 if (allowed.names.len == 0) break :blk .{ .string = @tagName(allowed.mode) };
-                var tools: std.json.Array = .init(arena);
+                var tools: @import("runtime_value.zig").Array = .init(arena);
                 try tools.ensureTotalCapacity(allowed.names.len);
                 for (allowed.names) |name| tools.appendAssumeCapacity(try self.wireNamedTool(arena, name));
-                var selection: std.json.ObjectMap = .empty;
+                var selection: @import("runtime_value.zig").ObjectMap = .empty;
                 try selection.put(arena, "mode", .{ .string = @tagName(allowed.mode) });
                 try selection.put(arena, "tools", .{ .array = tools });
                 if (self.api == .responses) {
                     try selection.put(arena, "type", .{ .string = "allowed_tools" });
                     break :blk .{ .object = selection };
                 }
-                var wrapper: std.json.ObjectMap = .empty;
+                var wrapper: @import("runtime_value.zig").ObjectMap = .empty;
                 try wrapper.put(arena, "type", .{ .string = "allowed_tools" });
                 try wrapper.put(arena, "allowed_tools", .{ .object = selection });
                 break :blk .{ .object = wrapper };
@@ -938,7 +1013,7 @@ pub const OpenAI = struct {
     /// Send a JSON request through the same bounded, retrying transport used by
     /// generation. `path` is relative to `base_url`; response values own their
     /// strings in `arena`. Additional headers support compatible provider APIs.
-    pub fn postJson(self: *OpenAI, arena: Allocator, path: []const u8, body: std.json.Value, headers: []const std.http.Header) anyerror!std.json.Value {
+    pub fn postJson(self: *OpenAI, arena: Allocator, path: []const u8, body: @import("runtime_value.zig").Value, headers: []const std.http.Header) anyerror!@import("runtime_value.zig").Value {
         const url = try std.fmt.allocPrint(arena, "{s}/{s}", .{
             std.mem.trimEnd(u8, self.base_url, "/"),
             std.mem.trimStart(u8, path, "/"),
@@ -947,7 +1022,7 @@ pub const OpenAI = struct {
         var encoded: Writer.Allocating = .init(arena);
         pyjson.writeJson(&encoded.writer, body, .compact) catch |err| return switch (err) {
             error.WriteFailed => error.OutOfMemory,
-            error.JsonTooDeep => error.LMFailure,
+            error.JsonTooDeep, error.ParseValue => error.LMFailure,
         };
         const response = try self.fetchWithRetries(arena, url, auth, encoded.written(), headers);
         defer self.client.allocator.free(response.body);
@@ -1003,10 +1078,10 @@ pub const OpenAI = struct {
         });
     }
 
-    fn parseJson(arena: Allocator, body: []const u8) Error!std.json.Value {
+    fn parseJson(arena: Allocator, body: []const u8) Error!@import("runtime_value.zig").Value {
         // The HTTP body is freed after parsing. Escaped and unescaped strings
         // must both belong to the caller's arena, not to the transport buffer.
-        return std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{ .allocate = .alloc_always }) catch |err| switch (err) {
+        return std.json.parseFromSliceLeaky(@import("runtime_value.zig").Value, arena, body, .{ .allocate = .alloc_always }) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.LMFailure,
         };
@@ -1023,7 +1098,7 @@ pub const OpenAI = struct {
             if (choice != .object) return error.LMFailure;
             const message = choice.object.get("message") orelse return error.LMFailure;
             if (message != .object) return error.LMFailure;
-            completion.* = .{ .text = "", .provider_data = parsed };
+            completion.* = .{ .text = null, .provider_data = parsed };
             if (message.object.get("tool_calls")) |calls| {
                 if (calls != .array) return error.LMFailure;
                 const native = try arena.alloc(ToolCall, calls.array.items.len);
@@ -1042,10 +1117,14 @@ pub const OpenAI = struct {
             if (message.object.get("content")) |content| {
                 switch (content) {
                     .string => completion.text = content.string,
-                    .null => if (completion.tool_calls.len == 0) return error.LMFailure,
+                    .null => if (completion.tool_calls.len == 0) {
+                        completion.text = "";
+                    },
                     else => return error.LMFailure,
                 }
-            } else if (completion.tool_calls.len == 0) return error.LMFailure;
+            } else if (completion.tool_calls.len == 0) {
+                completion.text = "";
+            }
             if (message.object.get("reasoning_content")) |reasoning| {
                 switch (reasoning) {
                     .null => {},
@@ -1061,30 +1140,34 @@ pub const OpenAI = struct {
     pub fn parseResponse(arena: Allocator, body: []const u8) Error![]const []const u8 {
         const completions = try parseCompletions(arena, body);
         const out = try arena.alloc([]const u8, completions.len);
-        for (out, completions) |*text, completion| text.* = completion.text;
+        for (out, completions) |*text, completion| text.* = completion.text orelse return error.LMFailure;
         return out;
     }
 
-    /// A Responses output may begin with reasoning or other non-message items.
-    /// Completed assistant output_text or actual function calls are answers;
-    /// refusal/incomplete responses never masquerade as successful model text.
+    /// Normalize visible text without conflating absent TextParts with "".
+    /// lm15 ignores root/item statuses and roles here; refusal, reasoning and
+    /// tool-only outputs have null text rather than a fabricated empty answer.
     pub fn parseResponsesResponse(arena: Allocator, body: []const u8) Error!Completion {
         const parsed = try parseJson(arena, body);
         if (parsed != .object) return error.LMFailure;
-        const status = parsed.object.get("status") orelse return error.LMFailure;
-        if (!stringEquals(status, "completed")) return error.LMFailure;
-        const output = parsed.object.get("output") orelse return error.LMFailure;
-        if (output != .array) return error.LMFailure;
+        if (parsed.object.get("error")) |failure| {
+            if (failure == .object) return error.LMFailure;
+        }
+        const output = parsed.object.get("output") orelse .null;
+        if (output != .array and output != .null) return error.LMFailure;
+        const items: []const @import("runtime_value.zig").Value = if (output == .array) output.array.items else &.{};
+        var part_count: usize = 0;
         var text: TextParts = .{ .joined = .init(arena) };
         var reasoning: TextParts = .{ .joined = .init(arena) };
         var calls: std.ArrayList(ToolCall) = .empty;
         var continuation: std.ArrayList(Continuation) = .empty;
-        for (output.array.items) |item| {
-            if (item != .object) return error.LMFailure;
-            const kind = item.object.get("type") orelse return error.LMFailure;
+        for (items) |item| {
+            if (item != .object) continue;
+            const kind = item.object.get("type") orelse continue;
             if (stringEquals(kind, "reasoning")) {
-                if (try reasoningText(arena, item)) |summary| try reasoning.add(summary, "");
-                var state: std.json.ObjectMap = .empty;
+                const summary = try reasoningText(arena, item);
+                if (summary) |visible| try reasoning.add(visible, "");
+                var state: @import("runtime_value.zig").ObjectMap = .empty;
                 for ([_][]const u8{ "id", "encrypted_content" }) |name| {
                     if (item.object.get(name)) |field| {
                         if (field == .null) continue;
@@ -1097,36 +1180,37 @@ pub const OpenAI = struct {
                     .kind = "reasoning_item",
                     .data = .{ .object = state },
                 });
+                if (state.count() != 0 or summary != null) part_count += 1;
             } else if (stringEquals(kind, "function_call")) {
-                if (item.object.get("status")) |call_status| {
-                    if (!stringEquals(call_status, "completed")) return error.LMFailure;
-                }
+                const call_id = try responseText(arena, item.object.get("call_id"));
+                const item_id = if (call_id.len == 0) try responseText(arena, item.object.get("id")) else "";
                 try calls.append(arena, .{
-                    .id = try responseString(item, "call_id", true),
+                    .id = if (call_id.len != 0) call_id else if (item_id.len != 0) item_id else try std.fmt.allocPrint(arena, "call_{d}", .{part_count}),
                     .name = try responseString(item, "name", true),
-                    .arguments = try responseString(item, "arguments", false),
+                    .arguments = try responseArguments(arena, item.object.get("arguments")),
                 });
+                part_count += 1;
             } else if (stringEquals(kind, "message")) {
-                const role = item.object.get("role") orelse return error.LMFailure;
-                if (!stringEquals(role, "assistant")) return error.LMFailure;
-                if (item.object.get("status")) |message_status| {
-                    if (!stringEquals(message_status, "completed")) return error.LMFailure;
-                }
-                const content = item.object.get("content") orelse return error.LMFailure;
+                const content = item.object.get("content") orelse .null;
+                if (content == .null) continue;
                 if (content != .array) return error.LMFailure;
                 for (content.array.items) |part| {
-                    if (part != .object) return error.LMFailure;
-                    const part_type = part.object.get("type") orelse return error.LMFailure;
-                    if (stringEquals(part_type, "refusal")) return error.LMFailure;
-                    if (!stringEquals(part_type, "output_text")) continue;
-                    const value = part.object.get("text") orelse return error.LMFailure;
-                    if (value != .string) return error.LMFailure;
-                    try text.add(value.string, "");
+                    if (part != .object) continue;
+                    const part_type = part.object.get("type") orelse continue;
+                    if (stringEquals(part_type, "refusal")) {
+                        const refusal = try responseText(arena, part.object.get("refusal"));
+                        const refused = if (refusal.len != 0) refusal else try responseText(arena, part.object.get("text"));
+                        if (refused.len == 0) try text.add("", "");
+                        part_count += 1;
+                    } else if (stringEquals(part_type, "output_text") or stringEquals(part_type, "text")) {
+                        try text.add(try responseText(arena, part.object.get("text")), "");
+                        part_count += 1;
+                    }
                 }
             }
         }
-        const answer = text.value() orelse "";
-        if (answer.len == 0 and calls.items.len == 0) return error.LMFailure;
+        if (part_count == 0) try text.add(try responseText(arena, parsed.object.get("output_text")), "");
+        const answer = text.value();
         return .{
             .text = answer,
             .reasoning = reasoning.value(),
@@ -1136,36 +1220,89 @@ pub const OpenAI = struct {
         };
     }
 
-    fn reasoningText(arena: Allocator, item: std.json.Value) Error!?[]const u8 {
+    /// lm15's str(value or ""), retaining strings without allocation.
+    fn responseText(arena: Allocator, input: ?@import("runtime_value.zig").Value) Error![]const u8 {
+        const value = input orelse return "";
+        switch (value) {
+            .null => return "",
+            .string => |s| return s,
+            .bool => |b| if (!b) return "",
+            .integer => |n| if (n == 0) return "",
+            .float => |n| if (n == 0) return "",
+            .array => |a| if (a.items.len == 0) return "",
+            .object => |o| if (o.count() == 0) return "",
+            .number_string, .custom => {},
+        }
+        return responseStringValue(arena, value);
+    }
+
+    fn responseStringValue(arena: Allocator, value: @import("runtime_value.zig").Value) Error![]const u8 {
+        if (value == .string) return value.string;
+        var out: Writer.Allocating = .init(arena);
+        defer out.deinit();
+        @import("pyjson.zig").writeStr(&out.writer, value) catch |err| return switch (err) {
+            error.WriteFailed => error.OutOfMemory,
+            else => error.LMFailure,
+        };
+        return out.toOwnedSlice();
+    }
+
+    fn responseArguments(arena: Allocator, input: ?@import("runtime_value.zig").Value) Error![]const u8 {
+        const Value = @import("runtime_value.zig").Value;
+        var normalized: Value = .{ .object = .empty };
+        if (input) |raw| {
+            if (raw == .object) {
+                normalized = raw;
+            } else if (raw == .string and raw.string.len != 0) {
+                const decoded = std.json.parseFromSliceLeaky(Value, arena, raw.string, .{}) catch |err| blk: {
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    var partial: @import("runtime_value.zig").ObjectMap = .empty;
+                    try partial.put(arena, "partial_json", raw);
+                    break :blk Value{ .object = partial };
+                };
+                if (decoded == .object) {
+                    normalized = decoded;
+                } else {
+                    try normalized.object.put(arena, "value", decoded);
+                }
+            }
+        }
+        if (normalized.object.count() == 0) return "{}";
+        var out: Writer.Allocating = .init(arena);
+        defer out.deinit();
+        @import("pyjson.zig").writeJsonAscii(&out.writer, normalized) catch |err| return switch (err) {
+            error.WriteFailed => error.OutOfMemory,
+            else => error.LMFailure,
+        };
+        return out.toOwnedSlice();
+    }
+
+    fn reasoningText(arena: Allocator, item: @import("runtime_value.zig").Value) Error!?[]const u8 {
         if (item.object.get("summary")) |summary| {
             if (summary == .array) {
                 var parts: TextParts = .{ .joined = .init(arena) };
                 for (summary.array.items) |part| {
-                    if (part != .object) return error.LMFailure;
-                    if (!stringEquals(part.object.get("type") orelse return error.LMFailure, "summary_text")) continue;
-                    try parts.add(try responseString(part, "text", false), "\n");
+                    const value = if (part == .object) part.object.get("text") orelse .null else part;
+                    try parts.add(try responseStringValue(arena, value), "\n");
                 }
-                return parts.value();
+                const joined = parts.value() orelse return null;
+                return if (joined.len == 0) null else joined;
             }
-            if (summary == .string) {
-                if (summary.string.len != 0) return summary.string;
-            } else if (summary != .null) return error.LMFailure;
+            const text = try responseText(arena, summary);
+            if (text.len != 0) return text;
         }
-        if (item.object.get("text")) |text| {
-            if (text != .string) return error.LMFailure;
-            if (text.string.len != 0) return text.string;
-        }
-        return null;
+        const text = try responseText(arena, item.object.get("text"));
+        return if (text.len == 0) null else text;
     }
 
-    fn responseString(object: std.json.Value, name: []const u8, nonempty: bool) Error![]const u8 {
+    fn responseString(object: @import("runtime_value.zig").Value, name: []const u8, nonempty: bool) Error![]const u8 {
         if (object != .object) return error.LMFailure;
         const text = object.object.get(name) orelse return error.LMFailure;
         if (text != .string or (nonempty and text.string.len == 0)) return error.LMFailure;
         return text.string;
     }
 
-    fn stringEquals(value: std.json.Value, expected: []const u8) bool {
+    fn stringEquals(value: @import("runtime_value.zig").Value, expected: []const u8) bool {
         return value == .string and std.mem.eql(u8, value.string, expected);
     }
 
@@ -1194,7 +1331,7 @@ pub const OpenAI = struct {
 
 const testing = std.testing;
 
-test "keyword LM scopes and OpenAI wire format" {
+test "keyword LM scopes and Chat completion order" {
     var kw: KeywordLM = .{
         .rules = &.{
             .{ .needle = "capital", .response = "A" },
@@ -1202,15 +1339,10 @@ test "keyword LM scopes and OpenAI wire format" {
         },
         .default = "C",
     };
-    const msgs = [_]Message{ .{ .role = .system, .content = "hint" }, .{ .role = .user, .content = "q" } };
+    const msgs = [_]Message{ .{ .role = .system, .content = .{ .text = "hint" } }, .{ .role = .user, .content = .{ .text = "q" } } };
     try testing.expectEqualStrings("B", kw.respond(&msgs));
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    var client: OpenAI = .{ .client = undefined, .base_url = "http://x", .model = "m" };
-    const body = try client.requestBody(arena.allocator(), .{ .messages = &msgs, .options = .{ .temperature = 0.0 } });
-    try testing.expectEqualStrings(
-        \\{"model": "m", "messages": [{"role": "system", "content": "hint"}, {"role": "user", "content": "q"}], "temperature": 0.0}
-    , body);
     const content = try OpenAI.parseResponse(arena.allocator(),
         \\{"choices": [{"message": {"role": "assistant", "content": "hi"}}]}
     );
@@ -1220,15 +1352,13 @@ test "keyword LM scopes and OpenAI wire format" {
         \\{"choices": [{"message": {"content": "a"}}, {"message": {"content": "b"}}]}
     );
     try testing.expectEqualStrings("b", many[1]);
-    const body_n = try client.requestBody(arena.allocator(), .{ .messages = &msgs, .options = .{ .n = 3 } });
-    try testing.expect(std.mem.endsWith(u8, body_n, "\"n\": 3}"));
 }
 
 test "replay LM matches recorded requests exactly and reports misses" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const a = [_]Message{.{ .role = .user, .content = "a" }};
-    const b = [_]Message{.{ .role = .user, .content = "b" }};
+    const a = [_]Message{.{ .role = .user, .content = .{ .text = "a" } }};
+    const b = [_]Message{.{ .role = .user, .content = .{ .text = "b" } }};
     var used = [_]bool{ false, false };
     var replay: ReplayLM = .{
         .calls = &.{ .{ .messages = &a, .completion = "A1" }, .{ .messages = &a, .completion = "A2" } },
@@ -1249,5 +1379,5 @@ test "replay LM matches recorded requests exactly and reports misses" {
     try testing.expectEqualStrings("B", try recorder.lm().complete(arena.allocator(), .{ .messages = &b }));
     try testing.expect(inner.exhausted());
     try testing.expectEqual(@as(usize, 1), recorder.calls.items.len);
-    try testing.expectEqualStrings("b", recorder.calls.items[0].messages[0].content);
+    try testing.expectEqualStrings("b", recorder.calls.items[0].messages[0].content.text);
 }

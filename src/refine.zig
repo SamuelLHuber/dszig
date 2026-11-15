@@ -12,7 +12,7 @@ const feedback = @import("feedback.zig");
 const pyjson = @import("pyjson.zig");
 const best_of_n = @import("best_of_n.zig");
 const Allocator = std.mem.Allocator;
-const Value = std.json.Value;
+const Value = @import("runtime_value.zig").Value;
 const Record = value.Record;
 const Context = predict.Context;
 const Trace = predict.Trace;
@@ -173,7 +173,7 @@ pub fn Refine(comptime P: type) type {
             reward: f64,
         ) anyerror!Record {
             const arena = ctx.arena;
-            var trajectory: std.json.Array = .init(arena);
+            var trajectory: @import("runtime_value.zig").Array = .init(arena);
             try trajectory.ensureTotalCapacity(steps.len);
             for (steps) |step| {
                 const name = for (names) |named| {
@@ -185,7 +185,7 @@ pub fn Refine(comptime P: type) type {
                 try row.put(arena, "outputs", .{ .object = try maskedFields(arena, step.predictor.fields[step.predictor.input_count..], &step.outputs) });
                 trajectory.appendAssumeCapacity(.{ .object = row });
             }
-            var module_names: std.json.Array = .init(arena);
+            var module_names: @import("runtime_value.zig").Array = .init(arena);
             try module_names.ensureTotalCapacity(names.len);
             for (names) |named| module_names.appendAssumeCapacity(.{ .string = named.name });
             var inputs: Record = .empty;
@@ -299,11 +299,12 @@ fn maskedFields(arena: Allocator, fields: []const signature.Field, record: *cons
     return result;
 }
 
-fn dumps(arena: Allocator, v: Value) (Allocator.Error || error{JsonTooDeep})!Value {
+fn dumps(arena: Allocator, v: Value) (Allocator.Error || error{ JsonTooDeep, AdapterParse })!Value {
     var text: std.Io.Writer.Allocating = .init(arena);
     pyjson.writeJson(&text.writer, v, .orjson_indent2) catch |err| return switch (err) {
         error.JsonTooDeep => error.JsonTooDeep,
         error.WriteFailed => error.OutOfMemory,
+        error.ParseValue => error.AdapterParse,
     };
     return .{ .string = text.written() };
 }

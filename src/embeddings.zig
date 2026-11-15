@@ -354,7 +354,7 @@ const Config = struct {
 };
 
 fn parseConfig(arena: Allocator, bytes: []const u8) !Config {
-    const config = try std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{ .duplicate_field_behavior = .use_last });
+    const config = try std.json.parseFromSliceLeaky(@import("runtime_value.zig").Value, arena, bytes, .{ .duplicate_field_behavior = .use_last });
     if (config != .object) return error.InvalidConfig;
     const k = config.object.get("k") orelse return error.MissingConfigField;
     const normalize = config.object.get("normalize") orelse return error.MissingConfigField;
@@ -1018,7 +1018,7 @@ test "Embeddings save writes independently produced NumPy NPY bytes" {
     const actual = try temporary.dir.readFileAlloc(testing.io, "corpus_embeddings.npy", arena, .unlimited);
     try testing.expectEqualSlices(u8, &expected, actual);
     const config_bytes = try temporary.dir.readFileAlloc(testing.io, "config.json", arena, .unlimited);
-    const config = try std.json.parseFromSliceLeaky(std.json.Value, arena, config_bytes, .{});
+    const config = try std.json.parseFromSliceLeaky(@import("runtime_value.zig").Value, arena, config_bytes, .{});
     try testing.expectEqual(@as(i64, -1), config.object.get("k").?.integer);
     try testing.expect(!config.object.get("normalize").?.bool);
     try testing.expect(!config.object.get("has_faiss_index").?.bool);

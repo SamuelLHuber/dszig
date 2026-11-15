@@ -6,7 +6,7 @@ const value = @import("value.zig");
 const types = @import("types.zig");
 const unicode = @import("xml_unicode.zig");
 const Allocator = std.mem.Allocator;
-const Value = std.json.Value;
+const Value = @import("runtime_value.zig").Value;
 const Error = value.ParseError;
 const max_depth = @import("pyjson.zig").max_depth;
 
@@ -121,7 +121,7 @@ fn validate(arena: Allocator, schema: Value, definitions: Value, input: Value, d
         if (input != .array) return error.ParseValue;
         const prefix = get(schema, "prefixItems");
         const items = get(schema, "items");
-        var result: std.json.Array = .init(arena);
+        var result: @import("runtime_value.zig").Array = .init(arena);
         try result.ensureTotalCapacity(input.array.items.len);
         for (input.array.items, 0..) |item, i| {
             const child = if (prefix == .array and i < prefix.array.items.len) prefix.array.items[i] else items;

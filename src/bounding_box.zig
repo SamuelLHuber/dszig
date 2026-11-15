@@ -2,7 +2,7 @@
 //! Construct with init or fromValue to enforce finite edges and positive area.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Value = std.json.Value;
+const Value = @import("runtime_value.zig").Value;
 
 pub const BoundingBox = struct {
     top: f64,
@@ -80,7 +80,7 @@ pub const BoundingBox = struct {
 
     /// Canonical structured model dump, not a media marker or encoded string.
     pub fn toValue(self: BoundingBox, arena: Allocator) Allocator.Error!Value {
-        var object: std.json.ObjectMap = .empty;
+        var object: @import("runtime_value.zig").ObjectMap = .empty;
         try object.ensureTotalCapacity(arena, 4);
         object.putAssumeCapacity("top", .{ .float = self.top });
         object.putAssumeCapacity("bottom", .{ .float = self.bottom });

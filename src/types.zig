@@ -7,9 +7,10 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Value = std.json.Value;
+const Value = @import("runtime_value.zig").Value;
 const code = @import("code.zig");
 const BoundingBox = @import("bounding_box.zig").BoundingBox;
+const File = @import("file.zig").File;
 
 pub const Error = error{ ParseValue, OutOfMemory };
 
@@ -37,12 +38,12 @@ pub fn isDict(comptime T: type) bool {
 
 /// A struct typed as a Pydantic model (not a dict).
 fn isModel(comptime T: type) bool {
-    return @typeInfo(T) == .@"struct" and T != std.json.ObjectMap and !isDict(T) and !@hasField(T, "map");
+    return @typeInfo(T) == .@"struct" and T != @import("runtime_value.zig").ObjectMap and !isDict(T) and !@hasField(T, "map");
 }
 
 /// Types that need the JSON-typed field kind.
 pub fn isNested(comptime T: type) bool {
-    if (T == []const u8 or T == []const []const u8 or T == std.json.ObjectMap) return false;
+    if (T == []const u8 or T == []const []const u8 or T == @import("runtime_value.zig").ObjectMap) return false;
     return switch (@typeInfo(T)) {
         .optional => true,
         .@"struct" => !@hasField(T, "map"),
@@ -68,7 +69,7 @@ pub fn pyName(comptime T: type) []const u8 {
     comptime {
         if (T == []const u8 or T == @import("signature.zig").Reasoning) return "str";
         if (T == bool) return "bool";
-        if (T == std.json.ObjectMap) return "dict[str, Any]";
+        if (T == @import("runtime_value.zig").ObjectMap) return "dict[str, Any]";
         if (isDict(T)) return "dict[str, " ++ pyName(T.dszig_dict_value) ++ "]";
         return switch (@typeInfo(T)) {
             .int => "int",
@@ -162,7 +163,7 @@ fn entriesOf(comptime T: type) []const Entry {
     comptime {
         if (T == []const u8) return &.{.{ .key = "type", .val = quote("string") }};
         if (T == bool) return &.{.{ .key = "type", .val = quote("boolean") }};
-        if (T == std.json.ObjectMap) return &.{ .{ .key = "type", .val = quote("object") }, .{ .key = "additionalProperties", .val = "true" } };
+        if (T == @import("runtime_value.zig").ObjectMap) return &.{ .{ .key = "type", .val = quote("object") }, .{ .key = "additionalProperties", .val = "true" } };
         if (isDict(T)) return &.{ .{ .key = "type", .val = quote("object") }, .{ .key = "additionalProperties", .val = render(entriesOf(T.dszig_dict_value)) } };
         return switch (@typeInfo(T)) {
             .int => &.{.{ .key = "type", .val = quote("integer") }},
@@ -208,8 +209,8 @@ fn modelEntries(comptime S: type, comptime ordered_properties: bool) []const Ent
         const final = props;
         const description: []const Entry = if (code.isCode(S) and S.schema_description_json.len > 0)
             &.{.{ .key = "description", .val = S.schema_description_json }}
-        else if (S == BoundingBox)
-            &.{.{ .key = "description", .val = quote(BoundingBox.schema_description) }}
+        else if (@hasDecl(S, "schema_description"))
+            &.{.{ .key = "description", .val = quote(S.schema_description) }}
         else if (S == @import("signature.zig").Reasoning)
             &.{.{ .key = "description", .val = "\"Reasoning type in DSPy.\\n\\nThis type is useful when you want the DSPy output to include the reasoning of the LM. We build this type so that\\nDSPy can support the reasoning model and non-reasoning model with the same code.\\n\\nThis is a str-like type, you can convert a string directly to a Reasoning object, and from DSPy adapters'\\nperspective, `Reasoning` is treated as a string.\"" }}
         else
@@ -217,16 +218,16 @@ fn modelEntries(comptime S: type, comptime ordered_properties: bool) []const Ent
         return &[_]Entry{
             .{ .key = "type", .val = quote("object") },
             .{ .key = "properties", .val = if (ordered_properties) renderOrdered(&final) else render(&final) },
-            .{ .key = "required", .val = required ++ "]" },
+        } ++ (if (n_required != 0) &[_]Entry{.{ .key = "required", .val = required ++ "]" }} else &[_]Entry{}) ++ &[_]Entry{
             .{ .key = "title", .val = quote(modelName(S)) },
-        } ++ description ++ (if (S == BoundingBox) &[_]Entry{.{ .key = "additionalProperties", .val = "false" }} else &[_]Entry{});
+        } ++ description ++ (if (S == BoundingBox or S == File) &[_]Entry{.{ .key = "additionalProperties", .val = "false" }} else &[_]Entry{});
     }
 }
 
 fn collectDefs(comptime T: type, comptime seen: []const type) []const type {
     comptime {
         var out = seen;
-        if (T == std.json.ObjectMap) return out;
+        if (T == @import("runtime_value.zig").ObjectMap) return out;
         if (isDict(T)) return collectDefs(T.dszig_dict_value, out);
         switch (@typeInfo(T)) {
             .optional => |o| out = collectDefs(o.child, out),
@@ -281,6 +282,10 @@ pub fn validate(comptime T: type, arena: Allocator, v: Value) Error!Value {
 
 fn validateMode(comptime T: type, arena: Allocator, v: Value, comptime xml_lax: bool) Error!Value {
     if (comptime code.isCode(T)) return T.validate(arena, v);
+    if (T == File) {
+        const file = File.fromValue(v) catch return error.ParseValue;
+        return if (v == .custom) v else file.toRuntime(arena);
+    }
     if (T == BoundingBox) {
         const box = (if (xml_lax) BoundingBox.fromXmlValue(v) else BoundingBox.fromValue(v)) catch return error.ParseValue;
         return box.toValue(arena);
@@ -290,10 +295,10 @@ fn validateMode(comptime T: type, arena: Allocator, v: Value, comptime xml_lax: 
         return if (content == .string) content else error.ParseValue;
     }
     if (T == []const u8) return if (v == .string) v else error.ParseValue;
-    if (T == std.json.ObjectMap) return if (v == .object) v else error.ParseValue;
+    if (T == @import("runtime_value.zig").ObjectMap) return if (v == .object) v else error.ParseValue;
     if (comptime isDict(T)) {
         if (v != .object) return error.ParseValue;
-        var out: std.json.ObjectMap = .empty;
+        var out: @import("runtime_value.zig").ObjectMap = .empty;
         try out.ensureTotalCapacity(arena, v.object.count());
         var it = v.object.iterator();
         while (it.next()) |e| out.putAssumeCapacity(e.key_ptr.*, try validateMode(T.dszig_dict_value, arena, e.value_ptr.*, xml_lax));
@@ -331,14 +336,14 @@ fn validateMode(comptime T: type, arena: Allocator, v: Value, comptime xml_lax: 
         .optional => |o| return if (v == .null) v else validateMode(o.child, arena, v, xml_lax),
         .pointer => |p| {
             if (v != .array) return error.ParseValue;
-            var out: std.json.Array = .init(arena);
+            var out: @import("runtime_value.zig").Array = .init(arena);
             try out.ensureTotalCapacity(v.array.items.len);
             for (v.array.items) |item| out.appendAssumeCapacity(try validateMode(p.child, arena, item, xml_lax));
             return .{ .array = out };
         },
         .@"struct" => |s| {
             if (v != .object) return error.ParseValue;
-            var out: std.json.ObjectMap = .empty;
+            var out: @import("runtime_value.zig").ObjectMap = .empty;
             inline for (s.field_names, s.field_types, 0..) |name, FT, i| {
                 if (v.object.get(name)) |fv| {
                     try out.put(arena, name, try validateMode(FT, arena, fv, xml_lax));

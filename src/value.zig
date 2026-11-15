@@ -7,8 +7,8 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
-const Value = std.json.Value;
-const ObjectMap = std.json.ObjectMap;
+const Value = @import("runtime_value.zig").Value;
+const ObjectMap = @import("runtime_value.zig").ObjectMap;
 const Writer = std.Io.Writer;
 
 const pyjson = @import("pyjson.zig");
@@ -118,7 +118,7 @@ pub fn parseJsonValue(arena: Allocator, field: Field, v: Value) ParseError!Value
         var aw: Writer.Allocating = .init(arena);
         pyjson.writeStr(&aw.writer, v) catch |err| return switch (err) {
             error.WriteFailed => error.OutOfMemory,
-            error.JsonTooDeep => error.ParseValue,
+            error.JsonTooDeep, error.ParseValue => error.ParseValue,
         };
         return .{ .string = aw.written() };
     }
@@ -315,7 +315,7 @@ fn parseStrListText(arena: Allocator, text: []const u8) ParseError!Value {
 }
 
 fn parsePyStrList(arena: Allocator, s: []const u8) ParseError!Value {
-    var array: std.json.Array = .init(arena);
+    var array: @import("runtime_value.zig").Array = .init(arena);
     var i: usize = 0;
     if (i >= s.len or s[i] != '[') return error.ParseValue;
     i += 1;
@@ -391,18 +391,19 @@ pub fn toRecord(arena: Allocator, comptime T: type, value: T) Allocator.Error!Re
 
 pub fn toValue(arena: Allocator, comptime T: type, v: T) Allocator.Error!Value {
     if (comptime code.isCode(T)) return v.toValue();
+    if (T == @import("file.zig").File) return v.toRuntime(arena);
     if (T == signature.Reasoning) return .{ .string = v.content };
     if (T == @import("tool.zig").ToolCalls) return v.toValue(arena);
     if (T == Value) return v;
     if (T == []const u8) return .{ .string = v };
     if (T == []const []const u8) {
-        var array: std.json.Array = .init(arena);
+        var array: @import("runtime_value.zig").Array = .init(arena);
         try array.ensureTotalCapacity(v.len);
         for (v) |s| array.appendAssumeCapacity(.{ .string = s });
         return .{ .array = array };
     }
     if (T == bool) return .{ .bool = v };
-    if (T == std.json.ObjectMap) return .{ .object = v };
+    if (T == @import("runtime_value.zig").ObjectMap) return .{ .object = v };
     if (T == signature.StrDict) return .{ .object = v.map };
     if (comptime types.isDict(T)) {
         var map: ObjectMap = .empty;
@@ -419,7 +420,7 @@ pub fn toValue(arena: Allocator, comptime T: type, v: T) Allocator.Error!Value {
         .@"enum" => .{ .string = @tagName(v) },
         .optional => |o| if (v) |x| try toValue(arena, o.child, x) else .null,
         .pointer => |p| blk: {
-            var array: std.json.Array = .init(arena);
+            var array: @import("runtime_value.zig").Array = .init(arena);
             try array.ensureTotalCapacity(v.len);
             for (v) |item| array.appendAssumeCapacity(try toValue(arena, p.child, item));
             break :blk .{ .array = array };
@@ -443,6 +444,7 @@ pub fn fromRecord(arena: Allocator, comptime T: type, record: *const Record) Con
 pub fn fromValue(arena: Allocator, comptime T: type, v: Value) ConvertError!T {
     if (comptime code.isCode(T)) return T.fromValue(v) catch error.TypeMismatch;
     if (T == @import("bounding_box.zig").BoundingBox) return T.fromValue(v) catch error.TypeMismatch;
+    if (T == @import("file.zig").File) return T.fromValue(v) catch error.TypeMismatch;
     if (T == Value) return v;
     if (T == @import("tool.zig").ToolCalls) return T.fromValue(arena, v) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
@@ -464,7 +466,7 @@ pub fn fromValue(arena: Allocator, comptime T: type, v: Value) ConvertError!T {
         return out;
     }
     if (T == bool) return if (v == .bool) v.bool else error.TypeMismatch;
-    if (T == std.json.ObjectMap) return if (v == .object) v.object else error.TypeMismatch;
+    if (T == @import("runtime_value.zig").ObjectMap) return if (v == .object) v.object else error.TypeMismatch;
     if (T == signature.StrDict) {
         _ = strDict(v) catch return error.TypeMismatch;
         return .{ .map = v.object };
@@ -539,6 +541,7 @@ pub fn pyEqual(a: Value, b: Value) bool {
         .number_string => |s| integerStringEqualsValue(s, b),
         .null => b == .null,
         .string => |s| b == .string and std.mem.eql(u8, s, b.string),
+        .custom => |custom| b == .custom and custom.eql(b.custom),
         .array => |x| blk: {
             if (b != .array or b.array.items.len != x.items.len) break :blk false;
             for (x.items, b.array.items) |p, q| if (!pyEqual(p, q)) break :blk false;
@@ -642,13 +645,66 @@ fn floatEqualsInt(f: f64, i: i64) bool {
     return @as(i64, @intFromFloat(f)) == i;
 }
 
+/// `serialize_for_json`: only actual custom objects become their serialized
+/// values. Ordinary dictionaries with identical keys stay dictionaries.
+pub fn serializedValue(arena: Allocator, input: Value) ParseError!Value {
+    return (try serializeDepth(arena, input, 0)).value;
+}
+
+const Serialized = struct { value: Value, changed: bool };
+
+fn serializeDepth(arena: Allocator, input: Value, depth: u32) ParseError!Serialized {
+    if (depth >= pyjson.max_depth) return error.ParseValue;
+    return switch (input) {
+        .custom => |custom| .{
+            .value = (try serializeDepth(arena, try custom.serialize(arena), depth + 1)).value,
+            .changed = true,
+        },
+        .array => |array| blk: {
+            var out: ?@import("runtime_value.zig").Array = null;
+            for (array.items, 0..) |item, index| {
+                const serialized = try serializeDepth(arena, item, depth + 1);
+                if (out == null and serialized.changed) {
+                    out = .init(arena);
+                    try out.?.ensureTotalCapacity(array.items.len);
+                    out.?.appendSliceAssumeCapacity(array.items[0..index]);
+                }
+                if (out) |*result| result.appendAssumeCapacity(serialized.value);
+            }
+            break :blk if (out) |result|
+                .{ .value = .{ .array = result }, .changed = true }
+            else
+                .{ .value = input, .changed = false };
+        },
+        .object => |object| blk: {
+            var out: ?ObjectMap = null;
+            for (object.keys(), object.values(), 0..) |key, item, index| {
+                const serialized = try serializeDepth(arena, item, depth + 1);
+                if (out == null and serialized.changed) {
+                    out = .empty;
+                    try out.?.ensureTotalCapacity(arena, object.count());
+                    for (object.keys()[0..index], object.values()[0..index]) |before_key, before_value|
+                        out.?.putAssumeCapacity(before_key, before_value);
+                }
+                if (out) |*result| result.putAssumeCapacity(key, serialized.value);
+            }
+            break :blk if (out) |result|
+                .{ .value = .{ .object = result }, .changed = true }
+            else
+                .{ .value = input, .changed = false };
+        },
+        else => .{ .value = input, .changed = false },
+    };
+}
+
 /// Deep copy of a value into `arena` (strings included).
 pub fn cloneValue(arena: Allocator, v: Value) Allocator.Error!Value {
     return switch (v) {
+        .custom => |custom| .{ .custom = try custom.clone(arena) },
         .string => |s| .{ .string = try arena.dupe(u8, s) },
         .number_string => |s| .{ .number_string = try arena.dupe(u8, s) },
         .array => |a| blk: {
-            var out: std.json.Array = .init(arena);
+            var out: @import("runtime_value.zig").Array = .init(arena);
             try out.ensureTotalCapacity(a.items.len);
             for (a.items) |item| out.appendAssumeCapacity(try cloneValue(arena, item));
             break :blk .{ .array = out };

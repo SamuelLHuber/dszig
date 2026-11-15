@@ -36,7 +36,7 @@ pub const Example = struct {
 
     /// Build from a JSON object literal, e.g. `{"question": "...", "answer": "..."}`.
     pub fn fromJson(arena: Allocator, json: []const u8, input_keys: []const []const u8) !Example {
-        const v = try std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{});
+        const v = try std.json.parseFromSliceLeaky(@import("runtime_value.zig").Value, arena, json, .{});
         if (v != .object) return error.ExpectedObject;
         return .{ .record = v.object, .input_keys = input_keys };
     }

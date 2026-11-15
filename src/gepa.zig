@@ -29,7 +29,7 @@ const Context = predict.Context;
 const Example = optimize.Example;
 const Record = value.Record;
 const Trace = predict.Trace;
-const Value = std.json.Value;
+const Value = @import("runtime_value.zig").Value;
 
 /// What a GEPA metric returns: DSPy's float or `dspy.Prediction(score, feedback)`.
 pub const Feedback = struct { score: f64, feedback: ?[]const u8 = null };
@@ -47,7 +47,7 @@ pub const FeedbackMetric = *const fn (
 
 pub const ProposeInstruction = signature.Signature(struct {
     pub const instructions = PROPOSE_INSTRUCTIONS;
-    pub const Input = struct { current_instruction: []const u8, examples_with_feedback: []const std.json.ObjectMap };
+    pub const Input = struct { current_instruction: []const u8, examples_with_feedback: []const @import("runtime_value.zig").ObjectMap };
     pub const Output = struct { new_instruction: []const u8 };
     pub const descriptions = .{
         .current_instruction = "The instructions I provided to the assistant.",
@@ -390,13 +390,13 @@ pub const GEPA = struct {
 
             /// `DspyAdapter.make_reflective_dataset`; `null` where no example
             /// produced a usable trace for that predictor.
-            fn reflectiveDataset(e: *Self, candidate: []const []const u8, runs: []const Run, ids: []const usize, components: []const usize) Allocator.Error![]?[]const std.json.ObjectMap {
+            fn reflectiveDataset(e: *Self, candidate: []const []const u8, runs: []const Run, ids: []const usize, components: []const usize) Allocator.Error![]?[]const @import("runtime_value.zig").ObjectMap {
                 const program = try e.build(candidate);
                 const preds = try predict.namedPredictors(e.out, program);
-                const result = try e.out.alloc(?[]const std.json.ObjectMap, components.len);
+                const result = try e.out.alloc(?[]const @import("runtime_value.zig").ObjectMap, components.len);
                 for (components, result) |k, *slot| {
                     const module = preds[k].param.predict;
-                    var items: std.ArrayList(std.json.ObjectMap) = .empty;
+                    var items: std.ArrayList(@import("runtime_value.zig").ObjectMap) = .empty;
                     for (runs, ids) |run, id| {
                         const prediction = run.prediction orelse continue;
                         var matching: std.ArrayList(*const Trace.Step) = .empty;
@@ -404,7 +404,7 @@ pub const GEPA = struct {
                         if (matching.items.len == 0) continue;
                         const step = matching.items[e.adapter_rng.randbelow(matching.items.len)];
                         const fb = e.gepa.metric(e.out, &e.trainset[id], &prediction, run.trace, e.names[k], step);
-                        var item: std.json.ObjectMap = .empty;
+                        var item: @import("runtime_value.zig").ObjectMap = .empty;
                         try item.put(e.out, "Inputs", .{ .object = step.inputs });
                         try item.put(e.out, "Generated Outputs", .{ .object = step.outputs });
                         const text = fb.feedback orelse try std.fmt.allocPrint(e.out, "This trajectory got a score of {s}.", .{try pyFloat(e.out, fb.score)});
@@ -417,7 +417,7 @@ pub const GEPA = struct {
             }
 
             /// `InstructionProposer.__call__`; `null` when a call fails.
-            fn proposeTexts(e: *Self, candidate: []const []const u8, components: []const usize, datasets: []const ?[]const std.json.ObjectMap) Allocator.Error!?[]?[]const u8 {
+            fn proposeTexts(e: *Self, candidate: []const []const u8, components: []const usize, datasets: []const ?[]const @import("runtime_value.zig").ObjectMap) Allocator.Error!?[]?[]const u8 {
                 const texts = try e.out.alloc(?[]const u8, components.len);
                 const proposer: predict.Predict(ProposeInstruction) = .{};
                 for (components, datasets, texts) |k, dataset, *t| {

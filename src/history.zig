@@ -6,7 +6,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const Value = std.json.Value;
+const Value = @import("runtime_value.zig").Value;
 const adapter = @import("adapter.zig");
 const signature = @import("signature.zig");
 const value = @import("value.zig");
@@ -43,7 +43,7 @@ pub const History = struct {
     }
 
     pub fn toValue(self: History, arena: Allocator) Allocator.Error!Value {
-        var messages: std.json.Array = .init(arena);
+        var messages: @import("runtime_value.zig").Array = .init(arena);
         try messages.ensureTotalCapacity(self.messages.len);
         for (self.messages) |message| messages.appendAssumeCapacity(.{ .object = message });
         var out: Record = .empty;
@@ -70,7 +70,7 @@ pub const History = struct {
                 }
             }
             const user_content = try adapter.formatUser(selected_adapter, arena, view, event, main_request);
-            if (user_content.len > 0) try messages.append(arena, .{ .role = .user, .content = user_content });
+            if (user_content.len > 0) try messages.append(arena, .{ .role = .user, .content = try adapter.renderedContent(arena, user_content) });
 
             var calls_field: ?[]const u8 = null;
             var recorded_calls: ?tool.ToolCalls = null;
@@ -96,7 +96,7 @@ pub const History = struct {
                 try assistant_values.put(arena, calls_field.?, try calls.formatValue(arena));
             }
             const assistant_content = try adapter.formatAssistantPartial(selected_adapter, arena, view, &assistant_values);
-            if (assistant_content.len > 0) try messages.append(arena, .{ .role = .assistant, .content = assistant_content });
+            if (assistant_content.len > 0) try messages.append(arena, .{ .role = .assistant, .content = .{ .text = assistant_content } });
 
             if (results) |tool_results| {
                 var fields: Record = .empty;
@@ -114,7 +114,7 @@ pub const History = struct {
                     .inputs = &.{result_field},
                     .outputs = &.{},
                 }, &fields, false);
-                if (content.len > 0) try messages.append(arena, .{ .role = .user, .content = content });
+                if (content.len > 0) try messages.append(arena, .{ .role = .user, .content = try adapter.renderedContent(arena, content) });
             }
         }
         return messages.items;
@@ -140,7 +140,7 @@ fn appendNativeEvent(
     }
     var content_view = view;
     content_view.outputs = fields[0..count];
-    const content = try adapter.formatAssistantPartial(selected_adapter, arena, content_view, event);
+    const content = if (count == 0) "" else try adapter.formatAssistantPartial(selected_adapter, arena, content_view, event);
     var valid_results = false;
     if (calls.tool_call_results) |results| {
         valid_results = calls.tool_calls.len == results.tool_call_results.len;
@@ -163,7 +163,7 @@ fn appendNativeEvent(
     }
     if (content.len > 0 or valid_results) try messages.append(arena, .{
         .role = .assistant,
-        .content = content,
+        .content = .{ .text = content },
         .tool_calls = if (valid_results) tool.callsToNative(arena, calls.tool_calls) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             error.ParseValue => error.AdapterParse,
@@ -172,18 +172,25 @@ fn appendNativeEvent(
     });
     if (valid_results) {
         for (calls.tool_call_results.?.tool_call_results) |result| {
-            const text = if (result.value == .string) result.value.string else blk: {
+            const serialized = value.serializedValue(arena, result.value) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.ParseValue => error.AdapterParse,
+            };
+            const bare_text = result.value == .string or
+                (result.value == .custom and result.value.custom.vtable.is_type and serialized == .string);
+            const text = if (bare_text) serialized.string else blk: {
                 var out: std.Io.Writer.Allocating = .init(arena);
-                pyjson.writeJson(&out.writer, result.value, .compact) catch |err| return switch (err) {
+                pyjson.writeJson(&out.writer, serialized, .compact) catch |err| return switch (err) {
                     error.WriteFailed => error.OutOfMemory,
                     error.JsonTooDeep => error.JsonTooDeep,
+                    error.ParseValue => error.AdapterParse,
                 };
                 break :blk out.written();
             };
             // The supported OpenAI tool-row formats have no error flag;
             // lm15 carries the recorded status as this exact text prefix.
             const result_content = if (result.is_error) try std.fmt.allocPrint(arena, "[error] {s}", .{text}) else text;
-            try messages.append(arena, .{ .role = .tool, .content = result_content, .tool_call_id = result.call_id });
+            try messages.append(arena, .{ .role = .tool, .content = try adapter.renderedContent(arena, result_content), .tool_call_id = result.call_id });
         }
     }
 }

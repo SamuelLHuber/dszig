@@ -91,7 +91,7 @@ pub fn parse(arena: Allocator, bytes: []const u8) ParseError!Value {
 }
 
 fn number(text: []const u8) Value {
-    return switch (std.json.Value.parseFromNumberSlice(text)) {
+    return switch (@import("runtime_value.zig").Value.parseFromNumberSlice(text)) {
         .integer => |i| .{ .integer = i },
         .float => |f| .{ .float = f },
         .number_string => |s| if (std.mem.indexOfAny(u8, s, ".eE") != null)
@@ -196,7 +196,7 @@ pub const ConvertError = Allocator.Error || error{ CyclicValue, NestingTooDeep }
 /// Convert acyclic data to `std.json.Value` for the existing serializers,
 /// copying strings into `arena`. Shared acyclic containers are expanded; a
 /// cycle or more than `max_conversion_depth` nested containers fails.
-pub fn toValue(arena: Allocator, input: Value) ConvertError!std.json.Value {
+pub fn toValue(arena: Allocator, input: Value) ConvertError!@import("runtime_value.zig").Value {
     var active: std.AutoHashMapUnmanaged(usize, void) = .empty;
     defer active.deinit(arena);
     return convert(arena, &active, input, 0);
@@ -207,7 +207,7 @@ fn convert(
     active: *std.AutoHashMapUnmanaged(usize, void),
     v: Value,
     depth: usize,
-) ConvertError!std.json.Value {
+) ConvertError!@import("runtime_value.zig").Value {
     return switch (v) {
         .null => .null,
         .bool => |b| .{ .bool = b },
@@ -218,7 +218,7 @@ fn convert(
         .array => |array| array: {
             try enter(arena, active, @intFromPtr(array), depth);
             defer _ = active.remove(@intFromPtr(array));
-            var out: std.json.Array = .init(arena);
+            var out: @import("runtime_value.zig").Array = .init(arena);
             try out.ensureTotalCapacity(array.items.len);
             for (array.items) |item| out.appendAssumeCapacity(try convert(arena, active, item, depth + 1));
             break :array .{ .array = out };
@@ -226,7 +226,7 @@ fn convert(
         .object => |record| object: {
             try enter(arena, active, @intFromPtr(record), depth);
             defer _ = active.remove(@intFromPtr(record));
-            var out: std.json.ObjectMap = .empty;
+            var out: @import("runtime_value.zig").ObjectMap = .empty;
             try out.ensureTotalCapacity(arena, record.count());
             for (record.keys(), record.values()) |key, item| {
                 out.putAssumeCapacity(try arena.dupe(u8, key), try convert(arena, active, item, depth + 1));

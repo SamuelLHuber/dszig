@@ -55,7 +55,7 @@ const lm = @import("lm.zig");
 const value = @import("value.zig");
 const pyjson = @import("pyjson.zig");
 const Allocator = std.mem.Allocator;
-const Value = std.json.Value;
+const Value = @import("runtime_value.zig").Value;
 const Record = value.Record;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Key = [32]u8;
@@ -325,6 +325,7 @@ fn truthy(item: ?Value) bool {
         .string, .number_string => |s| s.len != 0,
         .array => |a| a.items.len != 0,
         .object => |o| o.count() != 0,
+        .custom => true,
     };
 }
 
@@ -520,7 +521,7 @@ fn prepareRequest(arena: Allocator, hosted: HostedOptions, kwargs: Record, input
     const model = try hostedModel(hosted.model);
     var body: Record = .empty;
     try body.put(arena, "model", .{ .string = model.name });
-    var input: std.json.Array = .init(arena);
+    var input: @import("runtime_value.zig").Array = .init(arena);
     try input.ensureTotalCapacity(inputs.len);
     for (inputs) |text| input.appendAssumeCapacity(.{ .string = text });
     try body.put(arena, "input", .{ .array = input });
@@ -849,14 +850,14 @@ fn responseEmbeddings(arena: Allocator, response: Value) !Value {
             return a.object.get("index").?.integer < b.object.get("index").?.integer;
         }
     }.less);
-    var output: std.json.Array = .init(arena);
+    var output: @import("runtime_value.zig").Array = .init(arena);
     try output.ensureTotalCapacity(data.array.items.len);
     for (data.array.items) |row| {
         var embedding = row.object.get("embedding").?;
         if (embedding == .string) {
             const length = try decodeBase64(embedding.string, null);
             if (length % @sizeOf(f32) != 0) return error.InvalidEmbeddingShape;
-            var numbers: std.json.Array = .init(arena);
+            var numbers: @import("runtime_value.zig").Array = .init(arena);
             try numbers.resize(length / @sizeOf(f32));
             _ = try decodeBase64Output(embedding.string, .{ .numbers = numbers.items });
             embedding = .{ .array = numbers };
