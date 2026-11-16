@@ -31,6 +31,7 @@ pub const XmlAdapter = @import("xml.zig");
 pub const inference = @import("inference.zig");
 pub const http = @import("http.zig");
 pub const lm = @import("lm.zig");
+pub const training = @import("training.zig");
 pub const LM = lm.LM;
 pub const TypeSafe = lm.TypeSafe;
 pub const predict = @import("predict.zig");

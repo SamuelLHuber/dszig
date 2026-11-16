@@ -6,7 +6,7 @@ allocators and execution context are explicit.
 
 **This is not a feature-complete or fully identical implementation of DSPy.** The
 cross-runtime gates cover the behaviors below, not every DSPy capability. In
-particular, the Python-executing RLM/Flex stack, provider fine-tuning jobs, images/audio,
+particular, the Python-executing RLM/Flex stack, training optimizers, images/audio,
 full provider SDK coverage, and streaming are not implemented. Native File and
 bounded Responses document support are implemented, not general multimodal
 parity. See [Compatibility limits](#compatibility-limits).
@@ -115,7 +115,7 @@ retain the actual continuation and raw provider response independently.
 | Typed decisions | `Noul`, configured `Score`/`Choice`, generative evidence classes, criteria/state snapshots, native Annotated metadata, owning evidence collectors and TypeSafe SystemOne prediction; finite coverage and unsupported rows below |
 | Retrieval and embeddings | `Retrieve`, lexical `InMemoryRetriever`, HTTP `ColBERTv2` with shared mutable-graph memory caching, custom/OpenAI/Azure `Embedder`, float32 `KNN`, per-query `KNNFewShot`, and brute-force `Embeddings`/`EmbeddingsWithScores` with NumPy persistence |
 | Evaluation and few-shot search | `optimize.evaluate`, concurrent `parallel.Evaluator`, `bootstrapTraceData` with real parse-failure capture and ordered native rollouts, `LabeledFewShot`, `BootstrapFewShot`, `BootstrapFewShotWithRandomSearch`, `BootstrapFewShotWithOptuna`, teacher context, zero thresholds and positional multi-use trace selection |
-| Fine-tuning data | `Adapter.formatFinetuneData` for Chat/XML, including native File provider blocks, typed answers, demos and History; no provider training jobs or `BootstrapFinetune` |
+| Fine-tuning | Chat/XML `Adapter.formatFinetuneData`; bounded OpenAI HTTP training jobs with startup workers, model copying and joined cancellation; no `BootstrapFinetune` |
 | Instruction optimization | `InferRules`; `MIPROv2`, its program-aware proposer and an Optuna 4.5.0 TPE port; `COPRO`; `SIMBA`; supported instance-frontier `GEPA` paths against gepa 0.1.4 |
 | Agents and tools | `ReAct`, comptime `Tool`, `History`, `ToolCalls`, tool results, native declarations and text tool calls, typed submit, retained history |
 | Voting | `Ensemble`, `ensemble.majority`, Unicode text normalization; exact Python numeric equality, NaN object identity and source-order fallback behavior |
@@ -1088,7 +1088,9 @@ Program value copies retain model identity without owning the model.
 Program save/dump now stores a bound LM's configuration rather than silently
 writing null. `lm.OpenAI` supports native configuration persistence, including
 its API, model, capability flags, generation token limit, response bound, retries
-and timeouts. The native class discriminator and transport settings are **not
+and timeouts, plus `finetuning_model`, `train_kwargs` and `launch_kwargs`.
+Nested training/launch options are JSON objects owned by the startup load arena.
+The native class discriminator and transport settings are **not
 Python LM-state interchange**. API keys, HTTP clients, trust stores and header
 providers are never serialized. Custom engines must provide `LM.VTable.dump_state`
 and an application-owned `LM.StateLoader`; inference-only scripted, replay, cache
@@ -1131,6 +1133,66 @@ Debug and ReleaseSafe also exercised a restored model through actual localhost
 HTTP and typed Predict, returning `42`; the fixture verified model, token limit
 and injected authentication. This is not live-model inference, training-job,
 whole-runtime static-memory, or complete LM/provider save/load parity evidence.
+
+## Native OpenAI training jobs
+
+`LM.finetune(&job, request)` starts genuine OpenAI-compatible HTTP training in a
+caller-owned `training.Job`. Unsupported engines return `error.UnsupportedFinetuning`.
+Initialize the immovable job with `Job.init(io, buffers, limits, thread_config)` at
+startup: it creates one persistent worker. Supply disjoint bounded body/scratch
+buffers and explicit row, poll, whole-job, whole-request, cleanup and poll-interval
+limits. The client, authentication provider, dataset and model configuration are
+borrowed until completion; do not mutate them concurrently.
+
+Requests accept `.chat` or `.completion` data. Like the source provider, this
+checks the format tag, not training-row schema. The worker uploads JSONL with
+purpose `fine-tune`, creates `/fine_tuning/jobs`, polls status and the latest
+event, and obtains the succeeded job's trained model. A configured nonempty
+`finetuning_model` overrides the inference model. Empty/absent per-job
+`train_kwargs` fall back to the LM's defaults. OpenAI's provider prefix is removed
+from the wire training model; the returned trained name is not prefixed again.
+`launch_kwargs` persist as configuration; this OpenAI provider does not launch a
+local training engine.
+
+`Job.wait()` joins the submitted operation and returns its actual model or error.
+The returned OpenAI borrows the job's inline model-name storage until reuse.
+`OpenAI.copyWithModel(&target, model_name)` copies configuration without allocation,
+retaining inference clients/authentication/options and borrowing the supplied name.
+Copy that name into caller-owned stable storage before retaining a result across
+job reuse. `Job.status(arena)` queries fresh remote status with separate caller
+scratch; do not read mutable job fields while work is running.
+
+`cancelAndWait()` requests cancellation, cleans up known remote resources and
+waits for the local completion barrier. Every request races a whole-request timer;
+both sides are canceled and joined before scratch reuse. The supplied Io backend
+and authentication callbacks must cooperate with cancellation; a non-cooperating
+caller callback can delay the barrier. `release()` cancels any
+remaining nonterminal remote job and deletes the training file. It must succeed
+before another `start`: failed cleanup retains IDs and refuses reuse.
+`deinit()` cancels, joins the startup worker, and reports remaining cleanup errors.
+Report those errors rather than silently dropping them. A response lost after a
+remote commit can leave an unknown remote object: no automatic create retry or
+claim of guaranteed remote rollback is made.
+
+This intentionally does not reproduce the source's unbounded polling or its
+cancel-during-poll hang. Native failure results are errors, not Python exception
+objects returned as successful Future values. Polling avoids redundant SDK
+existence/estimate retrieves; event IDs are deduplicated against the immediately
+preceding ID. Native limits include 1,024-byte retained identifiers/model names
+and the supplied response/body capacities. Before submission, an iterative
+fixed-depth traversal bounds JSON input bytes/nodes by body capacity, including
+hyperparameters; huge inputs cannot evade work bounds by producing tiny output.
+Non-JSON custom runtime values and invalid UTF-8 refuse rather than executing a
+user serializer on the worker. HTTP-client and Io internals may allocate:
+bounded job buffers are not whole-runtime static-memory proof.
+
+The actual DSPy provider was exercised with an in-process scripted SDK; the
+OpenAI SDK itself is absent from the pinned reference environment. Native
+localhost HTTP exercised upload/create/poll/events, trained-model typed Predict,
+failure, remote cancellation, poll/request bounds, cancellation and slot reuse.
+These are finite protocol/lifecycle checks, not paid training, authenticated
+model inference, SDK/error identity, all providers, training-job persistence,
+`BootstrapFinetune`, `BetterTogether`, DST/PBT or full DSPy parity.
 
 ## Native parallel composition
 
@@ -1651,8 +1713,8 @@ The following prevent a claim that DSZig can do everything DSPy can:
   guest. A restricted expression evaluator is not an identical implementation.
 - **Other modules and optimizers:** no AvatarOptimizer, BetterTogether,
   BootstrapFinetune. Trace bootstrapping and Chat/XML fine-tuning data formatting
-  are implemented as described above; native LM training bindings, provider job
-  lifecycle and optimizer training orchestration are not.
+  and bounded OpenAI training jobs are implemented as described above;
+  optimizer training orchestration is not.
   Native Parallel uses explicit typed
   tasks and contexts, not Python callback objects or ambient thread-local settings.
   Its startup capacities and cooperative join contract are described above.
@@ -1676,8 +1738,8 @@ The following prevent a claim that DSZig can do everything DSPy can:
   handling, File tool-result markers and bounded Responses document translation
   are implemented as described above. There is still no complete lm15 provider
   catalog/routing/auth/error taxonomy, full provider SDK, embedding providers
-  beyond OpenAI/Azure, Image/Audio, general rich-media tool results, provider
-  training lifecycle or native streaming. Document support is not general
+  beyond OpenAI/Azure, Image/Audio, general rich-media tool results, non-OpenAI
+  training providers or native streaming. Document support is not general
   multimodal support, and Chat Completions does not accept document parts.
 - **File and DocumentPart boundaries:** the constructor smoke explicitly leaves
   606 successful source Python DocumentPart object/repr/bytes operations

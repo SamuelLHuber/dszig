@@ -364,6 +364,8 @@ pub const LM = struct {
         complete: *const fn (ptr: *anyopaque, arena: Allocator, request: Request) Error![]const Completion,
         /// Custom native engines explicitly opt into persistent state.
         dump_state: ?*const fn (ptr: *anyopaque, arena: Allocator) StateError!@import("runtime_value.zig").Value = null,
+        /// A genuine provider starts work in the caller's startup-created slot.
+        finetune: ?*const fn (ptr: *anyopaque, job: *@import("training.zig").Job, request: @import("training.zig").Request) anyerror!void = null,
     };
 
     /// Explicit application resources, never reconstructed from serialized pointers.
@@ -385,6 +387,11 @@ pub const LM = struct {
 
     pub fn sameInstance(a: LM, b: LM) bool {
         return a.ptr == b.ptr and a.vtable == b.vtable;
+    }
+
+    pub fn finetune(model: LM, job: *@import("training.zig").Job, request: @import("training.zig").Request) !void {
+        const start = model.vtable.finetune orelse return error.UnsupportedFinetuning;
+        return start(model.ptr, job, request);
     }
 
     pub fn dumpState(lm: LM, arena: Allocator) StateError!@import("runtime_value.zig").Value {
@@ -792,6 +799,10 @@ pub const OpenAI = struct {
     /// e.g. "https://api.openai.com/v1"; a trailing slash is accepted.
     base_url: []const u8,
     model: []const u8,
+    /// Training configuration is borrowed until persisted or startup-restored.
+    finetuning_model: ?[]const u8 = null,
+    train_kwargs: @import("runtime_value.zig").Value = .{ .object = .empty },
+    launch_kwargs: @import("runtime_value.zig").Value = .{ .object = .empty },
     api: Api = .chat_completions,
     /// Explicit capabilities, not inferred from model-name substrings.
     supports_reasoning: bool = false,
@@ -854,10 +865,17 @@ pub const OpenAI = struct {
                     @field(target, name) = if (comptime T == []const u8) blk: {
                         if (encoded != .string) return error.InvalidLMState;
                         break :blk try arena.dupe(u8, encoded.string);
-                    } else @import("value.zig").fromValue(arena, T, encoded) catch |err| return switch (err) {
-                        error.OutOfMemory => error.OutOfMemory,
-                        else => error.InvalidLMState,
-                    };
+                    } else if (comptime T == ?[]const u8) blk: {
+                        if (encoded == .null) break :blk null;
+                        if (encoded != .string) return error.InvalidLMState;
+                        break :blk try arena.dupe(u8, encoded.string);
+                    } else if (comptime T == @import("runtime_value.zig").Value)
+                        try cloneConfigObject(arena, encoded)
+                    else
+                        @import("value.zig").fromValue(arena, T, encoded) catch |err| return switch (err) {
+                            error.OutOfMemory => error.OutOfMemory,
+                            else => error.InvalidLMState,
+                        };
                 }
             }
             return target.lm();
@@ -870,7 +888,7 @@ pub const OpenAI = struct {
         "base_url",                 "model",                    "api",                       "supports_reasoning",
         "supports_response_format", "supports_response_schema", "supports_function_calling", "max_tokens",
         "max_response_bytes",       "max_retries",              "retry_base_ms",             "timeout_ns",
-        "connect_timeout_ns",
+        "connect_timeout_ns",       "finetuning_model",         "train_kwargs",              "launch_kwargs",
     };
 
     fn dumpState(ptr: *anyopaque, arena: Allocator) StateError!@import("runtime_value.zig").Value {
@@ -878,20 +896,43 @@ pub const OpenAI = struct {
         var state: @import("runtime_value.zig").ObjectMap = .empty;
         try state.ensureTotalCapacity(arena, persistent_fields.len + 1);
         state.putAssumeCapacity("__lm_class__", .{ .string = "dszig.lm.OpenAI" });
-        inline for (persistent_fields) |name|
-            state.putAssumeCapacity(name, try @import("value.zig").toValue(arena, @FieldType(OpenAI, name), @field(self, name)));
+        inline for (persistent_fields) |name| {
+            const encoded = if (comptime @FieldType(OpenAI, name) == @import("runtime_value.zig").Value)
+                try cloneConfigObject(arena, @field(self, name))
+            else
+                try @import("value.zig").toValue(arena, @FieldType(OpenAI, name), @field(self, name));
+            state.putAssumeCapacity(name, encoded);
+        }
         return .{ .object = state };
+    }
+
+    fn cloneConfigObject(arena: Allocator, input: @import("runtime_value.zig").Value) StateError!@import("runtime_value.zig").Value {
+        if (input != .object) return error.InvalidLMState;
+        if (!providerJsonValue(input, 0)) return error.InvalidLMState;
+        return inference.cloneJsonValue(arena, input);
+    }
+
+    /// No allocation or ownership transfer: the caller retains the model text
+    /// and all resources/options borrowed from the original client.
+    pub fn copyWithModel(self: *const OpenAI, target: *OpenAI, model: []const u8) void {
+        target.* = self.*;
+        target.model = model;
     }
 
     pub fn lm(self: *OpenAI) LM {
         return .{
             .ptr = self,
-            .vtable = &.{ .complete = complete, .dump_state = dumpState },
+            .vtable = &.{ .complete = complete, .dump_state = dumpState, .finetune = startFinetune },
             .supports_reasoning = self.supports_reasoning,
             .supports_response_format = self.supports_response_format,
             .supports_response_schema = self.supports_response_schema,
             .supports_function_calling = self.supports_function_calling,
         };
+    }
+
+    fn startFinetune(ptr: *anyopaque, job: *@import("training.zig").Job, request: @import("training.zig").Request) anyerror!void {
+        const self: *OpenAI = @ptrCast(@alignCast(ptr));
+        try job.start(self, request);
     }
 
     /// A Responses request represents one completion; `complete` issues
@@ -1743,6 +1784,159 @@ test "scripted response construction rejects non JSON provider data" {
     const null_metadata = [_]?Value{.null};
     var with_null: ScriptedLM = .{ .responses = &.{"answer"}, .provider_data = &null_metadata };
     try testing.expectEqualStrings("answer", try with_null.lm().complete(arena, .{ .messages = &messages }));
+}
+
+// Builds {"hyperparameters": {"n_epochs": 3, "tags": [tag]}} entirely in `arena`,
+// so a restored copy can be distinguished from a view into the source arena.
+fn testNestedConfig(arena: Allocator, tag: []const u8) !@import("runtime_value.zig").Value {
+    var tags: @import("runtime_value.zig").Array = .init(arena);
+    try tags.append(.{ .string = try arena.dupe(u8, tag) });
+    var inner: @import("runtime_value.zig").ObjectMap = .empty;
+    try inner.put(arena, try arena.dupe(u8, "n_epochs"), .{ .integer = 3 });
+    try inner.put(arena, try arena.dupe(u8, "tags"), .{ .array = tags });
+    var outer: @import("runtime_value.zig").ObjectMap = .empty;
+    try outer.put(arena, try arena.dupe(u8, "hyperparameters"), .{ .object = inner });
+    return .{ .object = outer };
+}
+
+test "OpenAI training configuration survives destruction of the source arena" {
+    // Dump and restore through the public LM state interfaces, free every byte
+    // of the source, then read the nested configuration from the restored model.
+    var source_memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer source_memory.deinit();
+    var target_memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer target_memory.deinit();
+    const source = source_memory.allocator();
+    const target = target_memory.allocator();
+
+    var defaults: OpenAI = .{ .client = undefined, .base_url = "http://unused", .model = "m" };
+    const default_state = try defaults.lm().dumpState(source);
+    try testing.expect(default_state.object.get("finetuning_model").? == .null);
+    try testing.expectEqual(@as(usize, 0), default_state.object.get("train_kwargs").?.object.count());
+    try testing.expectEqual(@as(usize, 0), default_state.object.get("launch_kwargs").?.object.count());
+
+    var original: OpenAI = .{
+        .client = undefined,
+        .base_url = "https://saved.invalid/v1",
+        .model = "base-model",
+        .api_key = "must-not-be-saved",
+        .finetuning_model = try source.dupe(u8, "tunable-model"),
+        .train_kwargs = try testNestedConfig(source, "train"),
+        .launch_kwargs = try testNestedConfig(source, "launch"),
+    };
+    const state = try original.lm().dumpState(source);
+    try testing.expect(state.object.get("api_key") == null);
+    try testing.expect(state.object.get("client") == null);
+    try testing.expect(state.object.get("header_provider") == null);
+    // The dump is a clone: mutating the model afterwards must not alter it.
+    const dumped_tags = state.object.get("train_kwargs").?.object.get("hyperparameters").?.object.get("tags").?;
+    try testing.expect(dumped_tags.array.items.ptr !=
+        original.train_kwargs.object.get("hyperparameters").?.object.get("tags").?.array.items.ptr);
+
+    var loader: OpenAI.StateLoader = .{ .client = undefined, .base_url = "https://trusted.invalid/v1", .api_key = "injected" };
+    const interface = loader.loader();
+    const restored_lm = try interface.restore(interface.ptr, target, state);
+    var without_model = try inference.cloneJsonValue(source, state);
+    try testing.expect(without_model.object.orderedRemove("finetuning_model"));
+    try testing.expect(without_model.object.orderedRemove("train_kwargs"));
+    const sparse_lm = try interface.restore(interface.ptr, target, without_model);
+    _ = source_memory.reset(.free_all);
+
+    const restored: *OpenAI = @ptrCast(@alignCast(restored_lm.ptr));
+    try testing.expectEqualStrings("tunable-model", restored.finetuning_model.?);
+    try testing.expectEqualStrings("injected", restored.api_key.?);
+    inline for (.{ "train", "launch" }) |tag| {
+        const config = @field(restored, tag ++ "_kwargs");
+        try testing.expectEqual(@as(usize, 1), config.object.count());
+        const inner = config.object.get("hyperparameters").?;
+        try testing.expectEqual(@as(i64, 3), inner.object.get("n_epochs").?.integer);
+        const tags = inner.object.get("tags").?.array.items;
+        try testing.expectEqual(@as(usize, 1), tags.len);
+        try testing.expectEqualStrings(tag, tags[0].string);
+    }
+    // Absent keys keep the Source defaults rather than failing the load.
+    const sparse: *OpenAI = @ptrCast(@alignCast(sparse_lm.ptr));
+    try testing.expect(sparse.finetuning_model == null);
+    try testing.expectEqual(@as(usize, 0), sparse.train_kwargs.object.count());
+    try testing.expectEqual(@as(usize, 1), sparse.launch_kwargs.object.count());
+}
+
+test "OpenAI training configuration rejects non object and non JSON values" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const Value = @import("runtime_value.zig").Value;
+    const python = @import("python_value.zig");
+    var nested_tuple: @import("runtime_value.zig").ObjectMap = .empty;
+    try nested_tuple.put(arena, "nested", try python.tuple(arena, &.{.{ .string = "1" }}));
+    var nested_nan: @import("runtime_value.zig").ObjectMap = .empty;
+    try nested_nan.put(arena, "nested", .{ .float = std.math.nan(f64) });
+    const invalid = [_]Value{
+        .null,
+        .{ .string = "{}" },
+        .{ .array = .init(arena) },
+        .{ .object = nested_tuple },
+        .{ .object = nested_nan },
+    };
+    var loader: OpenAI.StateLoader = .{ .client = undefined, .base_url = "http://unused" };
+    const interface = loader.loader();
+    inline for (.{ "train_kwargs", "launch_kwargs" }) |name| {
+        for (invalid) |value| {
+            var model: OpenAI = .{ .client = undefined, .base_url = "http://unused", .model = "m" };
+            @field(model, name) = value;
+            try testing.expectError(error.InvalidLMState, model.lm().dumpState(arena));
+
+            var valid: OpenAI = .{ .client = undefined, .base_url = "http://unused", .model = "m" };
+            var state = try valid.lm().dumpState(arena);
+            _ = try interface.restore(interface.ptr, arena, state);
+            try state.object.put(arena, name, value);
+            try testing.expectError(error.InvalidLMState, interface.restore(interface.ptr, arena, state));
+        }
+    }
+    var valid: OpenAI = .{ .client = undefined, .base_url = "http://unused", .model = "m" };
+    var state = try valid.lm().dumpState(arena);
+    try state.object.put(arena, "finetuning_model", .{ .integer = 1 });
+    try testing.expectError(error.InvalidLMState, interface.restore(interface.ptr, arena, state));
+}
+
+test "OpenAI model copy shares resources and sends the substituted model" {
+    // The copy must reach the real request encoder with the new model while
+    // the original keeps its own, and neither owns separate resources.
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var client: std.http.Client = .{ .allocator = testing.allocator, .io = testing.io };
+    defer client.deinit();
+    var original: OpenAI = .{
+        .client = &client,
+        .base_url = "https://example.invalid/v1",
+        .model = "base-model",
+        .api = .responses,
+        .api_key = "credential",
+        .max_tokens = 41,
+        .finetuning_model = "tunable-model",
+        .train_kwargs = try testNestedConfig(arena, "train"),
+    };
+    const trained_name: []const u8 = "ft:base-model:org::job";
+    var trained: OpenAI = undefined;
+    original.copyWithModel(&trained, trained_name);
+
+    try testing.expect(trained.model.ptr == trained_name.ptr);
+    try testing.expectEqual(original.client, trained.client);
+    try testing.expect(trained.base_url.ptr == original.base_url.ptr);
+    try testing.expect(trained.api_key.?.ptr == original.api_key.?.ptr);
+    try testing.expect(trained.finetuning_model.?.ptr == original.finetuning_model.?.ptr);
+    try testing.expectEqual(original.api, trained.api);
+    try testing.expectEqual(original.train_kwargs.object.keys().ptr, trained.train_kwargs.object.keys().ptr);
+
+    const request: Request = .{ .messages = &.{.{ .role = .user, .content = .{ .text = "q" } }} };
+    const trained_body = try OpenAI.parseJson(arena, try trained.requestBody(arena, request));
+    try testing.expectEqualStrings(trained_name, trained_body.object.get("model").?.string);
+    try testing.expectEqual(@as(i64, 41), trained_body.object.get("max_output_tokens").?.integer);
+    try testing.expect(trained_body.object.get("train_kwargs") == null);
+    const original_body = try OpenAI.parseJson(arena, try original.requestBody(arena, request));
+    try testing.expectEqualStrings("base-model", original_body.object.get("model").?.string);
+    try testing.expectEqualStrings("base-model", original.model);
 }
 
 test "keyword LM scopes and Chat completion order" {
