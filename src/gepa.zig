@@ -694,7 +694,9 @@ pub const GEPA = struct {
     ) !Result(P) {
         assert(trainset.len > 0);
         assert(self.reflection_minibatch_size > 0);
-        const valset = options.valset orelse trainset;
+        // Source computes its budget from the supplied set before applying
+        // `valset or trainset`; an empty sampled holdout still evaluates trainset.
+        const valset = if (options.valset) |set| if (set.len > 0) set else trainset else trainset;
         assert(valset.len > 0);
         const owned = try out.create(P);
         owned.* = student;
@@ -705,7 +707,7 @@ pub const GEPA = struct {
                 .light => 6,
                 .medium => 12,
                 .heavy => 18,
-            }, valset.len)
+            }, if (options.valset) |set| set.len else trainset.len)
         else if (self.max_full_evals) |k|
             k * (trainset.len + if (options.valset) |v| v.len else 0)
         else
@@ -855,6 +857,38 @@ test "GEPA scoring failures preserve capture-specific outputs while feedback err
         try std.testing.expectError(error.OutOfMemory, engine.runOne(engine.ctx, &program, &examples[0], capture));
     }
     try std.testing.expectEqual(@as(usize, 5), script.index);
+}
+
+test "GEPA empty validation evaluates the entire training set" {
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const Sig = signature.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: []const u8 };
+    });
+    const Metric = struct {
+        fn score(_: Allocator, example: *const Example, prediction: *const Record, _: ?*const Trace, _: ?[]const u8, _: ?*const Trace.Step) value.ParseError!Feedback {
+            return .{ .score = @floatFromInt(@intFromBool(std.mem.eql(
+                u8,
+                example.record.get("answer").?.string,
+                prediction.get("answer").?.string,
+            ))) };
+        }
+    };
+    var script: @import("lm.zig").ScriptedLM = .{
+        .responses = &.{ "<answer>ok</answer>", "<answer>wrong</answer>" },
+    };
+    const examples = [_]Example{
+        try Example.fromJson(arena, "{\"question\":\"q\",\"answer\":\"ok\"}", &.{"question"}),
+        try Example.fromJson(arena, "{\"question\":\"r\",\"answer\":\"ok\"}", &.{"question"}),
+    };
+    const optimizer: GEPA = .{ .metric = Metric.score, .max_metric_calls = 1 };
+    const result = try optimizer.compile(predict.Predict(Sig), arena, .{ .arena = arena, .lm = script.lm() }, .{}, &examples, .{ .valset = &.{} });
+    try std.testing.expectEqualSlices(f64, &.{ 1, 0 }, result.val_subscores[0]);
+    try std.testing.expectEqual(@as(f64, 0.5), result.val_aggregate_scores[0]);
+    try std.testing.expectEqual(@as(usize, 2), result.total_metric_calls);
+    try std.testing.expectEqual(@as(usize, 1), result.max_metric_calls);
 }
 
 fn sumScores(runs: []const GEPA.Run) f64 {

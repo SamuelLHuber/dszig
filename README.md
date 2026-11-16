@@ -6,7 +6,7 @@ allocators and execution context are explicit.
 
 **This is not a feature-complete or fully identical implementation of DSPy.** The
 cross-runtime gates cover the behaviors below, not every DSPy capability. In
-particular, the Python-executing RLM/Flex stack, `BetterTogether`, images/audio,
+particular, the Python-executing RLM/Flex stack, AvatarOptimizer, images/audio,
 full provider SDK coverage, and streaming are not implemented. Native File and
 bounded Responses document support are implemented, not general multimodal
 parity. See [Compatibility limits](#compatibility-limits).
@@ -116,6 +116,7 @@ retain the actual continuation and raw provider response independently.
 | Retrieval and embeddings | `Retrieve`, lexical `InMemoryRetriever`, HTTP `ColBERTv2` with shared mutable-graph memory caching, custom/OpenAI/Azure `Embedder`, float32 `KNN`, per-query `KNNFewShot`, and brute-force `Embeddings`/`EmbeddingsWithScores` with NumPy persistence |
 | Evaluation and few-shot search | `optimize.evaluate`, concurrent `parallel.Evaluator`, `bootstrapTraceData` with real parse-failure capture and ordered native rollouts, `LabeledFewShot`, `BootstrapFewShot`, `BootstrapFewShotWithRandomSearch`, `BootstrapFewShotWithOptuna`, teacher context, zero thresholds and positional multi-use trace selection |
 | Fine-tuning | Chat/XML `Adapter.formatFinetuneData`; native `BootstrapFinetune` over bounded OpenAI HTTP jobs, startup workers, retained model names and joined failure cleanup |
+| Optimizer composition | Native `BetterTogether`, real default prompt/weight optimization, typed custom registries, retained candidate LM snapshots and joined lifecycle cleanup |
 | Instruction optimization | `InferRules`; `MIPROv2`, its program-aware proposer and an Optuna 4.5.0 TPE port; `COPRO`; `SIMBA`; supported instance-frontier `GEPA` paths against gepa 0.1.4 |
 | Agents and tools | `ReAct`, comptime `Tool`, `History`, `ToolCalls`, tool results, native declarations and text tool calls, typed submit, retained history |
 | Voting | `Ensemble`, `ensemble.majority`, Unicode text normalization; exact Python numeric equality, NaN object identity and source-order fallback behavior |
@@ -1242,8 +1243,11 @@ All starts precede waits. On failure, every started job is canceled and joined,
 including jobs Source abandons on its first failure. All releases are attempted;
 cleanup errors take precedence and retain IDs so those jobs cannot be reused
 unsafely. The student is rebound only after every job and cleanup succeeds.
-OpenAI's Source `kill` is a no-op; the native optimizer does not pretend to
-manage a separate local inference engine.
+Each source LM is killed immediately before its training job starts, as in
+Source. A native lifecycle hook must join its workers before returning and
+support repeated kills, including shared-LM groups and error cleanup.
+OpenAI-compatible remote API LMs need no local lifecycle hook; this does not
+implement a separate local inference engine.
 
 A slot owns its retained trained-model name and copied OpenAI configuration.
 Slots must remain unmoved and alive while compiled bindings use them; reusing a
@@ -1255,8 +1259,8 @@ Formatting/tracing scratch can be reclaimed after compile joins.
 
 This is native-program orchestration over the implemented OpenAI provider,
 not arbitrary Python module execution, every provider's training API, paid
-training, `BetterTogether`, or whole-runtime allocation-freedom. The bounded
-training/HTTP limitations above still apply.
+training, every BetterTogether optimizer option, or whole-runtime
+allocation-freedom. The bounded training/HTTP limitations above still apply.
 
 The native HTTP consumer exercised 23 scenarios in both Debug and ReleaseSafe,
 including parallel traces, heterogeneous and mixed student/teacher lists,
@@ -1269,6 +1273,89 @@ arrival order was not compared. Compiled typed predictions returned `42` after
 the 1 MiB compile backing was overwritten. Actual Source had 106 finite oracle
 cases; its training jobs were scripted real futures, not provider/SDK/network
 work, and those 106 cases were not all matched to native execution.
+
+## Native BetterTogether
+
+`BetterTogether.compile(P, out, gpa, io, ctx, &student, trainset, options,
+defaults)` runs real native prompt and weight optimizers. Its default strategy
+is exactly `"p -> w -> p"`: `BootstrapFewShotWithRandomSearch`,
+`BootstrapFinetune`, then prompt search again. `defaults` supplies the weight
+limits and fresh slot sets; optional typed `prompt` and `weight` configurations
+replace the corresponding defaults.
+
+Set every student predictor's LM explicitly before compiling; `ctx.lm` alone
+does not satisfy that requirement. Already compiled students refuse. Explicit
+teachers use `bootstrap_finetune.Teacher.init(T, &teacher)`. Top-level
+`options.teachers` is normalized as a list, including the Source distinction
+between an implicit student and an explicit `.student` (`None`) list element.
+Teacher paths/counts, not native signature equality, determine compatibility.
+
+`compileWith(..., options, .{ .p = &prompt, .w = &weight, ... })` accepts an
+anonymous registry of borrowed native adapters. Exact field names are strategy
+keys, separated by `" -> "`. Builtin adapters cover RandomSearch, LabeledFewShot,
+BootstrapFewShot, MIPROv2, COPRO, GEPA, InferRules, SIMBA, Optuna and
+BootstrapFinetune. Custom entries implement
+`compile(self, comptime P, better_together.optimizers.Request(P)) !P`.
+In-place entries declare `returns_in_place = true` and mutate `student_ref`;
+others return a value that is published only after restoration and launch
+succeed. InferRules borrows its initialized optimizer to retain induction state.
+
+`options.optimizer_compile_args` supplies per-key dataset and teacher
+overrides. `valset = .{ .value = null }` explicitly removes validation for that
+optimizer call; omission preserves the standard value. The singular `teacher`
+override is `.none`, `.program` or `.list`. For example, a single typed teacher
+is `.{ .program = bootstrap_finetune.Teacher.init(P, &teacher).program }`.
+Unlike a top-level singleton list, that value works with prompt optimizers
+expecting one program. Explicit arguments unsupported by a builtin optimizer
+refuse before launch; optimizer-specific settings remain typed on the adapter,
+not a Python keyword dictionary. Prompt adapters currently require a single
+teacher of the same nominal `P`; heterogeneous erased teachers remain supported
+by BootstrapFinetune. Lists are not silently coerced to single programs.
+
+The result contains `program`, `candidate_programs` (program, optional score
+and strategy prefix), and `flag_compilation_error_occurred`. Validation ties
+retain the earliest candidate; absent or empty validation selects the latest
+successful candidate. Evaluation failures score zero. A failed optimizer,
+snapshot or replacement launch stops composition and retains earlier
+candidates. If any predictor loses its LM, all previous bindings are restored
+positionally. Named LMs relaunch when the model-name list changes, not merely
+when handle identities change.
+
+Candidate snapshots clone LMs, preserving shared LM identity within each
+candidate and distinct clones across candidates. A custom LM must implement
+the real `clone` hook or compilation refuses. OpenAI snapshots own model/URL
+strings and nested training/launch configuration, but borrow the initialized
+HTTP client, authentication and callback resources. They have no Python
+engine store to copy. Signature-class instruction mutations propagate through
+the reachable current/original programs, candidates and explicit teachers,
+not arbitrary global objects. Const teachers remain readable, but an operation
+requiring instruction writes refuses rather than casting away their constness.
+
+Supply explicit limits for strategy bytes/steps, examples, predictors and
+teachers. `out` is caller-owned arena or fixed startup backing retaining the
+result graph; release it as a unit only after all candidates are finished.
+Every weight attempt needs distinct, unused slot/name storage while any
+current/original/teacher binding borrows it. Startup jobs may be shared across
+sequential slot sets because training and cleanup join before reuse.
+Lifecycle cleanup attempts every unique handle even after a hook error.
+The composition seed is an optional native `u32`; omitted seeds use secure
+randomness. Attempt/provider allocators and HTTP resources retain their existing
+contracts: bounded metadata backing does **not** prove whole-runtime
+post-initialization allocation freedom or generated-code process isolation.
+
+The HTTP consumer exercised 23 scenarios in both Debug and ReleaseSafe,
+including unmodified default prompt search, repeated weight steps, teacher
+overrides and alias propagation, GEPA's empty sampled holdout, slot refusal,
+failed training and a provider requiring shutdown before training.
+It made 637 localhost requests and created
+13 training jobs per mode. Eighteen matched actual DSPy scenarios passed
+122 comparisons per mode of selection, candidate metadata, failure boundaries
+and complete SDK training rows. Error categories and model-name equality
+relations were compared, not
+identical exception types or fixture-specific generated model strings.
+Candidate clone invariants were checked separately. Eight additional lifecycle
+control cases exercised failure cleanup with synchronous resource tokens; those
+are not inference, actual worker-join or subprocess-isolation evidence.
 
 ## Native parallel composition
 
@@ -1787,9 +1874,10 @@ The following prevent a claim that DSZig can do everything DSPy can:
   LocalInterpreter, InterpreterPool or complete Python execution environment.
   DSPy's RLM/Flex execute arbitrary Python and can import real DSPy inside the
   guest. A restricted expression evaluator is not an identical implementation.
-- **Other modules and optimizers:** no AvatarOptimizer or BetterTogether.
-  Trace bootstrapping, Chat/XML fine-tuning data formatting, bounded OpenAI
-  training jobs and native BootstrapFinetune orchestration are implemented
+- **Other modules and optimizers:** no AvatarOptimizer. Native BetterTogether
+  composes implemented optimizers, with the typed argument, teacher, ownership
+  and provider limits described above. Trace bootstrapping, Chat/XML fine-tuning
+  data formatting, bounded OpenAI training jobs and BootstrapFinetune are implemented
   with the provider, capacity and ownership limits described above.
   Native Parallel uses explicit typed
   tasks and contexts, not Python callback objects or ambient thread-local settings.

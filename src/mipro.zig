@@ -445,7 +445,7 @@ pub const MIPROv2 = struct {
         ctx: Context,
         prompt: ?Context,
         student: P,
-        teacher: ?P,
+        teacher: anytype,
         trainset_in: []const Example,
         options: Options,
     ) !Result(P) {
@@ -512,7 +512,7 @@ pub const MIPROv2 = struct {
         gpa: Allocator,
         ctx: Context,
         student: P,
-        teacher: ?P,
+        teacher: anytype,
         trainset: []const Example,
         num_sets: usize,
         zeroshot: bool,

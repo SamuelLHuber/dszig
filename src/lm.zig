@@ -366,6 +366,14 @@ pub const LM = struct {
         dump_state: ?*const fn (ptr: *anyopaque, arena: Allocator) StateError!@import("runtime_value.zig").Value = null,
         /// A genuine provider starts work in the caller's startup-created slot.
         finetune: ?*const fn (ptr: *anyopaque, job: *@import("training.zig").Job, request: @import("training.zig").Request) anyerror!void = null,
+        /// API providers need no local process. Native engines opt into lifecycle
+        /// hooks explicitly; kill must return only after their workers have joined.
+        launch: ?*const fn (ptr: *anyopaque) anyerror!void = null,
+        kill: ?*const fn (ptr: *anyopaque) anyerror!void = null,
+        model_name: ?*const fn (ptr: *anyopaque) []const u8 = null,
+        /// Ordinary Module.deepcopy clones model instances; native engines must
+        /// provide a real snapshot rather than silently sharing mutable state.
+        clone: ?*const fn (ptr: *anyopaque, arena: Allocator) anyerror!LM = null,
     };
 
     /// Explicit application resources, never reconstructed from serialized pointers.
@@ -387,6 +395,24 @@ pub const LM = struct {
 
     pub fn sameInstance(a: LM, b: LM) bool {
         return a.ptr == b.ptr and a.vtable == b.vtable;
+    }
+
+    pub fn clone(model: LM, arena: Allocator) !LM {
+        const copy = model.vtable.clone orelse return error.UnsupportedLMCopy;
+        return copy(model.ptr, arena);
+    }
+
+    pub fn modelName(model: LM) ?[]const u8 {
+        const name = model.vtable.model_name orelse return null;
+        return name(model.ptr);
+    }
+
+    pub fn launch(model: LM) !void {
+        if (model.vtable.launch) |start| try start(model.ptr);
+    }
+
+    pub fn kill(model: LM) !void {
+        if (model.vtable.kill) |stop| try stop(model.ptr);
     }
 
     pub fn finetune(model: LM, job: *@import("training.zig").Job, request: @import("training.zig").Request) !void {
@@ -922,12 +948,35 @@ pub const OpenAI = struct {
     pub fn lm(self: *OpenAI) LM {
         return .{
             .ptr = self,
-            .vtable = &.{ .complete = complete, .dump_state = dumpState, .finetune = startFinetune },
+            .vtable = &.{
+                .complete = complete,
+                .dump_state = dumpState,
+                .finetune = startFinetune,
+                .model_name = modelName,
+                .clone = clone,
+            },
             .supports_reasoning = self.supports_reasoning,
             .supports_response_format = self.supports_response_format,
             .supports_response_schema = self.supports_response_schema,
             .supports_function_calling = self.supports_function_calling,
         };
+    }
+
+    fn clone(ptr: *anyopaque, arena: Allocator) anyerror!LM {
+        const self: *OpenAI = @ptrCast(@alignCast(ptr));
+        const copy = try arena.create(OpenAI);
+        copy.* = self.*;
+        copy.model = try arena.dupe(u8, self.model);
+        copy.base_url = try arena.dupe(u8, self.base_url);
+        if (self.finetuning_model) |name| copy.finetuning_model = try arena.dupe(u8, name);
+        copy.train_kwargs = try @import("value.zig").cloneValue(arena, self.train_kwargs);
+        copy.launch_kwargs = try @import("value.zig").cloneValue(arena, self.launch_kwargs);
+        return copy.lm();
+    }
+
+    fn modelName(ptr: *anyopaque) []const u8 {
+        const self: *OpenAI = @ptrCast(@alignCast(ptr));
+        return self.model;
     }
 
     fn startFinetune(ptr: *anyopaque, job: *@import("training.zig").Job, request: @import("training.zig").Request) anyerror!void {

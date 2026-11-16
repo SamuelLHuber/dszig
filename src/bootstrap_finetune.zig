@@ -10,16 +10,37 @@ const training = @import("training.zig");
 const lm = @import("lm.zig");
 const adapter = @import("adapter.zig");
 const optimize = @import("optimize.zig");
-const Value = @import("runtime_value.zig").Value;
+const runtime_value = @import("runtime_value.zig");
+const Value = runtime_value.Value;
 
 /// A borrowed, typed native program. Teachers need matching predictor paths, not
 /// matching Zig types or signatures. No program copy or callback training facade.
 pub const Teacher = union(enum) {
     /// A None element in Source's teacher list means the current student.
     student,
-    program: struct { ptr: *const anyopaque, vtable: *const VTable },
+    program: Program,
+
+    /// An erased borrowed program. Heterogeneous teachers stay usable through
+    /// the vtable; a typed pointer is recovered only for the exact nominal P.
+    pub const Program = struct {
+        ptr: *const anyopaque,
+        vtable: *const VTable,
+        writable: bool,
+
+        pub fn get(self: Program, comptime P: type) ?*const P {
+            if (self.vtable.type_identity != runtime_value.typeIdentity(P)) return null;
+            return @ptrCast(@alignCast(self.ptr));
+        }
+
+        pub fn getMutable(self: Program, comptime P: type) ?*P {
+            if (!self.writable) return null;
+            return @constCast(self.get(P) orelse return null);
+        }
+    };
 
     const VTable = struct {
+        /// Nominal per-P token: @typeName can collide across generic arguments.
+        type_identity: *const anyopaque,
         predictors: *const fn (*const anyopaque, Allocator) Allocator.Error![]predict.NamedParam,
         collect: *const fn (
             *const anyopaque,
@@ -30,7 +51,8 @@ pub const Teacher = union(enum) {
         ) anyerror![]trace.TraceData,
     };
 
-    pub fn init(comptime P: type, program: *const P) Teacher {
+    pub fn init(comptime P: type, program: anytype) Teacher {
+        comptime assert(@TypeOf(program) == *P or @TypeOf(program) == *const P);
         const Implementation = struct {
             fn predictors(
                 ptr: *const anyopaque,
@@ -51,9 +73,17 @@ pub const Teacher = union(enum) {
                 return trace.bootstrapTraceData(P, arena, ctx, typed, dataset, options);
             }
 
-            const vtable: VTable = .{ .predictors = predictors, .collect = collect };
+            const vtable: VTable = .{
+                .type_identity = runtime_value.typeIdentity(P),
+                .predictors = predictors,
+                .collect = collect,
+            };
         };
-        return .{ .program = .{ .ptr = program, .vtable = &Implementation.vtable } };
+        return .{ .program = .{
+            .ptr = program,
+            .vtable = &Implementation.vtable,
+            .writable = @TypeOf(program) == *P,
+        } };
     }
 };
 
@@ -113,11 +143,14 @@ pub const Slot = struct {
     job: *training.Job,
     model: lm.OpenAI = undefined,
     name: [1024]u8 = undefined,
+    /// Meta-optimizers must not overwrite names borrowed by earlier candidates.
+    used: bool = false,
 
     fn retain(self: *Slot, trained: *const lm.OpenAI) !void {
         if (trained.model.len > self.name.len) return error.TrainingIdentifierTooLong;
         @memcpy(self.name[0..trained.model.len], trained.model);
         trained.copyWithModel(&self.model, self.name[0..trained.model.len]);
+        self.used = true;
         assert(self.model.model.ptr == self.name[0..].ptr);
     }
 };
@@ -161,7 +194,7 @@ pub const BootstrapFinetune = struct {
         if (dataset.len > self.limits.max_examples) return error.FinetuneExampleLimit;
         const initial = try predict.namedPredictors(out, student);
         if (initial.len > self.limits.max_predictors) return error.FinetunePredictorLimit;
-        try self.validateTeachers(out, initial, teachers);
+        try validateTeachers(out, initial, teachers, self.limits.max_teachers);
         const num_threads = if (self.num_threads == 0) 8 else self.num_threads;
         var options = trace_options;
         options.metric = self.metric;
@@ -186,37 +219,6 @@ pub const BootstrapFinetune = struct {
             if (self.exclude_demos) state.demos = &.{};
         }
         student.compiled = true;
-    }
-
-    fn validateTeachers(
-        self: *const BootstrapFinetune,
-        arena: Allocator,
-        student: []const predict.NamedParam,
-        teachers: ?[]const Teacher,
-    ) !void {
-        const count = if (teachers) |items| items.len else 1;
-        if (count > self.limits.max_teachers) return error.FinetuneTeacherLimit;
-        if (teachers) |items| {
-            // Validate the entire list before executing even its first teacher.
-            for (items) |teacher| {
-                const program = switch (teacher) {
-                    .student => continue,
-                    .program => |program| program,
-                };
-                const predictors = try program.vtable.predictors(program.ptr, arena);
-                if (predictors.len != student.len) return error.ProgramMismatch;
-                for (student, predictors) |left, right| {
-                    if (!std.mem.eql(u8, left.name, right.name)) return error.ProgramMismatch;
-                }
-                for (student) |left| {
-                    for (predictors) |right| {
-                        if (left.param.predict == right.param.predict) {
-                            return error.SharedFinetunePredictor;
-                        }
-                    }
-                }
-            }
-        }
     }
 
     fn collect(
@@ -297,6 +299,37 @@ pub const BootstrapFinetune = struct {
     }
 };
 
+/// Shared Source structural and explicit-predictor identity preparation.
+pub fn validateTeachers(
+    arena: Allocator,
+    student: []const predict.NamedParam,
+    teachers: ?[]const Teacher,
+    max_teachers: u32,
+) !void {
+    const count = if (teachers) |items| items.len else 1;
+    if (count > max_teachers) return error.FinetuneTeacherLimit;
+    if (teachers) |items| {
+        for (items) |teacher| {
+            const program = switch (teacher) {
+                .student => continue,
+                .program => |program| program,
+            };
+            const predictors = try program.vtable.predictors(program.ptr, arena);
+            if (predictors.len != student.len) return error.ProgramMismatch;
+            for (student, predictors) |left, right| {
+                if (!std.mem.eql(u8, left.name, right.name)) return error.ProgramMismatch;
+            }
+            for (student) |left| {
+                for (predictors) |right| {
+                    if (left.param.predict == right.param.predict) {
+                        return error.SharedFinetunePredictor;
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn groupIndex(groups: []const Group, model: lm.LM, pred_ind: ?usize) ?usize {
     for (groups, 0..) |group, index| {
         if (group.pred_ind == pred_ind and group.source.sameInstance(model)) return index;
@@ -320,6 +353,12 @@ fn runTraining(groups: []Group, slots: []Slot) !void {
     var started: usize = 0;
     var failure: ?anyerror = null;
     for (groups, slots) |group, slot| {
+        // Free inference resources before training, as Source does. A hook must
+        // join its workers before returning; remote API providers need no hook.
+        group.source.kill() catch |err| {
+            failure = err;
+            break;
+        };
         group.source.finetune(slot.job, group.request) catch |err| {
             failure = err;
             break;

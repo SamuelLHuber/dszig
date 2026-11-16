@@ -273,13 +273,13 @@ pub const BootstrapFewShot = struct {
         gpa: Allocator,
         ctx: Context,
         student_in: P,
-        teacher_in: ?P,
+        teacher_in: anytype,
         trainset: []const Example,
     ) !Result(P) {
         if (student_in.compiled) return error.StudentCompiled;
         var student = student_in;
         try predict.resetPredictors(out, &student);
-        var teacher = teacher_in orelse student_in;
+        var teacher = (try teacherProgram(P, teacher_in)) orelse student_in;
         if (self.max_labeled_demos > 0 and !teacher.compiled) {
             teacher = try (LabeledFewShot{ .k = self.max_labeled_demos }).compile(P, out, teacher, trainset);
         }
@@ -435,6 +435,16 @@ pub fn tracePick(arena: Allocator, predictor_name: []const u8, prior_count: usiz
     return if (rng.random() < 0.5) rng.randbelow(count - 1) else count - 1;
 }
 
+fn teacherProgram(comptime P: type, teacher: anytype) !?P {
+    return switch (@typeInfo(@TypeOf(teacher))) {
+        .null => null,
+        .optional => teacher,
+        .@"struct" => teacher,
+        .pointer => error.OptimizerTeacherListUnsupported,
+        else => @compileError("teacher must be a program, optional program, or teacher list"),
+    };
+}
+
 /// `dspy.BootstrapFewShotWithRandomSearch`: evaluates seeds -3 (no demos),
 /// -2 (LabeledFewShot), -1 (BootstrapFewShot) and 0.. (shuffled trainset,
 /// `randint(1, max_bootstrapped_demos)` demos) on `valset` and keeps the
@@ -469,12 +479,12 @@ pub const BootstrapFewShotWithRandomSearch = struct {
         gpa: Allocator,
         ctx: Context,
         student: P,
-        teacher: ?P,
+        teacher: anytype,
         trainset: []const Example,
         valset: ?[]const Example,
     ) !Result(P) {
         assert(self.max_bootstrapped_demos > 0);
-        const val = valset orelse trainset;
+        const val = if (valset) |set| if (set.len > 0) set else trainset else trainset;
         const candidates = try out.alloc(Candidate, self.num_candidate_programs + 3);
         var count: usize = 0;
         var best: P = undefined;
@@ -523,7 +533,7 @@ pub const BootstrapFewShotWithRandomSearch = struct {
         gpa: Allocator,
         ctx: Context,
         student: P,
-        teacher: ?P,
+        teacher: anytype,
         trainset: []const Example,
         seed: i64,
     ) !P {
@@ -551,6 +561,8 @@ pub const BootstrapFewShotWithRandomSearch = struct {
             .max_errors = self.max_errors,
             .teacher_settings = self.teacher_settings,
         };
+        // Only bootstrap consumes the teacher. Earlier reset/labeled candidates
+        // may satisfy stop_at_score before an invalid Source list is encountered.
         return (try optimizer.compile(P, arena, gpa, ctx, student, teacher, shuffled)).program;
     }
 };
