@@ -52,6 +52,7 @@ pub fn SlotFor(comptime Result: type) type {
 pub fn Runner(comptime Result: type) type {
     return struct {
         ptr: *anyopaque,
+        workers: u16,
         tasks: u32,
         attempts: u32,
         forward: *const fn (*anyopaque, []const TaskFor(Result), Options) anyerror![]const SlotFor(Result),
@@ -178,7 +179,7 @@ pub fn Parallel(comptime Result: type, comptime limits: Limits) type {
 
         pub fn runner(self: *Self) Runner(Result) {
             assert(self.address == self);
-            return .{ .ptr = self, .tasks = limits.tasks, .attempts = limits.attempts, .forward = forwardErased };
+            return .{ .ptr = self, .workers = limits.workers, .tasks = limits.tasks, .attempts = limits.attempts, .forward = forwardErased };
         }
 
         fn forwardErased(ptr: *anyopaque, tasks: []const Task, options: Options) anyerror![]const Slot {

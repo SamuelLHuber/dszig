@@ -77,6 +77,8 @@ pub const LabeledFewShot = optimize.LabeledFewShot;
 pub const BootstrapFewShotWithRandomSearch = optimize.BootstrapFewShotWithRandomSearch;
 pub const bootstrap_trace = @import("bootstrap_trace.zig");
 pub const bootstrapTraceData = bootstrap_trace.bootstrapTraceData;
+pub const bootstrap_finetune = @import("bootstrap_finetune.zig");
+pub const BootstrapFinetune = bootstrap_finetune.BootstrapFinetune;
 pub const tpe_int = @import("tpe_int.zig");
 pub const bootstrap_optuna = @import("bootstrap_optuna.zig");
 pub const BootstrapFewShotWithOptuna = bootstrap_optuna.BootstrapFewShotWithOptuna;
@@ -117,4 +119,5 @@ pub const unicode = @import("unicode.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());
+    _ = @import("bootstrap_finetune_data.zig");
 }

@@ -6,7 +6,7 @@ allocators and execution context are explicit.
 
 **This is not a feature-complete or fully identical implementation of DSPy.** The
 cross-runtime gates cover the behaviors below, not every DSPy capability. In
-particular, the Python-executing RLM/Flex stack, training optimizers, images/audio,
+particular, the Python-executing RLM/Flex stack, `BetterTogether`, images/audio,
 full provider SDK coverage, and streaming are not implemented. Native File and
 bounded Responses document support are implemented, not general multimodal
 parity. See [Compatibility limits](#compatibility-limits).
@@ -115,7 +115,7 @@ retain the actual continuation and raw provider response independently.
 | Typed decisions | `Noul`, configured `Score`/`Choice`, generative evidence classes, criteria/state snapshots, native Annotated metadata, owning evidence collectors and TypeSafe SystemOne prediction; finite coverage and unsupported rows below |
 | Retrieval and embeddings | `Retrieve`, lexical `InMemoryRetriever`, HTTP `ColBERTv2` with shared mutable-graph memory caching, custom/OpenAI/Azure `Embedder`, float32 `KNN`, per-query `KNNFewShot`, and brute-force `Embeddings`/`EmbeddingsWithScores` with NumPy persistence |
 | Evaluation and few-shot search | `optimize.evaluate`, concurrent `parallel.Evaluator`, `bootstrapTraceData` with real parse-failure capture and ordered native rollouts, `LabeledFewShot`, `BootstrapFewShot`, `BootstrapFewShotWithRandomSearch`, `BootstrapFewShotWithOptuna`, teacher context, zero thresholds and positional multi-use trace selection |
-| Fine-tuning | Chat/XML `Adapter.formatFinetuneData`; bounded OpenAI HTTP training jobs with startup workers, model copying and joined cancellation; no `BootstrapFinetune` |
+| Fine-tuning | Chat/XML `Adapter.formatFinetuneData`; native `BootstrapFinetune` over bounded OpenAI HTTP jobs, startup workers, retained model names and joined failure cleanup |
 | Instruction optimization | `InferRules`; `MIPROv2`, its program-aware proposer and an Optuna 4.5.0 TPE port; `COPRO`; `SIMBA`; supported instance-frontier `GEPA` paths against gepa 0.1.4 |
 | Agents and tools | `ReAct`, comptime `Tool`, `History`, `ToolCalls`, tool results, native declarations and text tool calls, typed submit, retained history |
 | Voting | `Ensemble`, `ensemble.majority`, Unicode text normalization; exact Python numeric equality, NaN object identity and source-order fallback behavior |
@@ -1192,7 +1192,83 @@ localhost HTTP exercised upload/create/poll/events, trained-model typed Predict,
 failure, remote cancellation, poll/request bounds, cancellation and slot reuse.
 These are finite protocol/lifecycle checks, not paid training, authenticated
 model inference, SDK/error identity, all providers, training-job persistence,
-`BootstrapFinetune`, `BetterTogether`, DST/PBT or full DSPy parity.
+`BetterTogether`, DST/PBT or full DSPy parity.
+
+## Native BootstrapFinetune
+
+`BootstrapFinetune.compile(P, out, io, ctx, &student, trainset, teachers, slots,
+trace_options)` collects actual native traces, formats training rows and starts
+real `LM.finetune` jobs. It mutates the supplied student; it neither resets nor
+copies it, and an already compiled root is accepted. Predictor bindings are
+required even if `ctx.lm` supplies inference: like Source, that validation occurs
+**after** teacher trace collection.
+
+Initialize every `slots[i].job` at startup using the training API above. Supply
+explicit limits for teachers, examples, predictors, emitted training rows and
+visited trace steps. `out` holds discovery, retained traces and training JSON;
+use distinct bounded startup backing for it and attempt scratch. The optimizer
+does not own a heap or create worker threads. Without `trace_options.rollouts`,
+collection is serial; with it, collection uses that startup pool and its private
+attempt contexts. `num_threads` (default eight; zero selects eight) bounds job
+count and refuses a trace pool whose exposed worker count exceeds it.
+`parallel.Runner` exposes that startup `workers` count as well as task/attempt
+capacities.
+
+`teachers = null` uses the actual student. Explicit lists accept heterogeneous
+native programs through `bootstrap_finetune.Teacher.init(T, &teacher)`, including
+different signatures with the same predictor names and count. Explicit shared
+predictor identities are refused, including an explicit student alias.
+A `.student` list element represents Source's `None`; an empty list collects
+nothing and still prepares empty datasets for the bound student models.
+
+Groups use LM identity and, unless `multitask` is true, predictor index. Selection
+uses the **trace position**, not the traced predictor identity; formatting uses
+that step's own signature and demonstrations. With a metric, nonzero numeric
+scores survive, including negative values and NaN. Each group uses a fresh
+Python-compatible `Random(0)` shuffle. `exclude_demos` removes formatter demos
+and, after success, student demos.
+
+`adapters` and `train_kwargs` accept a `.global` value or explicit `.per_lm`
+identity entries. Missing keys in nonempty maps refuse. A null adapter uses
+`ctx.adapter`, not an LM property. As in Source, an empty adapter dictionary
+cannot infer a format; empty training kwargs use the provider's defaults.
+Chat/XML prepare chat data. JSON accepts an empty selection but its formatter
+refuses selected rows; TwoStep cannot infer a training format even when empty.
+A selected failed prediction is not an answer dictionary: Chat/XML refuse its
+missing mapping protocol when outputs are declared, rather than inventing
+answers from its diagnostic attributes.
+
+All starts precede waits. On failure, every started job is canceled and joined,
+including jobs Source abandons on its first failure. All releases are attempted;
+cleanup errors take precedence and retain IDs so those jobs cannot be reused
+unsafely. The student is rebound only after every job and cleanup succeeds.
+OpenAI's Source `kill` is a no-op; the native optimizer does not pretend to
+manage a separate local inference engine.
+
+A slot owns its retained trained-model name and copied OpenAI configuration.
+Slots must remain unmoved and alive while compiled bindings use them; reusing a
+slot explicitly invalidates its previous compiled model. Original clients,
+authentication and nested model configuration remain borrowed. Result storage
+is written only after **all** workers and cleanup have stopped reading inputs,
+so a reused slot cannot overwrite another running job's borrowed model name.
+Formatting/tracing scratch can be reclaimed after compile joins.
+
+This is native-program orchestration over the implemented OpenAI provider,
+not arbitrary Python module execution, every provider's training API, paid
+training, `BetterTogether`, or whole-runtime allocation-freedom. The bounded
+training/HTTP limitations above still apply.
+
+The native HTTP consumer exercised 23 scenarios in both Debug and ReleaseSafe,
+including parallel traces, heterogeneous and mixed student/teacher lists,
+separate/shared LM groups, negative/NaN scores, late missing-LM validation,
+adapter/config errors, thread/slot limits and joined job/start failure cleanup.
+Each mode made 183 localhost requests with 14 uploads/job creations. Complete
+training rows matched actual DSPy compile/trace output for six selected
+comparisons per mode, including all fields and shuffle order; remote group
+arrival order was not compared. Compiled typed predictions returned `42` after
+the 1 MiB compile backing was overwritten. Actual Source had 106 finite oracle
+cases; its training jobs were scripted real futures, not provider/SDK/network
+work, and those 106 cases were not all matched to native execution.
 
 ## Native parallel composition
 
@@ -1711,10 +1787,10 @@ The following prevent a claim that DSZig can do everything DSPy can:
   LocalInterpreter, InterpreterPool or complete Python execution environment.
   DSPy's RLM/Flex execute arbitrary Python and can import real DSPy inside the
   guest. A restricted expression evaluator is not an identical implementation.
-- **Other modules and optimizers:** no AvatarOptimizer, BetterTogether,
-  BootstrapFinetune. Trace bootstrapping and Chat/XML fine-tuning data formatting
-  and bounded OpenAI training jobs are implemented as described above;
-  optimizer training orchestration is not.
+- **Other modules and optimizers:** no AvatarOptimizer or BetterTogether.
+  Trace bootstrapping, Chat/XML fine-tuning data formatting, bounded OpenAI
+  training jobs and native BootstrapFinetune orchestration are implemented
+  with the provider, capacity and ownership limits described above.
   Native Parallel uses explicit typed
   tasks and contexts, not Python callback objects or ambient thread-local settings.
   Its startup capacities and cooperative join contract are described above.
