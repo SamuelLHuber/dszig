@@ -447,3 +447,87 @@ test "seeded scheduling properties match an independent completion-order error o
         try testing.expectEqual(terminal, state.terminal);
     }
 }
+
+const Scored = struct {
+    gate: *std.Io.Event,
+    io: std.Io,
+    pub const Input = struct { name: []const u8, wait: bool };
+    pub const Output = struct { label: []const u8 };
+
+    pub fn forward(self: *const Scored, ctx: dszig.Context, input: Input) !Output {
+        if (std.mem.eql(u8, input.name, "program_fail")) return error.LMFailure;
+        // Exhausts the attempt's fixed scratch backing.
+        if (std.mem.eql(u8, input.name, "oom")) _ = try ctx.arena.alloc(u8, 4096);
+        if (input.wait) try self.gate.waitTimeout(self.io, .{ .duration = .{
+            .raw = .fromSeconds(5),
+            .clock = .awake,
+        } });
+        const label = try std.fmt.allocPrint(ctx.arena, "label-{s}", .{input.name});
+        if (std.mem.eql(u8, input.name, "last")) self.gate.set(self.io);
+        return .{ .label = label };
+    }
+
+    fn metric(_: std.mem.Allocator, example: *const dszig.Example, prediction: ?*const dszig.value.Record, _: ?*const dszig.Trace) dszig.value.ParseError!f64 {
+        const name = example.record.get("name").?.string;
+        const label = prediction.?.get("label").?.string;
+        if (!std.mem.eql(u8, label["label-".len..], name)) return error.ParseValue;
+        return example.record.get("score").?.float;
+    }
+};
+
+test "parallel Evaluate sums out-of-order completions in devset order like serial Evaluate" {
+    const Evaluator = parallel.Evaluator(Scored, .{ .workers = 2, .tasks = 4, .attempts = 4, .failures = 1 });
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var unused: dszig.lm.ScriptedLM = .{ .responses = &.{} };
+    const contexts: [4]dszig.Context = @splat(.{ .arena = arena, .lm = unused.lm() });
+    var buffers: [4][256]u8 = undefined;
+    const backing = [_][]u8{ &buffers[0], &buffers[1], &buffers[2], &buffers[3] };
+    var evaluator: Evaluator = undefined;
+    try evaluator.init(testing.io, .{}, &backing);
+    defer evaluator.deinit();
+
+    // The first example finishes last; float addition order changes the sum.
+    const keys: []const []const u8 = &.{ "name", "wait" };
+    const devset = [_]dszig.Example{
+        try dszig.Example.fromJson(arena, "{\"name\":\"first\",\"wait\":true,\"score\":1e16}", keys),
+        try dszig.Example.fromJson(arena, "{\"name\":\"second\",\"wait\":false,\"score\":1.0}", keys),
+        try dszig.Example.fromJson(arena, "{\"name\":\"third\",\"wait\":false,\"score\":-1e16}", keys),
+        try dszig.Example.fromJson(arena, "{\"name\":\"last\",\"wait\":false,\"score\":1.0}", keys),
+    };
+    const options: parallel.Options = .{ .straggler_timeout_ns = 0 };
+    var gate: std.Io.Event = .unset;
+    const program: Scored = .{ .gate = &gate, .io = testing.io };
+    const concurrent = try evaluator.evaluate(&contexts, &program, &devset, Scored.metric, options);
+    gate.set(testing.io);
+    const serial = try dszig.optimize.evaluate(Scored, testing.allocator, contexts[0], &program, &devset, Scored.metric, 10);
+    try testing.expectEqual(@as(u64, @bitCast(serial.sum)), @as(u64, @bitCast(concurrent.sum)));
+    try testing.expectEqual(@as(f64, 1), concurrent.sum);
+    try testing.expectEqual(serial.score, concurrent.score);
+    try testing.expectEqual(@as(usize, 0), concurrent.errors);
+
+    var failing = devset;
+    failing[0] = try dszig.Example.fromJson(arena, "{\"name\":\"program_fail\",\"wait\":false,\"score\":1.0}", keys);
+    failing[2] = try dszig.Example.fromJson(arena, "{\"name\":\"third\",\"wait\":false,\"score\":2.0}", keys);
+    const recovered = try evaluator.evaluate(&contexts, &program, &failing, Scored.metric, options);
+    try testing.expectEqual(@as(f64, 4), recovered.sum);
+    try testing.expectEqual(@as(f64, 100), recovered.score);
+    try testing.expectEqual(@as(usize, 1), recovered.errors);
+    try testing.expectError(error.ExecutionCanceled, evaluator.evaluate(&contexts, &program, &failing, Scored.metric, .{
+        .max_errors = 1,
+        .straggler_timeout_ns = 0,
+    }));
+
+    failing[0] = try dszig.Example.fromJson(arena, "{\"name\":\"oom\",\"wait\":false,\"score\":1.0}", keys);
+    try testing.expectError(error.OutOfMemory, evaluator.evaluate(&contexts, &program, &failing, Scored.metric, .{
+        .max_errors = 100,
+        .straggler_timeout_ns = 0,
+    }));
+    // Reuse after an aborted run; each attempt's scratch was reset.
+    gate = .unset;
+    const reused = try evaluator.evaluate(&contexts, &program, &devset, Scored.metric, options);
+    try testing.expectEqual(@as(f64, 1), reused.sum);
+    const overflow = [_]dszig.Example{ devset[1], devset[1], devset[1], devset[1], devset[1] };
+    try testing.expectError(error.TaskCapacity, evaluator.evaluate(&contexts, &program, &overflow, Scored.metric, options));
+}
