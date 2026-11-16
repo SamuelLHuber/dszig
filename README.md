@@ -992,6 +992,54 @@ and ReleaseSafe, including the explicit unsupported-row failure. The pinned
 344-test/28-step Debug and ReleaseSafe gates, actual RAG/bootstrap, 687-request
 replay and independent Python fixture/artifact/reference gate also passed.
 
+## Native seeded evaluation campaigns
+
+The native simulation harness executes real `dszig.optimize.evaluate` calls with
+a typed arithmetic program and metric, without Python, a network or an API key.
+Generated cases vary row values, scores, program/metric failures and error
+budgets. An independent oracle checks the outcome, program-call count,
+ties-to-even percentage rounding, unchanged dataset/input roles, scratch
+reclamation and absence of unexpected LM calls.
+
+Run these commands from the repository root with the pinned development tools:
+
+```sh
+# Four fixed seeds, 512 cases each, plus rounding/error boundaries,
+# wrong-answer detection and shrinking regression tests:
+devenv shell -- zig build simulation-test
+
+# A reproducible generated campaign (default: 10,000 cases):
+devenv shell -- zig build simulate -- --seed 0x1234 --cases 512
+
+# Enter the shell BEFORE redirecting: its startup banner is not replay JSON.
+devenv shell
+
+# Deliberately corrupt actual program answers to prove detection and shrinking.
+# EXPECTED NONZERO EXIT: stdout contains only the concrete failing Replay JSON;
+# stderr contains the negative-control label, violation and seed/index details.
+zig build simulate -- --wrong-answer --seed 0x1234 --cases 512 > replay.json
+
+# Reexecute that concrete counterexample, in the same negative-control mode.
+# EXPECTED NONZERO EXIT again, reporting the score violation:
+zig build simulate -- --replay replay.json --wrong-answer
+```
+
+Normal campaigns report seed, replay version and case count when no violation
+is found. `--seed` accepts a `u64` with base prefixes; `--cases` is bounded to
+1–1,000,000. On the first violation, the driver shrinks the case while retaining
+the same violation, with at most 4,096 shrink attempts, and emits a versioned
+concrete replay rather than seed-only evidence. Preserve that JSON for failures
+in normal mode too, and replay it without `--wrong-answer`. Replay inputs are
+limited to 16 KiB and must have a supported version and valid scenario.
+`--replay` cannot be combined with explicit `--seed` or `--cases`.
+
+This is a **seeded sequential evaluation campaign**, not full optimizer
+coverage, concurrent deterministic simulation testing, a static-allocation
+proof or additional DSPy parity evidence. The harness initializes fixed
+execution backing and reuses example storage, but the current evaluation core
+still makes allocator calls against that backing. The wrong-answer switch is
+an explicit test-only negative control, not a production-runtime modification.
+
 ## Cross-runtime verification
 
 ```sh
