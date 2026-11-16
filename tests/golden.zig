@@ -449,6 +449,72 @@ test "SIMBA program, scores and every request match DSPy" {
     try testing.expectEqualStrings(want.object.get("artifact").?.string, try dszig.state.saveAlloc(arena, &result.program));
 }
 
+test "SIMBA with concurrent rollouts makes DSPy's requests and selects DSPy's program" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    // ArenaAllocator over the thread-safe testing allocator is thread-safe.
+    const arena = arena_state.allocator();
+    const limits: dszig.parallel.Limits = .{ .workers = 4, .tasks = 16, .attempts = 16, .failures = 1 };
+    var mocks: [limits.attempts + 1]SimbaMock = @splat(.{ .arena = arena });
+    const train = try live_suite.dateExamples(arena, .train);
+    const dev = try live_suite.dateExamples(arena, .dev);
+    for (&mocks) |*mock| for ([_][]const dszig.Example{ train, dev }) |set| {
+        for (set) |ex| try mock.golds.put(arena, ex.record.get("question").?.string, ex.record.get("answer").?.string);
+    };
+    var contexts: [limits.attempts]dszig.Context = undefined;
+    for (&contexts, mocks[1..]) |*context, *mock| context.* = .{ .arena = arena, .lm = mock.lm() };
+    const Pool = dszig.Parallel(dszig.SIMBA.Run, limits);
+    const pool = try testing.allocator.create(Pool);
+    defer testing.allocator.destroy(pool);
+    try pool.init(testing.io, .{});
+    defer pool.deinit();
+    const ctx: dszig.Context = .{ .arena = arena, .lm = mocks[0].lm(), .lm_options = .{ .temperature = 0.0 } };
+    const simba: dszig.SIMBA = .{
+        .metric = live_suite.exactMetric,
+        .bsize = 4,
+        .num_candidates = 3,
+        .max_steps = 3,
+        .max_demos = 2,
+        .rollouts = .{ .runner = pool.runner(), .contexts = &contexts },
+    };
+    const result = try simba.compile(live_suite.DateQA, arena, ctx, .{}, train, .{ .program_code = live_suite.dates_class_source });
+
+    const want = try std.json.parseFromSliceLeaky(Value, arena, simba_case, .{});
+    // Completion order is concurrent; the multiset of requests must match.
+    try expectSameCalls(SimbaMock, arena, want.object.get("calls").?.array.items, &mocks);
+    const scores = want.object.get("scores").?.array.items;
+    try testing.expectEqual(scores.len, result.scores.len);
+    for (scores, result.scores) |w, got| try testing.expectEqual(w.float, got);
+    const train_scores = want.object.get("train_scores").?.array.items;
+    for (train_scores, result.train_scores[0..train_scores.len]) |w, got| {
+        if (w == .null) try testing.expect(got == null) else try testing.expectEqual(w.float, got.?);
+    }
+    try testing.expectEqualStrings(want.object.get("artifact").?.string, try dszig.state.saveAlloc(arena, &result.program));
+}
+
+/// Compare DSPy's request log with the union of every mock's log, ignoring
+/// the interleaving produced by concurrent completion.
+fn expectSameCalls(comptime Mock: type, arena: Allocator, calls: []const Value, mocks: []const Mock) !void {
+    var expected: std.ArrayList([]const u8) = .empty;
+    for (calls) |w| {
+        const items = w.array.items;
+        try expected.append(arena, try std.fmt.allocPrint(arena, "{s} {d} {s}", .{ try compact(arena, items[0]), items[1].float, items[2].string }));
+    }
+    var actual: std.ArrayList([]const u8) = .empty;
+    for (mocks) |*mock| for (mock.calls.items) |got| {
+        try actual.append(arena, try std.fmt.allocPrint(arena, "{s} {d} {s}", .{ try compact(arena, got.rollout orelse .null), got.temperature.?, &got.digest }));
+    };
+    const lessThan = struct {
+        fn f(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.f;
+    std.sort.pdq([]const u8, expected.items, {}, lessThan);
+    std.sort.pdq([]const u8, actual.items, {}, lessThan);
+    try testing.expectEqual(expected.items.len, actual.items.len);
+    for (expected.items, actual.items) |w, got| try testing.expectEqualStrings(w, got);
+}
+
 const Address = struct { city: []const u8, zip_code: i64 };
 
 const Person = struct {
@@ -750,35 +816,56 @@ const TwoStep = struct {
 };
 
 test "GEPA candidates, scores and every request match DSPy" {
-    try checkGepa(live_suite.DateQA, gepa_case, 150);
+    try checkGepa(live_suite.DateQA, gepa_case, 150, false);
 }
 
 test "GEPA merge on a two-predictor program matches DSPy" {
-    try checkGepa(TwoStep, gepa_merge_case, 400);
+    try checkGepa(TwoStep, gepa_merge_case, 400, false);
 }
 
-fn checkGepa(comptime P: type, case: []const u8, budget: usize) !void {
+test "GEPA with concurrent rollouts makes DSPy's requests and selects DSPy's candidates" {
+    try checkGepa(live_suite.DateQA, gepa_case, 150, true);
+    try checkGepa(TwoStep, gepa_merge_case, 400, true);
+}
+
+fn checkGepa(comptime P: type, case: []const u8, budget: usize, concurrent: bool) !void {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
+    // ArenaAllocator over the thread-safe testing allocator is thread-safe.
     const arena = arena_state.allocator();
-    var mock: GepaMock = .{ .arena = arena };
+    const limits: dszig.parallel.Limits = .{ .workers = 4, .tasks = 8, .attempts = 8, .failures = 1 };
+    // mocks[0] serves the reflection LM and serial runs; the rest serve attempts.
+    var mocks: [limits.attempts + 1]GepaMock = @splat(.{ .arena = arena });
     const train = try live_suite.dateExamples(arena, .train);
     const dev = try live_suite.dateExamples(arena, .dev);
-    for ([_][]const dszig.Example{ train, dev }) |set| {
+    for (&mocks) |*mock| for ([_][]const dszig.Example{ train, dev }) |set| {
         for (set) |ex| try mock.golds.put(arena, ex.record.get("question").?.string, ex.record.get("answer").?.string);
-    }
-    const ctx: dszig.Context = .{ .arena = arena, .lm = mock.lm(), .lm_options = .{ .temperature = 0.0 } };
-    const gepa: dszig.GEPA = .{ .metric = gepaMetric, .max_metric_calls = budget };
+    };
+    var contexts: [limits.attempts]dszig.Context = undefined;
+    for (&contexts, mocks[1..]) |*context, *mock| context.* = .{ .arena = arena, .lm = mock.lm() };
+    const Pool = dszig.Parallel(dszig.GEPA.Run, limits);
+    const pool = try testing.allocator.create(Pool);
+    defer testing.allocator.destroy(pool);
+    try pool.init(testing.io, .{});
+    defer pool.deinit();
+    const ctx: dszig.Context = .{ .arena = arena, .lm = mocks[0].lm(), .lm_options = .{ .temperature = 0.0 } };
+    var gepa: dszig.GEPA = .{ .metric = gepaMetric, .max_metric_calls = budget };
+    if (concurrent) gepa.rollouts = .{ .runner = pool.runner(), .contexts = &contexts };
     const result = try gepa.compile(P, arena, ctx, .{}, train, .{ .valset = dev });
 
     const want = try std.json.parseFromSliceLeaky(Value, arena, case, .{});
     const calls = want.object.get("calls").?.array.items;
-    try testing.expectEqual(calls.len, mock.calls.items.len);
-    for (calls, mock.calls.items) |w, got| {
-        const items = w.array.items;
-        try testing.expectEqualStrings(try compact(arena, items[0]), try compact(arena, got.rollout orelse .null));
-        try testing.expectEqual(items[1].float, got.temperature.?);
-        try testing.expectEqualStrings(items[2].string, &got.digest);
+    if (concurrent) {
+        // Completion order is concurrent; the multiset of requests must match.
+        try expectSameCalls(GepaMock, arena, calls, &mocks);
+    } else {
+        try testing.expectEqual(calls.len, mocks[0].calls.items.len);
+        for (calls, mocks[0].calls.items) |w, got| {
+            const items = w.array.items;
+            try testing.expectEqualStrings(try compact(arena, items[0]), try compact(arena, got.rollout orelse .null));
+            try testing.expectEqual(items[1].float, got.temperature.?);
+            try testing.expectEqualStrings(items[2].string, &got.digest);
+        }
     }
     const candidates = want.object.get("candidates").?.array.items;
     try testing.expectEqual(candidates.len, result.candidates.len);

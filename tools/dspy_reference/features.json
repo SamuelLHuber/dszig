@@ -389,7 +389,7 @@
    "dszig": [
     "gepa.zig"
    ],
-   "checks": "gepa.json, gepa_merge.json, suite replay",
+   "checks": "gepa.json, gepa_merge.json (serial and native-pool rollouts), suite replay",
    "bench": [
     "dates_gepa"
    ],
@@ -902,7 +902,7 @@
     "simba.zig",
     "nprandom.zig"
    ],
-   "checks": "simba.json, suite replay train scores",
+   "checks": "simba.json (serial and native-pool rollouts), suite replay train scores",
    "bench": [
     "dates_simba"
    ],

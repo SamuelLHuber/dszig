@@ -1126,7 +1126,7 @@ Regenerate this table with
 | `dspy.File` (`adapters/types/file.py`) | native | `file.zig` | file_oracle.py | – |
 | `dspy.FinalOutput` (`primitives/code_interpreter.py`) | missing | – | – | – |
 | `dspy.Flex` (`predict/flex/flex.py`) | missing | – | – | – |
-| `dspy.GEPA` (`teleprompt/gepa/gepa.py`) | partial | `gepa.zig` | gepa.json, gepa_merge.json, suite replay | dates_gepa: 264 ms → 1.64 ms |
+| `dspy.GEPA` (`teleprompt/gepa/gepa.py`) | partial | `gepa.zig` | gepa.json, gepa_merge.json (serial and native-pool rollouts), suite replay | dates_gepa: 264 ms → 1.64 ms |
 | `dspy.History` (`adapters/types/history.py`) | native | `history.zig` | react.json | – |
 | `dspy.Image` (`adapters/types/image.py`) | missing | – | – | – |
 | `dspy.InferRules` (`teleprompt/infer_rules.py`) | native | `infer_rules.zig` | infer_rules_oracle.py | – |
@@ -1173,7 +1173,7 @@ Regenerate this table with
 | `dspy.Reasoning` (`adapters/types/reasoning.py`) | native | `reasoning.zig` | reasoning_identity_oracle.py | – |
 | `dspy.Refine` (`predict/refine.py`) | native | `refine.zig` | refine_oracle.py | – |
 | `dspy.Retrieve` (`retrievers/retrieve.py`) | native | `predict.zig` | bootstrap_rag.json, suite replay | rag: 52 ms → 0.24 ms |
-| `dspy.SIMBA` (`teleprompt/simba.py`) | native | `simba.zig`, `nprandom.zig` | simba.json, suite replay train scores | dates_simba: 282 ms → 2.10 ms |
+| `dspy.SIMBA` (`teleprompt/simba.py`) | native | `simba.zig`, `nprandom.zig` | simba.json (serial and native-pool rollouts), suite replay train scores | dates_simba: 282 ms → 2.10 ms |
 | `dspy.SandboxSerializable` (`primitives/sandbox_serializable.py`) | missing | – | – | – |
 | `dspy.Signature` (`signatures/signature.py`) | partial | `signature.zig` | compile-fail cases, format_cases.json, nested.json | – |
 | `dspy.SignatureMeta` (`signatures/signature.py`) | partial | `signature.zig` | comptime signatures | – |
@@ -1306,8 +1306,19 @@ candidates through it, each call using the optimizer's own `max_errors`; a
 program-type mismatch returns `error.ProgramTypeMismatch`, and null keeps serial
 `optimize.evaluate`. Candidate evaluation is sequential between candidates, as in
 DSPy; only examples within one evaluation run concurrently. `BootstrapFewShot`
-has no DSPy thread option and stays serial; SIMBA and GEPA batch rollouts remain
-serial.
+has no DSPy thread option and stays serial.
+
+SIMBA's `num_threads` is `rollouts`: a `Parallel(SIMBA.Run, limits).runner()` and
+per-attempt contexts supplying LM and retriever pointees. Trajectory sampling,
+candidate scoring and final trainset scoring then run on the pool in submission
+order, with every random draw made beforehand, as DSPy does. Because SIMBA
+retains predictions and traces, they are allocated from `out`, which must then be
+thread-safe (an `ArenaAllocator` over a thread-safe child is); a configured
+teacher LM is shared and must be thread-safe. GEPA's `rollouts` field
+(`Parallel(GEPA.Run, limits)`) runs each minibatch and valset evaluation the
+same way, under the same `out` requirement. Golden tests check that concurrent
+SIMBA and GEPA (including merge) issue DSPy's exact multiset of requests and
+select DSPy's programs and scores.
 
 ## Native seeded evaluation campaigns
 
@@ -1596,8 +1607,7 @@ The following prevent a claim that DSZig can do everything DSPy can:
   BootstrapFinetune or bootstrap_trace_data. Native Parallel uses explicit typed
   tasks and contexts, not Python callback objects or ambient thread-local settings.
   Its startup capacities and cooperative join contract are described above.
-- **Optimizer execution and shared identity:** SIMBA and GEPA batch rollouts
-  run serially. InferRules' signature-alias propagation does not update arbitrary external
+- **Optimizer execution and shared identity:** InferRules' signature-alias propagation does not update arbitrary external
   instances outside the reachable program graph. Canonical Zig signature/Code
   types and default CoT construction do not reproduce every fresh dynamic Python
   class identity; Refine shares this boundary. Mid-bootstrap mutation of a
