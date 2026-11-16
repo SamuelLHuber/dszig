@@ -43,7 +43,7 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit, DSPy golden, behaviour and compile-fail tests");
     test_step.dependOn(&run_unit_tests.step);
-    for ([_][]const u8{ "tests/golden.zig", "tests/behavior.zig", "tests/live_replay.zig", "tests/optuna.zig", "tests/trace_selection.zig", "tests/simulation.zig" }) |path| {
+    for ([_][]const u8{ "tests/golden.zig", "tests/behavior.zig", "tests/live_replay.zig", "tests/optuna.zig", "tests/trace_selection.zig", "tests/simulation.zig", "tests/parallel.zig" }) |path| {
         const t = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path(path),
             .target = target,
@@ -61,7 +61,7 @@ pub fn build(b: *std.Build) void {
     addCompileFailTests(b, test_step);
 
     const examples_step = b.step("examples", "Build and run the examples");
-    for ([_][]const u8{ "rag", "bootstrap" }) |name| {
+    for ([_][]const u8{ "rag", "bootstrap", "parallel" }) |name| {
         const exe = b.addExecutable(.{ .name = name, .root_module = b.createModule(.{
             .root_source_file = b.path(b.fmt("examples/{s}.zig", .{name})),
             .target = target,

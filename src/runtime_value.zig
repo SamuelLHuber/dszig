@@ -102,10 +102,21 @@ pub const CustomVTable = struct {
 /// Native objects use their class's clone/free protocol. Model boxes are owned;
 /// immutable class-owned singletons may retain their static box across clones.
 /// owns_data describes whether ordinary model fields need deep destruction.
+/// A borrowed handle owns neither its box nor the fields behind that box.
 pub const Custom = struct {
     ptr: *const anyopaque,
     vtable: *const CustomVTable,
     owns_data: bool = false,
+    owns_box: bool = true,
+
+    /// The source box and its fields must outlive every use of this handle.
+    /// Clone still invokes the original class protocol and returns owned storage.
+    pub fn borrowed(self: Custom) Custom {
+        var result = self;
+        result.owns_data = false;
+        result.owns_box = false;
+        return result;
+    }
 
     pub fn get(self: Custom, comptime T: type) ?*const T {
         if (self.vtable.type_identity != typeIdentity(T)) return null;
@@ -161,11 +172,16 @@ pub const Custom = struct {
     pub fn clone(self: Custom, allocator: Allocator) Allocator.Error!Custom {
         const result = try self.vtable.clone(allocator, self.ptr);
         std.debug.assert(result.owns_data);
+        std.debug.assert(result.owns_box);
         std.debug.assert(self.sameType(result));
         return result;
     }
 
     pub fn deinit(self: Custom, allocator: Allocator) void {
+        if (!self.owns_box) {
+            std.debug.assert(!self.owns_data);
+            return;
+        }
         self.vtable.deinit(allocator, self.ptr, self.owns_data);
     }
 

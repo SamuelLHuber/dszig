@@ -54,6 +54,15 @@ pub const Reasoning = struct {
         return .{ .custom = .{ .ptr = boxed, .vtable = &runtime_vtable } };
     }
 
+    /// The caller retains both the typed slot and its borrowed content.
+    pub fn borrowedRuntime(self: *const Reasoning) Value {
+        return .{ .custom = .{
+            .ptr = self,
+            .vtable = &runtime_vtable,
+            .owns_box = false,
+        } };
+    }
+
     pub fn writeRepr(self: Reasoning, writer: *Writer) Writer.Error!void {
         try pyjson.writeReprString(writer, self.content);
     }

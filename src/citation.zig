@@ -202,9 +202,13 @@ pub const Citations = struct {
 
         /// A child stored inside Citations already has stable storage. Borrow
         /// that storage without allocating a second box; its deinit is a no-op.
-        fn borrowedRuntime(self: *const Citation) Value {
-            if (self.runtime_origin) |origin| return .{ .custom = origin };
-            return .{ .custom = .{ .ptr = self, .vtable = &borrowed_vtable } };
+        pub fn borrowedRuntime(self: *const Citation) Value {
+            if (self.runtime_origin) |origin| return .{ .custom = origin.borrowed() };
+            return .{ .custom = .{
+                .ptr = self,
+                .vtable = &Citation.runtime_vtable,
+                .owns_box = false,
+            } };
         }
 
         pub const Field = struct { name: []const u8, value: Value };
@@ -340,11 +344,6 @@ pub const Citations = struct {
             .deinit = Citation.deinitRuntime,
             .eql = Citation.equalRuntime,
         };
-        const borrowed_vtable: runtime.CustomVTable = blk: {
-            var table = Citation.runtime_vtable;
-            table.deinit = deinitBorrowed;
-            break :blk table;
-        };
 
         fn actual(ptr: *const anyopaque) *const Citation {
             return @ptrCast(@alignCast(ptr));
@@ -394,7 +393,6 @@ pub const Citations = struct {
             if (owns_data) Citation.actual(ptr).deinit(allocator);
             allocator.destroy(Citation.actual(ptr));
         }
-        fn deinitBorrowed(_: Allocator, _: *const anyopaque, _: bool) void {}
         fn equalRuntime(left: *const anyopaque, right: *const anyopaque) runtime.CustomError!bool {
             return left == right or try Citation.actual(left).eql(Citation.actual(right).*);
         }
@@ -564,6 +562,16 @@ pub const Citations = struct {
         const boxed = try arena.create(Citations);
         boxed.* = self;
         return .{ .custom = .{ .ptr = boxed, .vtable = &runtime_vtable } };
+    }
+
+    /// Borrow stable collection storage without creating an outer model box.
+    pub fn borrowedRuntime(self: *const Citations) Value {
+        if (self.runtime_origin) |origin| return .{ .custom = origin.borrowed() };
+        return .{ .custom = .{
+            .ptr = self,
+            .vtable = &runtime_vtable,
+            .owns_box = false,
+        } };
     }
 
     /// Raw round-trip fields, not the string produced by format().

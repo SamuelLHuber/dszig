@@ -802,40 +802,74 @@ fn checkGepa(comptime P: type, case: []const u8, budget: usize) !void {
     try testing.expectEqualStrings(want.object.get("artifact").?.string, try dszig.state.saveAlloc(arena, &result.program));
 }
 
-fn squareOrFail(fail_mod: usize, index: usize, item: *const usize) anyerror!usize {
-    std.debug.assert(index == item.*);
-    if (item.* % fail_mod == fail_mod - 1) return error.ItemFailed;
-    return item.* * item.*;
+const SquareTask = struct {
+    item: u32,
+    fail_mod: u32,
+
+    fn invoke(ptr: *anyopaque, attempt: dszig.parallel.Attempt, output: *u64) anyerror!void {
+        const self: *const SquareTask = @ptrCast(@alignCast(ptr));
+        std.debug.assert(attempt.task_index == self.item);
+        if (self.item % self.fail_mod == self.fail_mod - 1) return error.ItemFailed;
+        output.* = @as(u64, self.item) * self.item;
+    }
+};
+
+fn checkParallelCase(comptime Pool: type, pool: *Pool, case: Value, frames: []SquareTask, tasks: []Pool.Task) !void {
+    const n: u32 = @intCast(case.object.get("n").?.integer);
+    const fail_mod: u32 = @intCast(case.object.get("fail_mod").?.integer);
+    for (frames[0..n], tasks[0..n], 0..) |*frame, *task, i| {
+        frame.* = .{ .item = @intCast(i), .fail_mod = fail_mod };
+        task.* = .{ .ptr = frame, .invoke = SquareTask.invoke };
+    }
+    const options: dszig.parallel.Options = .{
+        .max_errors = @intCast(case.object.get("max_errors").?.integer),
+        .straggler_timeout_ns = 0,
+    };
+    const report = pool.forward(tasks[0..n], options) catch |err| {
+        try testing.expectEqual(error.ExecutionCanceled, err);
+        try testing.expect(case.object.get("cancelled").?.bool);
+        return;
+    };
+    try testing.expect(!case.object.get("cancelled").?.bool);
+    const expected_failed = case.object.get("failed").?.array.items;
+    var failed: usize = 0;
+    for (report.results, 0..) |slot, i| switch (slot) {
+        .failed => {
+            try testing.expect(failed < expected_failed.len);
+            try testing.expectEqual(@as(usize, @intCast(expected_failed[failed].integer)), i);
+            failed += 1;
+        },
+        .value => |got| {
+            const want = case.object.get("results").?.array.items[i];
+            try testing.expectEqual(@as(u64, @intCast(want.integer)), got.*);
+        },
+    };
+    try testing.expectEqual(expected_failed.len, failed);
 }
 
-test "ParallelExecutor matches DSPy 3.5.0 ordering, failures and max_errors cancellation" {
+test "native Parallel matches DSPy 3.5.0 ParallelExecutor ordering, failures and max_errors cancellation" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const data = try std.json.parseFromSliceLeaky(Value, arena, parallel_cases, .{});
+    const limits = .{ .tasks = 64, .attempts = 64, .failures = 64 };
+    const Serial = dszig.Parallel(u64, .{ .workers = 1, .tasks = limits.tasks, .attempts = limits.attempts, .failures = limits.failures });
+    const Threaded = dszig.Parallel(u64, .{ .workers = 8, .tasks = limits.tasks, .attempts = limits.attempts, .failures = limits.failures });
+    var serial: Serial = undefined;
+    try serial.init(testing.io, .{});
+    defer serial.deinit();
+    var threaded: Threaded = undefined;
+    try threaded.init(testing.io, .{});
+    defer threaded.deinit();
+    var frames: [limits.tasks]SquareTask = undefined;
+    var serial_tasks: [limits.tasks]Serial.Task = undefined;
+    var threaded_tasks: [limits.tasks]Threaded.Task = undefined;
     for (data.object.get("cases").?.array.items) |case| {
-        const n: usize = @intCast(case.object.get("n").?.integer);
-        const items = try arena.alloc(usize, n);
-        for (items, 0..) |*item, i| item.* = i;
-        const outcomes = try arena.alloc(dszig.parallel.Outcome(usize), n);
-        const options: dszig.parallel.Options = .{
-            .num_threads = @intCast(case.object.get("threads").?.integer),
-            .max_errors = @intCast(case.object.get("max_errors").?.integer),
-        };
-        const fail_mod: usize = @intCast(case.object.get("fail_mod").?.integer);
-        const result = dszig.parallel.execute(usize, usize, testing.io, options, fail_mod, squareOrFail, items, outcomes);
-        try testing.expectEqual(case.object.get("cancelled").?.bool, result == error.ExecutionCancelled);
-        var failed: std.ArrayList(usize) = .empty;
-        for (outcomes, 0..) |outcome, i| if (outcome == .failed) try failed.append(arena, i);
-        const expected_failed = case.object.get("failed").?.array.items;
-        try testing.expectEqual(expected_failed.len, failed.items.len);
-        for (expected_failed, failed.items) |want, got| try testing.expectEqual(@as(usize, @intCast(want.integer)), got);
-        if (case.object.get("results").? == .array) {
-            for (case.object.get("results").?.array.items, outcomes) |want, got| switch (want) {
-                .null => try testing.expect(got == .failed),
-                .integer => |v| try testing.expectEqual(@as(usize, @intCast(v)), got.ok),
-                else => unreachable,
-            };
-        }
+        // DSPy's sequential path pins cancellation order; threaded cases are
+        // generated with outcomes that do not depend on scheduling.
+        if (case.object.get("threads").?.integer == 1)
+            try checkParallelCase(Serial, &serial, case, &frames, &serial_tasks)
+        else
+            try checkParallelCase(Threaded, &threaded, case, &frames, &threaded_tasks);
     }
 }

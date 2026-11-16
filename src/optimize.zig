@@ -70,6 +70,11 @@ pub fn evaluate(
     max_errors: usize,
 ) !Evaluation {
     assert(devset.len > 0);
+    // Static outer storage survives each scratch reset without consuming the
+    // per-example backing budget. Retained optimizer runs use runProgram.
+    var storage: value.RecordStorage(@typeInfo(P.Output).@"struct".field_names.len) = undefined;
+    try storage.init();
+    var output: P.Output = undefined;
     var sum: f64 = 0;
     var errors: usize = 0;
     for (devset) |*example| {
@@ -78,8 +83,8 @@ pub fn evaluate(
         var c = ctx;
         c.arena = scratch.allocator();
         c.trace = null;
-        const score: anyerror!f64 = if (runProgram(P, c, program, example)) |prediction|
-            metric(c.arena, example, &prediction, null)
+        const score: anyerror!f64 = if (runProgramInto(P, c, program, example, &output, &storage.record))
+            metric(c.arena, example, &storage.record, null)
         else |err|
             err;
         sum += score catch |err| {
@@ -114,11 +119,44 @@ fn roundScore(score: f64) f64 {
     return if (negative) -rounded else rounded;
 }
 
+/// Materialize a prediction that can be retained for ctx.arena's lifetime.
 pub fn runProgram(comptime P: type, ctx: Context, program: *const P, example: *const Example) !Record {
-    const inputs = try example.inputs(ctx.arena);
-    const input = try value.fromRecord(ctx.arena, P.Input, &inputs);
-    const output = try program.forward(ctx, input);
-    return value.toRecord(ctx.arena, P.Output, output);
+    return value.toRecord(ctx.arena, P.Output, try forwardProgram(P, ctx, program, example));
+}
+
+/// Execute into caller-provisioned outer storage. Values borrow program output
+/// or ctx.arena until its reset; callers must copy any result they retain across
+/// reuse. Input/program failure also clears stale predictions.
+/// output must remain alive and unmoved until prediction is discarded or reused.
+pub fn runProgramInto(
+    comptime P: type,
+    ctx: Context,
+    program: *const P,
+    example: *const Example,
+    output: *P.Output,
+    prediction: *Record,
+) !void {
+    assert(prediction.capacity() >= @typeInfo(P.Output).@"struct".field_names.len);
+    output.* = forwardProgram(P, ctx, program, example) catch |err| {
+        prediction.clearRetainingCapacity();
+        return err;
+    };
+    try value.toRecordInto(ctx.arena, P.Output, output, prediction);
+}
+
+/// Execute a typed program directly from borrowed Example input roles, without
+/// materializing either an input dictionary or an outer prediction dictionary.
+pub fn forwardProgram(comptime P: type, ctx: Context, program: *const P, example: *const Example) !P.Output {
+    // Decode only declared input roles, directly from borrowed training storage.
+    // Interleave role checks and conversion to preserve declaration-order failures.
+    var input: P.Input = undefined;
+    const fields = @typeInfo(P.Input).@"struct";
+    inline for (fields.field_names, fields.field_types) |name, T| {
+        if (!example.isInput(name)) return error.MissingField;
+        const item = example.record.get(name) orelse return error.MissingField;
+        @field(input, name) = try value.fromValue(ctx.arena, T, item);
+    }
+    return program.forward(ctx, input);
 }
 
 /// `rng.sample(population, k)` over records.
@@ -226,13 +264,16 @@ pub const BootstrapFewShot = struct {
         var n_bootstrapped: usize = 0;
         var attempts: usize = 0;
         var errors: usize = 0;
+        var storage: value.RecordStorage(@typeInfo(P.Output).@"struct".field_names.len) = undefined;
+        try storage.init();
+        var output: P.Output = undefined;
 
         for (trainset, 0..) |*example, example_idx| {
             if (n_bootstrapped >= self.max_bootstrapped_demos) break;
             var round_idx: usize = 0;
             while (round_idx < self.max_rounds) : (round_idx += 1) {
                 attempts += 1;
-                const ok = try self.bootstrapOne(P, out, gpa, ctx, &teacher, teacher_preds, example, round_idx, name2traces, &errors);
+                const ok = try self.bootstrapOne(P, out, gpa, ctx, &teacher, teacher_preds, example, round_idx, name2traces, &errors, &output, &storage.record);
                 if (ok) {
                     bootstrapped[example_idx] = true;
                     n_bootstrapped += 1;
@@ -277,6 +318,8 @@ pub const BootstrapFewShot = struct {
         round_idx: usize,
         name2traces: []std.ArrayList(Record),
         errors: *usize,
+        output: *P.Output,
+        prediction: *Record,
     ) !bool {
         var scratch: std.heap.ArenaAllocator = .init(gpa);
         defer scratch.deinit();
@@ -304,11 +347,11 @@ pub const BootstrapFewShot = struct {
                 }
                 p.param.predict.demos = kept.items;
             }
-            break :blk runProgram(P, c, teacher, example);
+            break :blk runProgramInto(P, c, teacher, example, output, prediction);
         };
-        const success: anyerror!bool = if (run) |prediction| metric_result: {
+        const success: anyerror!bool = if (run) metric_result: {
             if (self.metric) |metric| {
-                const score = metric(arena, example, &prediction, &trace) catch |err| break :metric_result err;
+                const score = metric(arena, example, prediction, &trace) catch |err| break :metric_result err;
                 break :metric_result if (self.metric_threshold) |threshold| score >= threshold else score != 0;
             }
             break :metric_result true;

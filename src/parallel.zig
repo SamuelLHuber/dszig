@@ -1,107 +1,276 @@
-//! Native ParallelExecutor, the execution core of `dspy.Parallel` and
-//! DSPy's threaded Evaluate.
-//!
-//! Outcomes keep input order. A failed item records its error; once
-//! `max_errors` failures accumulate, items not yet started are skipped and
-//! `execute` returns `error.ExecutionCancelled`, where DSPy raises. One thread
-//! runs sequentially on the caller, exactly like DSPy's sequential path; more
-//! threads run as `std.Io.Group` workers that claim the next index atomically.
-//! Outcome storage is caller-provided, so the executor allocates nothing.
-//! Not ported: straggler resubmission (`timeout`, `straggler_limit`), progress
-//! bars and SIGINT handling.
-//!
-//! Upstream (DSPy 3.5.0): dspy/utils/parallelizer.py, dspy/predict/parallel.py
-
+//! Bounded native parallel calls. Initialize in place; never move a live pool.
+//! Worker threads are created only at initialization and joined at deinitialization.
+//! Every forward joins its running callbacks before returning or reusing storage.
 const std = @import("std");
 const assert = std.debug.assert;
+const scheduling = @import("parallel_state.zig");
+const Context = @import("predict.zig").Context;
+const optimize = @import("optimize.zig");
 
-pub const Options = struct {
-    /// DSPy `settings.num_threads` default.
-    num_threads: usize = 8,
-    /// DSPy `settings.max_errors` default.
-    max_errors: usize = 10,
+pub const Limits = scheduling.Limits;
+pub const Options = scheduling.Options;
+pub const Scheduler = scheduling.Scheduler;
+
+pub const Cancellation = struct {
+    flag: *const std.atomic.Value(bool),
+
+    pub fn requested(self: Cancellation) bool {
+        return self.flag.load(.acquire);
+    }
+
+    pub fn check(self: Cancellation) error{Canceled}!void {
+        if (self.requested()) return error.Canceled;
+    }
 };
 
-pub fn Outcome(comptime R: type) type {
-    return union(enum) { unfinished, ok: R, failed: anyerror };
-}
+pub const Attempt = struct {
+    index: u32,
+    task_index: u32,
+    ordinal: u32,
+    worker_index: u16,
+    cancellation: Cancellation,
+};
 
-pub const Error = error{ExecutionCancelled} || std.Io.Cancelable;
+/// Result can be any native type, including optional values or a heterogeneous
+/// tagged union. Callback output storage is stable until the next forward.
+/// Callback-owned children and program/context pointees are borrowed, not cloned.
+pub fn Parallel(comptime Result: type, comptime limits: Limits) type {
+    const State = Scheduler(limits);
+    return struct {
+        io: std.Io,
+        address: *const Self,
+        mutex: std.Io.Mutex = .init,
+        work: std.Io.Condition = .init,
+        changed: std.Io.Condition = .init,
+        live: bool = true,
+        running: bool = false,
+        workers_spawned: u16 = 0,
+        workers: [limits.workers]std.Thread = undefined,
+        cancellation: std.atomic.Value(bool) = .init(false),
+        scheduler: State = .{},
+        tasks: []const Task = &.{},
+        outputs: [limits.attempts]Result = undefined,
+        results: [limits.tasks]Slot = undefined,
+        failures: Failures = .{},
 
-/// Calls `function(context, index, &items[index])` for every item.
-/// `function` must be safe to call concurrently when `num_threads > 1`.
-pub fn execute(
-    comptime T: type,
-    comptime R: type,
-    io: std.Io,
-    options: Options,
-    context: anytype,
-    comptime function: fn (@TypeOf(context), usize, *const T) anyerror!R,
-    items: []const T,
-    outcomes: []Outcome(R),
-) Error!void {
-    assert(options.num_threads > 0);
-    assert(items.len == outcomes.len);
-    @memset(outcomes, .unfinished);
-    const Shared = struct {
-        context: @TypeOf(context),
-        items: []const T,
-        outcomes: []Outcome(R),
-        max_errors: usize,
-        next: std.atomic.Value(usize) = .init(0),
-        errors: std.atomic.Value(usize) = .init(0),
-        cancelled: std.atomic.Value(bool) = .init(false),
+        pub const Task = struct {
+            ptr: *anyopaque,
+            /// Must initialize output on success and cooperate with cancellation.
+            /// Attempt.index selects private scratch/context/output-child storage.
+            invoke: *const fn (*anyopaque, Attempt, *Result) anyerror!void,
+        };
+        pub const Slot = union(enum) { failed, value: *const Result };
+        pub const Failure = struct { task: Task, err: anyerror };
+        pub const Failures = struct {
+            buffer: [limits.failures]Failure = undefined,
+            len: u32 = 0,
 
-        fn runOne(self: *@This(), index: usize) void {
-            self.outcomes[index] = if (function(self.context, index, &self.items[index])) |result|
-                .{ .ok = result }
-            else |err| failed: {
-                if (self.errors.fetchAdd(1, .acq_rel) + 1 >= self.max_errors) self.cancelled.store(true, .release);
-                break :failed .{ .failed = err };
-            };
+            /// The handle, unlike a captured slice length, observes later appends.
+            pub fn items(self: *const Failures) []const Failure {
+                assert(self.len <= limits.failures);
+                return self.buffer[0..self.len];
+            }
+        };
+        pub const Report = struct {
+            results: []const Slot,
+            failures: *const Failures,
+        };
+        pub const Error = error{ TaskCapacity, AttemptCapacity, FailureCapacity, ExecutionCanceled, Canceled };
+        const Self = @This();
+
+        /// Owns OS threads, but never owns task frames, contexts or child results.
+        /// Initialization failure joins every thread already created.
+        pub fn init(self: *Self, io: std.Io, config: std.Thread.SpawnConfig) !void {
+            self.* = .{ .io = io, .address = self };
+            errdefer self.deinit();
+            for (0..limits.workers) |index| {
+                self.workers[index] = try std.Thread.spawn(config, worker, .{ self, @as(u16, @intCast(index)) });
+                self.workers_spawned += 1;
+            }
+            assert(self.workers_spawned == limits.workers);
         }
 
-        fn worker(self: *@This()) void {
-            while (!self.cancelled.load(.acquire)) {
-                const index = self.next.fetchAdd(1, .monotonic);
-                if (index >= self.items.len) return;
-                self.runOne(index);
+        pub fn deinit(self: *Self) void {
+            assert(self.address == self);
+            self.mutex.lockUncancelable(self.io);
+            assert(!self.running);
+            assert(self.live);
+            self.live = false;
+            self.work.broadcast(self.io);
+            self.mutex.unlock(self.io);
+            for (self.workers[0..self.workers_spawned]) |thread| thread.join();
+            self.workers_spawned = 0;
+        }
+
+        /// May be called from another thread while forward is running.
+        /// Cancellation is cooperative; a non-cooperating callback delays return.
+        pub fn cancel(self: *Self) void {
+            assert(self.address == self);
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            if (self.running) {
+                self.scheduler.cancel();
+                self.cancellation.store(true, .release);
+                self.changed.signal(self.io);
             }
         }
+
+        pub fn clearFailures(self: *Self) void {
+            assert(self.address == self);
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            assert(!self.running);
+            self.failures.len = 0;
+        }
+
+        /// Task descriptors are borrowed for this call. Failed descriptors retained
+        /// in the report borrow their frames until clearFailures/deinit.
+        pub fn forward(self: *Self, tasks: []const Task, options: Options) Error!Report {
+            assert(self.address == self);
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            assert(self.live);
+            assert(!self.running);
+            if (tasks.len > limits.tasks) return error.TaskCapacity;
+            self.running = true;
+            defer self.running = false;
+            self.tasks = tasks;
+            self.cancellation.store(false, .release);
+            self.scheduler.begin(@intCast(tasks.len), options);
+            self.work.broadcast(self.io);
+            self.awaitCompletion();
+            assert(self.scheduler.running_count == 0);
+            switch (self.scheduler.terminal) {
+                .success, .exhausted => {},
+                .canceled => return error.Canceled,
+                .error_limit => return error.ExecutionCanceled,
+                .capacity => return error.AttemptCapacity,
+                .idle, .running => unreachable,
+            }
+            if (options.return_failed_tasks) try self.retainFailures();
+            for (self.scheduler.winners[0..tasks.len], 0..) |winner, index| {
+                self.results[index] = if (winner) |id|
+                    .{ .value = &self.outputs[id] }
+                else
+                    .failed;
+            }
+            return .{ .results = self.results[0..tasks.len], .failures = &self.failures };
+        }
+
+        fn awaitCompletion(self: *Self) void {
+            while (self.scheduler.terminal == .running) {
+                const count = self.scheduler.attempt_count;
+                self.scheduler.retry(now(self.io));
+                if (self.scheduler.attempt_count != count) self.work.broadcast(self.io);
+                if (self.scheduler.terminal != .running) break;
+                const timeout: std.Io.Timeout = if (self.scheduler.delay(now(self.io))) |ns|
+                    .{ .duration = .{ .raw = .fromNanoseconds(ns), .clock = .awake } }
+                else
+                    .none;
+                self.changed.waitTimeout(self.io, &self.mutex, timeout) catch |err| switch (err) {
+                    error.Timeout => {},
+                    error.Canceled => self.scheduler.cancel(),
+                };
+            }
+            self.cancellation.store(true, .release);
+            // No queued callback may start after the terminal decision. Running
+            // callbacks retain exclusive output/scratch slots until this barrier.
+            while (self.scheduler.running_count != 0) {
+                self.changed.waitUncancelable(self.io, &self.mutex);
+            }
+            assert(self.scheduler.terminal != .running);
+            assert(self.scheduler.running_count == 0);
+        }
+
+        fn retainFailures(self: *Self) Error!void {
+            const count = self.scheduler.failure_count;
+            assert(self.failures.len <= limits.failures);
+            if (count > limits.failures - self.failures.len) return error.FailureCapacity;
+            const destination = self.failures.buffer[self.failures.len..][0..count];
+            for (self.scheduler.failed_indices[0..count], destination) |index, *failure| {
+                failure.* = .{
+                    .task = self.tasks[index],
+                    .err = self.scheduler.errors[index].?,
+                };
+            }
+            self.failures.len += count;
+            assert(self.failures.len <= limits.failures);
+        }
+
+        fn worker(self: *Self, worker_index: u16) void {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            // Persistent lifecycle loop: only deinit ends a worker. Each callback
+            // and each queue are independently bounded by the caller's contract.
+            while (self.live) {
+                const id = self.scheduler.start(now(self.io)) orelse {
+                    self.work.waitUncancelable(self.io, &self.mutex);
+                    continue;
+                };
+                const scheduled = self.scheduler.attempts[id];
+                const task = self.tasks[scheduled.task];
+                const attempt: Attempt = .{
+                    .index = id,
+                    .task_index = scheduled.task,
+                    .ordinal = scheduled.ordinal,
+                    .worker_index = worker_index,
+                    .cancellation = .{ .flag = &self.cancellation },
+                };
+                self.changed.signal(self.io);
+                self.mutex.unlock(self.io);
+                const failure: ?anyerror = if (task.invoke(task.ptr, attempt, &self.outputs[id]))
+                    null
+                else |err|
+                    err;
+                self.mutex.lockUncancelable(self.io);
+                self.scheduler.complete(id, failure);
+                if (self.scheduler.terminal != .running) self.cancellation.store(true, .release);
+                self.changed.signal(self.io);
+            }
+            assert(!self.live);
+        }
+
+        /// Typed native equivalent of binding a module and its arguments.
+        /// Provide independent per-attempt contexts; copying Context alone does
+        /// not isolate an allocator, mutable LM, trace or retriever pointee.
+        pub fn Program(comptime P: type) type {
+            if (P.Output != Result) @compileError("Parallel result must match the native program Output");
+            return struct {
+                program: *const P,
+                arguments: Arguments,
+                contexts: []const Context,
+                pub const Arguments = union(enum) {
+                    input: P.Input,
+                    example: *const optimize.Example,
+                };
+                const Call = @This();
+
+                pub fn task(self: *Call) Task {
+                    assert(self.contexts.len >= limits.attempts);
+                    return .{ .ptr = self, .invoke = invoke };
+                }
+
+                fn invoke(ptr: *anyopaque, attempt: Attempt, output: *Result) anyerror!void {
+                    const self: *Call = @ptrCast(@alignCast(ptr));
+                    assert(attempt.index < self.contexts.len);
+                    try attempt.cancellation.check();
+                    const ctx = self.contexts[attempt.index];
+                    output.* = switch (self.arguments) {
+                        .input => |input| try self.program.forward(ctx, input),
+                        .example => |example| blk: {
+                            if (@typeInfo(P.Input) != .@"struct") return error.TypeMismatch;
+                            break :blk try optimize.forwardProgram(P, ctx, self.program, example);
+                        },
+                    };
+                }
+            };
+        }
     };
-    var shared: Shared = .{ .context = context, .items = items, .outcomes = outcomes, .max_errors = options.max_errors };
-    if (options.num_threads == 1) {
-        for (0..items.len) |index| {
-            if (shared.cancelled.load(.acquire)) break;
-            shared.runOne(index);
-        }
-    } else {
-        var group: std.Io.Group = .init;
-        defer group.cancel(io);
-        for (0..@min(options.num_threads, items.len)) |_| {
-            group.concurrent(io, Shared.worker, .{&shared}) catch group.async(io, Shared.worker, .{&shared});
-        }
-        try group.await(io);
-    }
-    if (shared.cancelled.load(.acquire)) return error.ExecutionCancelled;
 }
 
-fn squareOrFail(fail_mod: usize, index: usize, item: *const usize) anyerror!usize {
-    assert(index == item.*);
-    if (item.* % fail_mod == fail_mod - 1) return error.ItemFailed;
-    return item.* * item.*;
-}
-
-test "parallel executor keeps input order across threads and cancels sequentially at max_errors" {
-    var items: [64]usize = undefined;
-    for (&items, 0..) |*item, i| item.* = i;
-    var outcomes: [64]Outcome(usize) = undefined;
-    try execute(usize, usize, std.testing.io, .{ .num_threads = 6, .max_errors = 100 }, @as(usize, 7), squareOrFail, &items, &outcomes);
-    for (outcomes, 0..) |outcome, i| {
-        if (i % 7 == 6) try std.testing.expectEqual(error.ItemFailed, outcome.failed) else try std.testing.expectEqual(i * i, outcome.ok);
-    }
-    try std.testing.expectError(error.ExecutionCancelled, execute(usize, usize, std.testing.io, .{ .num_threads = 1, .max_errors = 2 }, @as(usize, 3), squareOrFail, items[0..10], outcomes[0..10]));
-    try std.testing.expectEqual(@as(usize, 16), outcomes[4].ok);
-    try std.testing.expect(outcomes[5] == .failed);
-    try std.testing.expect(outcomes[6] == .unfinished);
+fn now(io: std.Io) u64 {
+    const ns = std.Io.Clock.awake.now(io).nanoseconds;
+    assert(ns >= 0);
+    assert(ns <= std.math.maxInt(u64));
+    return @intCast(ns);
 }

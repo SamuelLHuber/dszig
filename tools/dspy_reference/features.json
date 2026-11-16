@@ -779,8 +779,8 @@
   {
    "name": "Parallel",
    "status": "partial",
-   "dszig": ["parallel.zig"],
-   "checks": "parallel.json (ParallelExecutor order, failures, max_errors cancel); module-pair dispatch, timeout/straggler resubmit not ported",
+   "dszig": ["parallel.zig", "parallel_state.zig"],
+   "checks": "parallel.json (DSPy ParallelExecutor order, failures, max_errors cancel) on the native pool; tests/parallel.zig (typed program/Example bindings, straggler duplicates, cancellation joins, seeded scheduling); no progress bar, SIGINT or thread-local settings; attempts bounded (`AttemptCapacity`)",
    "bench": [],
    "upstream": "predict/parallel.py",
    "sha256": "9359c28c44cb0067a262e0e0ac3bd90a22bafc78510f6e477a353fd7b26d3d19"

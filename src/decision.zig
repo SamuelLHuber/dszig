@@ -392,6 +392,16 @@ fn DecisionType(comptime config: Configuration) type {
             return .{ .custom = .{ .ptr = box, .vtable = &runtime_vtable } };
         }
 
+        /// Keep the original configured class when borrowing a projected view.
+        pub fn borrowedRuntime(self: *const Self) Value {
+            if (self.runtime_origin) |origin| return .{ .custom = origin.borrowed() };
+            return .{ .custom = .{
+                .ptr = self,
+                .vtable = &runtime_vtable,
+                .owns_box = false,
+            } };
+        }
+
         /// Decisions override serialization, NOT Type.format(). Calling this
         /// inherited operation has no implementation in the actual Source.
         pub fn format(_: Self) error{NotImplemented}!Value {
