@@ -1129,7 +1129,9 @@ serially.
 
 Optimizers take DSPy's `num_threads` as `concurrent_evaluation`:
 `evaluator.concurrent(&contexts, options)` binds an initialized evaluator to its
-program type, per-attempt contexts and options. `BootstrapFewShotWithRandomSearch`,
+nominal program type, per-attempt contexts and options. A different program type
+is rejected before invocation, even when generic type display names collide.
+`BootstrapFewShotWithRandomSearch`,
 `BootstrapFewShotWithOptuna`, `MIPROv2`, `COPRO` and `InferRules` then evaluate
 candidates through it, each call using the optimizer's own `max_errors`; a
 program-type mismatch returns `error.ProgramTypeMismatch`, and null keeps serial
@@ -1492,8 +1494,9 @@ The following prevent a claim that DSZig can do everything DSPy can:
 - **Optimizer options:** unsupported GEPA custom code/instruction proposers,
   Flex components, other frontier/selection policies, format-failure feedback,
   logging integrations, and some MIPROv2/SIMBA/COPRO statistics/logging options.
-  Evaluation runs sequentially rather than implementing DSPy's parallel and
-  async execution. SIMBA uses Zig `@exp`, not NumPy's implementation.
+  Concurrent evaluation and SIMBA/GEPA rollouts use explicit startup-created
+  native pools; Python ambient settings and general async execution are not
+  implemented. SIMBA uses Zig `@exp`, not NumPy's implementation.
 - **Integer TPE numerical portability:** the independent sampler uses a native
   extended-precision logarithm before binary64 rounding to reproduce the observed
   source acquisition/selection boundaries. A separate 10,009-value primitive

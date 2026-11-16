@@ -100,7 +100,7 @@ pub fn evaluate(
 /// options (see `parallel.Evaluator.concurrent`). null keeps serial `evaluate`.
 pub const ConcurrentEvaluation = struct {
     ptr: *anyopaque,
-    program_type: []const u8,
+    program_type: *const anyopaque,
     run: *const fn (
         ptr: *anyopaque,
         program: *const anyopaque,
@@ -123,7 +123,7 @@ pub fn evaluateWith(
     max_errors: usize,
 ) !Evaluation {
     const bound = concurrent orelse return evaluate(P, gpa, ctx, program, devset, metric, max_errors);
-    if (!std.mem.eql(u8, bound.program_type, @typeName(P))) return error.ProgramTypeMismatch;
+    if (bound.program_type != @import("runtime_value.zig").typeIdentity(P)) return error.ProgramTypeMismatch;
     return bound.run(bound.ptr, program, devset, metric, max_errors);
 }
 

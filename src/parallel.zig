@@ -389,7 +389,7 @@ pub fn Evaluator(comptime P: type, comptime limits: Limits) type {
             assert(contexts.len >= limits.attempts);
             self.bound_contexts = contexts;
             self.bound_options = options;
-            return .{ .ptr = self, .program_type = @typeName(P), .run = runBound };
+            return .{ .ptr = self, .program_type = @import("runtime_value.zig").typeIdentity(P), .run = runBound };
         }
 
         fn runBound(

@@ -448,6 +448,63 @@ test "seeded scheduling properties match an independent completion-order error o
     }
 }
 
+fn ConfiguredProgram(comptime config: struct { factors: [100]i64 }) type {
+    return struct {
+        pub const Input = struct { x: i64 };
+        pub const Output = struct { y: i64 };
+
+        pub fn forward(_: *const @This(), _: dszig.Context, input: Input) !Output {
+            return .{ .y = input.x * config.factors[99] };
+        }
+
+        fn metric(_: std.mem.Allocator, _: *const dszig.Example, prediction: ?*const dszig.value.Record, _: ?*const dszig.Trace) dszig.value.ParseError!f64 {
+            return @floatFromInt(prediction.?.get("y").?.integer);
+        }
+    };
+}
+
+test "concurrent evaluation rejects distinct generic programs with colliding display names" {
+    const A = ConfiguredProgram(.{ .factors = @splat(2) });
+    const B = ConfiguredProgram(.{ .factors = @splat(3) });
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var unused: dszig.lm.ScriptedLM = .{ .responses = &.{} };
+    const contexts: [1]dszig.Context = @splat(.{ .arena = arena, .lm = unused.lm() });
+    var bytes: [0]u8 = undefined;
+    const backing = [_][]u8{&bytes};
+    var evaluator: parallel.Evaluator(A, .{ .workers = 1, .tasks = 1, .attempts = 1, .failures = 1 }) = undefined;
+    try evaluator.init(testing.io, .{}, &backing);
+    defer evaluator.deinit();
+    const devset = [_]dszig.Example{try dszig.Example.fromJson(arena, "{\"x\":7}", &.{"x"})};
+    const bound = evaluator.concurrent(&contexts, .{ .straggler_timeout_ns = 0 });
+    const b: B = .{};
+    try testing.expectError(error.ProgramTypeMismatch, dszig.optimize.evaluateWith(
+        B,
+        bound,
+        testing.allocator,
+        contexts[0],
+        &b,
+        &devset,
+        B.metric,
+        10,
+    ));
+    // Rejection leaves the bound evaluator usable by its actual program type.
+    const a: A = .{};
+    const result = try dszig.optimize.evaluateWith(
+        A,
+        bound,
+        testing.allocator,
+        contexts[0],
+        &a,
+        &devset,
+        A.metric,
+        10,
+    );
+    try testing.expectEqual(@as(f64, 14), result.sum);
+    try testing.expectEqual(@as(usize, 0), result.errors);
+}
+
 const Scored = struct {
     gate: *std.Io.Event,
     io: std.Io,
