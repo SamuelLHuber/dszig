@@ -114,7 +114,7 @@ retain the actual continuation and raw provider response independently.
 | Parallel composition | Startup-created `Parallel(Result, limits)` workers, typed program/Example/tuple bindings, ordered result slots, speculative straggler retries, bounded accumulated failure reports and joined cooperative cancellation |
 | Typed decisions | `Noul`, configured `Score`/`Choice`, generative evidence classes, criteria/state snapshots, native Annotated metadata, owning evidence collectors and TypeSafe SystemOne prediction; finite coverage and unsupported rows below |
 | Retrieval and embeddings | `Retrieve`, lexical `InMemoryRetriever`, HTTP `ColBERTv2` with shared mutable-graph memory caching, custom/OpenAI/Azure `Embedder`, float32 `KNN`, per-query `KNNFewShot`, and brute-force `Embeddings`/`EmbeddingsWithScores` with NumPy persistence |
-| Evaluation and few-shot search | `optimize.evaluate`, `LabeledFewShot`, `BootstrapFewShot`, `BootstrapFewShotWithRandomSearch`, `BootstrapFewShotWithOptuna`, teacher context, zero thresholds and positional multi-use trace selection |
+| Evaluation and few-shot search | `optimize.evaluate`, concurrent `parallel.Evaluator`, `LabeledFewShot`, `BootstrapFewShot`, `BootstrapFewShotWithRandomSearch`, `BootstrapFewShotWithOptuna`, teacher context, zero thresholds and positional multi-use trace selection |
 | Instruction optimization | `InferRules`; `MIPROv2`, its program-aware proposer and an Optuna 4.5.0 TPE port; `COPRO`; `SIMBA`; supported instance-frontier `GEPA` paths against gepa 0.1.4 |
 | Agents and tools | `ReAct`, comptime `Tool`, `History`, `ToolCalls`, tool results, native declarations and text tool calls, typed submit, retained history |
 | Voting | `Ensemble`, `ensemble.majority`, Unicode text normalization; exact Python numeric equality, NaN object identity and source-order fallback behavior |
@@ -1279,8 +1279,25 @@ execution, using zero-byte per-attempt scratch and no LM calls, and reports both
 elapsed times. This is a CPU dispatch example, not authenticated inference or a
 whole-runtime allocation/performance proof. The ordinary test suite also exercises
 actual concurrent typed Predict with separate scripted LMs and scratch, joined
-stragglers/cancellation, and seeded scheduling properties. Existing evaluation and
-optimizer loops are not automatically parallelized.
+stragglers/cancellation, and seeded scheduling properties.
+
+`parallel.Evaluator(P, limits)` is the native counterpart of
+`dspy.Evaluate(num_threads=...)`. `init(io, spawn_config, backing)` creates the
+workers, one prediction record and typed output slot per attempt, and a
+fixed-buffer scratch allocator over each borrowed `backing[attempt]`.
+`evaluate(contexts, &program, devset, metric, options)` runs program plus metric per
+example with the same `Options` as `Parallel` (`return_failed_tasks` must be false).
+Each attempt's context supplies its own LM/retriever pointees; its arena is
+replaced by the reset attempt scratch and its trace by null. The program and metric
+must be thread-safe. Scores are summed after the join in devset order, not
+completion order, with failed slots scoring 0, so the sum matches serial
+`optimize.evaluate` and DSPy. `errors` counts failed examples, not losing
+duplicate attempts. As with `Parallel`, reaching `max_errors` returns
+`error.ExecutionCanceled` (DSPy's executor raises "Execution cancelled"), while
+serial `optimize.evaluate` returns the triggering error. Out-of-memory, including
+exhausted attempt scratch, cancels the run and returns `error.OutOfMemory`, as
+serially. Optimizer loops (Bootstrap, random search, MIPRO and others) still
+evaluate serially.
 
 ## Native seeded evaluation campaigns
 

@@ -6,6 +6,7 @@ const assert = std.debug.assert;
 const scheduling = @import("parallel_state.zig");
 const Context = @import("predict.zig").Context;
 const optimize = @import("optimize.zig");
+const value = @import("value.zig");
 
 pub const Limits = scheduling.Limits;
 pub const Options = scheduling.Options;
@@ -264,6 +265,113 @@ pub fn Parallel(comptime Result: type, comptime limits: Limits) type {
                     };
                 }
             };
+        }
+    };
+}
+
+/// Native `dspy.Evaluate(num_threads=limits.workers)`: concurrent program and
+/// metric calls whose results are summed in devset order, failed slots scoring 0.
+/// Initialize in place; never move a live evaluator. Per-attempt prediction
+/// records, typed outputs and scratch allocators are created at initialization.
+/// Out-of-memory aborts the run, as in serial `optimize.evaluate`.
+pub fn Evaluator(comptime P: type, comptime limits: Limits) type {
+    const Pool = Parallel(f64, limits);
+    const Storage = value.RecordStorage(@typeInfo(P.Output).@"struct".field_names.len);
+    return struct {
+        pool: Pool,
+        storage: [limits.attempts]Storage,
+        outputs: [limits.attempts]P.Output,
+        scratch: [limits.attempts]std.heap.FixedBufferAllocator,
+        calls: [limits.tasks]Call,
+        tasks: [limits.tasks]Pool.Task,
+        program: *const P,
+        metric: optimize.Metric,
+        contexts: []const Context,
+        out_of_memory: std.atomic.Value(bool),
+
+        const Self = @This();
+        const Call = struct { evaluator: *Self, example: *const optimize.Example };
+
+        /// Borrows one scratch backing slice per attempt until deinit.
+        pub fn init(self: *Self, io: std.Io, config: std.Thread.SpawnConfig, backing: []const []u8) !void {
+            assert(backing.len >= limits.attempts);
+            for (&self.storage) |*storage| try storage.init();
+            for (&self.scratch, backing[0..limits.attempts]) |*scratch, bytes| scratch.* = .init(bytes);
+            self.out_of_memory = .init(false);
+            try self.pool.init(io, config);
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.pool.deinit();
+        }
+
+        /// contexts supply independent per-attempt LM/retriever pointees; their
+        /// arena and trace are replaced. program and metric must be thread-safe.
+        /// Predictions borrow attempt storage, valid only during the metric call.
+        pub fn evaluate(
+            self: *Self,
+            contexts: []const Context,
+            program: *const P,
+            devset: []const optimize.Example,
+            metric: optimize.Metric,
+            options: Options,
+        ) !optimize.Evaluation {
+            assert(devset.len > 0);
+            assert(contexts.len >= limits.attempts);
+            assert(!options.return_failed_tasks);
+            if (devset.len > limits.tasks) return error.TaskCapacity;
+            self.program = program;
+            self.metric = metric;
+            self.contexts = contexts;
+            self.out_of_memory.store(false, .release);
+            for (devset, self.calls[0..devset.len], self.tasks[0..devset.len]) |*example, *call, *task| {
+                call.* = .{ .evaluator = self, .example = example };
+                task.* = .{ .ptr = call, .invoke = invoke };
+            }
+            const report = self.pool.forward(self.tasks[0..devset.len], options) catch |err| {
+                if (self.out_of_memory.load(.acquire)) return error.OutOfMemory;
+                return err;
+            };
+            if (self.out_of_memory.load(.acquire)) return error.OutOfMemory;
+            // Sum after the join in devset order, not completion order, as DSPy does.
+            var sum: f64 = 0;
+            var errors: usize = 0;
+            for (report.results) |slot| switch (slot) {
+                .failed => errors += 1,
+                .value => |score| sum += score.*,
+            };
+            return optimize.summarize(sum, devset.len, errors);
+        }
+
+        fn invoke(ptr: *anyopaque, attempt: Attempt, score: *f64) anyerror!void {
+            const call: *Call = @ptrCast(@alignCast(ptr));
+            const self = call.evaluator;
+            assert(attempt.index < limits.attempts);
+            try attempt.cancellation.check();
+            const scratch = &self.scratch[attempt.index];
+            scratch.reset();
+            var ctx = self.contexts[attempt.index];
+            ctx.arena = scratch.allocator();
+            ctx.trace = null;
+            const prediction = &self.storage[attempt.index].record;
+            score.* = scoreExample(self, ctx, call.example, &self.outputs[attempt.index], prediction) catch |err| {
+                if (err == error.OutOfMemory) {
+                    self.out_of_memory.store(true, .release);
+                    self.pool.cancel();
+                }
+                return err;
+            };
+        }
+
+        fn scoreExample(
+            self: *const Self,
+            ctx: Context,
+            example: *const optimize.Example,
+            output: *P.Output,
+            prediction: *value.Record,
+        ) !f64 {
+            try optimize.runProgramInto(P, ctx, self.program, example, output, prediction);
+            return self.metric(ctx.arena, example, prediction, null);
         }
     };
 }

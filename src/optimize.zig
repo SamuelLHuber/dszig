@@ -94,8 +94,15 @@ pub fn evaluate(
             continue;
         };
     }
-    const ratio = 100.0 * sum / @as(f64, @floatFromInt(devset.len));
-    return .{ .score = roundScore(ratio), .sum = sum, .total = devset.len, .errors = errors };
+    return summarize(sum, devset.len, errors);
+}
+
+/// Report an ordered devset score sum as `dspy.Evaluate` does.
+pub fn summarize(sum: f64, total: usize, errors: usize) Evaluation {
+    assert(total > 0);
+    assert(errors <= total);
+    const ratio = 100.0 * sum / @as(f64, @floatFromInt(total));
+    return .{ .score = roundScore(ratio), .sum = sum, .total = total, .errors = errors };
 }
 
 /// Python round(x, 2): round the exact binary value to cents, ties to even.
