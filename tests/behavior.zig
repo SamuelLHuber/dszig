@@ -7,6 +7,309 @@ const rag = @import("rag_program");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 
+const BootstrapTraceSignature = dszig.Signature(struct {
+    pub const Input = struct { token: []const u8 };
+    pub const Output = struct { first: i64, second: i64, third: i64 = 9 };
+});
+
+const BootstrapTracePair = struct {
+    left: dszig.Predict(BootstrapTraceSignature) = .{},
+    right: dszig.Predict(BootstrapTraceSignature) = .{},
+    pub const Input = struct { question: []const u8 };
+    pub const Output = BootstrapTraceSignature.Output;
+
+    pub fn forward(self: *const @This(), ctx: dszig.Context, _: Input) !Output {
+        _ = try self.left.forward(ctx, .{ .token = "good" });
+        return self.right.forward(ctx, .{ .token = "bad" });
+    }
+};
+
+fn bootstrapTraceMetric(
+    _: Allocator,
+    _: *const dszig.Example,
+    prediction: ?*const dszig.value.Record,
+    trace: ?*const dszig.Trace,
+) dszig.value.ParseError!f64 {
+    if (trace != null or prediction == null) return error.ParseValue;
+    return @as(f64, @floatFromInt(prediction.?.get("first").?.integer)) / 10;
+}
+
+test "trace bootstrap retains preceding calls and attributes failure by signature class" {
+    var retained: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer retained.deinit();
+    const out = retained.allocator();
+    const example = try dszig.Example.fromJson(out, "{\"question\":\"outer\"}", &.{"question"});
+    var program: BootstrapTracePair = .{};
+    const responses = [_][2][]const u8{
+        .{
+            "[[ ## first ## ]]\n1\n[[ ## second ## ]]\n2",
+            "[[ ## second ## ]]\n2",
+        },
+        .{ "{\"first\":1,\"second\":2}", "{\"second\":\"2\"}" },
+        .{ "<first>1</first><second>2</second>", "<second>2</second>" },
+    };
+    for ([_]dszig.Adapter{ .chat, .json, .xml }, responses) |adapter, bodies| {
+        const result = block: {
+            var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer scratch.deinit();
+            var lm: dszig.lm.ScriptedLM = .{ .responses = &bodies };
+            break :block try dszig.bootstrap_trace.bootstrapTraceData(
+                BootstrapTracePair,
+                out,
+                .{
+                    .arena = scratch.allocator(),
+                    .lm = lm.lm(),
+                    .adapter = adapter,
+                    .json_fallback = false,
+                },
+                &program,
+                &.{example},
+                .{ .metric = bootstrapTraceMetric, .failure_score = 0.5 },
+            );
+        };
+        const row = result[0];
+        try testing.expectEqual(@as(usize, 0), row.example_ind);
+        // One supplied field plus the default gives 2/3 partial format credit.
+        try testing.expectEqual(@as(?f64, 0), row.score);
+        try testing.expectEqualStrings(bodies[1], row.prediction.failed.completion_text);
+        try testing.expectEqual(@as(?f64, 0), row.prediction.failed.format_reward);
+        try testing.expectEqual(@as(usize, 2), row.trace.len);
+        try testing.expect(row.trace[0].predictor == &program.left.state);
+        try testing.expectEqual(@as(i64, 9), row.trace[0].prediction.success.get("third").?.integer);
+        // The right call failed, but DSPy selects the first equal signature class.
+        try testing.expect(row.trace[1].predictor == &program.left.state);
+        try testing.expectEqualStrings("outer", row.trace[1].inputs.get("question").?.string);
+        try testing.expect(!row.trace[1].inputs.contains("token"));
+        try testing.expectEqualStrings(bodies[1], row.trace[1].prediction.failed.completion_text);
+    }
+}
+
+test "empty predictor completions fail before applying output defaults" {
+    const S = dszig.Signature(struct {
+        pub const Input = struct {};
+        pub const Output = struct { answer: i64 = 9 };
+    });
+    const program: dszig.Predict(S) = .{};
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    for ([_]dszig.Adapter{ .chat, .json, .xml }) |adapter| {
+        var lm: dszig.lm.ScriptedLM = .{ .responses = &.{""} };
+        var capture: dszig.predict.ParseFailure = .{};
+        try testing.expectError(error.AdapterParse, program.forward(
+            .{
+                .arena = memory.allocator(),
+                .lm = lm.lm(),
+                .adapter = adapter,
+                .json_fallback = false,
+                .parse_failure = &capture,
+            },
+            .{},
+        ));
+        try testing.expect(capture.signature_class == program.state.signature_class);
+        try testing.expect(capture.failure.parsed_result == null);
+        try testing.expectEqualStrings("", capture.failure.completion_text);
+    }
+}
+
+test "JSON parse failure retains converted predecessors and raw invalid siblings" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var failure: dszig.adapter.ParseFailure = .{};
+    const view: dszig.adapter.View = .{
+        .instructions = "",
+        .inputs = BootstrapTraceSignature.input_fields_list,
+        .outputs = BootstrapTraceSignature.output_fields_list,
+    };
+    try testing.expectError(error.AdapterParse, dszig.Adapter.json.parseWithFailure(
+        arena,
+        view,
+        "{\"second\":\"2\",\"first\":\"wrong\",\"third\":\"3\",\"extra\":0}",
+        &failure,
+    ));
+    const partial = failure.parsed_result.?;
+    try testing.expectEqual(@as(usize, 3), partial.count());
+    for ([_][]const u8{ "second", "first", "third" }, partial.keys()) |expected, actual| {
+        try testing.expectEqualStrings(expected, actual);
+    }
+    try testing.expectEqual(@as(i64, 2), partial.get("second").?.integer);
+    try testing.expectEqualStrings("wrong", partial.get("first").?.string);
+    try testing.expectEqualStrings("3", partial.get("third").?.string);
+    // A successful parse must not leak this failed completion into a later call.
+    _ = try dszig.Adapter.json.parseWithFailure(
+        arena,
+        view,
+        "{\"first\":4,\"second\":5}",
+        &failure,
+    );
+    try testing.expect(failure.parsed_result == null);
+    try testing.expectEqualStrings("", failure.completion_text);
+}
+
+const BootstrapTraceSingle = struct {
+    predict: dszig.Predict(BootstrapTraceSignature) = .{},
+    pub const Input = struct { question: []const u8 };
+    pub const Output = BootstrapTraceSignature.Output;
+
+    pub fn forward(self: *const @This(), ctx: dszig.Context, input: Input) !Output {
+        return self.predict.forward(ctx, .{ .token = input.question });
+    }
+};
+
+const BootstrapTraceLM = struct {
+    fn complete(
+        _: *anyopaque,
+        arena: Allocator,
+        request: dszig.lm.Request,
+    ) dszig.lm.Error![]const dszig.lm.Completion {
+        const text = request.messages[request.messages.len - 1].content.text;
+        const body = if (std.mem.indexOf(u8, text, "q0") != null)
+            "{\"first\":1,\"second\":2}"
+        else if (std.mem.indexOf(u8, text, "q1") != null)
+            "{\"second\":7}"
+        else if (std.mem.indexOf(u8, text, "q2") != null)
+            "{\"first\":8,\"second\":9}"
+        else
+            "{\"second\":\"2\",\"first\":\"wrong\",\"third\":\"3\"}";
+        const output = try arena.alloc(dszig.lm.Completion, 1);
+        output[0] = .{ .text = try arena.dupe(u8, body) };
+        return output;
+    }
+
+    fn lm(self: *@This()) dszig.LM {
+        return .{ .ptr = self, .vtable = &.{ .complete = complete } };
+    }
+};
+
+test "concurrent trace bootstrap retains ordered failures across joined scratch reuse" {
+    const Pool = dszig.Parallel(dszig.bootstrap_trace.Run, .{
+        .workers = 2,
+        .tasks = 2,
+        .attempts = 2,
+        .failures = 2,
+    });
+    const Scratch = struct {
+        allocators: [2]std.heap.FixedBufferAllocator,
+
+        fn reset(ptr: *anyopaque, index: u32) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.allocators[index].reset();
+        }
+    };
+    var retained: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer retained.deinit();
+    const out = retained.allocator();
+    var pool: Pool = undefined;
+    try pool.init(testing.io, .{});
+    defer pool.deinit();
+    var buffers: [2][131072]u8 = undefined;
+    var scratch: Scratch = undefined;
+    var models: [2]BootstrapTraceLM = .{ .{}, .{} };
+    var contexts: [2]dszig.Context = undefined;
+    for (&contexts, &scratch.allocators, &buffers, &models) |*ctx, *allocator, *buffer, *model| {
+        allocator.* = .init(buffer);
+        ctx.* = .{ .arena = allocator.allocator(), .lm = model.lm(), .adapter = .json };
+    }
+    const dataset = [_]dszig.Example{
+        try dszig.Example.fromJson(out, "{\"question\":\"q0\"}", &.{"question"}),
+        try dszig.Example.fromJson(out, "{\"question\":\"q1\"}", &.{"question"}),
+        try dszig.Example.fromJson(out, "{\"question\":\"q2\"}", &.{"question"}),
+        try dszig.Example.fromJson(out, "{\"question\":\"q3\"}", &.{"question"}),
+    };
+    var program: BootstrapTraceSingle = .{};
+    const result = try dszig.bootstrap_trace.bootstrapTraceData(
+        BootstrapTraceSingle,
+        out,
+        contexts[0],
+        &program,
+        &dataset,
+        .{
+            .metric = bootstrapTraceMetric,
+            .failure_score = 0.5,
+            .rollouts = .{ .runner = pool.runner(), .contexts = &contexts },
+            .scratch_reset = .{ .ptr = &scratch, .reset = Scratch.reset },
+        },
+    );
+    for (&buffers, scratch.allocators) |*buffer, allocator| {
+        try testing.expectEqual(@as(usize, 0), allocator.end_index);
+        @memset(buffer, 0xff);
+    }
+    try testing.expectEqual(@as(u32, 0), pool.scheduler.running_count);
+    try testing.expectEqual(@as(usize, 4), result.len);
+    for (result, [_]f64{ 0.1, 0, 0.8, 0.5 }, 0..) |row, score, index| {
+        try testing.expectEqual(index, row.example_ind);
+        try testing.expectEqual(@as(?f64, score), row.score);
+    }
+    try testing.expectEqual(@as(i64, 1), result[0].prediction.success.get("first").?.integer);
+    try testing.expectEqual(@as(i64, 8), result[2].prediction.success.get("first").?.integer);
+    try testing.expectEqualStrings("q0", result[0].trace[0].inputs.get("token").?.string);
+    try testing.expectEqualStrings("q2", result[2].trace[0].inputs.get("token").?.string);
+    try testing.expectEqualStrings("{\"second\":7}", result[1].prediction.failed.completion_text);
+    try testing.expectEqualStrings("q1", result[1].trace[0].inputs.get("question").?.string);
+    try testing.expectEqual(@as(?f64, 0.5), result[3].prediction.failed.format_reward);
+}
+
+test "trace metric failure reports successful evaluation before unpacking fails" {
+    const Hooks = struct {
+        call_id: u64 = 0,
+        ended: bool = false,
+        evaluation: ?dszig.optimize.Evaluation = null,
+
+        fn start(ptr: *anyopaque, event: dszig.bootstrap_trace.EvaluateStart) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.call_id = event.call_id;
+            return error.CallbackStartFailure;
+        }
+
+        fn end(ptr: *anyopaque, event: dszig.bootstrap_trace.EvaluateEnd) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.ended = event.call_id == self.call_id and event.err == null;
+            if (event.result) |result| self.evaluation = result.evaluation;
+            return error.CallbackEndFailure;
+        }
+
+        fn metric(
+            _: Allocator,
+            _: *const dszig.Example,
+            _: ?*const dszig.value.Record,
+            _: ?*const dszig.Trace,
+        ) dszig.value.ParseError!f64 {
+            return error.ParseValue;
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var lm: dszig.lm.ScriptedLM = .{ .responses = &.{"{\"first\":1,\"second\":2}"} };
+    var program: BootstrapTraceSingle = .{};
+    var hooks: Hooks = .{};
+    var failure: ?dszig.bootstrap_trace.Unhandled = null;
+    const example = try dszig.Example.fromJson(arena, "{\"question\":\"metric\"}", &.{"question"});
+    try testing.expectError(error.UnpackPredictionAndTrace, dszig.bootstrap_trace.bootstrapTraceData(
+        BootstrapTraceSingle,
+        arena,
+        .{ .arena = arena, .lm = lm.lm(), .adapter = .json },
+        &program,
+        &.{example},
+        .{
+            .metric = Hooks.metric,
+            .failure_score = 0.5,
+            .capture_crashes = true,
+            .unhandled = &failure,
+            .callbacks = &.{.{
+                .ptr = &hooks,
+                .on_evaluate_start = Hooks.start,
+                .on_evaluate_end = Hooks.end,
+            }},
+        },
+    ));
+    try testing.expect(hooks.ended);
+    try testing.expectEqual(@as(f64, 50), hooks.evaluation.?.score);
+    try testing.expectEqual(@as(usize, 1), hooks.evaluation.?.errors);
+    try testing.expectEqual(dszig.bootstrap_trace.Stage.metric, failure.?.stage);
+    try testing.expectEqual(error.ParseValue, failure.?.err);
+}
+
 const FixedTupleSignature = dszig.Signature(struct {
     pub const Input = struct { source: [2]i64 };
     pub const Output = struct {

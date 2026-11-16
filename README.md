@@ -114,7 +114,7 @@ retain the actual continuation and raw provider response independently.
 | Parallel composition | Startup-created `Parallel(Result, limits)` workers, typed program/Example/tuple bindings, ordered result slots, speculative straggler retries, bounded accumulated failure reports and joined cooperative cancellation |
 | Typed decisions | `Noul`, configured `Score`/`Choice`, generative evidence classes, criteria/state snapshots, native Annotated metadata, owning evidence collectors and TypeSafe SystemOne prediction; finite coverage and unsupported rows below |
 | Retrieval and embeddings | `Retrieve`, lexical `InMemoryRetriever`, HTTP `ColBERTv2` with shared mutable-graph memory caching, custom/OpenAI/Azure `Embedder`, float32 `KNN`, per-query `KNNFewShot`, and brute-force `Embeddings`/`EmbeddingsWithScores` with NumPy persistence |
-| Evaluation and few-shot search | `optimize.evaluate`, concurrent `parallel.Evaluator`, `LabeledFewShot`, `BootstrapFewShot`, `BootstrapFewShotWithRandomSearch`, `BootstrapFewShotWithOptuna`, teacher context, zero thresholds and positional multi-use trace selection |
+| Evaluation and few-shot search | `optimize.evaluate`, concurrent `parallel.Evaluator`, `bootstrapTraceData` with real parse-failure capture and ordered native rollouts, `LabeledFewShot`, `BootstrapFewShot`, `BootstrapFewShotWithRandomSearch`, `BootstrapFewShotWithOptuna`, teacher context, zero thresholds and positional multi-use trace selection |
 | Instruction optimization | `InferRules`; `MIPROv2`, its program-aware proposer and an Optuna 4.5.0 TPE port; `COPRO`; `SIMBA`; supported instance-frontier `GEPA` paths against gepa 0.1.4 |
 | Agents and tools | `ReAct`, comptime `Tool`, `History`, `ToolCalls`, tool results, native declarations and text tool calls, typed submit, retained history |
 | Voting | `Ensemble`, `ensemble.majority`, Unicode text normalization; exact Python numeric equality, NaN object identity and source-order fallback behavior |
@@ -1164,13 +1164,93 @@ example with the same `Options` as `Parallel` (`return_failed_tasks` must be fal
 Each attempt's context supplies its own LM/retriever pointees; its arena is
 replaced by the reset attempt scratch and its trace by null. The program and metric
 must be thread-safe. Scores are summed after the join in devset order, not
-completion order, with failed slots scoring 0, so the sum matches serial
-`optimize.evaluate` and DSPy. `errors` counts failed examples, not losing
+completion order, with failed slots scoring `failure_score`, as in DSPy.
+At the default zero failure score the sum also matches serial `optimize.evaluate`.
+`errors` counts failed examples, not losing
 duplicate attempts. As with `Parallel`, reaching `max_errors` returns
 `error.ExecutionCanceled` (DSPy's executor raises "Execution cancelled"), while
 serial `optimize.evaluate` returns the triggering error. Out-of-memory, including
 exhausted attempt scratch, cancels the run and returns `error.OutOfMemory`, as
 serially.
+
+### Trace bootstrapping
+
+`bootstrapTraceData(P, out, ctx, &program, dataset, options)` is the native
+counterpart of DSPy 3.5's `bootstrap_trace_data`. It runs the original program
+without patching or mutating it. Rows retain their dataset index, borrowed
+example, successful prediction or `FailedPrediction`, ordered trace and nullable
+score. The score is absent (`null`) when no metric was supplied.
+
+```zig
+const rows = try dszig.bootstrapTraceData(
+    Program, out, ctx, &program, dataset,
+    .{ .metric = metric, .failure_score = 0.5 },
+);
+```
+
+Adapter failures retain the actual completion and partial result from the
+production parser, including JSON fallback's **final** failed response.
+Missing-field payloads include all present fields and defaults, even after an
+earlier missing field. Chat/XML invalid values carry no partial result; JSON
+retains converted predecessors and raw invalid/following values. Empty
+completions fail before output defaults can turn them into a success.
+TwoStep extraction failures retain the original main response and signature,
+not the extraction response. Invalid native decision boxes retain the source's
+ASCII-escaped JSON answer text.
+
+Failed-format rewards are
+`format_failure_score + (failure_score - format_failure_score) * present / expected`,
+or `format_failure_score` with no present fields. Failed predictions bypass the
+metric. Successful predictions call it with a null trace, as under DSPy's
+Evaluate. The appended failed trace selects the **first predictor with the same
+signature class** and records top-level program inputs, not that predictor's
+inputs. A newly derived evidence signature with no matching program predictor
+follows the source's unhandled-failure policy rather than inventing a match.
+
+`capture_crashes` captures non-LM program errors, retaining preceding successful
+trace steps; its completion text is the native error name, not a fabricated
+Python exception class/message. `LMFailure` and `ScriptExhausted` are never
+captured as crashes. Unhandled program/metric rows are skipped with
+`raise_on_error = false`; otherwise all evaluation work finishes before
+`error.UnpackPredictionAndTrace` is returned. `unhandled` can retain the first
+cause, stage and dataset index. Out-of-memory and cancellation abort instead.
+
+For DSPy's `num_threads`, supply `rollouts` with a startup-created
+`Parallel(bootstrap_trace.Run, limits).runner()` and exclusive per-attempt
+contexts. Results are collected in dataset order only after every callback
+joins. Each context supplies its own scratch arena, LM and retriever; the
+program and metric must be thread-safe. `out` is used only by the calling
+thread, never concurrently. It owns retained predictions, completion text and
+successful trace children; rows and failed-step input values borrow the dataset,
+and predictor pointers borrow the program. Neither may expire while rows live.
+An optional `scratch_reset` callback reclaims attempt storage after joined
+results have been retained; do not reset or alias that storage with `out`.
+
+Native `callbacks` expose evaluation start/end events with a correlated
+process-local `u64` call ID and `callback_metadata`. Handler errors are logged
+and ignored. End receives the aggregate evaluation, including configured
+failure scores for unhandled rows; a later unpack failure does not retroactively
+turn a successful evaluation event into an error. An empty dataset, memory
+failure or cancellation reaches end as an error. `log_format_failures` enables
+format-failure warnings. There is no no-op `capture_failed_parses` option:
+upstream leaves that argument unused and always captures actual parse errors.
+
+Low-level callers can opt into `Context.parse_failure` or
+`Adapter.parseWithFailure` without using trace bootstrapping. Captures borrow
+the completion and parse arena; use one per concurrent context. If a program
+handles a predictor error and later raises its own `error.AdapterParse` without
+another predictor call, explicitly `reset()` its capture: Zig error values do
+not preserve Python exception-instance identity.
+
+An independent actual DSPy 3.5 comparison covered 15 direct parser cases,
+24 trace-bootstrap cases and 17 policy cases, including serial/parallel ordered
+results, duplicate signature classes, fallback, metric failure and crash policy.
+A separate comparison covered five evaluation callback lifecycles, TwoStep
+wrapping and two native decision-box failures. Four configured evidence-signature
+lookup-failure policies also matched. These finite checks do not supply
+fine-tuning, BetterTogether or whole-library static-memory parity.
+
+### Concurrent optimizer evaluation
 
 Optimizers take DSPy's `num_threads` as `concurrent_evaluation`:
 `evaluator.concurrent(&contexts, options)` binds an initialized evaluator to its
@@ -1459,7 +1539,8 @@ The following prevent a claim that DSZig can do everything DSPy can:
   DSPy's RLM/Flex execute arbitrary Python and can import real DSPy inside the
   guest. A restricted expression evaluator is not an identical implementation.
 - **Other modules and optimizers:** no AvatarOptimizer, BetterTogether,
-  BootstrapFinetune or bootstrap_trace_data. Native Parallel uses explicit typed
+  BootstrapFinetune. Trace bootstrapping is implemented as described above.
+  Native Parallel uses explicit typed
   tasks and contexts, not Python callback objects or ambient thread-local settings.
   Its startup capacities and cooperative join contract are described above.
 - **Optimizer execution and shared identity:** InferRules' signature-alias propagation does not update arbitrary external

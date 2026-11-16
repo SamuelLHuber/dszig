@@ -65,6 +65,21 @@ pub const View = struct {
 
 pub const Error = error{ AdapterParse, JsonTooDeep } || value.ParseError;
 
+/// DSPy AdapterParseError payload for one failed parse. Both members borrow:
+/// the text from the parsed completion, the record from the parse arena.
+pub const ParseFailure = struct {
+    /// JSONAdapter reports its extracted object span instead of the completion.
+    completion_text: []const u8 = "",
+    /// Null for unusable structure and Chat/XML invalid values. JSON type
+    /// failures retain converted predecessors and raw remaining values.
+    parsed_result: ?Record = null,
+};
+
+fn fail(failure: ?*ParseFailure, completion_text: []const u8, parsed_result: ?Record) error{AdapterParse} {
+    if (failure) |f| f.* = .{ .completion_text = completion_text, .parsed_result = parsed_result };
+    return error.AdapterParse;
+}
+
 /// Expand media where DSPy constructs user/tool parts; assistant/system stay text.
 pub fn renderedContent(arena: Allocator, rendered: []const u8) Error!Content {
     return Content.fromRendered(arena, rendered) catch |err| return switch (err) {
@@ -110,12 +125,29 @@ pub const Adapter = enum {
     }
 
     pub fn parse(adapter: Adapter, arena: Allocator, view: View, completion: []const u8) Error!Record {
-        return switch (adapter) {
-            .chat => parseChat(arena, view, completion),
-            .json => parseJson(arena, view, completion),
-            .xml => XmlAdapter.parse(arena, view, completion),
+        return adapter.parseWithFailure(arena, view, completion, null);
+    }
+
+    /// `parse` that also describes an `error.AdapterParse` in `failure`.
+    /// Every other outcome leaves a supplied `failure` empty.
+    pub fn parseWithFailure(adapter: Adapter, arena: Allocator, view: View, completion: []const u8, failure: ?*ParseFailure) Error!Record {
+        if (failure) |f| f.* = .{};
+        const result: Error!Record = switch (adapter) {
+            .chat => parseChat(arena, view, completion, failure),
+            .json => parseJson(arena, view, completion, failure),
+            .xml => XmlAdapter.parseWithFailure(arena, view, completion, failure),
             // Extraction needs its separate LM; use TwoStepAdapter.parse.
             .two_step => error.AdapterParse,
+        };
+        return result catch |err| {
+            if (failure) |f| {
+                if (err != error.AdapterParse) {
+                    f.* = .{};
+                } else if (f.completion_text.len == 0) {
+                    f.completion_text = completion;
+                }
+            }
+            return err;
         };
     }
 
@@ -704,7 +736,7 @@ pub fn parseFieldValue(arena: Allocator, field: Field, input: Value) Error!Value
     };
 }
 
-fn parseChat(arena: Allocator, view: View, completion: []const u8) Error!Record {
+fn parseChat(arena: Allocator, view: View, completion: []const u8, failure: ?*ParseFailure) Error!Record {
     var sections: std.ArrayList(Section) = .empty;
     try sections.append(arena, .{ .header = null, .lines = .empty });
     var lines = LineIterator{ .text = completion };
@@ -725,36 +757,63 @@ fn parseChat(arena: Allocator, view: View, completion: []const u8) Error!Record 
         if (fields.contains(header)) continue;
         const field = view.findOutput(header) orelse continue;
         const joined = try std.mem.join(arena, "\n", section.lines.items);
+        // An invalid value fails without a partial result, as in DSPy.
         const parsed = try parseFieldValue(arena, field, .{ .string = value.pyStrip(joined) });
         try fields.put(arena, field.name, parsed);
     }
-    try requireAllOutputs(arena, view, &fields);
+    try requireAllOutputs(arena, view, &fields, completion, failure);
     return fields;
 }
 
-fn requireAllOutputs(arena: Allocator, view: View, fields: *Record) Error!void {
+/// `apply_output_field_defaults` plus the missing-output check. A requested
+/// failure receives every present or defaulted field in signature order.
+fn requireAllOutputs(arena: Allocator, view: View, fields: *Record, completion_text: []const u8, failure: ?*ParseFailure) Error!void {
     var completed: Record = .empty;
+    var missing = false;
     for (view.outputs) |field| {
-        const supplied = fields.get(field.name);
-        const parsed = supplied orelse (try signature.outputDefault(arena, field)) orelse return error.AdapterParse;
+        const parsed = fields.get(field.name) orelse (try signature.outputDefault(arena, field)) orelse {
+            if (failure == null) return error.AdapterParse;
+            missing = true;
+            continue;
+        };
         try completed.put(arena, field.name, parsed);
     }
+    if (missing) return fail(failure, completion_text, completed);
     fields.* = completed;
 }
 
-fn parseJson(arena: Allocator, view: View, completion: []const u8) Error!Record {
+fn parseJson(arena: Allocator, view: View, completion: []const u8, failure: ?*ParseFailure) Error!Record {
+    // DSPy rebinds the completion to the extracted object before later errors.
+    var response = completion;
     const object = (try parseObject(arena, completion)) orelse blk: {
-        const span = firstBalancedBraces(completion) orelse return error.AdapterParse;
-        break :blk (try parseObject(arena, span)) orelse return error.AdapterParse;
+        response = firstBalancedBraces(completion) orelse return error.AdapterParse;
+        const extracted = parseObject(arena, response) catch |err| switch (err) {
+            error.AdapterParse => return fail(failure, response, null),
+            else => |other| return other,
+        };
+        break :blk extracted orelse return fail(failure, response, null);
     };
     var fields: Record = .empty;
     var it = object.iterator();
     while (it.next()) |entry| {
         const field = view.findOutput(entry.key_ptr.*) orelse continue;
-        const parsed = try parseFieldValue(arena, field, entry.value_ptr.*);
+        const parsed = parseFieldValue(arena, field, entry.value_ptr.*) catch |err| switch (err) {
+            error.AdapterParse => {
+                if (failure == null) return error.AdapterParse;
+                // DSPy converts its filtered dictionary in place: predecessors
+                // are converted, the failing and following values stay raw.
+                try fields.put(arena, field.name, entry.value_ptr.*);
+                while (it.next()) |rest| {
+                    const known = view.findOutput(rest.key_ptr.*) orelse continue;
+                    try fields.put(arena, known.name, rest.value_ptr.*);
+                }
+                return fail(failure, response, fields);
+            },
+            else => |other| return other,
+        };
         try fields.put(arena, field.name, parsed);
     }
-    try requireAllOutputs(arena, view, &fields);
+    try requireAllOutputs(arena, view, &fields, response, failure);
     return fields;
 }
 
