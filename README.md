@@ -1122,8 +1122,18 @@ duplicate attempts. As with `Parallel`, reaching `max_errors` returns
 `error.ExecutionCanceled` (DSPy's executor raises "Execution cancelled"), while
 serial `optimize.evaluate` returns the triggering error. Out-of-memory, including
 exhausted attempt scratch, cancels the run and returns `error.OutOfMemory`, as
-serially. Optimizer loops (Bootstrap, random search, MIPRO and others) still
-evaluate serially.
+serially.
+
+Optimizers take DSPy's `num_threads` as `concurrent_evaluation`:
+`evaluator.concurrent(&contexts, options)` binds an initialized evaluator to its
+program type, per-attempt contexts and options. `BootstrapFewShotWithRandomSearch`,
+`BootstrapFewShotWithOptuna`, `MIPROv2`, `COPRO` and `InferRules` then evaluate
+candidates through it, each call using the optimizer's own `max_errors`; a
+program-type mismatch returns `error.ProgramTypeMismatch`, and null keeps serial
+`optimize.evaluate`. Candidate evaluation is sequential between candidates, as in
+DSPy; only examples within one evaluation run concurrently. `BootstrapFewShot`
+has no DSPy thread option and stays serial; SIMBA and GEPA batch rollouts remain
+serial.
 
 ## Native seeded evaluation campaigns
 
@@ -1327,6 +1337,21 @@ homelab configuration. Selecting `CODEX_LB_API_KEY` requires an explicit
 It never reads or mutates personal agent settings and never embeds credentials
 in transcripts.
 
+Credentials are provisioned through SecretSpec, profile `live`, stored in the OS
+keyring (`tools/live/secretspec.toml`; it is not at the repository root because
+devenv auto-loads a root manifest into every shell):
+
+```sh
+secretspec --file tools/live/secretspec.toml set OPENAI_API_KEY --profile live --reason "dszig live inference"
+# Optional: OPENAI_BASE_URL, DSZIG_LIVE_MODEL, DSZIG_LIVE_API (chat_completions|responses)
+devenv shell -- dz-live-smoke   # one real native CoT request
+devenv shell -- dz-live         # DSPy and DSZig recordings, cross-replayed
+```
+
+The DSPy recorder (`tools/dspy_reference/live.py`) reads the same variables,
+passing `OPENAI_BASE_URL` as `api_base` and mapping `chat_completions` to DSPy's
+`chat` model type.
+
 For an OpenAI-compatible Responses endpoint:
 
 ```sh
@@ -1366,10 +1391,8 @@ The following prevent a claim that DSZig can do everything DSPy can:
   BootstrapFinetune or bootstrap_trace_data. Native Parallel uses explicit typed
   tasks and contexts, not Python callback objects or ambient thread-local settings.
   Its startup capacities and cooperative join contract are described above.
-- **Optimizer execution and shared identity:** `InferRules` and
-  `BootstrapFewShotWithOptuna` currently support serial evaluation
-  (`num_threads = null` or `1`), rejecting other explicit
-  settings. InferRules' signature-alias propagation does not update arbitrary external
+- **Optimizer execution and shared identity:** SIMBA and GEPA batch rollouts
+  run serially. InferRules' signature-alias propagation does not update arbitrary external
   instances outside the reachable program graph. Canonical Zig signature/Code
   types and default CoT construction do not reproduce every fresh dynamic Python
   class identity; Refine shares this boundary. Mid-bootstrap mutation of a

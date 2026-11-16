@@ -819,6 +819,59 @@ test "random search scores every seed, ranks them and keeps the best" {
     try testing.expectEqual(result.candidates[0].score, best.score);
 }
 
+test "random search with concurrent evaluation ranks the same candidates as serial evaluation" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    var learner: LearningLM = .{};
+    const ctx: dszig.Context = .{ .arena = out.allocator(), .lm = learner.lm(), .retriever = rag.corpus.retriever() };
+    const trainset = try rag.trainset(out.allocator());
+    var search: dszig.BootstrapFewShotWithRandomSearch = .{
+        .metric = rag.keywordMetric,
+        .max_bootstrapped_demos = 3,
+        .max_labeled_demos = 2,
+        .num_candidate_programs = 3,
+    };
+    const serial = try search.compile(rag.RAG, out.allocator(), testing.allocator, ctx, .{}, null, trainset, null);
+
+    const limits: dszig.parallel.Limits = .{ .workers = 3, .tasks = 8, .attempts = 8, .failures = 1 };
+    const Evaluator = dszig.parallel.Evaluator(rag.RAG, limits);
+    var learners: [limits.attempts]LearningLM = @splat(.{});
+    var contexts: [limits.attempts]dszig.Context = undefined;
+    for (&contexts, &learners) |*context, *model| context.* = .{ .arena = undefined, .lm = model.lm(), .retriever = rag.corpus.retriever() };
+    const buffers = try out.allocator().alloc([65536]u8, limits.attempts);
+    var backing: [limits.attempts][]u8 = undefined;
+    for (&backing, buffers) |*slice, *buffer| slice.* = buffer;
+    const evaluator = try testing.allocator.create(Evaluator);
+    defer testing.allocator.destroy(evaluator);
+    try evaluator.init(testing.io, .{}, &backing);
+    defer evaluator.deinit();
+    search.concurrent_evaluation = evaluator.concurrent(&contexts, .{ .straggler_timeout_ns = 0 });
+    const concurrent = try search.compile(rag.RAG, out.allocator(), testing.allocator, ctx, .{}, null, trainset, null);
+
+    try testing.expectEqual(serial.candidates.len, concurrent.candidates.len);
+    for (serial.candidates, concurrent.candidates) |expected, actual| {
+        try testing.expectEqual(expected.seed, actual.seed);
+        try testing.expectEqual(expected.score, actual.score);
+    }
+    const Other = struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct {};
+        pub fn forward(_: *const @This(), _: dszig.Context, _: Input) !Output {
+            return .{};
+        }
+    };
+    try testing.expectError(error.ProgramTypeMismatch, dszig.optimize.evaluateWith(
+        Other,
+        search.concurrent_evaluation,
+        testing.allocator,
+        ctx,
+        &.{},
+        trainset,
+        rag.keywordMetric,
+        10,
+    ));
+}
+
 test "random search stops at stop_at_score" {
     var out: std.heap.ArenaAllocator = .init(testing.allocator);
     defer out.deinit();

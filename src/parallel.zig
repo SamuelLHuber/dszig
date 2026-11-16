@@ -288,6 +288,8 @@ pub fn Evaluator(comptime P: type, comptime limits: Limits) type {
         metric: optimize.Metric,
         contexts: []const Context,
         out_of_memory: std.atomic.Value(bool),
+        bound_contexts: []const Context,
+        bound_options: Options,
 
         const Self = @This();
         const Call = struct { evaluator: *Self, example: *const optimize.Example };
@@ -303,6 +305,30 @@ pub fn Evaluator(comptime P: type, comptime limits: Limits) type {
 
         pub fn deinit(self: *Self) void {
             self.pool.deinit();
+        }
+
+        /// Bind contexts/options for optimizer use (`concurrent_evaluation`).
+        /// Each optimizer evaluate call overrides options.max_errors with the
+        /// optimizer's own budget. contexts must outlive the returned handle.
+        pub fn concurrent(self: *Self, contexts: []const Context, options: Options) optimize.ConcurrentEvaluation {
+            assert(contexts.len >= limits.attempts);
+            self.bound_contexts = contexts;
+            self.bound_options = options;
+            return .{ .ptr = self, .program_type = @typeName(P), .run = runBound };
+        }
+
+        fn runBound(
+            ptr: *anyopaque,
+            program: *const anyopaque,
+            devset: []const optimize.Example,
+            metric: optimize.Metric,
+            max_errors: usize,
+        ) anyerror!optimize.Evaluation {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            var options = self.bound_options;
+            options.max_errors = std.math.cast(u32, max_errors) orelse std.math.maxInt(u32);
+            const typed: *const P = @ptrCast(@alignCast(program));
+            return self.evaluate(self.bound_contexts, typed, devset, metric, options);
         }
 
         /// contexts supply independent per-attempt LM/retriever pointees; their

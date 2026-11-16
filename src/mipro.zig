@@ -360,6 +360,8 @@ pub const MIPROv2 = struct {
     auto: ?Auto = .light,
     num_candidates: ?usize = null,
     max_errors: usize = 10,
+    /// DSPy `num_threads` for trial evaluation; null evaluates serially.
+    concurrent_evaluation: ?optimize.ConcurrentEvaluation = null,
     seed: u32 = 9,
     init_temperature: f64 = 1.0,
     /// Used while bootstrapping demo candidates.
@@ -830,7 +832,7 @@ pub const MIPROv2 = struct {
     /// `batch_size` covers `valset`; any failure scores 0.0, as in DSPy.
     fn score(self: MIPROv2, comptime P: type, out: Allocator, gpa: Allocator, ctx: Context, program: *const P, valset: []const Example, batch_size: usize, rng: *pyrandom.Random) Allocator.Error!f64 {
         const devset = if (batch_size >= valset.len) valset else try createMinibatch(out, rng, valset, batch_size);
-        const result = optimize.evaluate(P, gpa, ctx, program, devset, self.metric, self.max_errors) catch |err| switch (err) {
+        const result = optimize.evaluateWith(P, self.concurrent_evaluation, gpa, ctx, program, devset, self.metric, self.max_errors) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return 0.0,
         };

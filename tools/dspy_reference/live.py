@@ -18,7 +18,13 @@ DEFAULT_OUT = pathlib.Path(__file__).resolve().parents[2] / "tests" / "fixtures"
 def main():
     out = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else pathlib.Path(os.environ.get("DSZIG_LIVE_TRANSCRIPT", DEFAULT_OUT))
     model = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("DSZIG_LIVE_MODEL", "openai/gpt-4o-mini")
-    lm = live_suite.RecordingLM(model, model_type=os.environ.get("DSZIG_LIVE_API", "auto"))
+    # Share the native recorder's settings: chat_completions -> DSPy "chat".
+    api = os.environ.get("DSZIG_LIVE_API", "chat_completions")
+    model_type = {"chat_completions": "chat", "responses": "responses"}.get(api)
+    if model_type is None:
+        sys.exit("DSZIG_LIVE_API must be chat_completions or responses")
+    client = {"api_base": os.environ["OPENAI_BASE_URL"]} if os.environ.get("OPENAI_BASE_URL") else {}
+    lm = live_suite.RecordingLM(model, model_type=model_type, **client)
     result = live_suite.run_suite(lm)
     transcript = {"target_dspy": dspy.__version__, "runtime": f"dspy {dspy.__version__}", "model": model,
                   "supports_reasoning": lm.supports_reasoning,
