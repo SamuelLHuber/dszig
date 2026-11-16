@@ -341,7 +341,8 @@ pub fn Parallel(comptime Result: type, comptime limits: Limits) type {
 }
 
 /// Native `dspy.Evaluate(num_threads=limits.workers)`: concurrent program and
-/// metric calls whose results are summed in devset order, failed slots scoring 0.
+/// metric calls whose results are summed in devset order, using failure_score
+/// for failed slots (zero by default).
 /// Initialize in place; never move a live evaluator. Per-attempt prediction
 /// records, typed outputs and scratch allocators are created at initialization.
 /// Out-of-memory aborts the run, as in serial `optimize.evaluate`.
@@ -361,6 +362,8 @@ pub fn Evaluator(comptime P: type, comptime limits: Limits) type {
         out_of_memory: std.atomic.Value(bool),
         bound_contexts: []const Context,
         bound_options: Options,
+        /// DSPy Evaluate.failure_score; configure between joined evaluations.
+        failure_score: f64,
 
         const Self = @This();
         const Call = struct { evaluator: *Self, example: *const optimize.Example };
@@ -371,6 +374,7 @@ pub fn Evaluator(comptime P: type, comptime limits: Limits) type {
             for (&self.storage) |*storage| try storage.init();
             for (&self.scratch, backing[0..limits.attempts]) |*scratch, bytes| scratch.* = .init(bytes);
             self.out_of_memory = .init(false);
+            self.failure_score = 0;
             try self.pool.init(io, config);
         }
 
@@ -434,7 +438,10 @@ pub fn Evaluator(comptime P: type, comptime limits: Limits) type {
             var sum: f64 = 0;
             var errors: usize = 0;
             for (report.results) |slot| switch (slot) {
-                .failed => errors += 1,
+                .failed => {
+                    errors += 1;
+                    sum += self.failure_score;
+                },
                 .value => |score| sum += score.*,
             };
             return optimize.summarize(sum, devset.len, errors);

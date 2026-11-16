@@ -1108,7 +1108,10 @@ actual concurrent typed Predict with separate scripted LMs and scratch, joined
 stragglers/cancellation, and seeded scheduling properties.
 
 `parallel.Evaluator(P, limits)` is the native counterpart of
-`dspy.Evaluate(num_threads=...)`. `init(io, spawn_config, backing)` creates the
+`dspy.Evaluate(num_threads=...)`. After initialization, set `failure_score`
+(default zero) to score recoverable program or metric failures; error-budget
+cancellation and out-of-memory still abort. Configure it only between joined
+evaluations. `init(io, spawn_config, backing)` creates the
 workers, one prediction record and typed output slot per attempt, and a
 fixed-buffer scratch allocator over each borrowed `backing[attempt]`.
 `evaluate(contexts, &program, devset, metric, options)` runs program plus metric per

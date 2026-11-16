@@ -469,6 +469,7 @@ const Scored = struct {
 
     fn metric(_: std.mem.Allocator, example: *const dszig.Example, prediction: ?*const dszig.value.Record, _: ?*const dszig.Trace) dszig.value.ParseError!f64 {
         const name = example.record.get("name").?.string;
+        if (std.mem.eql(u8, name, "metric_fail")) return error.ParseValue;
         const label = prediction.?.get("label").?.string;
         if (!std.mem.eql(u8, label["label-".len..], name)) return error.ParseValue;
         return example.record.get("score").?.float;
@@ -514,6 +515,14 @@ test "parallel Evaluate sums out-of-order completions in devset order like seria
     try testing.expectEqual(@as(f64, 4), recovered.sum);
     try testing.expectEqual(@as(f64, 100), recovered.score);
     try testing.expectEqual(@as(usize, 1), recovered.errors);
+
+    // Program and metric failures both contribute the configured value.
+    evaluator.failure_score = -0.5;
+    failing[2] = try dszig.Example.fromJson(arena, "{\"name\":\"metric_fail\",\"wait\":false,\"score\":2.0}", keys);
+    const penalized = try evaluator.evaluate(&contexts, &program, &failing, Scored.metric, options);
+    try testing.expectEqual(@as(f64, 1), penalized.sum);
+    try testing.expectEqual(@as(f64, 25), penalized.score);
+    try testing.expectEqual(@as(usize, 2), penalized.errors);
     try testing.expectError(error.ExecutionCanceled, evaluator.evaluate(&contexts, &program, &failing, Scored.metric, .{
         .max_errors = 1,
         .straggler_timeout_ns = 0,
