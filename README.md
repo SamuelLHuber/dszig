@@ -1340,6 +1340,16 @@ relabeled or used as evidence that the new 3.5 protocol matches an old protocol.
 Fresh 3.5 live recordings must identify their actual model, capabilities and
 `target_dspy` before either runtime replays them.
 
+The committed `dspy_3.5.0.json` and `dszig_3.5.0.json` recordings use the public
+OpenAI endpoint with `gpt-4o-mini`: 679 DSPy calls and 680 native calls.
+`devenv shell -- dz-live` completed both authenticated recordings, both
+cross-runtime replays and the pinned reference gate. The nine pipeline scores
+and serialized artifacts matched on replay; GEPA improved the date task from
+0% to 100%, while COPRO and SIMBA remained at 0% in this run. This is finite
+live-model coverage, not proof of every optimizer option or full DSPy parity.
+The recorder preserves lm15's already-flat JSON-schema metadata and also
+normalizes nested Chat-wire schema dictionaries.
+
 ## Real inference
 
 The live executable reads `OPENAI_API_KEY`, or `CODEX_LB_API_KEY` for the local

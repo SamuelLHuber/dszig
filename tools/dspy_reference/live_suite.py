@@ -262,7 +262,8 @@ def request_metadata(request, rollout):
     """Shared Zig/Python text/native metadata; canonical request stays separate."""
     messages = normalized_messages(request)
     format_ = request.config.response_format
-    if format_ is not None and format_.get("type") == "json_schema":
+    # Chat-wire dicts nest the schema; lm15's typed config is already flat.
+    if format_ is not None and format_.get("type") == "json_schema" and "json_schema" in format_:
         format_ = {"type": "json_schema", **format_["json_schema"]}
     choice = request.config.tool_choice
     tools = []
