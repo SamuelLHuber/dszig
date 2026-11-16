@@ -1,4 +1,4 @@
-//! Genuine Python builtin identities that cannot be represented by JSON tags.
+//! Genuine Python runtime identities that cannot be represented by JSON tags.
 //!
 //! Constructors borrow child values and byte buffers. Set/dictionary boxes own
 //! their deduplicated storage, but not its children; a string-only dictionary
@@ -30,6 +30,8 @@ const std = @import("std");
 const runtime = @import("runtime_value.zig");
 const pyjson = @import("pyjson.zig");
 const value_ops = @import("value.zig");
+const decimals = @import("decimal.zig");
+const decimal_environment = @import("decimal_environment.zig");
 const ownership = @import("inference.zig");
 const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
@@ -207,6 +209,115 @@ pub fn complex(a: Allocator, real: f64, imag: f64) Error!Value {
     return boxed(a, .{ .complex = .{ .real = real, .imag = imag } }, &complex_vtable);
 }
 
+/// Construct an exact Decimal from Python's decimal string grammar. The box
+/// owns its immutable coefficient; neither binary64 nor JSON is an intermediary.
+pub fn decimal(a: Allocator, text: []const u8) Error!Value {
+    const data = decimals.parse(a, text) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.ParseValue => return invalidDecimal(a),
+    };
+    errdefer data.deinit(a);
+    return decimalFromOwnedMetadata(a, data);
+}
+
+fn invalidDecimal(a: Allocator) Error!Value {
+    decimal_environment.getContext().signal(.invalid_operation) catch |signal| return decimalFailure(signal);
+    return decimalFromMetadata(a, .{ .kind = .quiet_nan, .digits = "" });
+}
+
+fn decimalTupleItems(input: Value) ?[]const Value {
+    if (input == .array) return input.array.items;
+    const python = view(input) orelse return null;
+    return if (python == .tuple) python.tuple else null;
+}
+
+fn decimalTupleInteger(input: Value) ?i64 {
+    const integer = if (input == .custom) input.custom.integerValue() orelse input else input;
+    return switch (integer) {
+        .bool => |number| @intFromBool(number),
+        .integer => |number| number,
+        .number_string => |text| if (std.json.isNumberFormattedLikeAnInteger(text))
+            std.fmt.parseInt(i64, text, 10) catch null
+        else
+            null,
+        else => null,
+    };
+}
+
+/// Decimal's three-part constructor accepts an outer list or tuple; Pydantic's
+/// Decimal annotation separately restricts that path to actual tuples. Invalid
+/// sign/digit/type arguments do not signal a decimal condition. A finite
+/// exponent outside libmpdec's range signals only after coefficient validation.
+pub fn decimalFromTuple(a: Allocator, input: Value) Error!Value {
+    const parts = decimalTupleItems(input) orelse return error.ParseValue;
+    if (parts.len != 3) return error.ParseValue;
+    const sign = decimalTupleInteger(parts[0]) orelse return error.ParseValue;
+    if (sign != 0 and sign != 1) return error.ParseValue;
+    var kind: decimals.Kind = .finite;
+    var exponent: i64 = 0;
+    if (parts[2] == .string) {
+        const token = parts[2].string;
+        if (std.mem.eql(u8, token, "F")) {
+            kind = .infinity;
+        } else if (std.mem.eql(u8, token, "n")) {
+            kind = .quiet_nan;
+        } else if (std.mem.eql(u8, token, "N")) {
+            kind = .signaling_nan;
+        } else return error.ParseValue;
+    } else {
+        // CPython converts to signed machine width before visiting digits;
+        // overflow here is not decimal.InvalidOperation and sets no flag.
+        exponent = decimalTupleInteger(parts[2]) orelse return error.ParseValue;
+    }
+    const digits = decimalTupleItems(parts[1]) orelse return error.ParseValue;
+    var first = digits.len;
+    for (digits, 0..) |digit, index| {
+        const number = decimalTupleInteger(digit) orelse return error.ParseValue;
+        if (number < 0 or number > 9) return error.ParseValue;
+        if (number != 0 and first == digits.len) first = index;
+    }
+    if (kind == .finite and (exponent < decimals.min_exponent or exponent > decimals.max_exponent))
+        return invalidDecimal(a);
+    const zero = kind == .infinity or (kind == .finite and first == digits.len);
+    const count = if (zero) 1 else digits.len - first;
+    const coefficient = try a.alloc(u8, count);
+    errdefer a.free(coefficient);
+    if (zero) {
+        coefficient[0] = '0';
+    } else for (digits[first..], coefficient) |digit, *byte| {
+        byte.* = @as(u8, @intCast(decimalTupleInteger(digit).?)) + '0';
+    }
+    return decimalFromOwnedMetadata(a, .{
+        .negative = sign != 0,
+        .digits = coefficient,
+        .exponent = exponent,
+        .kind = kind,
+    });
+}
+
+/// Adopt an owning coefficient without copying it. Construction failure leaves
+/// the metadata with its caller, as tupleFromOwnedSlice retains its input.
+pub fn decimalFromOwnedMetadata(a: Allocator, data: decimals.Decimal) Allocator.Error!Value {
+    const result = try boxed(a, .{ .decimal = data }, &decimal_vtable);
+    runtimeBox(result.custom.ptr).owns_storage = true;
+    return result;
+}
+
+/// Own a copy of exact metadata, including quantum, signed zero and NaN payload.
+pub fn decimalFromMetadata(a: Allocator, data: decimals.Decimal) Error!Value {
+    var copy = data;
+    copy.digits = try a.dupe(u8, data.digits);
+    errdefer a.free(copy.digits);
+    return decimalFromOwnedMetadata(a, copy);
+}
+
+/// Decimal(float) retains the float's exact binary fraction, not str(float).
+pub fn decimalFromFloat(a: Allocator, number: f64) Error!Value {
+    decimal_environment.getContext().signal(.float_operation) catch |err| return decimalFailure(err);
+    var buffer: [768]u8 = undefined;
+    return decimalFromMetadata(a, decimals.fromFloatExact(number, &buffer));
+}
+
 pub fn ellipsis(a: Allocator) Error!Value {
     return boxed(a, .ellipsis, &ellipsis_vtable);
 }
@@ -241,7 +352,7 @@ pub fn dictionary(a: Allocator, pairs: []const PythonEntry) Error!Value {
             try builder.resizeDictionary(minimum);
             unicode_keys = false;
         }
-        const lookup = builder.findEntries(entries.items, pair.key, hash);
+        const lookup = try builder.findEntries(entries.items, pair.key, hash);
         if (lookup.found) {
             entries.items[builder.slots[lookup.slot].index].value = pair.value;
         } else {
@@ -289,15 +400,17 @@ fn makeVTable(comptime kind: Kind, comptime hashable: bool) runtime.CustomVTable
         .set => "set",
         .frozen_set => "frozenset",
         .complex => "complex",
+        .decimal => "Decimal",
         .ellipsis => "ellipsis",
         .dictionary => "dict",
     };
     return .{
-        .type_name = "python.builtins." ++ name,
+        .type_name = if (kind == .decimal) "decimal.Decimal" else "python.builtins." ++ name,
         .type_identity = runtime.typeIdentity(Box),
         .model_name = name,
         .hashable = hashable,
         .bool_value = truthy,
+        .float_value = if (kind == .decimal) decimalFloat else null,
         .python = pythonView,
         .raw_value = rawValue,
         .serialized = serialized,
@@ -319,11 +432,27 @@ const unhashable_tuple_vtable = makeVTable(.tuple, false);
 const set_vtable = makeVTable(.set, false);
 const frozen_set_vtable = makeVTable(.frozen_set, true);
 const complex_vtable = makeVTable(.complex, true);
+const decimal_vtable = makeVTable(.decimal, true);
 const ellipsis_vtable = makeVTable(.ellipsis, true);
 const dictionary_vtable = makeVTable(.dictionary, false);
 
 fn pythonView(ptr: *const anyopaque) PythonValue {
     return runtimeBox(ptr).payload;
+}
+
+fn decimalFailure(err: decimal_environment.Context.Error) Error {
+    return if (err == error.OutOfMemory) error.OutOfMemory else error.ParseValue;
+}
+
+fn decimalFloatOperand(number: f64, buffer: *[768]u8) decimals.Decimal {
+    // Decimal equality records FloatOperation but deliberately ignores its
+    // trap. Ordered comparison and Decimal(float) use signal() instead.
+    decimal_environment.getContext().flags.insert(.float_operation);
+    return decimals.fromFloatExact(number, buffer);
+}
+
+fn decimalFloat(ptr: *const anyopaque) Error!f64 {
+    return pythonView(ptr).decimal.toFloat();
 }
 
 fn truthy(ptr: *const anyopaque) bool {
@@ -332,6 +461,7 @@ fn truthy(ptr: *const anyopaque) bool {
         .tuple, .set, .frozen_set => |items| items.len != 0,
         .dictionary => |pairs| pairs.len != 0,
         .complex => |c| c.real != 0 or c.imag != 0,
+        .decimal => |data| data.truthy(),
         .ellipsis => true,
     };
 }
@@ -372,15 +502,15 @@ const Table = struct {
 
     const Lookup = struct { slot: usize, found: bool };
 
-    fn findValues(self: *const Table, items: []const Value, key: Value, hash: u64) Lookup {
+    fn findValues(self: *const Table, items: []const Value, key: Value, hash: u64) Error!Lookup {
         return self.find(items, key, hash, false);
     }
 
-    fn findEntries(self: *const Table, pairs: []const PythonEntry, key: Value, hash: u64) Lookup {
+    fn findEntries(self: *const Table, pairs: []const PythonEntry, key: Value, hash: u64) Error!Lookup {
         return self.find(pairs, key, hash, true);
     }
 
-    fn find(self: *const Table, items: anytype, key: Value, hash: u64, comptime entries: bool) Lookup {
+    fn find(self: *const Table, items: anytype, key: Value, hash: u64, comptime entries: bool) Error!Lookup {
         if (self.slots.len == 0) return .{ .slot = 0, .found = false };
         const mask = self.slots.len - 1;
         var index: usize = @as(usize, @truncate(hash)) & mask;
@@ -391,7 +521,7 @@ const Table = struct {
                 const slot = self.slots[index + offset];
                 if (slot.index == absent) return .{ .slot = index + offset, .found = false };
                 const prior = if (entries) items[slot.index].key else items[slot.index];
-                if (slot.hash == hash and keyEqual(prior, key))
+                if (slot.hash == hash and try containerEqual(prior, key))
                     return .{ .slot = index + offset, .found = true };
             }
             perturb >>= 5;
@@ -479,7 +609,7 @@ fn makeSet(a: Allocator, items: []const Value, seed: u32, frozen: bool) Error!Va
     for (items, 0..) |item, index| {
         if (!hashAdmissible(item)) return error.ParseValue;
         const hash = try hashValue(item, seed);
-        const lookup = builder.findValues(items, item, hash);
+        const lookup = try builder.findValues(items, item, hash);
         if (!lookup.found) try builder.add(lookup.slot, index, hash, false);
     }
     const data = try a.alloc(Value, builder.used);
@@ -592,7 +722,14 @@ fn tupleHash(items: []const Value, seed: u32) error{ParseValue}!u64 {
     return if (acc == std.math.maxInt(u64)) 1546275796 else acc;
 }
 
-fn hashValue(v: Value, seed: u32) error{ParseValue}!u64 {
+fn hashValue(input: Value, seed: u32) error{ParseValue}!u64 {
+    const v = if (input == .custom) integer: {
+        const number = input.custom.integerValue() orelse break :integer input;
+        if (!input.custom.vtable.hashable) return error.ParseValue;
+        if (input.custom.vtable.python_hash) |hash|
+            return validHash(@bitCast(try hash(input.custom.ptr, seed)));
+        break :integer number;
+    } else input;
     if (view(v)) |python| return switch (python) {
         .bytes => |data| bytesHash(data, seed),
         .tuple => |items| try tupleHash(items, seed),
@@ -608,6 +745,7 @@ fn hashValue(v: Value, seed: u32) error{ParseValue}!u64 {
             break :blk if (acc == std.math.maxInt(u64)) 590923713 else acc;
         },
         .complex => |c| validHash(floatHash(c.real, v.custom.ptr) +% 1000003 *% floatHash(c.imag, v.custom.ptr)),
+        .decimal => |data| @bitCast(try data.hash(@bitCast(pointerHash(v.custom.ptr)))),
         .ellipsis => pointerHash(&ellipsis_identity),
         .bytearray, .set, .dictionary => error.ParseValue,
     };
@@ -660,7 +798,7 @@ fn hashValue(v: Value, seed: u32) error{ParseValue}!u64 {
     };
 }
 
-fn keyEqual(a: Value, b: Value) bool {
+pub fn containerEqual(a: Value, b: Value) Error!bool {
     // PyObject_RichCompareBool performs this identity shortcut for membership
     // and container elements, even when an object's own equality is false.
     if (a == .custom and b == .custom and a.custom.ptr == b.custom.ptr) return true;
@@ -669,14 +807,15 @@ fn keyEqual(a: Value, b: Value) bool {
     return value_ops.pyEqual(a, b);
 }
 
-fn equal(left: *const anyopaque, right: *const anyopaque) bool {
+fn equal(left: *const anyopaque, right: *const anyopaque) Error!bool {
     const other = runtimeBox(right);
     return equalValue(left, .{ .custom = .{ .ptr = other, .vtable = other.vtable } });
 }
 
-fn equalValue(ptr: *const anyopaque, other: Value) bool {
+fn equalValue(ptr: *const anyopaque, other: Value) Error!bool {
     const self = runtimeBox(ptr);
-    if (other == .custom and other.custom.ptr == ptr and self.payload != .complex) return true;
+    if (other == .custom and other.custom.ptr == ptr and
+        self.payload != .complex and self.payload != .decimal) return true;
     const b = view(other);
     return switch (self.payload) {
         .bytes, .bytearray => |data| if (b) |python| switch (python) {
@@ -686,7 +825,7 @@ fn equalValue(ptr: *const anyopaque, other: Value) bool {
         .tuple => |items| blk: {
             const python = b orelse break :blk false;
             if (python != .tuple or items.len != python.tuple.len) break :blk false;
-            for (items, python.tuple) |a_item, b_item| if (!keyEqual(a_item, b_item)) break :blk false;
+            for (items, python.tuple) |a_item, b_item| if (!try containerEqual(a_item, b_item)) break :blk false;
             break :blk true;
         },
         .set, .frozen_set => |items| blk: {
@@ -702,7 +841,7 @@ fn equalValue(ptr: *const anyopaque, other: Value) bool {
                     // CPython looks each LEFT key up in the RIGHT set. Operand
                     // direction remains observable for asymmetric custom ==.
                     const hash = hashValue(item, owner.hash_seed) catch break :blk false;
-                    if (!table.findValues(others, item, hash).found) break :blk false;
+                    if (!(try table.findValues(others, item, hash)).found) break :blk false;
                 }
             } else {
                 for (items) |item| {
@@ -710,7 +849,7 @@ fn equalValue(ptr: *const anyopaque, other: Value) bool {
                     var found = false;
                     for (others) |candidate| {
                         const candidate_hash = hashValue(candidate, 0) catch break :blk false;
-                        if (candidate_hash == hash and keyEqual(candidate, item)) {
+                        if (candidate_hash == hash and try containerEqual(candidate, item)) {
                             found = true;
                             break;
                         }
@@ -722,12 +861,17 @@ fn equalValue(ptr: *const anyopaque, other: Value) bool {
         },
         .complex => |c| blk: {
             if (b) |python| {
+                if (python == .decimal) {
+                    if (c.imag != 0) break :blk false;
+                    break :blk decimalEqual(python.decimal, .{ .float = c.real });
+                }
                 if (python != .complex) break :blk false;
                 break :blk c.real == python.complex.real and c.imag == python.complex.imag;
             }
             if (c.imag != 0) break :blk false;
             break :blk value_ops.pyEqual(.{ .float = c.real }, other);
         },
+        .decimal => |data| decimalEqual(data, other),
         .ellipsis => b != null and b.? == .ellipsis,
         .dictionary => |pairs| blk: {
             if (other == .object) {
@@ -739,8 +883,8 @@ fn equalValue(ptr: *const anyopaque, other: Value) bool {
                     // and equality, just as an arbitrary-key dict lookup does.
                     const candidate: Value = .{ .string = key };
                     const hash = hashValue(candidate, 0) catch break :blk false;
-                    const lookup = table.findEntries(pairs, candidate, hash);
-                    if (!lookup.found or !keyEqual(pairs[self.table[lookup.slot].index].value, child)) break :blk false;
+                    const lookup = try table.findEntries(pairs, candidate, hash);
+                    if (!lookup.found or !try containerEqual(pairs[self.table[lookup.slot].index].value, child)) break :blk false;
                 }
                 break :blk true;
             }
@@ -751,22 +895,56 @@ fn equalValue(ptr: *const anyopaque, other: Value) bool {
                 var match_index: usize = absent;
                 if (ownBox(other)) |owner| {
                     const table: Table = .{ .allocator = undefined, .slots = @constCast(owner.table) };
-                    const lookup = table.findEntries(python.dictionary, pair.key, hash);
+                    const lookup = try table.findEntries(python.dictionary, pair.key, hash);
                     if (lookup.found) match_index = owner.table[lookup.slot].index;
                 } else {
                     for (python.dictionary, 0..) |candidate, index| {
                         const candidate_hash = hashValue(candidate.key, 0) catch break :blk false;
-                        if (candidate_hash == hash and keyEqual(candidate.key, pair.key)) {
+                        if (candidate_hash == hash and try containerEqual(candidate.key, pair.key)) {
                             match_index = index;
                             break;
                         }
                     }
                 }
-                if (match_index == absent or !keyEqual(pair.value, python.dictionary[match_index].value)) break :blk false;
+                if (match_index == absent or !try containerEqual(pair.value, python.dictionary[match_index].value)) break :blk false;
             }
             break :blk true;
         },
     };
+}
+
+fn decimalEqual(data: decimals.Decimal, input: Value) Error!bool {
+    const other = if (input == .custom) input.custom.integerValue() orelse input else input;
+    var buffer: [768]u8 = undefined;
+    const operand: decimals.Decimal = switch (other) {
+        .bool => |number| .{ .digits = if (number) "1" else "0" },
+        .integer => |number| blk: {
+            const text = std.fmt.bufPrint(&buffer, "{d}", .{number}) catch unreachable;
+            break :blk .{ .negative = number < 0, .digits = text[@intFromBool(number < 0)..] };
+        },
+        .float => |number| decimalFloatOperand(number, &buffer),
+        .number_string => |text| blk: {
+            if (!std.json.isNumberFormattedLikeAnInteger(text)) {
+                const number = std.fmt.parseFloat(f64, text) catch return error.ParseValue;
+                break :blk decimalFloatOperand(number, &buffer);
+            }
+            const negative = text.len != 0 and text[0] == '-';
+            break :blk .{ .negative = negative, .digits = text[@intFromBool(negative)..] };
+        },
+        .custom => blk: {
+            const python = view(other) orelse return false;
+            break :blk switch (python) {
+                .decimal => |number| number,
+                .complex => |number| if (number.imag == 0)
+                    decimalFloatOperand(number.real, &buffer)
+                else
+                    return false,
+                else => return false,
+            };
+        },
+        else => return false,
+    };
+    return decimal_environment.getContext().equal(data, operand) catch |err| return decimalFailure(err);
 }
 
 fn rawValue(_: Allocator, ptr: *const anyopaque) Allocator.Error!Value {
@@ -794,6 +972,10 @@ fn clone(a: Allocator, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
     copy.* = .{ .payload = source.payload, .vtable = source.vtable, .hash_seed = source.hash_seed };
     switch (source.payload) {
         .bytes => |data| copy.payload = .{ .bytes = try a.dupe(u8, data) },
+        .decimal => |data| {
+            copy.payload.decimal.digits = try a.dupe(u8, data.digits);
+            copy.owns_storage = true;
+        },
         .bytearray => |data| {
             copy.payload = .{ .bytearray = try a.dupe(u8, data) };
             copy.bytearray_capacity = data.len;
@@ -849,6 +1031,7 @@ fn deinit(a: Allocator, ptr: *const anyopaque, owns_data: bool) void {
     const box = runtimeBox(ptr);
     switch (box.payload) {
         .bytes => |data| if (owns_data) a.free(data),
+        .decimal => |data| if (box.owns_storage) data.deinit(a),
         .bytearray => |data| {
             var storage: std.ArrayList(u8) = .empty;
             storage.items = @constCast(data);
@@ -873,7 +1056,9 @@ fn deinit(a: Allocator, ptr: *const anyopaque, owns_data: bool) void {
 }
 
 fn writeRuntimeStr(w: *Writer, ptr: *const anyopaque) runtime.CustomWriteError!void {
-    try writePythonRepr(w, runtimeBox(ptr).payload, 0);
+    const python = runtimeBox(ptr).payload;
+    if (python == .decimal) return python.decimal.write(w, decimal_environment.getContext().capitals);
+    try writePythonRepr(w, python, 0);
 }
 
 fn writeRuntimeRepr(w: *Writer, ptr: *const anyopaque, depth: u32) runtime.CustomWriteError!void {
@@ -953,6 +1138,11 @@ fn writePythonRepr(w: *Writer, python: PythonValue, depth: usize) runtime.Custom
             }
             try writeComplexComponent(w, c.imag, false);
             try w.writeAll(if (real_zero) "j" else "j)");
+        },
+        .decimal => |data| {
+            try w.writeAll("Decimal('");
+            try data.write(w, decimal_environment.getContext().capitals);
+            try w.writeAll("')");
         },
         .ellipsis => try w.writeAll("Ellipsis"),
         .dictionary => |pairs| {
@@ -1064,6 +1254,12 @@ fn serialized(a: Allocator, ptr: *const anyopaque, depth: u32) runtime.Serializa
             var out: Writer.Allocating = .init(a);
             defer out.deinit();
             writeComplexJsonText(&out.writer, c) catch return error.OutOfMemory;
+            break :blk .{ .string = try out.toOwnedSlice() };
+        },
+        .decimal => |data| blk: {
+            var out: Writer.Allocating = .init(a);
+            defer out.deinit();
+            data.write(&out.writer, decimal_environment.getContext().capitals) catch return error.OutOfMemory;
             break :blk .{ .string = try out.toOwnedSlice() };
         },
         .ellipsis => .{ .custom = .{ .ptr = ptr, .vtable = self.vtable } },
@@ -1191,6 +1387,11 @@ const KeyIterator = struct {
                         writeComplexJsonText(&fixed, c) catch unreachable;
                         return fixed.buffered();
                     },
+                    .decimal => {
+                        self.opaque_key = key.custom;
+                        self.opaque_offset = 0;
+                        continue;
+                    },
                     .ellipsis => return "Ellipsis",
                     .bytearray, .set, .frozen_set, .dictionary => return error.PythonSerializeFallback,
                 };
@@ -1205,7 +1406,9 @@ const KeyIterator = struct {
                     } else self.floatText(std.fmt.parseFloat(f64, text) catch return error.PythonSerializeFallback),
                     .float => |f| self.floatText(f),
                     .custom => |custom| {
-                        if (custom.vtable.enumeration) |inspect| {
+                        if (custom.integerValue()) |integer| {
+                            self.pending = integer;
+                        } else if (custom.vtable.enumeration) |inspect| {
                             self.pending = inspect(custom.ptr).value;
                         } else {
                             self.opaque_key = custom;
@@ -1394,6 +1597,11 @@ fn writePythonSerialized(w: *Writer, python: PythonValue, style: runtime.JsonSty
             try writeComplexJsonText(w, c);
             try w.writeByte('"');
         },
+        .decimal => |data| {
+            try w.writeByte('"');
+            try data.write(w, decimal_environment.getContext().capitals);
+            try w.writeByte('"');
+        },
         // Root TypeAdapter(ellipsis) retains the object; nested inference with
         // fallback=str converts it to text. Plain JSON must reject the root.
         .ellipsis => if (depth == 0) return error.ParseValue else try pyjson.writeJsonString(w, "Ellipsis"),
@@ -1553,14 +1761,14 @@ const SourceStringKey = struct {
         a.destroy(key);
     }
 
-    fn equalKey(left: *const anyopaque, right: *const anyopaque) bool {
+    fn equalKey(left: *const anyopaque, right: *const anyopaque) Error!bool {
         const a = get(left);
         const b = get(right);
         if (a.ordered != b.ordered) return false;
         return if (a.ordered) std.mem.order(u8, a.text, b.text) != .gt else std.mem.eql(u8, a.text, b.text);
     }
 
-    fn equalKeyValue(ptr: *const anyopaque, other: Value) bool {
+    fn equalKeyValue(ptr: *const anyopaque, other: Value) Error!bool {
         if (other == .custom) {
             if (other.custom.get(SourceStringKey)) |key|
                 return equalKey(ptr, key);
@@ -1577,8 +1785,8 @@ test "Python custom keys equal ordinary dictionary string keys through their has
     const key = try SourceStringKey.toRuntime(a, "x");
     const ordinary = try dictionary(a, &.{.{ .key = .{ .string = "x" }, .value = .{ .integer = 1 } }});
     const arbitrary = try dictionary(a, &.{.{ .key = key, .value = .{ .integer = 1 } }});
-    try testing.expect(value_ops.pyEqual(arbitrary, ordinary));
-    try testing.expect(value_ops.pyEqual(ordinary, arbitrary));
+    try testing.expect(try value_ops.pyEqual(arbitrary, ordinary));
+    try testing.expect(try value_ops.pyEqual(ordinary, arbitrary));
     const custom_first = try dictionary(a, &.{
         .{ .key = key, .value = .{ .integer = 1 } },
         .{ .key = .{ .string = "x" }, .value = .{ .integer = 2 } },
@@ -1604,8 +1812,8 @@ test "Python custom keys equal ordinary dictionary string keys through their has
 
     const owned = try ownership.cloneJsonValue(testing.allocator, arbitrary);
     defer ownership.freeJsonValue(testing.allocator, owned);
-    try testing.expect(value_ops.pyEqual(owned, ordinary));
-    try testing.expect(value_ops.pyEqual(ordinary, owned));
+    try testing.expect(try value_ops.pyEqual(owned, ordinary));
+    try testing.expect(try value_ops.pyEqual(ordinary, owned));
 }
 
 test "Python set and dictionary equality preserve asymmetric lookup operand direction" {
@@ -1614,19 +1822,19 @@ test "Python set and dictionary equality preserve asymmetric lookup operand dire
     const a = scratch.allocator();
     const lower = try SourceStringKey.toOrderedRuntime(a, "a");
     const upper = try SourceStringKey.toOrderedRuntime(a, "b");
-    try testing.expect(value_ops.pyEqual(lower, upper));
-    try testing.expect(!value_ops.pyEqual(upper, lower));
+    try testing.expect(try value_ops.pyEqual(lower, upper));
+    try testing.expect(!try value_ops.pyEqual(upper, lower));
     const lower_dict = try dictionary(a, &.{.{ .key = lower, .value = .{ .integer = 1 } }});
     const upper_dict = try dictionary(a, &.{.{ .key = upper, .value = .{ .integer = 1 } }});
-    try testing.expect(!value_ops.pyEqual(lower_dict, upper_dict));
-    try testing.expect(value_ops.pyEqual(upper_dict, lower_dict));
+    try testing.expect(!try value_ops.pyEqual(lower_dict, upper_dict));
+    try testing.expect(try value_ops.pyEqual(upper_dict, lower_dict));
     const lower_set = try set(a, &.{lower});
     const upper_set = try set(a, &.{upper});
-    try testing.expect(!value_ops.pyEqual(lower_set, upper_set));
-    try testing.expect(value_ops.pyEqual(upper_set, lower_set));
+    try testing.expect(!try value_ops.pyEqual(lower_set, upper_set));
+    try testing.expect(try value_ops.pyEqual(upper_set, lower_set));
     const lower_frozen = try frozenSet(a, &.{lower});
-    try testing.expect(!value_ops.pyEqual(lower_frozen, upper_set));
-    try testing.expect(value_ops.pyEqual(upper_set, lower_frozen));
+    try testing.expect(!try value_ops.pyEqual(lower_frozen, upper_set));
+    try testing.expect(try value_ops.pyEqual(upper_set, lower_frozen));
     try expectRepr("{StringKey('a', ordered=True)}", try set(a, &.{ lower, upper }));
     try expectRepr("{StringKey('b', ordered=True), StringKey('a', ordered=True)}", try set(a, &.{ upper, lower }));
 }
@@ -1675,8 +1883,8 @@ test "CPython dictionaries use dict probes growth and Unicode conversion rather 
         }
         const owned = try ownership.cloneJsonValue(testing.allocator, actual);
         defer ownership.freeJsonValue(testing.allocator, owned);
-        try testing.expect(value_ops.pyEqual(actual, owned));
-        try testing.expect(value_ops.pyEqual(owned, actual));
+        try testing.expect(try value_ops.pyEqual(actual, owned));
+        try testing.expect(try value_ops.pyEqual(owned, actual));
     }
 }
 
@@ -1697,8 +1905,8 @@ test "Python bytes retain identity and exact byte repr" {
         try testing.expect(actual.custom.vtable.hashable);
         try testing.expect(!actual.custom.vtable.is_type);
         try testing.expectEqual(case[0].len != 0, actual.custom.truthy());
-        try testing.expect(!value_ops.pyEqual(actual, .{ .string = case[0] }));
-        try testing.expect(!value_ops.pyEqual(.{ .string = case[0] }, actual));
+        try testing.expect(!try value_ops.pyEqual(actual, .{ .string = case[0] }));
+        try testing.expect(!try value_ops.pyEqual(.{ .string = case[0] }, actual));
         try expectRepr(case[1], actual);
     }
 }
@@ -1716,9 +1924,9 @@ test "Python tuple repr identity truth and recursive hash admission" {
     try testing.expect(one.custom.truthy());
     try testing.expect(one.custom.vtable.hashable);
     try testing.expect(!unhashable.custom.vtable.hashable);
-    try testing.expect(value_ops.pyEqual(one, equal_one));
-    try testing.expect(!value_ops.pyEqual(empty, list));
-    try testing.expect(!value_ops.pyEqual(list, empty));
+    try testing.expect(try value_ops.pyEqual(one, equal_one));
+    try testing.expect(!try value_ops.pyEqual(empty, list));
+    try testing.expect(!try value_ops.pyEqual(list, empty));
     try expectRepr("()", empty);
     try expectRepr("(1,)", one);
     try expectRepr("([],)", unhashable);
@@ -1728,7 +1936,7 @@ test "Python tuple repr identity truth and recursive hash admission" {
     // A representable container identity is reflexive even with an embedded
     // NaN; distinct embedded float-object identities remain a runtime limit.
     const nan_tuple = try tuple(a, &.{.{ .float = std.math.nan(f64) }});
-    try testing.expect(value_ops.pyEqual(nan_tuple, nan_tuple));
+    try testing.expect(try value_ops.pyEqual(nan_tuple, nan_tuple));
 }
 
 test "CPython seed-zero set layout dedup and frozen cross equality" {
@@ -1743,8 +1951,8 @@ test "CPython seed-zero set layout dedup and frozen cross equality" {
     const frozen = try frozenSet(a, &numeric);
     try expectRepr("{0, 1, 32, 3, 4, 8, 9, -1}", actual);
     try expectRepr("frozenset({0, 1, 32, 3, 4, 8, 9, -1})", frozen);
-    try testing.expect(value_ops.pyEqual(actual, frozen));
-    try testing.expect(value_ops.pyEqual(frozen, actual));
+    try testing.expect(try value_ops.pyEqual(actual, frozen));
+    try testing.expect(try value_ops.pyEqual(frozen, actual));
     try testing.expect(!actual.custom.vtable.hashable);
     try testing.expect(frozen.custom.vtable.hashable);
     try testing.expectEqual(@as(i64, -7633075888884608186), @as(i64, @bitCast(try hashValue(frozen, 0))));
@@ -1829,7 +2037,7 @@ test "Python dictionaries retain original equal key and insertion order" {
         .{ .key = .{ .integer = 0 }, .value = .{ .string = "zero" } },
         .{ .key = .{ .integer = 1 }, .value = .{ .string = "complex" } },
     });
-    try testing.expect(value_ops.pyEqual(actual, reverse));
+    try testing.expect(try value_ops.pyEqual(actual, reverse));
     const ordinary = try dictionary(a, &.{
         .{ .key = .{ .string = "x" }, .value = .{ .integer = 1 } },
         .{ .key = .{ .string = "y" }, .value = .{ .integer = 2 } },
@@ -1873,13 +2081,13 @@ test "Python complex source repr numeric equality and Pydantic text differ" {
         try testing.expectEqual(case.real != 0 or case.imag != 0, actual.custom.truthy());
     }
     const one = try complex(a, 1, -0.0);
-    try testing.expect(value_ops.pyEqual(one, .{ .bool = true }));
-    try testing.expect(value_ops.pyEqual(.{ .integer = 1 }, one));
-    try testing.expect(value_ops.pyEqual(one, .{ .number_string = "1" }));
+    try testing.expect(try value_ops.pyEqual(one, .{ .bool = true }));
+    try testing.expect(try value_ops.pyEqual(.{ .integer = 1 }, one));
+    try testing.expect(try value_ops.pyEqual(one, .{ .number_string = "1" }));
     const rounded = try complex(a, 9007199254740992, 0);
-    try testing.expect(!value_ops.pyEqual(rounded, .{ .number_string = "9007199254740993" }));
+    try testing.expect(!try value_ops.pyEqual(rounded, .{ .number_string = "9007199254740993" }));
     const nan = try complex(a, std.math.nan(f64), 0);
-    try testing.expect(!value_ops.pyEqual(nan, nan));
+    try testing.expect(!try value_ops.pyEqual(nan, nan));
     const dedup_nan = try set(a, &.{ nan, nan });
     try testing.expectEqual(@as(usize, 1), view(dedup_nan).?.set.len);
     const other_nan = try complex(a, std.math.nan(f64), 0);
@@ -1981,7 +2189,7 @@ test "Builtin owning clone survives every borrowed source allocation" {
     try testing.expect(copied.custom.owns_data);
     const second = try ownership.cloneJsonValue(testing.allocator, copied);
     defer ownership.freeJsonValue(testing.allocator, second);
-    try testing.expect(value_ops.pyEqual(copied, second));
+    try testing.expect(try value_ops.pyEqual(copied, second));
 }
 
 test "Arbitrary dictionary model keys stream Source text and long-key collisions" {
@@ -2027,7 +2235,7 @@ test "Builtin ownership clone keeps set order rather than reconstructing Python 
     const copy = try ownership.cloneJsonValue(a, original);
     defer ownership.freeJsonValue(a, copy);
     try expectRepr("{-417, 943}", copy);
-    try testing.expect(value_ops.pyEqual(original, copy));
+    try testing.expect(try value_ops.pyEqual(original, copy));
 }
 
 test "Builtin repr and dictionary keys retain the Source decimal conversion limit" {
@@ -2066,7 +2274,7 @@ fn exerciseBuiltinOwnership(a: Allocator) !void {
     try bytearrayExtend(a, mutable, view(mutable).?.bytearray);
     const mutable_copy = try ownership.cloneJsonValue(a, mutable);
     defer ownership.freeJsonValue(a, mutable_copy);
-    try testing.expect(value_ops.pyEqual(mutable, mutable_copy));
+    try testing.expect(try value_ops.pyEqual(mutable, mutable_copy));
     const binary = try bytes(a, "borrowed 雪");
     defer binary.custom.deinit(a);
     const point = try complex(a, -0.0, std.math.inf(f64));
@@ -2089,7 +2297,7 @@ fn exerciseBuiltinOwnership(a: Allocator) !void {
     defer mapping.custom.deinit(a);
     const copied = try ownership.cloneJsonValue(a, mapping);
     defer ownership.freeJsonValue(a, copied);
-    try testing.expect(value_ops.pyEqual(mapping, copied));
+    try testing.expect(try value_ops.pyEqual(mapping, copied));
     var growing_pairs: [27]PythonEntry = undefined;
     for ([_][]const u8{ "s", "t", "u" }, 0..) |text, index|
         growing_pairs[index] = .{ .key = .{ .string = text }, .value = .null };
@@ -2099,7 +2307,7 @@ fn exerciseBuiltinOwnership(a: Allocator) !void {
     defer growing.custom.deinit(a);
     const growing_copy = try ownership.cloneJsonValue(a, growing);
     defer ownership.freeJsonValue(a, growing_copy);
-    try testing.expect(value_ops.pyEqual(growing, growing_copy));
+    try testing.expect(try value_ops.pyEqual(growing, growing_copy));
     const ordinary = try dictionary(a, &.{.{ .key = .{ .string = "x" }, .value = binary }});
     var storage = ordinary.object;
     defer storage.deinit(a);

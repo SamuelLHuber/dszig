@@ -15,6 +15,11 @@ fn repr(comptime v: Value, comptime as_str: bool) []const u8 {
         const size = switch (v) {
             .string, .number_string => |s| s.len * 10 + 64,
             .custom => |c| blk: {
+                if (c.integerValue()) |integer| break :blk switch (integer) {
+                    .integer => 20,
+                    .number_string => |text| text.len,
+                    else => unreachable,
+                };
                 if (c.vtable.enumeration) |inspect| {
                     const member = inspect(c.ptr);
                     break :blk member.class_name.len + member.member_name.len + 1;
@@ -69,8 +74,11 @@ pub fn Literal(comptime arguments: []const Value) type {
                 else => @compileError("dszig: Literal supports scalars, Enum members and bytes only"),
             }
             for (result[0..len]) |previous| {
-                const same_kind = (smallInt(v) != null and smallInt(previous) != null) or std.meta.activeTag(v) == std.meta.activeTag(previous);
-                if (same_kind and value.pyEqual(v, previous)) break;
+                const same_kind = if (v == .custom and previous == .custom)
+                    v.custom.sameType(previous.custom)
+                else
+                    (smallInt(v) != null and smallInt(previous) != null) or std.meta.activeTag(v) == std.meta.activeTag(previous);
+                if (same_kind and (value.pyEqual(v, previous) catch @compileError("dszig: Literal argument equality failed"))) break;
             } else {
                 result[len] = v;
                 len += 1;
@@ -105,8 +113,8 @@ pub fn Literal(comptime arguments: []const Value) type {
 
         /// Decode an already validated prediction, retaining DSPy's shortcut
         /// type (e.g. True for Literal[1]) rather than validating it twice.
-        pub fn fromValue(input: Value) error{ParseValue}!Self {
-            for (allowed) |v| if (value.pyEqual(v, input)) return .{ .value = input };
+        pub fn fromValue(input: Value) runtime.CustomError!Self {
+            for (allowed) |v| if (try value.pyEqual(v, input)) return .{ .value = input };
             return error.ParseValue;
         }
         pub fn toRuntime(self: Self, _: Allocator) Allocator.Error!Value {
@@ -117,13 +125,13 @@ pub fn Literal(comptime arguments: []const Value) type {
 
 /// Runtime schema-backed literals (XML leaves) use the same lookup as typed
 /// annotations. No coercion occurs before exact bool/int/string selection.
-pub fn validateValues(allowed: []const Value, input: Value) error{ParseValue}!Value {
+pub fn validateValues(allowed: []const Value, input: Value) runtime.CustomError!Value {
     if (input == .bool or input == .string) {
         var i = allowed.len;
         while (i > 0) {
             i -= 1;
             const v = allowed[i];
-            if (std.meta.activeTag(v) == std.meta.activeTag(input) and value.pyEqual(v, input)) return v;
+            if (std.meta.activeTag(v) == std.meta.activeTag(input) and try value.pyEqual(v, input)) return v;
         }
     }
     const has_int = for (allowed) |v| {
@@ -138,17 +146,21 @@ pub fn validateValues(allowed: []const Value, input: Value) error{ParseValue}!Va
             if (smallInt(v)) |expected| if (expected == integer) return v;
         }
     }
+    // Pydantic's Python-dict lookup rejects unhashable inputs before invoking
+    // equality. DSPy's direct membership shortcut above it is deliberately
+    // separate: bytearray can equal bytes there, and sNaN can raise there.
+    _ = @import("python_value.zig").pythonHash(input, 0) catch return error.ParseValue;
     var i = allowed.len;
     while (i > 0) {
         i -= 1;
         const v = allowed[i];
-        if ((!primitive(v) or v == .bool) and value.pyEqual(v, input)) return v;
+        if ((!primitive(v) or v == .bool) and try value.pyEqual(v, input)) return v;
     }
     i = allowed.len;
     while (i > 0) {
         i -= 1;
         const v = allowed[i];
-        if (primitive(v) and value.pyEqual(v, input)) return v;
+        if (primitive(v) and try value.pyEqual(v, input)) return v;
     }
     return error.ParseValue;
 }
@@ -159,7 +171,7 @@ fn identity(_: Allocator, input: Value) runtime.CustomError!Value {
 
 /// DSPy's membership shortcut, wrapper stripping and repair-first fallback.
 pub fn parseValues(arena: Allocator, allowed: []const Value, input: Value) runtime.CustomError!Value {
-    for (allowed) |v| if (value.pyEqual(v, input)) return input;
+    for (allowed) |v| if (try value.pyEqual(v, input)) return input;
     if (input != .string) return validateValues(allowed, input);
     var text = value.pyStrip(input.string);
     for ([_][]const u8{ "Literal[", "str[" }) |prefix| {
@@ -170,7 +182,7 @@ pub fn parseValues(arena: Allocator, allowed: []const Value, input: Value) runti
     }
     if (text.len > 1 and text[0] == text[text.len - 1] and (text[0] == '\'' or text[0] == '"')) text = text[1 .. text.len - 1];
     const stripped: Value = .{ .string = text };
-    for (allowed) |v| if (value.pyEqual(v, stripped)) return stripped;
+    for (allowed) |v| if (try value.pyEqual(v, stripped)) return stripped;
     const candidate = try value.parseText(arena, .{
         .name = "literal",
         .kind = .json,
@@ -180,6 +192,18 @@ pub fn parseValues(arena: Allocator, allowed: []const Value, input: Value) runti
         .validate = identity,
     }, text);
     return validateValues(allowed, candidate);
+}
+
+test "Bytes Literal rejects unhashable validation but direct parsing preserves bytearray" {
+    const python = @import("python_value.zig");
+    const a = std.testing.allocator;
+    const Binary = Literal(&.{comptime python.staticBytes("hi")});
+    const input = try python.bytearray(a, "hi");
+    defer input.custom.deinit(a);
+    try std.testing.expectError(error.ParseValue, Binary.validate(a, input));
+    const direct = try Binary.parseValue(a, input);
+    try python.bytearraySet(input, 0, 'H');
+    try std.testing.expectEqualStrings("Hi", python.view(direct).?.bytearray);
 }
 
 test "Bytes Literal keeps bytes distinct from text and owning clones free normally" {

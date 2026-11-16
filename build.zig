@@ -28,22 +28,35 @@ pub fn build(b: *std.Build) void {
             .{ .name = "rag_program", .module = rag_program },
         },
     });
+    const evaluation_simulation = b.createModule(.{
+        .root_source_file = b.path("tools/evaluation_simulation.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "dszig", .module = dszig }},
+    });
     const imports: []const std.Build.Module.Import = &.{
         .{ .name = "dszig", .module = dszig },
         .{ .name = "rag_program", .module = rag_program },
         .{ .name = "live_suite", .module = live_suite },
+        .{ .name = "evaluation_simulation", .module = evaluation_simulation },
     };
 
     const test_step = b.step("test", "Run unit, DSPy golden, behaviour and compile-fail tests");
     test_step.dependOn(&run_unit_tests.step);
-    for ([_][]const u8{ "tests/golden.zig", "tests/behavior.zig", "tests/live_replay.zig", "tests/optuna.zig", "tests/trace_selection.zig" }) |path| {
+    for ([_][]const u8{ "tests/golden.zig", "tests/behavior.zig", "tests/live_replay.zig", "tests/optuna.zig", "tests/trace_selection.zig", "tests/simulation.zig" }) |path| {
         const t = b.addTest(.{ .root_module = b.createModule(.{
             .root_source_file = b.path(path),
             .target = target,
             .optimize = optimize,
             .imports = imports,
         }) });
-        test_step.dependOn(&b.addRunArtifact(t).step);
+        const run_test = b.addRunArtifact(t);
+        test_step.dependOn(&run_test.step);
+        if (std.mem.eql(u8, path, "tests/simulation.zig")) {
+            b.step("simulation-test", "Run native evaluator simulation properties").dependOn(
+                &run_test.step,
+            );
+        }
     }
     addCompileFailTests(b, test_step);
 
@@ -98,6 +111,19 @@ pub fn build(b: *std.Build) void {
     run_bench.addPassthruArgs();
     b.step("bench", "Time the native suite replaying a transcript (compare with tools/dspy_reference/bench.py)").dependOn(&run_bench.step);
     examples_step.dependOn(&bench.step);
+
+    const simulate = b.addExecutable(.{ .name = "simulate", .root_module = b.createModule(.{
+        .root_source_file = b.path("tools/simulate.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = imports,
+    }) });
+    b.installArtifact(simulate);
+    const run_simulate = b.addRunArtifact(simulate);
+    run_simulate.addPassthruArgs();
+    b.step("simulate", "Run seeded native evaluator simulation or a concrete replay").dependOn(
+        &run_simulate.step,
+    );
 }
 
 /// Each tests/compile_fail/<name>.zig must fail to compile with `message`.

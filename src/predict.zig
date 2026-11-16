@@ -176,18 +176,18 @@ pub const Trace = struct {
     }
 
     /// Structural equality (predictor identity, inputs, outputs, order).
-    pub fn eql(a: *const Trace, b: *const Trace) bool {
+    pub fn eql(a: *const Trace, b: *const Trace) value.ParseError!bool {
         if (a.steps.items.len != b.steps.items.len) return false;
         for (a.steps.items, b.steps.items) |x, y| {
             if (x.predictor != y.predictor) return false;
-            if (!orderedRecordEqual(&x.inputs, &y.inputs)) return false;
-            if (!orderedRecordEqual(&x.outputs, &y.outputs)) return false;
+            if (!(try orderedRecordEqual(&x.inputs, &y.inputs))) return false;
+            if (!(try orderedRecordEqual(&x.outputs, &y.outputs))) return false;
         }
         return true;
     }
 };
 
-fn orderedRecordEqual(a: *const Record, b: *const Record) bool {
+fn orderedRecordEqual(a: *const Record, b: *const Record) value.ParseError!bool {
     if (a.count() != b.count()) return false;
     for (a.keys(), b.keys()) |ka, kb| if (!std.mem.eql(u8, ka, kb)) return false;
     return value.recordEqual(a, b);

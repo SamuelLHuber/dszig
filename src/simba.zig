@@ -366,7 +366,12 @@ pub const SIMBA = struct {
             error.OutOfMemory => return error.OutOfMemory,
             else => null,
         };
-        const score = if (prediction) |*p| self.metric(out, example, p, null) else 0.0;
+        // Source invokes the metric even after program failure, with None.
+        // Scoring failure must not discard a successful prediction or trace.
+        const score = self.metric(out, example, if (prediction) |*p| p else null, null) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => 0.0,
+        };
         return .{ .prediction = prediction, .steps = trace.steps.items, .names = names, .score = score, .example = example };
     }
 
@@ -638,6 +643,71 @@ test "feedback masks typed Reasoning without masking ordinary strings or mutatin
     try std.testing.expectEqualStrings("Actual reasoning.", (try signature.Reasoning.fromValue(original.get("analysis").?)).content);
     try std.testing.expectEqualStrings("Direct reasoning.", (try signature.Reasoning.fromValue(original.get("direct").?)).content);
     try std.testing.expectEqualStrings("", (try signature.Reasoning.fromValue(original.get("empty").?)).content);
+}
+
+test "SIMBA metric failures keep successful predictions and traces but allocation failures remain fatal" {
+    const Sig = signature.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: []const u8 };
+    });
+    const P = predict.Predict(Sig);
+    const FailingMetric = struct {
+        fn failure(_: Allocator, _: *const Example, _: ?*const Record, _: ?*const predict.Trace) value.ParseError!f64 {
+            return error.ParseValue;
+        }
+
+        fn allocationFailure(_: Allocator, _: *const Example, _: ?*const Record, _: ?*const predict.Trace) value.ParseError!f64 {
+            return error.OutOfMemory;
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var script: @import("lm.zig").ScriptedLM = .{ .responses = &.{ "<answer>ok</answer>", "<answer>ok</answer>" } };
+    const ctx: Context = .{ .arena = arena, .lm = script.lm(), .adapter = .xml };
+    const example = try Example.fromJson(arena, "{\"question\":\"q\",\"answer\":\"ok\"}", &.{"question"});
+    var program: P = .{};
+    var optimizer: SIMBA = .{ .metric = FailingMetric.failure };
+    const run = try optimizer.wrap(P, arena, ctx, &program, &example);
+    try std.testing.expectEqual(@as(f64, 0), run.score.?);
+    try std.testing.expectEqualStrings("ok", run.prediction.?.get("answer").?.string);
+    try std.testing.expectEqual(@as(usize, 1), run.steps.len);
+    try std.testing.expectEqualStrings("q", run.steps[0].inputs.get("question").?.string);
+    try std.testing.expectEqualStrings("ok", run.steps[0].outputs.get("answer").?.string);
+    try std.testing.expectEqual(@as(usize, 1), script.index);
+
+    optimizer.metric = FailingMetric.allocationFailure;
+    try std.testing.expectError(error.OutOfMemory, optimizer.wrap(P, arena, ctx, &program, &example));
+    try std.testing.expectEqual(@as(usize, 2), script.index);
+}
+
+test "SIMBA lets metrics score missing predictions after program failure" {
+    const Program = struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: []const u8 };
+
+        pub fn forward(_: *const @This(), _: Context, _: Input) error{ParseValue}!Output {
+            return error.ParseValue;
+        }
+    };
+    const MissingPredictionMetric = struct {
+        fn score(_: Allocator, example: *const Example, prediction: ?*const Record, _: ?*const predict.Trace) value.ParseError!f64 {
+            if (prediction != null) return error.ParseValue;
+            return example.record.get("fallback").?.float;
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var script: @import("lm.zig").ScriptedLM = .{ .responses = &.{} };
+    const example = try Example.fromJson(arena, "{\"question\":\"q\",\"fallback\":0.375}", &.{"question"});
+    var program: Program = .{};
+    const optimizer: SIMBA = .{ .metric = MissingPredictionMetric.score };
+    const run = try optimizer.wrap(Program, arena, .{ .arena = arena, .lm = script.lm() }, &program, &example);
+    try std.testing.expect(run.prediction == null);
+    try std.testing.expectEqual(@as(f64, 0.375), run.score.?);
+    try std.testing.expectEqual(@as(usize, 0), run.steps.len);
+    try std.testing.expectEqual(@as(usize, 0), script.index);
 }
 
 test "roundHalfEven matches Python round" {

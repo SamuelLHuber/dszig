@@ -76,7 +76,7 @@ fn expectMessages(arena: Allocator, expected: []const Value, actual: []const dsz
     for (expected, projected) |want, got| {
         try testing.expectEqualStrings(want.object.get("role").?.string, got.object.get("role").?.string);
         try testing.expectEqualStrings(want.object.get("content").?.string, got.object.get("content").?.string);
-        try testing.expect(dszig.value.recordEqual(&want.object, &got.object));
+        try testing.expect(try dszig.value.recordEqual(&want.object, &got.object));
     }
 }
 
@@ -721,8 +721,8 @@ fn gepaMetric(
     trace: ?*const dszig.Trace,
     pred_name: ?[]const u8,
     _: ?*const dszig.Trace.Step,
-) dszig.gepa.Feedback {
-    const score = live_suite.exactMetric(arena, example, prediction, trace);
+) dszig.value.ParseError!dszig.gepa.Feedback {
+    const score = try live_suite.exactMetric(arena, example, prediction, trace);
     if (pred_name == null or score != 0) return .{ .score = score };
     const gold = example.record.get("answer").?.string;
     return .{ .score = score, .feedback = std.fmt.allocPrint(arena, "Expected {s}.", .{gold}) catch "" };

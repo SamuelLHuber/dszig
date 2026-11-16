@@ -232,9 +232,9 @@ pub const Citations = struct {
             return true;
         }
 
-        pub fn eql(self: Citation, other: Citation) bool {
+        pub fn eql(self: Citation, other: Citation) runtime.CustomError!bool {
             inline for (field_names) |name| {
-                if (!values.pyEqual(self.fieldValue(name), other.fieldValue(name))) return false;
+                if (!try values.pyEqual(self.fieldValue(name), other.fieldValue(name))) return false;
             }
             return true;
         }
@@ -395,8 +395,8 @@ pub const Citations = struct {
             allocator.destroy(Citation.actual(ptr));
         }
         fn deinitBorrowed(_: Allocator, _: *const anyopaque, _: bool) void {}
-        fn equalRuntime(left: *const anyopaque, right: *const anyopaque) bool {
-            return left == right or Citation.actual(left).eql(Citation.actual(right).*);
+        fn equalRuntime(left: *const anyopaque, right: *const anyopaque) runtime.CustomError!bool {
+            return left == right or try Citation.actual(left).eql(Citation.actual(right).*);
         }
     };
 
@@ -542,9 +542,9 @@ pub const Citations = struct {
         return result;
     }
 
-    pub fn contains(self: Citations, item: Value) bool {
+    pub fn contains(self: Citations, item: Value) runtime.CustomError!bool {
         for (self.citations) |*element| {
-            if (values.pyEqual(element.borrowedRuntime(), item)) return true;
+            if (try values.pyEqual(element.borrowedRuntime(), item)) return true;
         }
         return false;
     }
@@ -553,9 +553,9 @@ pub const Citations = struct {
         return (try self.get(index)).borrowedRuntime();
     }
 
-    pub fn eql(self: Citations, other: Citations) bool {
+    pub fn eql(self: Citations, other: Citations) runtime.CustomError!bool {
         if (self.len() != other.len()) return false;
-        for (self.citations, other.citations) |a, b| if (!a.eql(b)) return false;
+        for (self.citations, other.citations) |a, b| if (!try a.eql(b)) return false;
         return true;
     }
 
@@ -707,8 +707,8 @@ pub const Citations = struct {
         if (owns_data) actual(ptr).deinit(allocator);
         allocator.destroy(actual(ptr));
     }
-    fn equalRuntime(left: *const anyopaque, right: *const anyopaque) bool {
-        return left == right or actual(left).eql(actual(right).*);
+    fn equalRuntime(left: *const anyopaque, right: *const anyopaque) runtime.CustomError!bool {
+        return left == right or try actual(left).eql(actual(right).*);
     }
 
     /// Explicit listener object identities: source EngineChunk/AttributeDict
@@ -811,19 +811,19 @@ pub const Citations = struct {
             if (owns_data) inference.freeJsonValue(allocator, .{ .object = object(ptr).attributes });
             allocator.destroy(object(ptr));
         }
-        fn equal(a: *const anyopaque, b: *const anyopaque) bool {
+        fn equal(a: *const anyopaque, b: *const anyopaque) runtime.CustomError!bool {
             if ((object(a).kind == .namespace) != (object(b).kind == .namespace)) return false;
-            return a == b or values.recordEqual(&object(a).attributes, &object(b).attributes);
+            return a == b or try values.recordEqual(&object(a).attributes, &object(b).attributes);
         }
-        fn equalValue(ptr: *const anyopaque, other: Value) bool {
-            return object(ptr).kind != .namespace and other == .object and values.recordEqual(&object(ptr).attributes, &other.object);
+        fn equalValue(ptr: *const anyopaque, other: Value) runtime.CustomError!bool {
+            return object(ptr).kind != .namespace and other == .object and try values.recordEqual(&object(ptr).attributes, &other.object);
         }
     };
 
-    pub fn parseStreamChunk(arena: Allocator, chunk: Value) Allocator.Error!?Citations {
+    pub fn parseStreamChunk(arena: Allocator, chunk: Value) runtime.CustomError!?Citations {
         const choices = attribute(chunk, "choices") orelse return null;
         if (!truth(choices)) return null;
-        const first = indexZero(choices) orelse return null;
+        const first = try indexZero(choices) orelse return null;
         const delta = attribute(first, "delta") orelse return null;
         const fields = attribute(delta, "provider_specific_fields") orelse return null;
         if (!truth(fields)) return null;
@@ -954,13 +954,13 @@ fn attribute(input: Value, name: []const u8) ?Value {
     return object.attributes.get(name);
 }
 
-fn indexZero(input: Value) ?Value {
+fn indexZero(input: Value) runtime.CustomError!?Value {
     if (input == .array) return if (input.array.items.len != 0) input.array.items[0] else null;
     const payload = python.view(input) orelse return null;
     return switch (payload) {
         .tuple => |items| if (items.len != 0) items[0] else null,
         .dictionary => |entries| blk: {
-            for (entries) |entry| if (values.pyEqual(entry.key, .{ .integer = 0 })) break :blk entry.value;
+            for (entries) |entry| if (try values.pyEqual(entry.key, .{ .integer = 0 })) break :blk entry.value;
             break :blk null;
         },
         else => null,
@@ -1104,7 +1104,7 @@ test "Citation lax fields retain arbitrary integers and genuine runtime identity
     try std.testing.expectEqual(@as(i64, 1000), typed.document_index.?.value.integer);
     try std.testing.expectEqualStrings("18446744073709551616", typed.start_char_index.?.value.number_string);
     try std.testing.expectEqual(@as(i64, 1), typed.end_char_index.?.value.integer);
-    try std.testing.expect(!values.pyEqual(boxed, input));
+    try std.testing.expect(!try values.pyEqual(boxed, input));
     try std.testing.expectEqual(boxed.custom.ptr, (try types.validate(Citations.Citation, arena, boxed)).custom.ptr);
     const view = try values.fromValue(arena, Citations.Citation, boxed);
     try std.testing.expectEqual(boxed.custom.ptr, (try values.toValue(arena, Citations.Citation, view)).custom.ptr);
@@ -1151,7 +1151,7 @@ test "Citations source validator differs from from_dict_list and preserves neste
     const collection = parent.custom.get(Citations).?;
     try std.testing.expectEqual(child.custom.ptr, (try collection.getRuntime(0)).custom.ptr);
     try std.testing.expectEqual(child.custom.ptr, (try collection.getRuntime(-1)).custom.ptr);
-    try std.testing.expect(collection.contains(child));
+    try std.testing.expect(try collection.contains(child));
     try std.testing.expect(parent.custom.truthy());
     try std.testing.expectEqual(parent.custom.ptr, (try types.validate(Citations, arena, parent)).custom.ptr);
     const iterator = try parent.custom.vtable.iterate.?(arena, parent.custom.ptr);
@@ -1191,7 +1191,7 @@ test "Citations own cloned fields and borrowed child classes survive their sourc
     const cloned_child = try interior.custom.clone(std.testing.allocator);
     defer cloned_child.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("雪", cloned_child.get(Citations.Citation).?.cited_text);
-    try std.testing.expect(values.pyEqual(interior, .{ .custom = cloned_child }));
+    try std.testing.expect(try values.pyEqual(interior, .{ .custom = cloned_child }));
     var buffer: [1024]u8 = undefined;
     var writer: Writer = .fixed(&buffer);
     try pyjson.writeJson(&writer, .{ .custom = cloned }, .compact);

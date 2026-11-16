@@ -286,6 +286,131 @@ configurations. Custom vtables that support typed `get(T)` provide
 `type_identity = runtime_value.typeIdentity(T)`; opaque callback objects do not
 acquire a typed identity from their display name.
 
+Equality is fallible: `value.pyEqual`, `value.recordEqual` and custom vtable
+`eql`/`eql_value` callbacks return `ParseValue || OutOfMemory` error unions.
+Callers must propagate comparison failures rather than convert them to `false`.
+The same contract extends through class equality, content/request matching,
+trace equality and replay; strict JSON matching still distinguishes booleans
+from numbers. Container-element comparison uses `python_value.containerEqual`:
+the same genuine boxed Decimal NaN is equal to itself as a list/dictionary/tuple
+element without invoking Decimal equality or raising `InvalidOperation`. Direct
+Decimal equality remains different: a quiet NaN is unequal to itself, while a
+signaling NaN can fail. This does not add missing float-object identity.
+
+### Native integer-subclass enums
+
+`dszig.IntEnum(name, entries)` creates genuine immutable integer-subclass
+members alongside the existing nominal `dszig.Enum` classes.
+`IntEnumWithIdentity(name, entries, Identity)` supplies an explicit nominal class
+identity. Aliases share a singleton. Numeric equality and hashing cross class
+boundaries without making those classes identical: lax validation can resolve
+an equal member of another class, while strict validation requires the actual
+declared class. Reflection exposes a nominal identity token, not a type-name
+string.
+
+Exact borrowed integer payloads participate in bool/int/float/string and Decimal
+validation, arithmetic, ordering and Python dictionary key equality. Numeric
+operations retain integers above binary64's exact range and support genuine
+complex operands; Decimal/float arithmetic remains refused. Member `str` is
+numeric, while `repr` retains its class and canonical member name.
+
+Declaration-time builtin floats truncate toward zero without routing large
+integers through binary64 arithmetic. Base-ten strings accept signs, leading
+zeros, digit separators and Unicode decimal digits, subject to CPython's default
+4,300-digit string limit. Conversion precedes singleton alias resolution.
+
+The following independent frozen-source observations matched in both native
+Debug and ReleaseSafe, with byte-identical output between modes:
+
+| Native consumer | Compared / Source rows | Outcome/value/identity/signal observations | Normalized exception identities unobserved |
+| --- | ---: | ---: | ---: |
+| IntEnum runtime operations | 2,294 / 2,324 | 24,577 | 657 |
+| IntEnum scalar validation | 35 / 35 | 379 | 6 |
+| Builtin IntEnum declarations | 19 / 19 | 134 | 0 |
+| Configured Decimal policies | 368 / 368 | 3,950 | 233 |
+
+The runtime consumer deliberately exits nonzero for incomplete coverage:
+sequence repetition is not implemented by the numeric helpers. Unsafe unbounded
+repetitions were separately left unattempted by the Source probe. The declaration
+probe includes fractional and maximum finite floats, signed zero, subnormals,
+Unicode/separated strings, exact wide integers and the 4,300-digit boundary.
+Seventeen independently compiled Debug programs also refused the source-observed
+malformed strings, over-limit strings and nonfinite floats; compile-time
+refusals do not establish Python exception identity. Declaration-time bytes,
+Decimal, tuple/base arguments, arbitrary Python `int(value)` protocols, custom
+mixins, configurable Python digit limits and dynamic Python class construction
+are not implemented. Normalized native errors are not proof of identical Python
+exception classes.
+
+### Native Decimal values and arithmetic
+
+`dszig.Decimal` stores a genuine runtime Decimal box; it is not a string or a
+lookalike dictionary. `python_value.decimal(allocator, text)` constructs an exact
+coefficient/exponent value, preserving signed zero, trailing-zero quantum and
+NaN payloads. Default typed Decimal validation is finite-only and distinct from
+the constructor. `DecimalWithOptions(.{ .allow_inf_nan = true })` admits genuine
+nonfinite values without changing their runtime class. `Decimal.validate`
+follows Python-input coercion; `validateStrict` requires a genuine Decimal
+instance before applying the configured finite/nonfinite policy, retaining
+accepted identity and rejecting other kinds before conversion or signaling.
+
+`validateJson` follows JSON-input coercion, including its different shortest
+plain float spelling and lax constructor-array path. `validateJsonStrict`
+accepts JSON scalars but refuses constructor arrays before conversion. Quoted
+JSON text retains its original quantum. Configured malformed-input coercion
+preserves the actual `InvalidOperation` flag/trap transition: an untrapped
+constructor can produce a quiet NaN, accepted only by the nonfinite policy.
+`schemaSerialization()` provides the actual string-only serialization schema,
+distinct from the validation schema. These policies, identities and all nine
+signals are covered by the configured-policy observations above.
+
+`dszig.decimal` exposes the explicitly managed context environment.
+`LocalContext.enter` copies a context into the stable local guard; `deinit`
+restores the previously borrowed context object. Contexts provide precision,
+eight rounding modes, exponent bounds, capitals/clamp settings, and nine sticky
+signals with independent traps. Native contextual add/subtract/multiply/divide
+and absolute value return owned exact metadata; quiet `copyAbs` does not round
+or signal. Runtime numeric helpers preserve Decimal/integer arithmetic and
+refuse Decimal/float arithmetic rather than silently converting it to binary64.
+DecisionState uses those same helpers before final model validation.
+
+Generated decision evidence retains genuine nested probability models in its
+raw fields. `toPythonValue(allocator, by_alias)` instead returns fresh
+Python-mode dump dictionaries, recursively projecting those nested generated
+models without revalidating their fields. Aliased backend projection remains a
+separate API.
+
+Native Debug and ReleaseSafe executables matched all **30,100** frozen independent
+CPython/DSPy arithmetic, context and configured-decision rows: **1,462,558**
+observations, including **9,465** independently executed model-dump views.
+The receipt includes both successful and refused operations. Exact Decimal
+signal exception classes were compared for 1,989 refusals; **9,665 normalized
+exception classes remain unobserved**, not proven equivalent. A separate
+genuine-Decimal container probe went from six mismatches to zero across
+16 Source rows and 160 outcome/signal observations.
+
+This is finite evidence, not complete Decimal or DSPy parity. Other Decimal
+operators, general Python numeric protocols, arbitrary mutable alias graphs,
+full Pydantic policies and Python exception reconstruction are not established
+by those runs. The separate validation consumer matched **18,016 of 21,837
+Source rows** and **24,752 actual dump calls**, with 1,521,288 observations and
+zero mismatches in both native modes. This includes actual strict Enum and
+Decimal boundaries, the declared numeric IntEnum class, configured nonfinite
+validation and both Decimal schema modes, not synthetic consumer refusals.
+It still exits nonzero for incomplete coverage:
+3,120 rows are unsupported, 701 are unconsumed (including 699 preserved
+invalid-baseline cases), and 35,392 Source dump frames are unobserved. Warning
+emission, 1,196 identity frames and 11,331 normalized exception classes remain
+unobserved. Those gaps are not passing observations.
+
+A separate integer-division consumer matched 679 actual CPython rows through
+both the direct exact-ratio helper and public `numericQuotient`, checking 1,358
+outcome/binary64-bit observations. Its 53 refusal rows do not compare Python
+exception identity. The public SIMBA smoke also exercised a failed program
+whose metric received a genuine null prediction exactly once and returned the
+Source fallback score 0.375 without any LM requests; this is not whole-SIMBA
+or live-inference parity.
+
 Typed conversion boxes the supported native model families; parsing ordinary JSON does
 not. A raw lookalike dictionary remains a dictionary until explicit typed
 validation. Native class validation preserves an existing box, subject to the
@@ -444,6 +569,19 @@ signature equality.
 `optimize.evaluate` follows Python's exact `round(score, 2)`, including
 ties-to-even, binary decimal boundaries such as `2.675 → 2.67`, signed zero
 and nonfinite scores. It does not round an already-rounded `score * 100`.
+
+`optimize.Metric` and GEPA feedback callbacks can return `ParseValue` or
+`OutOfMemory`. Evaluate and bootstrap apply their existing error budgets to
+metric failures as well as program failures; bootstrap restores temporary
+teacher demos before scoring. SIMBA retains a successful prediction and trace
+when scoring fails, with a zero score. GEPA uses its configured failure score,
+with an empty prediction when trace capture is disabled versus no prediction
+or trajectory when capture is enabled. Reflective feedback failures propagate.
+Allocation failures remain fatal. `optimize.Metric` receives a nullable
+`?*const Record` prediction: SIMBA calls it with null after a program failure,
+rather than skipping scoring or supplying an empty record. A callback may
+assign its own fallback score; callbacks that require an actual prediction
+must explicitly reject null.
 
 `BootstrapFewShotWithOptuna.compile` takes explicit `std.Io` and a required
 `max_demos` bootstrap limit. Each candidate selects exactly one demo per
@@ -1027,6 +1165,54 @@ Regenerate this table with
 | `dspy.syncify` (`utils/syncify.py`) | missing | – | – | – |
 | `dspy.track_usage` (–) | missing | – | – | – |
 
+
+## Native seeded evaluation campaigns
+
+The native simulation harness executes real `dszig.optimize.evaluate` calls with
+a typed arithmetic program and metric, without Python, a network or an API key.
+Generated cases vary row values, scores, program/metric failures and error
+budgets. An independent oracle checks the outcome, program-call count,
+ties-to-even percentage rounding, unchanged dataset/input roles, scratch
+reclamation and absence of unexpected LM calls.
+
+Run these commands from the repository root with the pinned development tools:
+
+```sh
+# Four fixed seeds, 512 cases each, plus rounding/error boundaries,
+# wrong-answer detection and shrinking regression tests:
+devenv shell -- zig build simulation-test
+
+# A reproducible generated campaign (default: 10,000 cases):
+devenv shell -- zig build simulate -- --seed 0x1234 --cases 512
+
+# Enter the shell BEFORE redirecting: its startup banner is not replay JSON.
+devenv shell
+
+# Deliberately corrupt actual program answers to prove detection and shrinking.
+# EXPECTED NONZERO EXIT: stdout contains only the concrete failing Replay JSON;
+# stderr contains the negative-control label, violation and seed/index details.
+zig build simulate -- --wrong-answer --seed 0x1234 --cases 512 > replay.json
+
+# Reexecute that concrete counterexample, in the same negative-control mode.
+# EXPECTED NONZERO EXIT again, reporting the score violation:
+zig build simulate -- --replay replay.json --wrong-answer
+```
+
+Normal campaigns report seed, replay version and case count when no violation
+is found. `--seed` accepts a `u64` with base prefixes; `--cases` is bounded to
+1–1,000,000. On the first violation, the driver shrinks the case while retaining
+the same violation, with at most 4,096 shrink attempts, and emits a versioned
+concrete replay rather than seed-only evidence. Preserve that JSON for failures
+in normal mode too, and replay it without `--wrong-answer`. Replay inputs are
+limited to 16 KiB and must have a supported version and valid scenario.
+`--replay` cannot be combined with explicit `--seed` or `--cases`.
+
+This is a **seeded sequential evaluation campaign**, not full optimizer
+coverage, concurrent deterministic simulation testing, a static-allocation
+proof or additional DSPy parity evidence. The harness initializes fixed
+execution backing and reuses example storage, but the current evaluation core
+still makes allocator calls against that backing. The wrong-answer switch is
+an explicit test-only negative control, not a production-runtime modification.
 
 ## Cross-runtime verification
 

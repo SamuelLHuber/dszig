@@ -65,11 +65,11 @@ pub fn cloneDecision(arena: Allocator, decision: DecisionRequest) Allocator.Erro
     };
 }
 
-pub fn decisionEqual(a: ?DecisionRequest, b: ?DecisionRequest) bool {
+pub fn decisionEqual(a: ?DecisionRequest, b: ?DecisionRequest) @import("runtime_value.zig").CustomError!bool {
     const x = a orelse return b == null;
     const y = b orelse return false;
-    return inference.jsonEqual(x.state, y.state) and inference.jsonEqual(x.questions, y.questions) and
-        inference.jsonEqual(x.response_schema, y.response_schema);
+    return try inference.jsonEqual(x.state, y.state) and try inference.jsonEqual(x.questions, y.questions) and
+        try inference.jsonEqual(x.response_schema, y.response_schema);
 }
 
 /// Borrowed metadata view; callers own `decision` for the view's lifetime.
@@ -91,7 +91,7 @@ pub fn decisionFromValue(arena: Allocator, input: @import("runtime_value.zig").V
     });
 }
 
-pub const Error = error{ LMFailure, ScriptExhausted } || Allocator.Error;
+pub const Error = error{ LMFailure, ScriptExhausted } || @import("runtime_value.zig").CustomError;
 
 /// One provider completion and its optional, genuinely returned reasoning.
 pub const Completion = struct {
@@ -598,11 +598,11 @@ pub const ReplayLM = struct {
             const recorded = call.all();
             const first = offset;
             offset += recorded.len;
-            if (!sameMessages(call.messages, request.messages)) continue;
-            if (!inference.toolsEqual(call.tools, request.tools)) continue;
-            if (!decisionEqual(call.decision, request.decision)) continue;
+            if (!(try sameMessages(call.messages, request.messages))) continue;
+            if (!(try inference.toolsEqual(call.tools, request.tools))) continue;
+            if (!(try decisionEqual(call.decision, request.decision))) continue;
             if (call.options) |options| {
-                if (!sameOptions(options, request.options)) continue;
+                if (!(try sameOptions(options, request.options))) continue;
             }
             if (call.reasonings.len != 0 and call.reasonings.len != recorded.len) return error.LMFailure;
             if (call.tool_calls.len != 0 and call.tool_calls.len != recorded.len) return error.LMFailure;
@@ -628,13 +628,13 @@ pub const ReplayLM = struct {
         return error.LMFailure;
     }
 
-    fn sameOptions(a: Options, b: Options) bool {
+    fn sameOptions(a: Options, b: Options) @import("runtime_value.zig").CustomError!bool {
         if (a.temperature != b.temperature or
             a.parallel_tool_calls != b.parallel_tool_calls or a.n != b.n or
             a.reasoning_effort_present != b.reasoning_effort_present) return false;
-        if (!inference.jsonEqual(a.rollout_id orelse .null, b.rollout_id orelse .null)) return false;
+        if (!(try inference.jsonEqual(a.rollout_id orelse .null, b.rollout_id orelse .null))) return false;
         if (a.response_format) |format| {
-            if (!inference.responseFormatEqual(format, b.response_format orelse return false)) return false;
+            if (!(try inference.responseFormatEqual(format, b.response_format orelse return false))) return false;
         } else if (b.response_format != null) return false;
         if (a.tool_choice) |choice| {
             const other = b.tool_choice orelse return false;
@@ -646,14 +646,14 @@ pub const ReplayLM = struct {
         return b.reasoning_effort == null;
     }
 
-    fn sameMessages(a: []const Message, b: []const Message) bool {
+    fn sameMessages(a: []const Message, b: []const Message) @import("runtime_value.zig").CustomError!bool {
         if (a.len != b.len) return false;
         for (a, b) |x, y| {
-            if (x.role != y.role or !adapter.Content.eql(x.content, y.content)) return false;
+            if (x.role != y.role or !(try adapter.Content.eql(x.content, y.content))) return false;
             if (!optionalStringEqual(x.tool_call_id, y.tool_call_id)) return false;
             if (!optionalStringEqual(x.reasoning, y.reasoning)) return false;
-            if (!inference.toolCallsEqual(x.tool_calls, y.tool_calls)) return false;
-            if (!inference.continuationsEqual(x.continuation, y.continuation)) return false;
+            if (!(try inference.toolCallsEqual(x.tool_calls, y.tool_calls))) return false;
+            if (!(try inference.continuationsEqual(x.continuation, y.continuation))) return false;
         }
         return true;
     }
@@ -1668,6 +1668,35 @@ test "keyword LM scopes and Chat completion order" {
         \\{"choices": [{"message": {"content": "a"}}, {"message": {"content": "b"}}]}
     );
     try testing.expectEqualStrings("b", many[1]);
+}
+
+test "replay equality failure leaves the recorded completion available" {
+    var local: @import("decimal_environment.zig").LocalContext = .{};
+    local.enter(&.{});
+    defer local.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const signaling = try @import("python_value.zig").decimal(a, "sNaN");
+    const ordinary = try @import("python_value.zig").decimal(a, "1");
+    const messages = [_]Message{.{ .role = .user, .content = .{ .text = "q" } }};
+    var used = [_]bool{false};
+    var replay: ReplayLM = .{
+        .calls = &.{.{ .messages = &messages, .options = .{ .rollout_id = ordinary }, .completion = "available" }},
+        .used = &used,
+    };
+    const model = replay.lm();
+    try testing.expectError(error.ParseValue, model.complete(a, .{
+        .messages = &messages,
+        .options = .{ .rollout_id = signaling },
+    }));
+    try testing.expect(!used[0]);
+    try testing.expectEqual(@as(usize, 0), replay.misses);
+    try testing.expectEqualStrings("available", try model.complete(a, .{
+        .messages = &messages,
+        .options = .{ .rollout_id = ordinary },
+    }));
+    try testing.expect(replay.exhausted());
 }
 
 test "replay LM matches recorded requests exactly and reports misses" {

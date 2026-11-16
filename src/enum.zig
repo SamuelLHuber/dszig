@@ -1,7 +1,7 @@
 //! Explicit Python Enum classes, distinct from Zig enums (DSPy Literal).
 //! Class-owned members are immutable singleton boxes. Runtime-created Python
-//! classes, Enum mixins and arbitrary mutable member values are not represented
-//! by these comptime factories.
+//! classes, other Enum mixins and arbitrary mutable member values are not
+//! represented by these comptime factories.
 const std = @import("std");
 const runtime = @import("runtime_value.zig");
 const value = @import("value.zig");
@@ -88,8 +88,8 @@ test "Independent same-name Enum classes cannot validate or compare as one class
     const Right = EnumWithIdentity("Color", entries, struct {});
     const left = try Left.member("red");
     const right = try Right.member("red");
-    try std.testing.expect(!value.pyEqual(left, right));
-    try std.testing.expect(!value.pyEqual(left, .{ .string = "red" }));
+    try std.testing.expect(!try value.pyEqual(left, right));
+    try std.testing.expect(!try value.pyEqual(left, .{ .string = "red" }));
     try std.testing.expectError(error.ParseValue, Left.validate(std.testing.allocator, right));
 }
 
@@ -108,7 +108,172 @@ test "Pydantic Enum fast integer lookup overflow differs from DSPy value resolut
     try std.testing.expect(validated.custom.ptr == (try OnlyBig.member("big")).custom.ptr);
 }
 
+test "long integer enum values retain distinct members and exact aliases" {
+    const zeros: [1000]u8 = @splat('0');
+    const first = "1" ++ zeros;
+    const next = "1" ++ zeros[0..999].* ++ "1";
+    const Long = Enum("Long", &.{
+        .{ .name = "zero", .value = .{ .integer = 0 } },
+        .{ .name = "first", .value = .{ .number_string = first } },
+        .{ .name = "next", .value = .{ .number_string = next } },
+        .{ .name = "alias", .value = .{ .number_string = first } },
+    });
+    const member = try Long.member("first");
+    const alias = try Long.member("alias");
+    const other = try Long.member("next");
+    try std.testing.expect(member.custom.ptr == alias.custom.ptr);
+    try std.testing.expect(member.custom.ptr != other.custom.ptr);
+    try std.testing.expect(std.mem.eql(u8, first, Long.dszig_enum_values[3].number_string));
+    const parsed = try Long.parseValue(std.testing.allocator, .{ .number_string = next });
+    try std.testing.expect(parsed.custom.ptr == other.custom.ptr);
+}
+
+test "IntEnum exact numeric equality does not erase nominal validation or alias identity" {
+    const entries = &[_]Entry{
+        .{ .name = "zero", .value = .{ .integer = 0 } },
+        .{ .name = "one", .value = .{ .integer = 1 } },
+        .{ .name = "alias", .value = .{ .integer = 1 } },
+        .{ .name = "wide", .value = .{ .integer = 9007199254740993 } },
+        .{ .name = "beyond", .value = .{ .number_string = "18446744073709551616" } },
+    };
+    const Left = IntEnumWithIdentity("Number", entries, struct {});
+    const Right = IntEnumWithIdentity("Number", entries, struct {});
+    const left = try Left.member("one");
+    const right = try Right.member("one");
+    const wide = try Left.member("wide");
+    const beyond = try Left.member("beyond");
+    try std.testing.expect(try value.pyEqual(left, right));
+    try std.testing.expect(!left.custom.sameType(right.custom));
+    try std.testing.expect((try Left.member("alias")).custom.ptr == left.custom.ptr);
+    try std.testing.expect(!((try Left.member("zero")).custom.truthy()));
+    try std.testing.expectError(error.ParseValue, Left.validateStrict(std.testing.allocator, right));
+    try std.testing.expect((try Left.validate(std.testing.allocator, right)).custom.ptr == left.custom.ptr);
+    try std.testing.expect(!try value.pyEqual(wide, .{ .float = 9007199254740992.0 }));
+    try std.testing.expect(try value.pyEqual(beyond, .{ .number_string = "18446744073709551616" }));
+    try std.testing.expectEqual(try @import("python_value.zig").pythonHash(left, 1), try @import("python_value.zig").pythonHash(.{ .integer = 1 }, 1));
+    const left_metadata = left.custom.vtable.enumeration.?(left.custom.ptr);
+    const right_metadata = right.custom.vtable.enumeration.?(right.custom.ptr);
+    try std.testing.expect(left_metadata.class_identity != right_metadata.class_identity);
+}
+
+test "IntEnum declaration coercion truncates floats and canonicalizes Unicode integer strings" {
+    const Converted = IntEnum("Converted", &.{
+        .{ .name = "positive", .value = .{ .float = 1.9 } },
+        .{ .name = "negative", .value = .{ .float = -1.9 } },
+        .{ .name = "alias", .value = .{ .string = " +００１ " } },
+        .{ .name = "zero", .value = .{ .float = -0.0 } },
+        .{ .name = "wide", .value = .{ .string = "\u{2002}٩_٠٠٧_١٩٩_٢٥٤_٧٤٠_٩٩٣\u{2002}" } },
+        .{ .name = "float_wide", .value = .{ .float = 0x1p64 } },
+    });
+    const positive = try Converted.member("positive");
+    try std.testing.expectEqual(@as(i64, 1), positive.custom.integerValue().?.integer);
+    try std.testing.expectEqual(@as(i64, -1), (try Converted.member("negative")).custom.integerValue().?.integer);
+    try std.testing.expectEqual(@as(i64, 0), (try Converted.member("zero")).custom.integerValue().?.integer);
+    try std.testing.expect((try Converted.member("alias")).custom.ptr == positive.custom.ptr);
+    const wide = try Converted.member("wide");
+    try std.testing.expect(try value.pyEqual(wide, .{ .integer = 9007199254740993 }));
+    try std.testing.expect(!try value.pyEqual(wide, .{ .float = 9007199254740992.0 }));
+    try std.testing.expectEqualStrings("18446744073709551616", (try Converted.member("float_wide")).custom.integerValue().?.number_string);
+}
+
 pub fn EnumWithIdentity(comptime name: []const u8, comptime entries: []const Entry, comptime Identity: type) type {
+    return EnumClass(name, entries, Identity, false);
+}
+
+/// Genuine immutable integer subclasses with class-owned singleton members.
+/// Declaration-time builtin floats truncate toward zero; decimal strings,
+/// bools and integer subclasses normalize before canonical alias resolution.
+pub fn IntEnum(comptime name: []const u8, comptime entries: []const Entry) type {
+    return IntEnumWithIdentity(name, entries, void);
+}
+
+pub fn IntEnumWithIdentity(comptime name: []const u8, comptime entries: []const Entry, comptime Identity: type) type {
+    const normalized = comptime blk: {
+        @setEvalBranchQuota(1_000_000);
+        var result: [entries.len]Entry = undefined;
+        for (entries, 0..) |entry, index| {
+            const input = if (entry.value == .custom)
+                entry.value.custom.integerValue() orelse @compileError("dszig: IntEnum values must be exact integers")
+            else
+                entry.value;
+            const integer: Value = switch (input) {
+                .bool => |boolean| .{ .integer = @intFromBool(boolean) },
+                .integer => input,
+                .number_string => |text| number: {
+                    if (!value.isJsonNumber(text) or !std.json.isNumberFormattedLikeAnInteger(text))
+                        @compileError("dszig: IntEnum values must be exact integers");
+                    break :number Value.parseFromNumberSlice(text);
+                },
+                .float => |number| declarationFloat(number),
+                .string => |text| declarationString(text),
+                else => @compileError("dszig: IntEnum declaration does not support this integer conversion"),
+            };
+            result[index] = .{ .name = entry.name, .value = integer };
+        }
+        break :blk result;
+    };
+    return EnumClass(name, &normalized, Identity, true);
+}
+
+fn declarationFloat(comptime number: f64) Value {
+    if (!std.math.isFinite(number))
+        @compileError("dszig: IntEnum cannot convert a nonfinite float to an integer");
+    const bits: u64 = @bitCast(number);
+    const exponent = @as(i32, @intCast((bits >> 52) & 0x7ff)) - 1023;
+    if (exponent < 0) return .{ .integer = 0 };
+    const significand = (bits & 0x000f_ffff_ffff_ffff) | 0x0010_0000_0000_0000;
+    const magnitude: comptime_int = if (exponent >= 52)
+        @as(comptime_int, significand) << (exponent - 52)
+    else
+        significand >> (52 - exponent);
+    const integer = if (bits >> 63 != 0) -magnitude else magnitude;
+    return Value.parseFromNumberSlice(std.fmt.comptimePrint("{d}", .{integer}));
+}
+
+fn declarationString(comptime text: []const u8) Value {
+    const unicode = @import("unicode.zig");
+    // CPython's integer parser excludes the ASCII information separators
+    // U+001C..U+001F even though str.isspace() includes them.
+    const source = unicode.strip(text, true);
+    if (source.len == 0) @compileError("dszig: invalid IntEnum integer string");
+    const negative = source[0] == '-';
+    const start: usize = @intFromBool(negative or source[0] == '+');
+    var buffer: [text.len]u8 = undefined;
+    var length: usize = 0;
+    var offset = start;
+    var previous_digit = false;
+    while (offset < source.len) {
+        const width = std.unicode.utf8ByteSequenceLength(source[offset]) catch
+            @compileError("dszig: invalid IntEnum integer string");
+        if (width > source.len - offset)
+            @compileError("dszig: invalid IntEnum integer string");
+        const cp = std.unicode.utf8Decode(source[offset..][0..width]) catch
+            @compileError("dszig: invalid IntEnum integer string");
+        offset += width;
+        if (cp == '_') {
+            if (!previous_digit or offset == source.len)
+                @compileError("dszig: invalid IntEnum integer separator");
+            previous_digit = false;
+            continue;
+        }
+        const digit = unicode.decimalDigit(cp) orelse
+            @compileError("dszig: invalid IntEnum integer digit");
+        buffer[length] = '0' + digit;
+        length += 1;
+        previous_digit = true;
+    }
+    if (length == 0) @compileError("dszig: invalid IntEnum integer string");
+    if (length > 4300)
+        @compileError("dszig: IntEnum integer string exceeds CPython's default 4300-digit limit");
+    var first: usize = 0;
+    while (first < length and buffer[first] == '0') first += 1;
+    if (first == length) return .{ .integer = 0 };
+    const frozen = buffer;
+    const magnitude = frozen[first..length];
+    return Value.parseFromNumberSlice(if (negative) "-" ++ magnitude else magnitude);
+}
+
+fn EnumClass(comptime name: []const u8, comptime entries: []const Entry, comptime Identity: type, comptime integer: bool) type {
     comptime {
         for (entries, 0..) |entry, index| {
             if (entry.name.len == 0) @compileError("dszig: enum member name must not be empty");
@@ -121,11 +286,19 @@ pub fn EnumWithIdentity(comptime name: []const u8, comptime entries: []const Ent
         pub const model_name = name;
         pub const class_identity = Identity;
         pub const dszig_enum_entries = entries;
+        pub const dszig_int_enum = integer;
         index: usize,
 
         fn canonical(comptime index: usize) usize {
             return comptime resolved: {
-                for (entries[0..index], 0..) |previous, i| if (value.pyEqual(previous.value, entries[index].value)) break :resolved canonical(i);
+                // Lazy enum tables and member lookups evaluate independently
+                // of the caller's quota, including exact long-integer equality.
+                @setEvalBranchQuota(1_000_000);
+                for (entries[0..index], 0..) |previous, i| {
+                    const same = value.pyEqual(previous.value, entries[index].value) catch |err|
+                        @compileError("dszig: enum alias equality failed: " ++ @errorName(err));
+                    if (same) break :resolved canonical(i);
+                }
                 break :resolved index;
             };
         }
@@ -165,7 +338,7 @@ pub fn EnumWithIdentity(comptime name: []const u8, comptime entries: []const Ent
         pub fn parseValue(_: Allocator, input: Value) runtime.CustomError!Value {
             inline for (entries, 0..) |entry, index| {
                 if (comptime canonical(index) != index) continue;
-                if (value.pyEqual(entry.value, input)) return boxed(index);
+                if (try value.pyEqual(entry.value, input)) return boxed(index);
             }
             if (input == .string) return member(input.string);
             return error.ParseValue;
@@ -173,8 +346,9 @@ pub fn EnumWithIdentity(comptime name: []const u8, comptime entries: []const Ent
 
         /// Pydantic validation accepts existing members or their values, not
         /// arbitrary member names (DSPy's direct enum parser adds name lookup).
-        pub fn validate(_: Allocator, input: Value) runtime.CustomError!Value {
+        pub fn validate(arena: Allocator, input: Value) runtime.CustomError!Value {
             if (input == .custom and input.custom.get(Self) != null) return input;
+            if (integer) return validateInteger(arena, input, false);
             // Pydantic core 2.50.2 LiteralLookup::validate converts exact
             // integer inputs to i64 before falling back to Python equality
             // whenever this enum has a fast i64 bucket. Preserve its overflow
@@ -194,7 +368,89 @@ pub fn EnumWithIdentity(comptime name: []const u8, comptime entries: []const Ent
             }
             inline for (entries, 0..) |entry, index| {
                 if (comptime canonical(index) != index) continue;
-                if (value.pyEqual(entry.value, input)) return boxed(index);
+                if (try value.pyEqual(entry.value, input)) return boxed(index);
+            }
+            return error.ParseValue;
+        }
+
+        pub fn validateStrict(_: Allocator, input: Value) runtime.CustomError!Value {
+            if (input == .custom and input.custom.get(Self) != null) return input;
+            return error.ParseValue;
+        }
+
+        /// JSON strictness is distinct from Python's instance-only strict
+        /// mode: the final Enum constructor still uses numeric equality.
+        pub fn validateJson(arena: Allocator, text: []const u8) runtime.CustomError!Value {
+            const input = try parseJson(arena, text);
+            return validate(arena, input);
+        }
+
+        pub fn validateJsonStrict(arena: Allocator, text: []const u8) runtime.CustomError!Value {
+            const input = try parseJson(arena, text);
+            if (integer) return validateInteger(arena, input, true);
+            return validate(arena, input);
+        }
+
+        fn parseJson(arena: Allocator, text: []const u8) runtime.CustomError!Value {
+            return @import("json_repair.zig").parseJson(arena, text) catch |err| switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.ParseValue,
+            };
+        }
+
+        fn validateInteger(arena: Allocator, input: Value, comptime strict: bool) runtime.CustomError!Value {
+            // Pydantic's IntEnum lookup coerces to int, then extracts i64,
+            // but only when this class has an i64-valued lookup bucket.
+            // Conversion errors fall back to Enum(value); extraction overflow
+            // does not. The fallback also preserves Decimal sNaN signaling.
+            const has_i64 = comptime blk: {
+                for (dszig_enum_values) |v| if (v == .integer) break :blk true;
+                break :blk false;
+            };
+            if (has_i64) {
+                if (@import("python_value.zig").view(input)) |builtin| {
+                    if (builtin == .decimal and builtin.decimal.kind == .finite) {
+                        // Reject out-of-range Decimal values without expanding
+                        // an arbitrarily large positive exponent into storage.
+                        const lower = value.numericOrder(input, .{ .integer = std.math.minInt(i64) }) catch return error.ParseValue;
+                        const upper = value.numericOrder(input, .{ .integer = std.math.maxInt(i64) }) catch return error.ParseValue;
+                        if (lower == .lt or upper == .gt) return error.ParseValue;
+                    }
+                }
+                var scratch: std.heap.ArenaAllocator = .init(arena);
+                defer scratch.deinit();
+                const parsed: ?Value = if (strict)
+                    if (input == .integer or input == .number_string) input else null
+                else
+                    value.coerceInteger(scratch.allocator(), input) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.ParseValue => null,
+                    };
+                if (parsed) |number| {
+                    // The lax int validator can return an Enum's actual value
+                    // without revalidation. Its subsequent PyInt extraction
+                    // still accepts bool and genuine integer subclasses.
+                    const base = if (number == .custom) number.custom.integerValue() orelse number else number;
+                    const small: ?i64 = switch (base) {
+                        .bool => |candidate| @intFromBool(candidate),
+                        .integer => |candidate| candidate,
+                        .number_string => |text| if (std.json.isNumberFormattedLikeAnInteger(text))
+                            std.fmt.parseInt(i64, text, 10) catch return error.ParseValue
+                        else
+                            null,
+                        else => null,
+                    };
+                    if (small) |candidate| {
+                        inline for (entries, 0..) |entry, index| {
+                            if (comptime canonical(index) != index) continue;
+                            if (try value.pyEqual(entry.value, .{ .integer = candidate })) return boxed(index);
+                        }
+                    }
+                }
+            }
+            inline for (entries, 0..) |entry, index| {
+                if (comptime canonical(index) != index) continue;
+                if (try value.pyEqual(entry.value, input)) return boxed(index);
             }
             return error.ParseValue;
         }
@@ -215,6 +471,8 @@ pub fn EnumWithIdentity(comptime name: []const u8, comptime entries: []const Ent
             .model_name = name,
             .hashable = true,
             .enumeration = inspect,
+            .integer_value = if (integer) integerValue else null,
+            .float_value = if (integer) floatValue else null,
             .raw_value = rawValue,
             .serialized = serialized,
             .write_str = writeStr,
@@ -231,7 +489,13 @@ pub fn EnumWithIdentity(comptime name: []const u8, comptime entries: []const Ent
         }
         fn inspect(ptr: *const anyopaque) runtime.EnumValue {
             const entry = entries[instance(ptr).index];
-            return .{ .class_identity = @typeName(Self), .class_name = name, .member_name = entry.name, .value = entry.value };
+            return .{ .class_identity = runtime.typeIdentity(Self), .class_name = name, .member_name = entry.name, .value = entry.value };
+        }
+        fn integerValue(ptr: *const anyopaque) Value {
+            return entries[instance(ptr).index].value;
+        }
+        fn floatValue(ptr: *const anyopaque) runtime.CustomError!f64 {
+            return value.numericFloat(integerValue(ptr)) catch error.ParseValue;
         }
         fn rawValue(_: Allocator, ptr: *const anyopaque) Allocator.Error!Value {
             return boxed(instance(ptr).index);
@@ -240,11 +504,12 @@ pub fn EnumWithIdentity(comptime name: []const u8, comptime entries: []const Ent
             return value.serializedValueDepth(arena, entries[instance(ptr).index].value, depth + 1);
         }
         fn writeStr(writer: *Writer, ptr: *const anyopaque) runtime.CustomWriteError!void {
+            if (integer) return pyjson.writeStr(writer, integerValue(ptr));
             try writer.print("{s}.{s}", .{ name, entries[instance(ptr).index].name });
         }
         fn writeRepr(writer: *Writer, ptr: *const anyopaque, depth: u32) runtime.CustomWriteError!void {
             try writer.writeByte('<');
-            try writeStr(writer, ptr);
+            try writer.print("{s}.{s}", .{ name, entries[instance(ptr).index].name });
             try writer.writeAll(": ");
             try pyjson.writeRepr(writer, entries[instance(ptr).index].value, depth + 1);
             try writer.writeByte('>');
@@ -264,7 +529,7 @@ pub fn EnumWithIdentity(comptime name: []const u8, comptime entries: []const Ent
             return result;
         }
         fn deinit(_: Allocator, _: *const anyopaque, _: bool) void {}
-        fn equal(left: *const anyopaque, right: *const anyopaque) bool {
+        fn equal(left: *const anyopaque, right: *const anyopaque) runtime.CustomError!bool {
             return instance(left).index == instance(right).index;
         }
     };

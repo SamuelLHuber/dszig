@@ -65,7 +65,7 @@ pub const View = struct {
     }
 };
 
-pub const Error = error{ AdapterParse, JsonTooDeep } || Allocator.Error;
+pub const Error = error{ AdapterParse, JsonTooDeep } || value.ParseError;
 
 /// Expand media where DSPy constructs user/tool parts; assistant/system stay text.
 pub fn renderedContent(arena: Allocator, rendered: []const u8) Error!Content {
@@ -328,7 +328,7 @@ pub fn responseFormat(arena: Allocator, view: View, supports_schema: bool) Error
 fn putDefinition(arena: Allocator, definitions: *Record, name: []const u8, schema: Value) Error!void {
     const entry = try definitions.getOrPut(arena, name);
     if (entry.found_existing) {
-        if (!value.pyEqual(entry.value_ptr.*, schema)) return error.AdapterParse;
+        if (!(try value.pyEqual(entry.value_ptr.*, schema))) return error.AdapterParse;
     } else {
         entry.value_ptr.* = schema;
     }

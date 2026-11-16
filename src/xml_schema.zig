@@ -105,12 +105,12 @@ fn validate(arena: Allocator, schema: Value, definitions: Value, input: Value, d
     }
     const enumeration = get(schema, "enum");
     if (enumeration == .array) {
-        for (enumeration.array.items) |member| if (value.pyEqual(member, input)) return member;
+        for (enumeration.array.items) |member| if (try value.pyEqual(member, input)) return member;
         return error.ParseValue;
     }
     if (schema.object.contains("const")) {
         const member = get(schema, "const");
-        return if (value.pyEqual(member, input)) member else error.ParseValue;
+        return if (try value.pyEqual(member, input)) member else error.ParseValue;
     }
     const schema_type = get(schema, "type");
     if (schema_type == .null) return input;

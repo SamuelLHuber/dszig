@@ -456,7 +456,7 @@ fn setAliasedInstruction(targets: AliasTargets, identity: *const predict.Predict
     }
 }
 
-fn unusedMetric(_: Allocator, _: *const Example, _: *const Record, _: ?*const predict.Trace) f64 {
+fn unusedMetric(_: Allocator, _: *const Example, _: ?*const Record, _: ?*const predict.Trace) value.ParseError!f64 {
     unreachable;
 }
 
@@ -607,13 +607,14 @@ fn testExamples(arena: Allocator, count: usize) ![]const Example {
     }
     return examples;
 }
-fn testMetric(_: Allocator, example: *const Example, prediction: *const Record, _: ?*const predict.Trace) f64 {
-    return if (value.pyEqual(example.record.get("answer").?, prediction.get("answer") orelse return 0)) 1 else 0;
+fn testMetric(_: Allocator, example: *const Example, maybe_prediction: ?*const Record, _: ?*const predict.Trace) value.ParseError!f64 {
+    const prediction = maybe_prediction orelse return error.ParseValue;
+    return if (try value.pyEqual(example.record.get("answer").?, prediction.get("answer") orelse return 0)) 1 else 0;
 }
-fn nanMetric(_: Allocator, _: *const Example, _: *const Record, _: ?*const predict.Trace) f64 {
+fn nanMetric(_: Allocator, _: *const Example, _: ?*const Record, _: ?*const predict.Trace) value.ParseError!f64 {
     return std.math.nan(f64);
 }
-fn negativeInfinityMetric(_: Allocator, _: *const Example, _: *const Record, _: ?*const predict.Trace) f64 {
+fn negativeInfinityMetric(_: Allocator, _: *const Example, _: ?*const Record, _: ?*const predict.Trace) value.ParseError!f64 {
     return -std.math.inf(f64);
 }
 fn expectedInstruction(out: Allocator, original: []const u8, rule_index: usize) ![]const u8 {

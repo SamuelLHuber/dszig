@@ -20,7 +20,8 @@ pub const CodeMetadata = struct {
 
 /// Borrowed builtin payloads preserve Python's non-JSON value identities.
 pub const EnumValue = struct {
-    class_identity: []const u8,
+    /// Same nominal token as CustomVTable.type_identity, never a display name.
+    class_identity: *const anyopaque,
     class_name: []const u8,
     member_name: []const u8,
     value: Value,
@@ -33,6 +34,7 @@ pub const PythonValue = union(enum) {
     set: []const Value,
     frozen_set: []const Value,
     complex: struct { real: f64, imag: f64 },
+    decimal: @import("decimal.zig").Decimal,
     ellipsis: void,
     dictionary: []const PythonEntry,
 };
@@ -70,6 +72,10 @@ pub const CustomVTable = struct {
     bool_value: ?*const fn (*const anyopaque) bool = null,
     /// Python __float__, without numeric identity or numeric equality.
     float_value: ?*const fn (*const anyopaque) CustomError!f64 = null,
+    /// Actual Python int-subclass payload, not an arbitrary __int__ conversion.
+    /// The immutable borrowed result is .integer or canonical integer
+    /// .number_string; it must never contain another custom object or a float.
+    integer_value: ?*const fn (*const anyopaque) Value = null,
     decision: ?DecisionMetadata = null,
     code: ?CodeMetadata = null,
     python: ?*const fn (*const anyopaque) PythonValue = null,
@@ -87,10 +93,10 @@ pub const CustomVTable = struct {
     write_serialized_json: *const fn (*Writer, *const anyopaque, JsonStyle, usize) CustomWriteError!void,
     clone: *const fn (Allocator, *const anyopaque) Allocator.Error!Custom,
     deinit: *const fn (Allocator, *const anyopaque, bool) void,
-    eql: *const fn (*const anyopaque, *const anyopaque) bool,
+    eql: *const fn (*const anyopaque, *const anyopaque) CustomError!bool,
     /// Optional Python equality against a different value tag (e.g. Reasoning
     /// compares equal to its content string, but not to a lookalike dictionary).
-    eql_value: ?*const fn (*const anyopaque, Value) bool = null,
+    eql_value: ?*const fn (*const anyopaque, Value) CustomError!bool = null,
 };
 
 /// Native objects use their class's clone/free protocol. Model boxes are owned;
@@ -112,7 +118,24 @@ pub const Custom = struct {
     }
 
     pub fn truthy(self: Custom) bool {
-        return if (self.vtable.bool_value) |value| value(self.ptr) else true;
+        if (self.vtable.bool_value) |value| return value(self.ptr);
+        if (self.integerValue()) |integer| return switch (integer) {
+            .integer => |number| number != 0,
+            .number_string => |text| for (text) |byte| {
+                if (byte >= '1' and byte <= '9') break true;
+            } else false,
+            else => unreachable,
+        };
+        return true;
+    }
+
+    /// Borrow the exact builtin integer base without discarding this object's
+    /// class identity at storage, validation or serialization boundaries.
+    pub fn integerValue(self: Custom) ?Value {
+        const inspect = self.vtable.integer_value orelse return null;
+        const result = inspect(self.ptr);
+        std.debug.assert(result == .integer or result == .number_string);
+        return result;
     }
 
     pub fn rawValue(self: Custom, allocator: Allocator) Allocator.Error!Value {
@@ -146,7 +169,7 @@ pub const Custom = struct {
         self.vtable.deinit(allocator, self.ptr, self.owns_data);
     }
 
-    pub fn eql(self: Custom, other: Custom) bool {
+    pub fn eql(self: Custom, other: Custom) CustomError!bool {
         if (!self.sameType(other)) return false;
         return self.vtable.eql(self.ptr, other.ptr);
     }

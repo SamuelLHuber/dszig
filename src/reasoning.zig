@@ -137,11 +137,11 @@ pub const Reasoning = struct {
         allocator.destroy(reasoning);
     }
 
-    fn equalRuntime(left: *const anyopaque, right: *const anyopaque) bool {
+    fn equalRuntime(left: *const anyopaque, right: *const anyopaque) runtime.CustomError!bool {
         return std.mem.eql(u8, runtimeReasoning(left).content, runtimeReasoning(right).content);
     }
 
-    fn equalRuntimeValue(ptr: *const anyopaque, other: Value) bool {
+    fn equalRuntimeValue(ptr: *const anyopaque, other: Value) runtime.CustomError!bool {
         return other == .string and std.mem.eql(u8, runtimeReasoning(ptr).content, other.string);
     }
 };
@@ -167,12 +167,12 @@ test "Reasoning validation retains actual identity and explicitly converts strin
     const from_dictionary = try types.validate(Reasoning, arena, dictionary);
     try testing.expect(from_dictionary == .custom);
     try testing.expect(from_dictionary.custom.ptr != actual.custom.ptr);
-    try testing.expect(value.pyEqual(actual, from_dictionary));
+    try testing.expect(try value.pyEqual(actual, from_dictionary));
     try testing.expectEqual(@as(usize, 2), dictionary.object.count());
     const raw = try from_dictionary.custom.rawValue(arena);
     try testing.expectEqual(@as(usize, 1), raw.object.count());
     try testing.expect(raw.object.get("extra") == null);
-    try testing.expect(!value.pyEqual(actual, dictionary));
+    try testing.expect(!try value.pyEqual(actual, dictionary));
     for ([_][]const u8{ "", "text", "雪😀e\u{301}" }) |content| {
         const plain: Value = .{ .string = content };
         const from_string = try types.validate(Reasoning, arena, plain);
@@ -231,24 +231,24 @@ test "Reasoning equality is symmetric with strings but not lookalike dictionarie
         const different = try (Reasoning{ .content = "not equal" }).toRuntime(arena);
         const plain: Value = .{ .string = content };
         const dictionary = try typed.toValue(arena);
-        try testing.expect(value.pyEqual(actual, actual));
-        try testing.expect(value.pyEqual(actual, equal));
-        try testing.expect(value.pyEqual(equal, actual));
-        try testing.expect(!value.pyEqual(actual, different));
-        try testing.expect(value.pyEqual(actual, plain));
-        try testing.expect(value.pyEqual(plain, actual));
-        try testing.expect(!value.pyEqual(actual, dictionary));
-        try testing.expect(!value.pyEqual(dictionary, actual));
+        try testing.expect(try value.pyEqual(actual, actual));
+        try testing.expect(try value.pyEqual(actual, equal));
+        try testing.expect(try value.pyEqual(equal, actual));
+        try testing.expect(!try value.pyEqual(actual, different));
+        try testing.expect(try value.pyEqual(actual, plain));
+        try testing.expect(try value.pyEqual(plain, actual));
+        try testing.expect(!try value.pyEqual(actual, dictionary));
+        try testing.expect(!try value.pyEqual(dictionary, actual));
         for ([_]Value{ .null, .{ .bool = false }, .{ .integer = 0 }, .{ .string = "not equal" } }) |other| {
-            try testing.expect(!value.pyEqual(actual, other));
-            try testing.expect(!value.pyEqual(other, actual));
+            try testing.expect(!try value.pyEqual(actual, other));
+            try testing.expect(!try value.pyEqual(other, actual));
         }
         var actual_list: runtime.Array = .init(arena);
         try actual_list.append(actual);
         var string_list: runtime.Array = .init(arena);
         try string_list.append(plain);
-        try testing.expect(value.pyEqual(.{ .array = actual_list }, .{ .array = string_list }));
-        try testing.expect(value.pyEqual(.{ .array = string_list }, .{ .array = actual_list }));
+        try testing.expect(try value.pyEqual(.{ .array = actual_list }, .{ .array = string_list }));
+        try testing.expect(try value.pyEqual(.{ .array = string_list }, .{ .array = actual_list }));
     }
 }
 
@@ -261,7 +261,7 @@ test "Reasoning raw dumps retain fields while normal nested dumps contain conten
     const actual = try reasoning.toRuntime(arena);
     const dictionary = try reasoning.toValue(arena);
     try testing.expectEqualStrings("{\"content\":\"think 雪\"}", try std.json.Stringify.valueAlloc(arena, actual, .{}));
-    try testing.expect(value.pyEqual(dictionary, try actual.custom.rawValue(arena)));
+    try testing.expect(try value.pyEqual(dictionary, try actual.custom.rawValue(arena)));
     const normal = try value.serializedValue(arena, actual);
     try testing.expect(normal == .string);
     try testing.expectEqualStrings(reasoning.content, normal.string);
@@ -284,7 +284,7 @@ test "Reasoning raw dumps retain fields while normal nested dumps contain conten
     try testing.expect(serialized_items[0] == .string);
     try testing.expect(serialized_items[1] == .string);
     try testing.expect(serialized_items[2] == .object);
-    try testing.expect(value.pyEqual(dictionary, serialized_items[2]));
+    try testing.expect(try value.pyEqual(dictionary, serialized_items[2]));
     try testing.expect(items.items[0] == .custom);
     var streamed: Writer.Allocating = .init(arena);
     try pyjson.writeJson(&streamed.writer, nested, .minified);
@@ -366,8 +366,8 @@ test "Reasoning owning nested clones survive source storage mutation and release
     try testing.expectEqualStrings(expected, cloned.content);
     try testing.expectEqualStrings(expected, copies[1].object.get("content").?.string);
     try testing.expectEqualStrings(expected, copies[2].string);
-    try testing.expect(value.pyEqual(copies[0], copies[2]));
-    try testing.expect(!value.pyEqual(copies[0], copies[1]));
+    try testing.expect(try value.pyEqual(copies[0], copies[2]));
+    try testing.expect(!try value.pyEqual(copies[0], copies[1]));
     const serialized = try value.serializedValue(arena, owned);
     try testing.expectEqualStrings(expected, serialized.object.get("values").?.array.items[0].string);
     var rendered: Writer.Allocating = .init(arena);
@@ -375,7 +375,7 @@ test "Reasoning owning nested clones survive source storage mutation and release
     try testing.expectEqualStrings(expected, rendered.written());
     const second_copy = try inference.cloneJsonValue(allocator, copies[0]);
     defer inference.freeJsonValue(allocator, second_copy);
-    try testing.expect(value.pyEqual(second_copy, copies[0]));
+    try testing.expect(try value.pyEqual(second_copy, copies[0]));
 }
 
 test "Reasoning clone allocation failures preserve the borrowed source" {

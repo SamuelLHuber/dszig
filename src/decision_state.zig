@@ -4,8 +4,9 @@
 //! Effective configurations are mutable after construction exactly like the
 //! Source public dictionary: `question` and `decode` read the current values
 //! without revalidating them. Arithmetic uses Python operand rules for the
-//! values actually present (bools are numbers in arithmetic but not valid
-//! parameters; strings, containers and models fail).
+//! values actually present, including contextual Decimal arithmetic. Bools are
+//! numbers in arithmetic but not valid parameters; strings, containers and
+//! opaque models fail. Model validation converts numeric results only afterward.
 const std = @import("std");
 const adapter = @import("adapter.zig");
 const signature = @import("signature.zig");
@@ -19,7 +20,7 @@ const ObjectMap = runtime.ObjectMap;
 const Record = values.Record;
 const Kind = @import("decision.zig").Kind;
 
-pub const Error = error{ InvalidDecision, OutOfMemory };
+pub const Error = error{InvalidDecision} || runtime.CustomError;
 
 /// Nesting bound for configuration JSON checks. Source fails through Python
 /// recursion limits instead; both refuse the configuration.
@@ -185,7 +186,8 @@ pub const State = struct {
     }
 
     /// Decision outputs only, in output order. Answers are backend evidence
-    /// keyed by output name; Score/Choice probabilities use string labels.
+    /// keyed by output name; Score probabilities retain numeric dictionary keys,
+    /// while Choice probabilities use the declared string labels.
     pub fn decode(self: *const State, arena: Allocator, answers: *const Record) Error!Record {
         var outputs: Record = .empty;
         for (self.types) |entry| {
@@ -198,75 +200,98 @@ pub const State = struct {
                 .noul => {
                     const probability = try member(answer, "noul");
                     const threshold = config.get("threshold") orelse return error.InvalidDecision;
-                    const p = try toFloat(probability);
-                    const at_least = values.floatAtLeast(p, threshold) catch return error.InvalidDecision;
-                    const t = try toFloat(threshold);
-                    const other = 1 - t;
-                    const denominator = if (other > t) other else t;
-                    if (denominator == 0) return error.InvalidDecision;
+                    const order = values.numericOrder(probability, threshold) catch return error.InvalidDecision;
+                    const at_least = order == .gt or order == .eq;
+                    const difference = try arithmeticResult(values.numericDifference(arena, probability, threshold));
+                    const distance = try arithmeticResult(values.numericAbs(arena, difference));
+                    const other = try arithmeticResult(values.numericDifference(arena, .{ .integer = 1 }, threshold));
+                    // max(threshold, other) asks other > threshold, retaining
+                    // threshold for both equal and unordered operands.
+                    const denominator_order = values.numericOrder(other, threshold) catch return error.InvalidDecision;
+                    const denominator = if (denominator_order == .gt) other else threshold;
+                    const confidence = try arithmeticResult(values.numericQuotient(arena, distance, denominator));
                     try input.put(arena, "value", .{ .bool = at_least });
                     try input.put(arena, "probability", probability);
-                    try input.put(arena, "confidence", .{ .float = @abs(p - t) / denominator });
+                    try input.put(arena, "confidence", confidence);
                 },
                 .score => {
                     const probabilities = try scoreDistribution(answer, model.labels.len);
                     const entries = @import("python_value.zig").view(probabilities).?.dictionary;
-                    var total: f64 = 0;
-                    var weighted: f64 = 0;
+                    var total: Value = .{ .integer = 0 };
+                    for (entries) |pair| total = try arithmeticResult(values.numericSum(arena, total, pair.value));
+                    const total_order = values.numericOrder(total, .{ .integer = 0 }) catch return error.InvalidDecision;
+                    if (total_order == .lt or total_order == .eq) return error.InvalidDecision;
+
+                    var weighted: Value = .{ .integer = 0 };
                     for (entries) |pair| {
-                        const p = try toFloat(pair.value);
-                        total += p;
-                        weighted += (try toFloat(pair.key)) * p;
+                        const term = try arithmeticResult(values.numericProduct(arena, pair.key, pair.value));
+                        weighted = try arithmeticResult(values.numericSum(arena, weighted, term));
                     }
-                    if (total <= 0) return error.InvalidDecision;
-                    const mean = weighted / total;
+                    // Source computes the numerator before summing the values
+                    // a second time; reusing the precheck sum changes traps.
+                    var denominator: Value = .{ .integer = 0 };
+                    for (entries) |pair| denominator = try arithmeticResult(values.numericSum(arena, denominator, pair.value));
+                    const mean = try arithmeticResult(values.numericQuotient(arena, weighted, denominator));
+                    const confidence = try member(answer, "confidence");
                     const cuts = config.get("cuts") orelse return error.InvalidDecision;
                     var level: i64 = 0;
                     switch (cuts) {
                         .array => |items| for (items.items) |cut| {
-                            if (values.floatAtLeast(mean, cut) catch return error.InvalidDecision) level += 1;
+                            const order = values.numericOrder(mean, cut) catch return error.InvalidDecision;
+                            if (order == .gt or order == .eq) level += 1;
                         },
                         // Python iterates dictionary keys and string characters,
-                        // which compare against a float only when empty.
+                        // which compare against numeric means only when empty.
                         .object => |object| if (object.count() != 0) return error.InvalidDecision,
                         .string => |text| if (text.len != 0) return error.InvalidDecision,
                         else => return error.InvalidDecision,
                     }
-                    try input.put(arena, "value", .{ .float = mean });
-                    try input.put(arena, "confidence", try member(answer, "confidence"));
+                    try input.put(arena, "value", mean);
+                    try input.put(arena, "confidence", confidence);
                     try input.put(arena, "probabilities", probabilities);
                     try input.put(arena, "level", .{ .integer = level });
                 },
                 .choice => {
                     const probabilities = try distribution(answer, model.labels);
-                    var total: f64 = 0;
-                    for (probabilities.object.values()) |raw| total += try toFloat(raw);
-                    if (total <= 0) return error.InvalidDecision;
+                    var total: Value = .{ .integer = 0 };
+                    for (probabilities.object.values()) |raw| total = try arithmeticResult(values.numericSum(arena, total, raw));
+                    const total_order = values.numericOrder(total, .{ .integer = 0 }) catch return error.InvalidDecision;
+                    if (total_order == .lt or total_order == .eq) return error.InvalidDecision;
                     var raw_winner: usize = 0;
-                    var raw_best = try toFloat(probabilities.object.get(model.labels[0]).?);
+                    var raw_best = probabilities.object.get(model.labels[0]).?;
                     for (model.labels[1..], 1..) |label, i| {
-                        const p = try toFloat(probabilities.object.get(label).?);
-                        if (p > raw_best) {
+                        const p = probabilities.object.get(label).?;
+                        const order = values.numericOrder(p, raw_best) catch return error.InvalidDecision;
+                        if (order == .gt) {
                             raw_winner = i;
                             raw_best = p;
                         }
                     }
                     const weights = config.get("weights") orelse return error.InvalidDecision;
                     if (weights != .object) return error.InvalidDecision;
-                    // Weighted ties prefer the raw winner, then declaration order.
-                    var selected: usize = 0;
-                    var best: Value = undefined;
-                    for (model.labels, 0..) |label, i| {
+                    // The comprehension finishes every product before max
+                    // compares any score, preserving context/trap sequencing.
+                    const scores = try arena.alloc(Value, model.labels.len);
+                    defer arena.free(scores);
+                    for (model.labels, scores) |label, *score| {
                         const weight: Value = weights.object.get(label) orelse .{ .float = 1.0 };
-                        const score = values.numericProduct(arena, probabilities.object.get(label).?, weight) catch |err|
-                            return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidDecision;
-                        const order = if (i == 0) null else values.numericOrder(score, best) catch return error.InvalidDecision;
-                        if (i == 0 or order == .gt or (order == .eq and i == raw_winner and selected != raw_winner)) {
-                            selected = i;
-                            best = score;
-                        }
+                        score.* = try arithmeticResult(values.numericProduct(arena, probabilities.object.get(label).?, weight));
                     }
-                    const positive = values.numericOrder(best, .{ .integer = 0 }) catch return error.InvalidDecision;
+                    var selected: usize = 0;
+                    for (scores[1..], 1..) |score, i| {
+                        // Tuple ordering tests equality before ordering; its
+                        // equality path must not honor FloatOperation's trap.
+                        const same = (score == .custom and scores[selected] == .custom and
+                            score.custom.ptr == scores[selected].custom.ptr) or
+                            (values.pyEqual(score, scores[selected]) catch |err|
+                                return if (err == error.OutOfMemory) error.OutOfMemory else error.InvalidDecision);
+                        const greater = if (same)
+                            i == raw_winner and selected != raw_winner
+                        else
+                            (values.numericOrder(score, scores[selected]) catch return error.InvalidDecision) == .gt;
+                        if (greater) selected = i;
+                    }
+                    const positive = values.numericOrder(scores[selected], .{ .integer = 0 }) catch return error.InvalidDecision;
                     if (positive == .lt or positive == .eq) return error.InvalidDecision;
                     try input.put(arena, "value", model.values[selected]);
                     try input.put(arena, "confidence", try member(answer, "confidence"));
@@ -362,7 +387,7 @@ fn preserveAnswerSpace(arena: Allocator, binding: decision_evidence.Binding, ori
     if (declared.model.kind != binding.model.kind) return error.InvalidDecision;
     const criteria = try parseCriteria(arena, binding.model.criteria_json);
     const original_criteria = try parseCriteria(arena, declared.model.criteria_json);
-    if (!values.pyEqual(criteria, original_criteria)) return error.InvalidDecision;
+    if (!(try values.pyEqual(criteria, original_criteria))) return error.InvalidDecision;
     if (criteria == .object and original_criteria == .object) {
         for (criteria.object.keys(), original_criteria.object.keys()) |a, b| {
             if (!eql(a, b)) return error.InvalidDecision;
@@ -375,12 +400,12 @@ fn preserveAnswerSpace(arena: Allocator, binding: decision_evidence.Binding, ori
         if (members.len != original_members.len) return error.InvalidDecision;
         for (members) |a| {
             for (original_members) |b| {
-                if (sameLiteral(a, b)) break;
+                if (try sameLiteral(a, b)) break;
             } else return error.InvalidDecision;
         }
         for (original_members) |b| {
             for (members) |a| {
-                if (sameLiteral(a, b)) break;
+                if (try sameLiteral(a, b)) break;
             } else return error.InvalidDecision;
         }
     }
@@ -399,9 +424,9 @@ fn pythonType(v: Value) PythonType {
     };
 }
 
-fn sameLiteral(a: Value, b: Value) bool {
+fn sameLiteral(a: Value, b: Value) values.ParseError!bool {
     const kind = pythonType(a);
-    return kind != .other and kind == pythonType(b) and values.pyEqual(a, b);
+    return kind != .other and kind == pythonType(b) and try values.pyEqual(a, b);
 }
 
 fn parseCriteria(arena: Allocator, text: []const u8) Error!Value {
@@ -426,9 +451,11 @@ fn exactNumber(v: Value) ?Number {
     };
 }
 
-/// Python's implicit float conversion of an arithmetic operand.
-fn toFloat(v: Value) Error!f64 {
-    return values.numericFloat(v) catch error.InvalidDecision;
+fn arithmeticResult(result: (Allocator.Error || error{InvalidNumber})!Value) Error!Value {
+    return result catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidNumber => error.InvalidDecision,
+    };
 }
 
 fn member(answer: Value, key: []const u8) Error!Value {
@@ -444,7 +471,7 @@ fn scoreDistribution(answer: Value, levels: usize) Error!Value {
     if (python != .dictionary or python.dictionary.len != levels) return error.InvalidDecision;
     for (python.dictionary) |pair| {
         for (0..levels) |i| {
-            if (values.pyEqual(pair.key, .{ .integer = @intCast(i) })) break;
+            if (try values.pyEqual(pair.key, .{ .integer = @intCast(i) })) break;
         } else return error.InvalidDecision;
     }
     return probabilities;
@@ -500,4 +527,249 @@ test "Choice weights retain exact integers and distinguish integer zero from flo
     try std.testing.expectEqualStrings("technical", integer_zero.get("category").?.custom.get(Choice).?.value.string);
     probabilities.object.getPtr("category").?.object.getPtr("probabilities").?.object.getPtr("billing").?.* = .{ .float = 0.0 };
     try std.testing.expectError(error.InvalidDecision, huge_state.decode(a, &probabilities.object));
+}
+
+fn expectDecisionFlags(actual: @import("decimal_environment.zig").Signals, expected: []const @import("decimal_environment.zig").Signal) !void {
+    const environment = @import("decimal_environment.zig");
+    const wanted: environment.Signals = .initMany(expected);
+    for (std.meta.tags(environment.Signal)) |signal| {
+        try std.testing.expectEqual(wanted.contains(signal), actual.contains(signal));
+    }
+}
+
+test "Noul late Decimal thresholds compare before float validation and mixed arithmetic refusal" {
+    const python = @import("python_value.zig");
+    const environment = @import("decimal_environment.zig");
+    const Noul = @import("decision.zig").Noul;
+    const Sig = signature.Make(struct {}, struct { answer: Noul }, "", &.{});
+    const view: adapter.View = .{ .instructions = Sig.instructions, .inputs = Sig.input_fields_list, .outputs = Sig.output_fields_list };
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const a = memory.allocator();
+    const context: environment.Context = .{};
+    var local: environment.LocalContext = .{};
+    local.enter(&context);
+    defer local.deinit();
+
+    const config = try json_repair.parseJson(a, "{\"answer\":{\"threshold\":0.5}}");
+    const configured_threshold = config.object.getPtr("answer").?.object.getPtr("threshold").?;
+    configured_threshold.* = try python.decimal(a, "0.5");
+    try std.testing.expectError(error.InvalidDecision, State.init(a, view, config, false, null));
+    configured_threshold.* = .{ .bool = true };
+    try std.testing.expectError(error.InvalidDecision, State.init(a, view, config, false, null));
+    configured_threshold.* = .{ .float = 0.5 };
+    const state = try State.init(a, view, config, false, null);
+    const threshold = state.fields.getPtr("answer").?.object.getPtr("threshold").?;
+    threshold.* = try python.decimal(a, "0.5000000000000000000000000001");
+    try std.testing.expectError(error.InvalidDecision, state.validateParameters());
+
+    const answers = try json_repair.parseJson(a, "{\"answer\":{\"noul\":0.5}}");
+    const probability = answers.object.getPtr("answer").?.object.getPtr("noul").?;
+    probability.* = try python.decimal(a, "0.5");
+    local.context.clearFlags();
+    const decoded = try state.decode(a, &answers.object);
+    const result = decoded.get("answer").?.custom.get(Noul).?;
+    try std.testing.expect(!result.value);
+    try std.testing.expectEqual(@as(?f64, 0.5), result.probability);
+    try std.testing.expectEqual(@as(f64, 2e-28), result.confidence);
+    try expectDecisionFlags(local.context.flags, &.{ .inexact, .rounded });
+
+    // At precision one Source rounds the confidence arithmetic, not the
+    // probability passed to final model validation.
+    threshold.* = try python.decimal(a, "0.5");
+    probability.* = try python.decimal(a, "0.75");
+    local.context.precision = 1;
+    local.context.clearFlags();
+    const rounded = try state.decode(a, &answers.object);
+    const rounded_result = rounded.get("answer").?.custom.get(Noul).?;
+    try std.testing.expect(rounded_result.value);
+    try std.testing.expectEqual(@as(?f64, 0.75), rounded_result.probability);
+    try std.testing.expectEqual(@as(f64, 0.4), rounded_result.confidence);
+    try expectDecisionFlags(local.context.flags, &.{ .inexact, .rounded });
+    local.context.traps.insert(.rounded);
+    local.context.clearFlags();
+    try std.testing.expectError(error.InvalidDecision, state.decode(a, &answers.object));
+    try expectDecisionFlags(local.context.flags, &.{ .inexact, .rounded });
+    local.context.traps.remove(.rounded);
+    local.context.precision = 28;
+
+    // Source first performs Decimal >= float, then refuses their subtraction.
+    // Enabling FloatOperation's trap fails at that earlier comparison instead.
+    threshold.* = .{ .float = 0.5 };
+    probability.* = try python.decimal(a, "0.75");
+    local.context.clearFlags();
+    try std.testing.expectError(error.InvalidDecision, state.decode(a, &answers.object));
+    try expectDecisionFlags(local.context.flags, &.{.float_operation});
+    local.context.traps.insert(.float_operation);
+    local.context.clearFlags();
+    try std.testing.expectError(error.InvalidDecision, state.decode(a, &answers.object));
+    try expectDecisionFlags(local.context.flags, &.{.float_operation});
+}
+
+test "Score Decimal means on either side of a cut retain distinct levels after float validation" {
+    const python = @import("python_value.zig");
+    const environment = @import("decimal_environment.zig");
+    const Score = @import("decision.zig").ScoreWithLevels("[\"poor\",\"fair\",\"excellent\"]");
+    const Sig = signature.Make(struct {}, struct { answer: Score }, "", &.{});
+    const view: adapter.View = .{ .instructions = Sig.instructions, .inputs = Sig.input_fields_list, .outputs = Sig.output_fields_list };
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const a = memory.allocator();
+    const context: environment.Context = .{};
+    var local: environment.LocalContext = .{};
+    local.enter(&context);
+    defer local.deinit();
+
+    const config = try json_repair.parseJson(a, "{\"answer\":{}}");
+    const state = try State.init(a, view, config, false, null);
+    const cuts = state.fields.getPtr("answer").?.object.getPtr("cuts").?.array.items;
+    cuts[0] = try python.decimal(a, "0.5");
+    cuts[1] = try python.decimal(a, "1.5");
+    try std.testing.expectError(error.InvalidDecision, state.validateParameters());
+    const answers = try json_repair.parseJson(a, "{\"answer\":{}}");
+    const answer = &answers.object.getPtr("answer").?.object;
+    try answer.put(a, "confidence", try python.decimal(a, "0.8"));
+    const cases = [_]struct { first: []const u8, second: []const u8, level: i64, rounded: bool }{
+        .{ .first = "0.5000000000000000000000000001", .second = "0.4999999999999999999999999999", .level = 0, .rounded = true },
+        .{ .first = "0.5", .second = "0.5", .level = 1, .rounded = false },
+        .{ .first = "0.4999999999999999999999999999", .second = "0.5000000000000000000000000001", .level = 1, .rounded = true },
+    };
+    for (cases) |case| {
+        const probabilities = try python.dictionary(a, &.{
+            .{ .key = .{ .integer = 0 }, .value = try python.decimal(a, case.first) },
+            .{ .key = .{ .integer = 1 }, .value = try python.decimal(a, case.second) },
+            .{ .key = .{ .integer = 2 }, .value = try python.decimal(a, "0") },
+        });
+        try answer.put(a, "probabilities", probabilities);
+        local.context.clearFlags();
+        const decoded = try state.decode(a, &answers.object);
+        const result = decoded.get("answer").?.custom.get(Score).?;
+        try std.testing.expectEqual(@as(f64, 0.5), result.value);
+        try std.testing.expectEqual(case.level, result.fieldValue("level").integer);
+        try expectDecisionFlags(local.context.flags, if (case.rounded) &.{.rounded} else &.{});
+    }
+}
+
+test "Score distribution precheck raises Rounded before the weighted numerator raises Inexact" {
+    const python = @import("python_value.zig");
+    const environment = @import("decimal_environment.zig");
+    const Score = @import("decision.zig").ScoreWithLevels("[\"poor\",\"fair\",\"excellent\"]");
+    const Sig = signature.Make(struct {}, struct { answer: Score }, "", &.{});
+    const view: adapter.View = .{ .instructions = Sig.instructions, .inputs = Sig.input_fields_list, .outputs = Sig.output_fields_list };
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const a = memory.allocator();
+    const context: environment.Context = .{ .precision = 1 };
+    var local: environment.LocalContext = .{};
+    local.enter(&context);
+    defer local.deinit();
+
+    const config = try json_repair.parseJson(a, "{\"answer\":{}}");
+    const state = try State.init(a, view, config, false, null);
+    const cuts = state.fields.getPtr("answer").?.object.getPtr("cuts").?.array.items;
+    cuts[0] = try python.decimal(a, "0.5");
+    cuts[1] = try python.decimal(a, "1.5");
+    const answers = try json_repair.parseJson(a, "{\"answer\":{\"confidence\":0.8}}");
+    try answers.object.getPtr("answer").?.object.put(a, "probabilities", try python.dictionary(a, &.{
+        .{ .key = .{ .integer = 0 }, .value = try python.decimal(a, "0.2") },
+        .{ .key = .{ .integer = 1 }, .value = try python.decimal(a, "0.3") },
+        .{ .key = .{ .integer = 2 }, .value = try python.decimal(a, "0.5") },
+    }));
+    local.context.traps.insert(.rounded);
+    local.context.clearFlags();
+    try std.testing.expectError(error.InvalidDecision, state.decode(a, &answers.object));
+    try expectDecisionFlags(local.context.flags, &.{.rounded});
+
+    local.context.traps.remove(.rounded);
+    local.context.clearFlags();
+    const decoded = try state.decode(a, &answers.object);
+    const result = decoded.get("answer").?.custom.get(Score).?;
+    try std.testing.expectEqual(@as(f64, 1), result.value);
+    try std.testing.expectEqual(@as(i64, 1), result.fieldValue("level").integer);
+    try expectDecisionFlags(local.context.flags, &.{ .inexact, .rounded });
+
+    // With ordinary float cuts, all Decimal arithmetic precedes the first
+    // FloatOperation comparison trap. Its earlier rounding flags survive.
+    local.context.precision = 28;
+    cuts[0] = .{ .float = 0.5 };
+    cuts[1] = .{ .float = 1.5 };
+    try answers.object.getPtr("answer").?.object.put(a, "probabilities", try python.dictionary(a, &.{
+        .{ .key = .{ .integer = 0 }, .value = try python.decimal(a, "1E-28") },
+        .{ .key = .{ .integer = 1 }, .value = try python.decimal(a, "1") },
+        .{ .key = .{ .integer = 2 }, .value = try python.decimal(a, "1E-28") },
+    }));
+    local.context.clearFlags();
+    const float_cuts = try state.decode(a, &answers.object);
+    const float_cuts_result = float_cuts.get("answer").?.custom.get(Score).?;
+    try std.testing.expectEqual(@as(f64, 1), float_cuts_result.value);
+    try std.testing.expectEqual(@as(i64, 1), float_cuts_result.fieldValue("level").integer);
+    try expectDecisionFlags(local.context.flags, &.{ .float_operation, .inexact, .rounded });
+
+    local.context.traps.insert(.float_operation);
+    local.context.clearFlags();
+    try std.testing.expectError(error.InvalidDecision, state.decode(a, &answers.object));
+    try expectDecisionFlags(local.context.flags, &.{ .float_operation, .inexact, .rounded });
+}
+
+test "Choice Decimal subfloat winners survive rounded score ties and unordered weighted scores" {
+    const python = @import("python_value.zig");
+    const environment = @import("decimal_environment.zig");
+    const Choice = @import("decision.zig").ChoiceWithOptions(&.{
+        .{ .value = .{ .string = "left" }, .description_json = "\"Left option\"" },
+        .{ .value = .{ .string = "right" }, .description_json = "\"Right option\"" },
+    });
+    const Sig = signature.Make(struct {}, struct { answer: Choice }, "", &.{});
+    const view: adapter.View = .{ .instructions = Sig.instructions, .inputs = Sig.input_fields_list, .outputs = Sig.output_fields_list };
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const a = memory.allocator();
+    const context: environment.Context = .{};
+    var local: environment.LocalContext = .{};
+    local.enter(&context);
+    defer local.deinit();
+
+    const config = try json_repair.parseJson(a, "{\"answer\":{\"weights\":{\"left\":1,\"right\":1}}}");
+    const state = try State.init(a, view, config, false, null);
+    const answers = try json_repair.parseJson(a, "{\"answer\":{\"probabilities\":{}}}");
+    const answer = &answers.object.getPtr("answer").?.object;
+    try answer.put(a, "confidence", try python.decimal(a, "0.8"));
+    const probabilities = &answer.getPtr("probabilities").?.object;
+    try probabilities.put(a, "left", try python.decimal(a, "0.5"));
+    try probabilities.put(a, "right", try python.decimal(a, "0.5000000000000000000000000001"));
+    for ([_]usize{ 28, 1 }) |precision| {
+        local.context.precision = precision;
+        local.context.clearFlags();
+        const decoded = try state.decode(a, &answers.object);
+        try std.testing.expectEqualStrings("right", decoded.get("answer").?.custom.get(Choice).?.value.string);
+        try expectDecisionFlags(local.context.flags, &.{ .inexact, .rounded });
+    }
+
+    local.context.precision = 28;
+    const weights = state.fields.getPtr("answer").?.object.getPtr("weights").?;
+    weights.object.getPtr("left").?.* = try python.decimal(a, "1.000000000000000000000000001");
+    weights.object.getPtr("right").?.* = try python.decimal(a, "1");
+    try std.testing.expectError(error.InvalidDecision, state.validateParameters());
+    local.context.clearFlags();
+    const weighted = try state.decode(a, &answers.object);
+    try std.testing.expectEqualStrings("left", weighted.get("answer").?.custom.get(Choice).?.value.string);
+    try expectDecisionFlags(local.context.flags, &.{ .inexact, .rounded });
+
+    // A missing weight is float 1.0, not Decimal or integer one.
+    try probabilities.put(a, "left", try python.decimal(a, "0.4"));
+    try probabilities.put(a, "right", try python.decimal(a, "0.6"));
+    weights.* = .{ .object = .empty };
+    try weights.object.put(a, "left", try python.decimal(a, "1"));
+    local.context.clearFlags();
+    try std.testing.expectError(error.InvalidDecision, state.decode(a, &answers.object));
+    try expectDecisionFlags(local.context.flags, &.{});
+
+    // Untrapped NaN is neither greater nor <= zero. The first score survives,
+    // even though the other option is the raw probability winner.
+    weights.object.getPtr("left").?.* = try python.decimal(a, "NaN99");
+    try weights.object.put(a, "right", try python.decimal(a, "1"));
+    local.context.traps = .empty;
+    local.context.clearFlags();
+    const unordered = try state.decode(a, &answers.object);
+    try std.testing.expectEqualStrings("left", unordered.get("answer").?.custom.get(Choice).?.value.string);
+    try expectDecisionFlags(local.context.flags, &.{.invalid_operation});
 }

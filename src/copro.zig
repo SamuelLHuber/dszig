@@ -286,7 +286,8 @@ const TestProgram = struct {
     }
 };
 
-fn yesMetric(_: Allocator, _: *const Example, prediction: *const Record, _: ?*const predict.Trace) f64 {
+fn yesMetric(_: Allocator, _: *const Example, maybe_prediction: ?*const Record, _: ?*const predict.Trace) value.ParseError!f64 {
+    const prediction = maybe_prediction orelse return error.ParseValue;
     const answer = prediction.get("answer") orelse return 0;
     return if (answer == .string and std.mem.eql(u8, answer.string, "yes")) 1 else 0;
 }
