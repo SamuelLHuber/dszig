@@ -81,6 +81,11 @@ pub const bootstrap_finetune = @import("bootstrap_finetune.zig");
 pub const BootstrapFinetune = bootstrap_finetune.BootstrapFinetune;
 pub const better_together = @import("better_together.zig");
 pub const BetterTogether = better_together.BetterTogether;
+pub const avatar = @import("avatar.zig");
+pub const Avatar = avatar.Avatar;
+pub const AvatarWithOptions = avatar.AvatarWithOptions;
+pub const avatar_optimizer = @import("avatar_optimizer.zig");
+pub const AvatarOptimizer = avatar_optimizer.AvatarOptimizer;
 pub const tpe_int = @import("tpe_int.zig");
 pub const bootstrap_optuna = @import("bootstrap_optuna.zig");
 pub const BootstrapFewShotWithOptuna = bootstrap_optuna.BootstrapFewShotWithOptuna;
@@ -122,4 +127,6 @@ pub const unicode = @import("unicode.zig");
 test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("bootstrap_finetune_data.zig");
+    _ = @import("avatar.zig");
+    _ = @import("avatar_optimizer.zig");
 }

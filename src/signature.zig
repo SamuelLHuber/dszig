@@ -231,11 +231,22 @@ pub fn isSignature(comptime T: type) bool {
 /// list item. Recursive custom-type discovery is a separate description rule.
 fn customXmlLiteral(comptime T: type) bool {
     const annotation = if (@typeInfo(T) == .optional) @typeInfo(T).optional.child else T;
-    if (code.isCode(annotation) or annotation == BoundingBox or annotation == File or citation.isCitation(annotation) or decision.isDecision(annotation)) return true;
+    if (dspyXmlModel(annotation)) return true;
     return switch (@typeInfo(annotation)) {
         // DSPy's fixed tuples use a JSON body even in XML prompts.
         .array => true,
-        .pointer => |p| p.size == .slice and (code.isCode(p.child) or p.child == BoundingBox or p.child == File or citation.isCitation(p.child) or decision.isDecision(p.child)),
+        .pointer => |p| p.size == .slice and dspyXmlModel(p.child),
+        else => false,
+    };
+}
+
+/// Source keeps BaseModels owned by a `dspy.*` module as literal JSON leaves.
+/// Module metadata also covers native models that are not rich DSPy Types.
+fn dspyXmlModel(comptime T: type) bool {
+    if (code.isCode(T) or T == BoundingBox or T == File or citation.isCitation(T) or decision.isDecision(T)) return true;
+    return switch (@typeInfo(T)) {
+        .@"struct" => @hasDecl(T, "model_module") and
+            @hasDecl(T, "model_name") and std.mem.startsWith(u8, T.model_module, "dspy."),
         else => false,
     };
 }

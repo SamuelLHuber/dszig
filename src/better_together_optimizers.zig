@@ -78,15 +78,18 @@ pub const RandomSearch = struct {
     pub const accepts_valset = true;
     pub const accepts_teacher = true;
     optimizer: optimize.BootstrapFewShotWithRandomSearch,
+    compile_options: optimize.BootstrapFewShotWithRandomSearch.Options = .{
+        .restrict = null,
+        .labeled_sample = true,
+    },
 
-    /// Source accepts trainset, valset and teacher. Native does not expose Source
-    /// restrict/labeled_sample; this adapter does not invent those options.
+    /// Compile-local seed filtering and label sampling belong to this registry key.
     pub fn compile(self: *RandomSearch, comptime P: type, request: Request(P)) !P {
         // Preserve Source's delayed list error: stop_at_score may finish at
         // the reset/labeled candidate before any bootstrap consumes teacher.
         const result = switch (request.teacher) {
-            .list => |teachers| try self.optimizer.compile(P, request.out, request.gpa, request.ctx, request.student, teachers, request.trainset, request.valset),
-            .none, .program => try self.optimizer.compile(P, request.out, request.gpa, request.ctx, request.student, try teacherValue(P, request.teacher), request.trainset, request.valset),
+            .list => |teachers| try self.optimizer.compile(P, request.out, request.gpa, request.ctx, request.student, teachers, request.trainset, request.valset, self.compile_options),
+            .none, .program => try self.optimizer.compile(P, request.out, request.gpa, request.ctx, request.student, try teacherValue(P, request.teacher), request.trainset, request.valset, self.compile_options),
         };
         return result.program;
     }
@@ -97,11 +100,11 @@ pub const LabeledFewShot = struct {
     pub const accepts_valset = false;
     pub const accepts_teacher = false;
     optimizer: optimize.LabeledFewShot,
+    compile_options: optimize.LabeledFewShot.Options = .{ .sample = true },
 
     /// Source does not accept teacher or valset, so standard values are ignored.
-    /// The native optimizer implements Source's default sample=true only.
     pub fn compile(self: *LabeledFewShot, comptime P: type, request: Request(P)) !P {
-        return self.optimizer.compile(P, request.out, request.student, request.trainset);
+        return self.optimizer.compile(P, request.out, request.student, request.trainset, self.compile_options);
     }
 };
 

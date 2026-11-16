@@ -6,7 +6,7 @@ allocators and execution context are explicit.
 
 **This is not a feature-complete or fully identical implementation of DSPy.** The
 cross-runtime gates cover the behaviors below, not every DSPy capability. In
-particular, the Python-executing RLM/Flex stack, AvatarOptimizer, images/audio,
+particular, the Python-executing RLM/Flex stack, images/audio,
 full provider SDK coverage, and streaming are not implemented. Native File and
 bounded Responses document support are implemented, not general multimodal
 parity. See [Compatibility limits](#compatibility-limits).
@@ -118,7 +118,7 @@ retain the actual continuation and raw provider response independently.
 | Fine-tuning | Chat/XML `Adapter.formatFinetuneData`; native `BootstrapFinetune` over bounded OpenAI HTTP jobs, startup workers, retained model names and joined failure cleanup |
 | Optimizer composition | Native `BetterTogether`, real default prompt/weight optimization, typed custom registries, retained candidate LM snapshots and joined lifecycle cleanup |
 | Instruction optimization | `InferRules`; `MIPROv2`, its program-aware proposer and an Optuna 4.5.0 TPE port; `COPRO`; `SIMBA`; supported instance-frontier `GEPA` paths against gepa 0.1.4 |
-| Agents and tools | `ReAct`, comptime `Tool`, `History`, `ToolCalls`, tool results, native declarations and text tool calls, typed submit, retained history |
+| Agents and tools | `ReAct`, bounded native `Avatar` and `AvatarOptimizer`, comptime `Tool`, `History`, `ToolCalls`, tool results, native declarations and text tool calls, typed submit, retained history |
 | Voting | `Ensemble`, `ensemble.majority`, Unicode text normalization; exact Python numeric equality, NaN object identity and source-order fallback behavior |
 | Answer metrics | `metrics.emScore`, `f1Score`, `hotpotF1Score`, `precisionScore`, multi-reference `em`/`f1`/`hotpotF1`, thresholded and record-based answer matching, DPR-token passage matching |
 | LM boundary | `LM`, native `lm.OpenAI` Chat Completions/Responses and `lm.TypeSafe` SystemOne, shared bounded `http.Transport`, scripted/keyword LMs, recording/replay wrappers and typed native protocol metadata |
@@ -1274,6 +1274,98 @@ the 1 MiB compile backing was overwritten. Actual Source had 106 finite oracle
 cases; its training jobs were scripted real futures, not provider/SDK/network
 work, and those 106 cases were not all matched to native execution.
 
+## Few-shot compile options
+
+`LabeledFewShot.compile(P, out, student, trainset, options)` accepts
+`.{ .sample = true }` for CPython-compatible sampling or
+`.{ .sample = false }` for prefix selection. Its signed `i128` count preserves
+Python negative slicing in prefix mode. A negative sampled count fails only
+when a nonempty dataset has a predictor; empty data returns a reset copy first.
+Both modes own deep-copied demos in `out`. DSPy aliases the original Examples,
+so native ownership is an intentional difference, not alias-identity parity.
+
+`BootstrapFewShotWithRandomSearch.compile(..., valset, options)` accepts
+`restrict: ?[]const i64` and `labeled_sample: bool`. Restrictions are a borrowed
+seed set: duplicates and out-of-range entries are ignored, candidates retain
+ascending seed order, and no matching seed returns `RestrictMatchesNoSeed`
+before candidate work. `labeled_sample` changes only the labeled seed `-2`.
+The reset, labeled and fixed bootstrap seeds permit zero bootstrapped demos;
+a consumed random seed instead returns `InvalidBootstrapRange`. Early stopping
+can avoid that failure. Teacher-list refusal is likewise deferred until a
+bootstrap candidate actually consumes the teacher.
+
+BetterTogether's `optimizers.LabeledFewShot` and `optimizers.RandomSearch`
+expose `compile_options`; `Defaults.prompt_compile_options` configures the
+default `"p"` step. These are typed native options, not arbitrary Python kwargs.
+Random-search candidate reports still contain seed and score, not the Source
+candidate programs and per-example subscores.
+
+The Debug and ReleaseSafe public-API consumers each matched 203 value
+observations and 13 refusal
+categories across 32 labeled and 30 search Source cases, separately recording
+13 ownership differences. Its BetterTogether paths passed 67 checks.
+Eight additional actual Source zero-bootstrap cases matched 31 value
+observations and three refusal categories after reproducing and fixing the
+former eager native assertion. These execute real optimizer methods without
+model inference; categories do not reproduce Python exception classes/messages.
+
+## Bounded native Avatar
+
+`Avatar(Sig)` and `AvatarWithOptions(Sig, .{ .actions_max = 8,
+.tools_max = 32 })` build native actors with statically generated signature
+layouts. Initialize with `Program.init(arena, tools)`. Tools use
+`avatar.Tool`/`avatar.Runner`, distinct from ReAct's root-level `Tool`.
+`forward(ctx, input)` runs on a copy; mutable `call(ctx, input, options)`
+preserves actor evolution after failures. Successful calls restore the actor
+and return the task outputs plus ordered `actions`. After an evolved failure,
+another mutable call refuses before LM use until `reset()`.
+
+The action capacity is a real safety bound: the next decision may finish, but
+cannot execute another tool. Exhaustion returns `AvatarActionsExhausted`,
+never a fabricated final answer. Source's `max_iters` loop does not provide
+that bound; native call options preserve its observed behavior within the
+explicit capacity. Native tool callbacks are borrowed, and evolved signature
+class identities are static per layout rather than freshly generated Python
+classes. Typed inputs require all declared fields.
+
+`AvatarOptimizer.compile(P, out, gpa, ctx, rng, student, trainset)` evaluates
+native actors serially, partitions examples by score, samples positives before
+negatives from the explicit CPython-compatible generator, then runs comparator
+and feedback-instruction Predicts. It applies instructions only on a strict
+improvement and returns the newly proposed instruction without evaluating that
+proposal again. Reports use raw mean scores, not Evaluate percentages.
+Failed examples score zero except allocation failure, which propagates.
+Returned metadata/instructions live in `out`; tool callbacks remain borrowed.
+
+DSPy 3.5's original Avatar and AvatarOptimizer constructors fail because they
+refer to removed `dspy.TypedPredictor`. This port follows saved observations
+of unchanged Source methods on explicitly initialized real `dspy.Predict`
+instances, not working original constructors or unmodified end-to-end Source
+execution. Debug and ReleaseSafe native HTTP smokes each completed 22 actual
+requests, including tool execution, two optimizer iterations and execution of
+the optimized actor; both modes closed and joined the fixture. This is
+localhost transport evidence, not authenticated model inference or
+whole-runtime static-memory proof.
+
+Final Debug and ReleaseSafe gates each passed 496 tests and 34 build steps,
+including examples. The saved actor-method receipt covers 39 rows: each mode
+passed 7,674 Source-backed value/metadata/message comparisons and 19
+refusal-category comparisons, separately reporting 226 native invariants, nine
+deliberate differences and 65 unsupported-category reports. Two requests
+belonging to missing typed input remain explicitly unconsumed; three requests
+are unconsumed only in the supplemental capacity-limited replay. These are not
+parity matches. The unchanged expectations first exposed 136 prompt mismatches,
+fixed by propagating DSPy model-module metadata into shared XML annotation
+routing: DSPy-owned BaseModels use JSON leaves while ordinary models retain
+nested XML.
+
+The optimizer-method consumer accounts for all 25 saved rows: 20 matches,
+four refusal categories and one deliberate serial-context difference. All 13
+ordered sampling rows match. Its 2,677 checks include exact feedback inputs and
+prompts, but are checks, not 2,677 independent Source observations. Actor prompt
+bytes absent from that optimizer receipt, Python exception identity, dynamic
+class/object identity and Source thread scheduling are not established by it.
+
 ## Native BetterTogether
 
 `BetterTogether.compile(P, out, gpa, io, ctx, &student, trainset, options,
@@ -1874,7 +1966,10 @@ The following prevent a claim that DSZig can do everything DSPy can:
   LocalInterpreter, InterpreterPool or complete Python execution environment.
   DSPy's RLM/Flex execute arbitrary Python and can import real DSPy inside the
   guest. A restricted expression evaluator is not an identical implementation.
-- **Other modules and optimizers:** no AvatarOptimizer. Native BetterTogether
+- **Other modules and optimizers:** bounded native Avatar/AvatarOptimizer follow
+  Source methods, with broken Source constructors and the explicit native
+  capacity, class-identity, callback-ownership and serial-execution boundaries
+  described above. Native BetterTogether
   composes implemented optimizers, with the typed argument, teacher, ownership
   and provider limits described above. Trace bootstrapping, Chat/XML fine-tuning
   data formatting, bounded OpenAI training jobs and BootstrapFinetune are implemented

@@ -315,7 +315,7 @@ fn pipeline(
     }
     const search = @TypeOf(optimizer) == dszig.BootstrapFewShotWithRandomSearch;
     const compiled = if (search)
-        try optimizer.compile(P, arena, gpa, ctx, student, null, trainset, null)
+        try optimizer.compile(P, arena, gpa, ctx, student, null, trainset, null, .{ .restrict = null, .labeled_sample = true })
     else
         try optimizer.compile(P, arena, gpa, ctx, student, null, trainset);
     const optimized = try dszig.optimize.evaluate(P, gpa, ctx, &compiled.program, devset, metric, 10);

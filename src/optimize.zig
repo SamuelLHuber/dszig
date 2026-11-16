@@ -214,20 +214,56 @@ fn exampleRecords(arena: Allocator, examples: []const Example) Allocator.Error![
 
 /// `dspy.LabeledFewShot(k)`.
 pub const LabeledFewShot = struct {
-    k: usize = 16,
+    // A signed wide count preserves Python negative slicing and all native usize counts.
+    k: i128 = 16,
 
-    /// Returns a reset copy of `student` with `k` sampled demos per predictor.
-    /// Demos are deep-copied into `out`.
-    pub fn compile(self: LabeledFewShot, comptime P: type, out: Allocator, student: P, trainset: []const Example) Allocator.Error!P {
+    pub const Options = struct {
+        sample: bool = true,
+    };
+
+    /// Returns a reset copy. Selected demos are owned by `out`, including prefix mode.
+    /// Empty datasets return before validating k, matching Source reset_copy.
+    pub fn compile(
+        self: LabeledFewShot,
+        comptime P: type,
+        out: Allocator,
+        student: P,
+        trainset: []const Example,
+        options: Options,
+    ) !P {
         var program = student;
         try predict.resetPredictors(out, &program);
         if (trainset.len == 0) return program;
-        const population = try exampleRecords(out, trainset);
-        var rng = pyrandom.Random.init(0);
-        for (try predict.namedPredictors(out, &program)) |p| {
-            p.param.predict.demos = try sampleRecords(out, &rng, population, @min(self.k, trainset.len));
+        const predictors = try predict.namedPredictors(out, &program);
+        if (options.sample) {
+            // Source reaches sample's count validation only with a predictor.
+            if (predictors.len == 0) return program;
+            if (self.k < 0) return error.InvalidSampleCount;
+            var rng = pyrandom.Random.init(0);
+            const population = try exampleRecords(out, trainset);
+            const count: usize = @intCast(@min(self.k, trainset.len));
+            for (predictors) |p| {
+                p.param.predict.demos = try sampleRecords(out, &rng, population, count);
+            }
+        } else {
+            const count = self.prefixCount(trainset.len);
+            for (predictors) |p| {
+                const demos = try out.alloc(Record, count);
+                for (demos, trainset[0..count]) |*demo, *example| {
+                    demo.* = try value.cloneRecord(out, &example.record);
+                }
+                p.param.predict.demos = demos;
+            }
         }
         return program;
+    }
+
+    fn prefixCount(self: LabeledFewShot, length: usize) usize {
+        if (self.k >= 0) return @intCast(@min(self.k, length));
+        // Avoid negating minInt; Python's negative stop clamps at zero.
+        const magnitude: u128 = @as(u128, @intCast(-(self.k + 1))) + 1;
+        if (magnitude >= length) return 0;
+        return length - @as(usize, @intCast(magnitude));
     }
 };
 
@@ -281,7 +317,7 @@ pub const BootstrapFewShot = struct {
         try predict.resetPredictors(out, &student);
         var teacher = (try teacherProgram(P, teacher_in)) orelse student_in;
         if (self.max_labeled_demos > 0 and !teacher.compiled) {
-            teacher = try (LabeledFewShot{ .k = self.max_labeled_demos }).compile(P, out, teacher, trainset);
+            teacher = try (LabeledFewShot{ .k = self.max_labeled_demos }).compile(P, out, teacher, trainset, .{ .sample = true });
         }
         const student_preds = try predict.namedPredictors(out, &student);
         const teacher_preds = try predict.namedPredictors(out, &teacher);
@@ -462,6 +498,14 @@ pub const BootstrapFewShotWithRandomSearch = struct {
     concurrent_evaluation: ?ConcurrentEvaluation = null,
     teacher_settings: TeacherSettings = .{},
 
+    /// `restrict` is a borrowed compile-local seed set. Duplicates and seeds
+    /// outside the range are ignored; candidates always follow Source's
+    /// ascending seed range. `labeled_sample` only affects seed -2.
+    pub const Options = struct {
+        restrict: ?[]const i64 = null,
+        labeled_sample: bool = true,
+    };
+
     pub const Candidate = struct { seed: i64, score: f64 };
 
     /// `candidates` is `best_program.candidate_programs` without the
@@ -482,10 +526,20 @@ pub const BootstrapFewShotWithRandomSearch = struct {
         teacher: anytype,
         trainset: []const Example,
         valset: ?[]const Example,
+        options: Options,
     ) !Result(P) {
-        assert(self.max_bootstrapped_demos > 0);
+        const end = std.math.cast(i64, self.num_candidate_programs) orelse
+            return error.CandidateCapacityExceeded;
+        const range_count = std.math.add(usize, self.num_candidate_programs, 3) catch
+            return error.CandidateCapacityExceeded;
+        // Source rejects a restrict set matching no seed before any candidate work.
+        const candidate_count_max = if (options.restrict) |seeds| count: {
+            if (!matchesAny(end, seeds)) return error.RestrictMatchesNoSeed;
+            break :count @min(range_count, seeds.len);
+        } else range_count;
+        assert(candidate_count_max > 0);
         const val = if (valset) |set| if (set.len > 0) set else trainset else trainset;
-        const candidates = try out.alloc(Candidate, self.num_candidate_programs + 3);
+        const candidates = try out.alloc(Candidate, candidate_count_max);
         var count: usize = 0;
         var best: P = undefined;
         var best_score: f64 = 0;
@@ -493,11 +547,12 @@ pub const BootstrapFewShotWithRandomSearch = struct {
         defer if (best_arena) |*a| a.deinit();
 
         var seed: i64 = -3;
-        while (seed < @as(i64, @intCast(self.num_candidate_programs))) : (seed += 1) {
+        while (seed < end) : (seed += 1) {
+            if (!selected(seed, options.restrict)) continue;
             var arena_state: std.heap.ArenaAllocator = .init(gpa);
             var kept = false;
             defer if (!kept) arena_state.deinit();
-            const program = try self.candidate(P, arena_state.allocator(), gpa, ctx, student, teacher, trainset, seed);
+            const program = try self.candidate(P, arena_state.allocator(), gpa, ctx, student, teacher, trainset, seed, options.labeled_sample);
             const result = try evaluateWith(P, self.concurrent_evaluation, gpa, ctx, &program, val, self.metric, self.max_errors);
             if (count == 0 or result.score > best_score) {
                 best_score = result.score;
@@ -506,6 +561,7 @@ pub const BootstrapFewShotWithRandomSearch = struct {
                 kept = true;
                 best = program;
             }
+            assert(count < candidates.len);
             candidates[count] = .{ .seed = seed, .score = result.score };
             count += 1;
             if (self.stop_at_score) |stop| if (result.score >= stop) break;
@@ -522,6 +578,22 @@ pub const BootstrapFewShotWithRandomSearch = struct {
         return .{ .program = program, .candidates = candidates[0..count] };
     }
 
+    fn selected(seed: i64, restrict: ?[]const i64) bool {
+        const seeds = restrict orelse return true;
+        return std.mem.indexOfScalar(i64, seeds, seed) != null;
+    }
+
+    /// One pass over the borrowed set: true when any seed is in `-3..end`.
+    fn matchesAny(end: i64, seeds: []const i64) bool {
+        assert(end >= 0);
+        for (seeds) |seed| {
+            if (seed >= -3) {
+                if (seed < end) return true;
+            }
+        }
+        return false;
+    }
+
     fn scoreGreater(_: void, a: Candidate, b: Candidate) bool {
         return a.score > b.score;
     }
@@ -536,6 +608,7 @@ pub const BootstrapFewShotWithRandomSearch = struct {
         teacher: anytype,
         trainset: []const Example,
         seed: i64,
+        labeled_sample: bool,
     ) !P {
         assert(seed >= -3);
         if (seed == -3) {
@@ -543,10 +616,13 @@ pub const BootstrapFewShotWithRandomSearch = struct {
             try predict.resetPredictors(arena, &program);
             return program;
         }
-        if (seed == -2) return (LabeledFewShot{ .k = self.max_labeled_demos }).compile(P, arena, student, trainset);
+        if (seed == -2) return (LabeledFewShot{ .k = self.max_labeled_demos }).compile(P, arena, student, trainset, .{ .sample = labeled_sample });
         const shuffled = try arena.dupe(Example, trainset);
         var size = self.max_bootstrapped_demos;
         if (seed >= 0) {
+            // Fixed seeds permit zero bootstrapping; only a shuffled seed
+            // consumes randint(1, max_bootstrapped_demos).
+            if (self.max_bootstrapped_demos == 0) return error.InvalidBootstrapRange;
             var shuffle_rng = pyrandom.Random.init(@intCast(seed));
             shuffle_rng.shuffle(Example, shuffled);
             var size_rng = pyrandom.Random.init(@intCast(seed));

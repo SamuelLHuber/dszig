@@ -55,6 +55,11 @@ pub const Defaults = struct {
     weight_slot_sets: []const []finetune.Slot,
     trace_options: @import("bootstrap_trace.zig").Options = .{},
     prompt: ?optimize.BootstrapFewShotWithRandomSearch = null,
+    /// Source `restrict` / `labeled_sample` for the default prompt optimizer.
+    prompt_compile_options: optimize.BootstrapFewShotWithRandomSearch.Options = .{
+        .restrict = null,
+        .labeled_sample = true,
+    },
     weight: ?finetune.BootstrapFinetune = null,
 };
 
@@ -92,6 +97,7 @@ pub const BetterTogether = struct {
     ) !Result(P) {
         var prompt: optimizers.RandomSearch = .{
             .optimizer = defaults.prompt orelse .{ .metric = self.metric },
+            .compile_options = defaults.prompt_compile_options,
         };
         var weight: optimizers.BootstrapFinetune = .{
             .optimizer = defaults.weight orelse .{
