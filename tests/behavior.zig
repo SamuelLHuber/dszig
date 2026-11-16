@@ -121,6 +121,154 @@ test "native input decoding needs no projection allocation and never admits labe
     try testing.expectEqual(@as(i64, -1), product);
 }
 
+test "prepared native predictions preserve mutable metrics and retained results" {
+    const P = struct {
+        pub const Input = struct { number: i64, text: []const u8 };
+        pub const Output = struct { answer: i64, echo: []const u8 };
+
+        pub fn forward(_: *const @This(), _: dszig.Context, input: Input) !Output {
+            if (input.number < 0) return error.LMFailure;
+            return .{
+                .answer = input.number * @as(i64, @intCast(input.text.len)),
+                .echo = input.text,
+            };
+        }
+
+        fn metric(_: Allocator, _: *const dszig.Example, prediction: ?*const dszig.value.Record, _: ?*const dszig.Trace) dszig.value.ParseError!f64 {
+            const record = prediction orelse return error.ParseValue;
+            const answer = record.get("answer").?.integer;
+            record.getPtr("answer").?.* = .{ .integer = -100 };
+            return if (answer == 21) 1 else 0;
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var example = try dszig.Example.fromJson(
+        arena,
+        "{\"number\":7,\"text\":\"abc\",\"answer\":999}",
+        &.{ "number", "text" },
+    );
+    var prediction: dszig.value.Record = .empty;
+    try prediction.ensureTotalCapacity(testing.allocator, 2);
+    defer prediction.deinit(testing.allocator);
+    var unused: dszig.lm.ScriptedLM = .{ .responses = &.{} };
+    const ctx: dszig.Context = .{ .arena = testing.failing_allocator, .lm = unused.lm() };
+    const program: P = .{};
+
+    // The actual runner must use only provisioned outer storage for scalar fields.
+    try dszig.optimize.runProgramInto(P, ctx, &program, &example, &prediction);
+    try testing.expectEqual(@as(i64, 21), prediction.get("answer").?.integer);
+    try testing.expectEqualStrings("abc", prediction.get("echo").?.string);
+    const retained = try dszig.optimize.runProgram(
+        P,
+        .{ .arena = arena, .lm = unused.lm() },
+        &program,
+        &example,
+    );
+    const metric: dszig.optimize.Metric = P.metric;
+    try testing.expectEqual(@as(f64, 1), try metric(ctx.arena, &example, &prediction, null));
+    try testing.expectEqual(@as(i64, -100), prediction.get("answer").?.integer);
+    try testing.expectEqual(@as(i64, 999), example.record.get("answer").?.integer);
+
+    try example.record.put(arena, "number", .{ .integer = 8 });
+    try example.record.put(arena, "text", .{ .string = "xy" });
+    try dszig.optimize.runProgramInto(P, ctx, &program, &example, &prediction);
+    try testing.expectEqual(@as(i64, 16), prediction.get("answer").?.integer);
+    try testing.expectEqualStrings("xy", prediction.get("echo").?.string);
+    try testing.expectEqual(@as(i64, 21), retained.get("answer").?.integer);
+    try testing.expectEqualStrings("abc", retained.get("echo").?.string);
+    try testing.expectEqual(@as(usize, 0), unused.index);
+}
+
+test "prepared prediction failures clear stale records and partial conversions" {
+    const P = struct {
+        pub const Input = struct { number: i64 };
+        pub const Output = struct { answer: i64 };
+
+        pub fn forward(_: *const @This(), _: dszig.Context, input: Input) !Output {
+            if (input.number < 0) return error.LMFailure;
+            return .{ .answer = input.number * 2 };
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var example = try dszig.Example.fromJson(arena, "{\"number\":7}", &.{"number"});
+    var prediction: dszig.value.Record = .empty;
+    try prediction.ensureTotalCapacity(testing.allocator, 2);
+    defer prediction.deinit(testing.allocator);
+    var unused: dszig.lm.ScriptedLM = .{ .responses = &.{} };
+    const ctx: dszig.Context = .{ .arena = testing.failing_allocator, .lm = unused.lm() };
+    const program: P = .{};
+
+    try dszig.optimize.runProgramInto(P, ctx, &program, &example, &prediction);
+    try example.record.put(arena, "number", .{ .bool = true });
+    try testing.expectError(error.TypeMismatch, dszig.optimize.runProgramInto(P, ctx, &program, &example, &prediction));
+    try testing.expectEqual(@as(usize, 0), prediction.count());
+    try example.record.put(arena, "number", .{ .integer = 7 });
+    try dszig.optimize.runProgramInto(P, ctx, &program, &example, &prediction);
+    try example.record.put(arena, "number", .{ .integer = -1 });
+    try testing.expectError(error.LMFailure, dszig.optimize.runProgramInto(P, ctx, &program, &example, &prediction));
+    try testing.expectEqual(@as(usize, 0), prediction.count());
+
+    // A later conversion failure must discard already-written earlier fields.
+    const Nested = struct { answer: i64, notes: []const []const u8 };
+    try testing.expectError(error.OutOfMemory, dszig.value.toRecordInto(
+        testing.failing_allocator,
+        Nested,
+        &.{ .answer = 5, .notes = &.{"note"} },
+        &prediction,
+    ));
+    try testing.expectEqual(@as(usize, 0), prediction.count());
+    try example.record.put(arena, "number", .{ .integer = 8 });
+    try dszig.optimize.runProgramInto(P, ctx, &program, &example, &prediction);
+    try testing.expectEqual(@as(i64, 16), prediction.get("answer").?.integer);
+}
+
+test "prepared native output storage supports indexed fields and reuse" {
+    const P = struct {
+        pub const Input = struct { number: i64 };
+        pub const Output = struct {
+            a: i64,
+            b: i64,
+            c: i64,
+            d: i64,
+            e: i64,
+            f: i64,
+            g: i64,
+            h: i64,
+            i: i64,
+        };
+
+        pub fn forward(_: *const @This(), _: dszig.Context, input: Input) !Output {
+            var output: Output = undefined;
+            inline for (@typeInfo(Output).@"struct".field_names, 0..) |name, index| {
+                @field(output, name) = input.number + @as(i64, @intCast(index));
+            }
+            return output;
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var example = try dszig.Example.fromJson(arena, "{\"number\":21}", &.{"number"});
+    var storage: dszig.value.RecordStorage(9) = undefined;
+    try storage.init();
+    var unused: dszig.lm.ScriptedLM = .{ .responses = &.{} };
+    const ctx: dszig.Context = .{ .arena = testing.failing_allocator, .lm = unused.lm() };
+    const program: P = .{};
+
+    try dszig.optimize.runProgramInto(P, ctx, &program, &example, &storage.record);
+    try testing.expectEqual(@as(i64, 21), storage.record.get("a").?.integer);
+    try testing.expectEqual(@as(i64, 29), storage.record.get("i").?.integer);
+    try testing.expectEqual(@as(usize, 9), storage.record.count());
+    try example.record.put(arena, "number", .{ .integer = -21 });
+    try dszig.optimize.runProgramInto(P, ctx, &program, &example, &storage.record);
+    try testing.expectEqual(@as(i64, -21), storage.record.get("a").?.integer);
+    try testing.expectEqual(@as(i64, -13), storage.record.get("i").?.integer);
+}
+
 test "Evaluate counts program and metric failures together and keeps allocation failures fatal" {
     const P = struct {
         calls: *usize,

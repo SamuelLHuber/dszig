@@ -574,9 +574,31 @@ Native optimizer execution decodes `P.Input` directly from the example's
 borrowed record, without allocating a temporary input dictionary. Only fields
 explicitly named by `input_keys` are eligible: an existing training label
 cannot silently become an input. Role checks and typed conversions follow
-declaration order, preserving which failure is reported first. Nested decoding,
-output records, program execution and metrics can still allocate; this change
-does not establish an allocator-free runtime.
+declaration order, preserving which failure is reported first.
+
+Evaluation and bootstrap provision their outer prediction dictionaries once
+before their example/attempt loops, using inline storage sized from the native
+output field count. They reuse that storage without charging it to each
+example's scratch budget. The scratch reset and error-budget policies remain
+unchanged. SIMBA and GEPA retain predictions, so those paths still materialize
+separate outer dictionaries rather than aliasing reusable storage.
+
+For explicit startup preparation, initialize `value.RecordStorage(field_count)`
+**in place and do not move it**, then pass `&storage.record` to
+`optimize.runProgramInto(P, ctx, program, example, prediction)`. The record must
+have capacity for every declared output field. Its backing must not alias
+program inputs or outputs. Values retain their existing borrowed/scratch
+lifetimes, and reuse invalidates the previous prediction. Any input, program
+or conversion failure leaves the prepared record empty, including a conversion
+failure after earlier fields were written. Metrics keep the ordinary `Record`
+interface, including mutation of existing values through `getPtr`.
+
+`optimize.runProgram` remains the materialization API for separately retained
+outer dictionaries; both execution paths share input decoding and field codecs.
+Use `value.cloneRecord` with an appropriate owning lifetime when retaining
+borrowed nested values beyond their source lifetime. Nested conversions,
+retained predictions, program execution and metrics can still allocate.
+This is not a whole-runtime allocator-free proof.
 
 `optimize.Metric` and GEPA feedback callbacks can return `ParseValue` or
 `OutOfMemory`. Evaluate and bootstrap apply their existing error budgets to

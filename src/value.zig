@@ -25,6 +25,35 @@ const Field = signature.Field;
 
 pub const Record = ObjectMap;
 
+/// Startup-provisioned outer dictionary storage. Initialize in place and do not
+/// move it afterwards: record entries and indexes borrow buffer. Nested values
+/// retain their normal, separate allocator/lifetime contract.
+pub fn RecordStorage(comptime field_capacity: usize) type {
+    // Reserve exact entry capacity, avoiding MultiArrayList's growth margin.
+    // The pinned ordered map uses <4 indexes per entry and <=2 u32s per index.
+    // Header and alignment slack cover the two separate startup allocations.
+    const entry_bytes = Record.DataList.capacityInBytes(field_capacity);
+    const index_bytes = 4 * field_capacity * 2 * @sizeOf(u32);
+    const padding_bytes = @sizeOf(u32) + @alignOf(Record.Data) + @alignOf(u32);
+    return struct {
+        record: Record,
+        buffer: [entry_bytes + index_bytes + padding_bytes]u8 align(@alignOf(Record.Data)),
+
+        const Self = @This();
+
+        pub fn init(self: *Self) Allocator.Error!void {
+            self.record = .empty;
+            var backing: std.heap.FixedBufferAllocator = .init(&self.buffer);
+            if (field_capacity > 0) {
+                try self.record.entries.setCapacity(backing.allocator(), field_capacity);
+                try self.record.ensureTotalCapacity(backing.allocator(), field_capacity);
+            }
+            std.debug.assert(self.record.capacity() >= field_capacity);
+            std.debug.assert(self.record.count() == 0);
+        }
+    };
+}
+
 pub const ParseError = error{ParseValue} || Allocator.Error;
 
 /// ASCII Python whitespace for byte-oriented token grammars.
@@ -349,12 +378,30 @@ pub const ConvertError = error{ MissingField, TypeMismatch } || Allocator.Error;
 /// Encode a typed struct (signature `Input`/`Output`) as an ordered record.
 pub fn toRecord(arena: Allocator, comptime T: type, value: T) Allocator.Error!Record {
     var record: Record = .empty;
-    const info = @typeInfo(T).@"struct";
-    try record.ensureTotalCapacity(arena, info.field_names.len);
-    inline for (info.field_names) |name| {
-        record.putAssumeCapacity(name, try toValue(arena, @TypeOf(@field(value, name)), @field(value, name)));
-    }
+    errdefer record.deinit(arena);
+    try record.ensureTotalCapacity(arena, @typeInfo(T).@"struct".field_names.len);
+    try toRecordInto(arena, T, &value, &record);
     return record;
+}
+
+/// Replace a prepared record without allocating its outer dictionary. The caller
+/// owns its backing and must provision at least T's field count before execution.
+/// Values may allocate in arena and must not alias the dictionary being replaced.
+/// Failure leaves the record empty; nested scratch still belongs to arena.
+pub fn toRecordInto(
+    arena: Allocator,
+    comptime T: type,
+    input: *const T,
+    record: *Record,
+) Allocator.Error!void {
+    const fields = @typeInfo(T).@"struct";
+    std.debug.assert(record.capacity() >= fields.field_names.len);
+    record.clearRetainingCapacity();
+    errdefer record.clearRetainingCapacity();
+    inline for (fields.field_names) |name| {
+        record.putAssumeCapacity(name, try toValue(arena, @TypeOf(@field(input.*, name)), @field(input.*, name)));
+    }
+    std.debug.assert(record.count() == fields.field_names.len);
 }
 
 pub fn toValue(arena: Allocator, comptime T: type, v: T) Allocator.Error!Value {
@@ -1374,6 +1421,38 @@ test "wide integer equality is exact across JSON representations" {
     try testing.expect(try pyEqual(.{ .number_string = exact }, .{ .float = 0x1.fffffffffffffp1023 }));
     const adjacent = try std.fmt.bufPrint(&buffer, "{d}", .{largest_float_integer + 1});
     try testing.expect(!try pyEqual(.{ .number_string = adjacent }, .{ .float = 0x1.fffffffffffffp1023 }));
+}
+
+test "record materialization releases entries when index provisioning fails" {
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(gpa: Allocator) !void {
+            const T = struct {
+                a: i64,
+                b: i64,
+                c: i64,
+                d: i64,
+                e: i64,
+                f: i64,
+                g: i64,
+                h: i64,
+                i: i64,
+            };
+            var record = try toRecord(gpa, T, .{
+                .a = 1,
+                .b = 2,
+                .c = 3,
+                .d = 4,
+                .e = 5,
+                .f = 6,
+                .g = 7,
+                .h = 8,
+                .i = 9,
+            });
+            defer record.deinit(gpa);
+            try testing.expectEqual(@as(i64, 1), record.get("a").?.integer);
+            try testing.expectEqual(@as(i64, 9), record.get("i").?.integer);
+        }
+    }.run, .{});
 }
 
 test "typed record round trip" {
