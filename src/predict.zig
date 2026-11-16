@@ -49,7 +49,11 @@ pub const ParseFailure = struct {
 pub const Context = struct {
     /// Per-call scratch: prompts, completions, parsed outputs.
     arena: Allocator,
-    lm: lm_mod.LM,
+    /// Settings-level fallback; bound predictors can run without one.
+    lm: lm_mod.LM = lm_mod.LM.unconfigured,
+    /// Privileged per-call override. Explicit null selects the settings LM.
+    lm_override: ?lm_mod.LM = null,
+    lm_override_present: bool = false,
     adapter: Adapter = .xml,
     /// Borrowed extraction configuration when adapter is .two_step.
     two_step: ?*const TwoStepAdapter = null,
@@ -234,6 +238,8 @@ pub const PredictState = struct {
     descs: []const []const u8,
     prefixes: []const []const u8,
     demos: []const Record = &.{},
+    /// Borrowed model identity survives program copies; reset clears it.
+    lm: ?lm_mod.LM = null,
     /// Persisted Predict.fields overrides, distinct from signature metadata.
     decision_fields: @import("runtime_value.zig").Value = .{ .object = .empty },
 
@@ -286,6 +292,18 @@ pub const PredictState = struct {
 
     pub fn reset(state: *PredictState) void {
         state.demos = &.{};
+        state.lm = null;
+    }
+
+    fn resolveContext(state: *const PredictState, base: Context) Error!Context {
+        var ctx = base;
+        if (base.lm_override_present or base.lm_override != null) {
+            ctx.lm = base.lm_override orelse base.lm;
+        } else {
+            ctx.lm = state.lm orelse base.lm;
+        }
+        if (ctx.lm.sameInstance(lm_mod.LM.unconfigured)) return error.NoLM;
+        return ctx;
     }
 
     /// Signature.with_instructions/with_updated_fields/load_state return a new
@@ -297,8 +315,9 @@ pub const PredictState = struct {
     }
 
     /// Run one LM call: format, complete, parse (with JSON fallback), trace.
-    pub fn call(state: *const PredictState, ctx: Context, inputs: *const Record) Error!Record {
-        if (ctx.parse_failure) |capture| capture.* = .{};
+    pub fn call(state: *const PredictState, ctx_in: Context, inputs: *const Record) Error!Record {
+        if (ctx_in.parse_failure) |capture| capture.* = .{};
+        const ctx = try state.resolveContext(ctx_in);
         const prepared = try state.prepare(ctx, inputs);
         const outputs = (try runPredict(state, ctx, prepared))[0];
         if (ctx.trace) |t| try t.record(state, prepared.inputs, &outputs);
@@ -310,10 +329,10 @@ pub const PredictState = struct {
     /// DSPy, a temperature that is unset or at most 0.15 becomes 0.7.
     pub fn callMany(state: *const PredictState, ctx_in: Context, inputs: *const Record, n: u32) Error![]const Record {
         assert(n >= 1);
-        var ctx = ctx_in;
+        if (ctx_in.parse_failure) |capture| capture.* = .{};
+        var ctx = try state.resolveContext(ctx_in);
         ctx.lm_options.n = n;
         if (n > 1 and (ctx.lm_options.temperature orelse 0) <= 0.15) ctx.lm_options.temperature = 0.7;
-        if (ctx.parse_failure) |capture| capture.* = .{};
         const prepared = try state.prepare(ctx, inputs);
         const outputs = try runPredict(state, ctx, prepared);
         if (ctx.trace) |t| try t.record(state, prepared.inputs, &outputs[0]);
@@ -1124,11 +1143,83 @@ fn joinName(arena: Allocator, prefix: []const u8, name: []const u8) Allocator.Er
 
 /// Reset every reachable predictor (DSPy `reset_copy` minus the copy:
 /// programs are values, so `var copy = program;` is the copy).
-pub fn resetDemos(arena: Allocator, program: anytype) Allocator.Error!void {
+pub fn resetPredictors(arena: Allocator, program: anytype) Allocator.Error!void {
     for (try namedPredictors(arena, program)) |p| p.param.predict.reset();
 }
 
+/// Bind every reachable predictor, preserving the caller-owned LM identity.
+pub fn setLM(arena: Allocator, program: anytype, model: ?lm_mod.LM) Allocator.Error!void {
+    for (try namedPredictors(arena, program)) |p| p.param.predict.lm = model;
+}
+
+/// Empty modules and mixed bound/unbound models have no unique LM.
+pub fn getLM(arena: Allocator, program: anytype) (Allocator.Error || error{MultipleLMs})!?lm_mod.LM {
+    const predictors = try namedPredictors(arena, program);
+    if (predictors.len == 0) return error.MultipleLMs;
+    const first = predictors[0].param.predict.lm;
+    for (predictors[1..]) |p| {
+        const next = p.param.predict.lm;
+        if ((first == null) != (next == null)) return error.MultipleLMs;
+        if (first) |model| if (!model.sameInstance(next.?)) return error.MultipleLMs;
+    }
+    return first;
+}
+
 const testing = std.testing;
+
+test "bound LM precedence includes explicit null and fanout and resets without changing copies" {
+    const Sig = signature.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: i64 };
+    });
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var bound: lm_mod.ScriptedLM = .{ .responses = &.{ "<answer>1</answer>", "<answer>4</answer>", "<answer>5</answer>", "<answer>6</answer>" } };
+    var fallback: lm_mod.ScriptedLM = .{ .responses = &.{ "<answer>2</answer>", "<answer>2</answer>" } };
+    var override: lm_mod.ScriptedLM = .{ .responses = &.{"<answer>3</answer>"} };
+    var program: Predict(Sig) = .{};
+    program.state.lm = bound.lm();
+    const input: Sig.Input = .{ .question = "q" };
+    try testing.expectEqual(@as(i64, 1), (try program.forward(.{ .arena = arena, .lm = fallback.lm() }, input)).answer);
+    try testing.expectEqual(@as(i64, 3), (try program.forward(.{ .arena = arena, .lm_override = override.lm() }, input)).answer);
+    try testing.expectEqual(@as(i64, 2), (try program.forward(.{ .arena = arena, .lm = fallback.lm(), .lm_override_present = true }, input)).answer);
+    const inputs = try value.toRecord(arena, Sig.Input, input);
+    const many = try program.state.callMany(.{ .arena = arena }, &inputs, 2);
+    try testing.expectEqual(@as(i64, 4), many[0].get("answer").?.integer);
+    try testing.expectEqual(@as(i64, 5), many[1].get("answer").?.integer);
+    const copy = program;
+    program.state.reset();
+    var capture: ParseFailure = .{ .expected_count = 99 };
+    try testing.expectError(error.NoLM, program.forward(.{ .arena = arena, .parse_failure = &capture }, input));
+    try testing.expectEqual(@as(u32, 0), capture.expected_count);
+    try testing.expectEqual(@as(i64, 6), (try copy.forward(.{ .arena = arena }, input)).answer);
+    try testing.expectEqual(@as(i64, 2), (try program.forward(.{ .arena = arena, .lm = fallback.lm() }, input)).answer);
+}
+
+test "module LM aggregation distinguishes shared identities mixed bindings and no predictors" {
+    const Sig = signature.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: i64 };
+    });
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var first: lm_mod.ScriptedLM = .{ .responses = &.{} };
+    var second: lm_mod.ScriptedLM = .{ .responses = &.{} };
+    var pair: struct { a: Predict(Sig) = .{}, b: Predict(Sig) = .{}, retrieve: Retrieve = .{} } = .{};
+    try testing.expect((try getLM(arena, &pair)) == null);
+    try setLM(arena, &pair, first.lm());
+    try testing.expect((try getLM(arena, &pair)).?.sameInstance(first.lm()));
+    pair.b.state.lm = second.lm();
+    try testing.expectError(error.MultipleLMs, getLM(arena, &pair));
+    pair.b.state.lm = null;
+    try testing.expectError(error.MultipleLMs, getLM(arena, &pair));
+    try resetPredictors(arena, &pair);
+    try testing.expect((try getLM(arena, &pair)) == null);
+    var empty: struct {} = .{};
+    try testing.expectError(error.MultipleLMs, getLM(arena, &empty));
+}
 
 test "TwoStepAdapter isolates extraction options and retries only the extraction stage" {
     const CountSignature = signature.Signature(struct {

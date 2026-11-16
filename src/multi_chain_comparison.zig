@@ -658,7 +658,7 @@ test "comparison state roundtrip preserves optimizer metadata demos and cheap-co
     try testing.expectEqualStrings(rationale_prefix, saved_fields[2].object.get("prefix").?.string);
 
     var restored: Compare = .{};
-    try state.loadState(arena, &restored, dumped);
+    try state.loadState(arena, &restored, dumped, .{});
     try testing.expectEqualStrings(compare.predict.state.instructions, restored.predict.state.instructions);
     try testing.expectEqualDeep(compare.predict.state.descs, restored.predict.state.descs);
     try testing.expectEqualDeep(compare.predict.state.prefixes, restored.predict.state.prefixes);

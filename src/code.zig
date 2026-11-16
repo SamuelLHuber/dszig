@@ -681,7 +681,7 @@ test "Code typed Predict traces and saved demos remain consumer-visible raw stri
     program.state.demos = &.{demo};
     const json = try state.saveAlloc(arena, &program);
     var restored: predict.Predict(Sig) = .{};
-    try state.load(arena, &restored, json);
+    try state.load(arena, &restored, json, .{});
     const round_trip = try value.fromRecord(arena, Demo, &restored.state.demos[0]);
     try testing.expectEqualStrings("print(1)", round_trip.source.code);
     try testing.expectEqualStrings("run();", round_trip.result.code);

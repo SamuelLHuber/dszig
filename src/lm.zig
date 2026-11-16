@@ -89,7 +89,10 @@ pub fn decisionFromValue(arena: Allocator, input: @import("runtime_value.zig").V
     });
 }
 
-pub const Error = error{ LMFailure, ScriptExhausted } || @import("runtime_value.zig").CustomError;
+pub const Error = error{ NoLM, LMFailure, ScriptExhausted } || @import("runtime_value.zig").CustomError;
+
+/// Persistent configuration is separate from transport clients and credentials.
+pub const StateError = error{ InvalidLMState, UnsupportedLMState, MissingLMLoader } || Allocator.Error;
 
 /// One provider completion and its optional, genuinely returned reasoning.
 pub const Completion = struct {
@@ -359,7 +362,35 @@ pub const LM = struct {
     pub const VTable = struct {
         /// Returns `request.options.n` completions, allocated in `arena`.
         complete: *const fn (ptr: *anyopaque, arena: Allocator, request: Request) Error![]const Completion,
+        /// Custom native engines explicitly opt into persistent state.
+        dump_state: ?*const fn (ptr: *anyopaque, arena: Allocator) StateError!@import("runtime_value.zig").Value = null,
     };
+
+    /// Explicit application resources, never reconstructed from serialized pointers.
+    /// The callback must return handles whose storage outlives the loaded program.
+    pub const StateLoader = struct {
+        ptr: *anyopaque,
+        restore: *const fn (ptr: *anyopaque, arena: Allocator, state: @import("runtime_value.zig").Value) StateError!LM,
+    };
+
+    var unconfigured_token: u8 = 0;
+    pub const unconfigured: LM = .{
+        .ptr = &unconfigured_token,
+        .vtable = &.{ .complete = unconfiguredComplete },
+    };
+
+    fn unconfiguredComplete(_: *anyopaque, _: Allocator, _: Request) Error![]const Completion {
+        return error.NoLM;
+    }
+
+    pub fn sameInstance(a: LM, b: LM) bool {
+        return a.ptr == b.ptr and a.vtable == b.vtable;
+    }
+
+    pub fn dumpState(lm: LM, arena: Allocator) StateError!@import("runtime_value.zig").Value {
+        const dump = lm.vtable.dump_state orelse return error.UnsupportedLMState;
+        return dump(lm.ptr, arena);
+    }
 
     pub fn complete(lm: LM, arena: Allocator, request: Request) Error![]const u8 {
         assert(request.options.n == 1);
@@ -785,10 +816,77 @@ pub const OpenAI = struct {
 
     pub const Api = enum { chat_completions, responses };
 
+    /// Startup loader with explicitly supplied trust, endpoint and credentials.
+    /// State loading never reads secrets or imports executable code.
+    pub const StateLoader = struct {
+        client: *std.http.Client,
+        base_url: []const u8,
+        api_key: ?[]const u8 = null,
+        header_provider: ?http.HeaderProvider = null,
+
+        pub fn loader(self: *StateLoader) LM.StateLoader {
+            return .{ .ptr = self, .restore = restore };
+        }
+
+        fn restore(ptr: *anyopaque, arena: Allocator, input: @import("runtime_value.zig").Value) StateError!LM {
+            const self: *StateLoader = @ptrCast(@alignCast(ptr));
+            if (input != .object) return error.InvalidLMState;
+            const class = input.object.get("__lm_class__") orelse return error.InvalidLMState;
+            if (class != .string) return error.InvalidLMState;
+            if (!std.mem.eql(u8, class.string, "dszig.lm.OpenAI")) return error.UnsupportedLMState;
+            const model = input.object.get("model") orelse return error.InvalidLMState;
+            if (model != .string) return error.InvalidLMState;
+            const target = try arena.create(OpenAI);
+            target.* = .{
+                .client = self.client,
+                .base_url = "",
+                .model = "",
+                .api_key = self.api_key,
+                .header_provider = self.header_provider,
+            };
+            inline for (persistent_fields) |name| {
+                const T = @FieldType(OpenAI, name);
+                var item = input.object.get(name);
+                if (comptime std.mem.eql(u8, name, "base_url")) {
+                    if (item == null) item = .{ .string = self.base_url };
+                }
+                if (item) |encoded| {
+                    @field(target, name) = if (comptime T == []const u8) blk: {
+                        if (encoded != .string) return error.InvalidLMState;
+                        break :blk try arena.dupe(u8, encoded.string);
+                    } else @import("value.zig").fromValue(arena, T, encoded) catch |err| return switch (err) {
+                        error.OutOfMemory => error.OutOfMemory,
+                        else => error.InvalidLMState,
+                    };
+                }
+            }
+            return target.lm();
+        }
+    };
+
+    // An allowlist prevents future runtime resources or credentials from
+    // becoming persistent merely because someone adds an OpenAI field.
+    const persistent_fields = .{
+        "base_url",                 "model",                    "api",                       "supports_reasoning",
+        "supports_response_format", "supports_response_schema", "supports_function_calling", "max_tokens",
+        "max_response_bytes",       "max_retries",              "retry_base_ms",             "timeout_ns",
+        "connect_timeout_ns",
+    };
+
+    fn dumpState(ptr: *anyopaque, arena: Allocator) StateError!@import("runtime_value.zig").Value {
+        const self: *OpenAI = @ptrCast(@alignCast(ptr));
+        var state: @import("runtime_value.zig").ObjectMap = .empty;
+        try state.ensureTotalCapacity(arena, persistent_fields.len + 1);
+        state.putAssumeCapacity("__lm_class__", .{ .string = "dszig.lm.OpenAI" });
+        inline for (persistent_fields) |name|
+            state.putAssumeCapacity(name, try @import("value.zig").toValue(arena, @FieldType(OpenAI, name), @field(self, name)));
+        return .{ .object = state };
+    }
+
     pub fn lm(self: *OpenAI) LM {
         return .{
             .ptr = self,
-            .vtable = &.{ .complete = complete },
+            .vtable = &.{ .complete = complete, .dump_state = dumpState },
             .supports_reasoning = self.supports_reasoning,
             .supports_response_format = self.supports_response_format,
             .supports_response_schema = self.supports_response_schema,

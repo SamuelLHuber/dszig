@@ -110,7 +110,7 @@ retain the actual continuation and raw provider response independently.
 | Class-style signatures and typed fields | `Signature`, `Dict`, `Code`, `CodeWithLanguage`, `BoundingBox`, `File`, `Citations` and `Citations.Citation`, scalar/string/list/fixed-array/optional/model fields, string literal enums and mixed scalar/Enum/bytes `Literal`, field descriptions/defaults, compile-time rejection of invalid signatures |
 | Runtime values and documents | `Value`, `Array`, `ObjectMap`, boxed native Code/File/Reasoning/BoundingBox/Citations/decision/evidence identity, recursive typed-class serialization, text/canonical-document content union and bounded Responses `input_file` translation |
 | Chat, JSON, XML and two-stage adapters | `Adapter.chat`, `.json`, `.xml`, `.two_step`; `TwoStepAdapter` with a separate extraction LM; independent prompt/parse fixtures, strict response-schema construction, JSON fallback, typed XML and Unicode key handling |
-| Prediction and reasoning | `Predict`, `ChainOfThought`, `BestOfN`, `Refine`, `MultiChainComparison`, explicit `Context`, typed outputs, serialized `Trace`, named predictor/parameter discovery |
+| Prediction and reasoning | `Predict`, `ChainOfThought`, `BestOfN`, `Refine`, `MultiChainComparison`, explicit `Context`, per-predictor LM bindings and module LM aggregation, typed outputs, serialized `Trace`, named predictor/parameter discovery |
 | Parallel composition | Startup-created `Parallel(Result, limits)` workers, typed program/Example/tuple bindings, ordered result slots, speculative straggler retries, bounded accumulated failure reports and joined cooperative cancellation |
 | Typed decisions | `Noul`, configured `Score`/`Choice`, generative evidence classes, criteria/state snapshots, native Annotated metadata, owning evidence collectors and TypeSafe SystemOne prediction; finite coverage and unsupported rows below |
 | Retrieval and embeddings | `Retrieve`, lexical `InMemoryRetriever`, HTTP `ColBERTv2` with shared mutable-graph memory caching, custom/OpenAI/Azure `Embedder`, float32 `KNN`, per-query `KNNFewShot`, and brute-force `Embeddings`/`EmbeddingsWithScores` with NumPy persistence |
@@ -122,7 +122,7 @@ retain the actual continuation and raw provider response independently.
 | Answer metrics | `metrics.emScore`, `f1Score`, `hotpotF1Score`, `precisionScore`, multi-reference `em`/`f1`/`hotpotF1`, thresholded and record-based answer matching, DPR-token passage matching |
 | LM boundary | `LM`, native `lm.OpenAI` Chat Completions/Responses and `lm.TypeSafe` SystemOne, shared bounded `http.Transport`, scripted/keyword LMs, recording/replay wrappers and typed native protocol metadata |
 | Cache | `CachedLM`, per-candidate/request identity, LRU eviction, rich-response JSON dump/load; failed calls are not cached |
-| State | `state.save`, `saveAlloc`, `load`, with DSPy 3.5.0 dependency metadata and program JSON artifact comparisons |
+| State | `state.save`, `saveAlloc`, `load`/`loadState` with explicit load options, native OpenAI configuration reconstruction, DSPy 3.5.0 dependency metadata and program JSON artifact comparisons |
 
 A named surface in this table is not a claim that every Python option or provider
 route is implemented. The limits below are part of the compatibility contract.
@@ -1068,6 +1068,70 @@ and ReleaseSafe, including the explicit unsupported-row failure. The pinned
 344-test/28-step Debug and ReleaseSafe gates, actual RAG/bootstrap, 687-request
 replay and independent Python fixture/artifact/reference gate also passed.
 
+## Native LM bindings and program state
+
+`Predict.state.lm` is an optional borrowed LM handle. A predictor selects an
+explicit `Context.lm_override`, then its own binding, then `Context.lm`.
+Set `lm_override_present = true` with a null override to bypass the binding
+and select the context fallback, matching DSPy's explicit `lm=None`.
+A bound predictor does not require a context fallback; an entirely unconfigured
+call returns `error.NoLM`. Capability selection, JSON fallback, native decisions
+and candidate fanout all use the selected handle.
+
+`predict.setLM(arena, &program, model)` binds every discovered predictor;
+passing null clears the bindings. `predict.getLM` returns the unique borrowed
+handle, or null if every predictor is unbound. Mixed bound/unbound predictors,
+distinct LM identities, and modules without predictors return `error.MultipleLMs`.
+Program value copies retain model identity without owning the model.
+`PredictState.reset` and `predict.resetPredictors` clear both demos and bindings.
+
+Program save/dump now stores a bound LM's configuration rather than silently
+writing null. `lm.OpenAI` supports native configuration persistence, including
+its API, model, capability flags, generation token limit, response bound, retries
+and timeouts. The native class discriminator and transport settings are **not
+Python LM-state interchange**. API keys, HTTP clients, trust stores and header
+providers are never serialized. Custom engines must provide `LM.VTable.dump_state`
+and an application-owned `LM.StateLoader`; inference-only scripted, replay, cache
+and recording handles do not automatically gain persistence.
+
+Loading has an explicit fourth argument:
+
+```zig
+var loader: dszig.lm.OpenAI.StateLoader = .{
+    .client = &http_client,
+    .base_url = trusted_base_url,
+    .api_key = credential,
+};
+try dszig.state.load(startup_arena, &program, saved_json, .{
+    .lm_loader = loader.loader(),
+});
+```
+
+Use `.{}` when loading programs without bound models. A nonempty LM state
+without a loader fails with `error.MissingLMLoader`, never a fake restored model.
+By default, loading removes the top-level `api_base`, `base_url` and `model_list`
+routing keys and uses the explicitly injected endpoint. Preserve saved routing
+only with `.allow_unsafe_lm_state = true` for trusted files. Credentials always
+come from the loader. Native loaders use static class dispatch, not serialized
+function pointers or dynamic Python imports.
+
+The startup arena owns reconstructed models and copied configuration strings;
+the injected client, trust and authentication resources must outlive the loaded
+program and every joined call using it. Restore constructs each predictor's LM
+separately, just as the source does: shared identity before saving need not remain
+shared after loading. A failed LM restore retains the source's earlier signature,
+demo and decision-state commits, while leaving the previous LM binding intact.
+
+An independent native executable matched **24 complete normalized observations**
+from actual DSPy 3.5: binding/override/null precedence, fanout, copy/reset behavior,
+module identity errors, secret redaction, trusted/untrusted routing, reconstruction
+and failure transitions. Native error enums are mapped to corresponding source
+refusals for that comparison, not claimed to be identical Python exceptions.
+Debug and ReleaseSafe also exercised a restored model through actual localhost
+HTTP and typed Predict, returning `42`; the fixture verified model, token limit
+and injected authentication. This is not live-model inference, training-job,
+whole-runtime static-memory, or complete LM/provider save/load parity evidence.
+
 ## Native parallel composition
 
 `Parallel(Result, limits)` runs native programs or callbacks on a persistent worker
@@ -1092,8 +1156,11 @@ Its `task()` is a native task descriptor:
 
 Provide at least `limits.attempts` contexts. **Copying Context does not isolate its
 pointees.** Scratch, mutable LM state, traces and mutable retrievers must be private
-to each simultaneously running attempt or explicitly synchronized. Do not mutate
-shared program configuration while calls run. In particular, do not freeze or
+to each simultaneously running attempt or explicitly synchronized. Predictor-bound
+LMs are shared through program value copies and override `Context.lm`: supplying
+a private fallback per attempt does not isolate a bound model. Use an explicit
+per-attempt `lm_override`, private program bindings, or a synchronized model.
+Do not mutate shared program configuration while calls run. In particular, do not freeze or
 globally roll back live InferRules instruction identities to make concurrency
 appear safe. Scratch-backed children must survive until the returned results are
 discarded; resetting a worker arena between tasks would invalidate earlier outputs.
@@ -1692,7 +1759,10 @@ The following prevent a claim that DSZig can do everything DSPy can:
   Python string representations use the pinned CPython 3.11 Unicode 14 tables;
   classification can differ from other Python/Unicode releases.
 - **Persistence and errors:** cache files/key hashing are not DSPy's diskcache
-  format; LM/provider/training state is not a complete DSPy save/load port.
+  format. Native OpenAI configuration and bound predictors support program
+  save/load with injected runtime resources; Python class reconstruction, all
+  native engine codecs, provider training state and complete DSPy LM save/load
+  remain unsupported.
   Python exception tracebacks are not reconstructed from native Zig errors.
 - **Upstream limits are not repaired silently:** stock DSPy 3.5.0 Retrieve still
   rejects the `json_mode` argument supplied by module state dumping. The RAG

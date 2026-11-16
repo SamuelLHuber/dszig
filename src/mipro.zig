@@ -530,7 +530,7 @@ pub const MIPROv2 = struct {
             var candidate: P = undefined;
             if (seed == -3) {
                 candidate = student;
-                try predict.resetDemos(out, &candidate);
+                try predict.resetPredictors(out, &candidate);
             } else if (seed == -2 and max_labeled > 0) {
                 candidate = try (optimize.LabeledFewShot{ .k = max_labeled }).compile(P, out, student, trainset);
             } else {

@@ -220,7 +220,7 @@ pub const LabeledFewShot = struct {
     /// Demos are deep-copied into `out`.
     pub fn compile(self: LabeledFewShot, comptime P: type, out: Allocator, student: P, trainset: []const Example) Allocator.Error!P {
         var program = student;
-        try predict.resetDemos(out, &program);
+        try predict.resetPredictors(out, &program);
         if (trainset.len == 0) return program;
         const population = try exampleRecords(out, trainset);
         var rng = pyrandom.Random.init(0);
@@ -278,7 +278,7 @@ pub const BootstrapFewShot = struct {
     ) !Result(P) {
         if (student_in.compiled) return error.StudentCompiled;
         var student = student_in;
-        try predict.resetDemos(out, &student);
+        try predict.resetPredictors(out, &student);
         var teacher = teacher_in orelse student_in;
         if (self.max_labeled_demos > 0 and !teacher.compiled) {
             teacher = try (LabeledFewShot{ .k = self.max_labeled_demos }).compile(P, out, teacher, trainset);
@@ -530,7 +530,7 @@ pub const BootstrapFewShotWithRandomSearch = struct {
         assert(seed >= -3);
         if (seed == -3) {
             var program = student;
-            try predict.resetDemos(arena, &program);
+            try predict.resetPredictors(arena, &program);
             return program;
         }
         if (seed == -2) return (LabeledFewShot{ .k = self.max_labeled_demos }).compile(P, arena, student, trainset);
