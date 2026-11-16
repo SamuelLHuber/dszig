@@ -86,6 +86,7 @@ pub const Avatar = avatar.Avatar;
 pub const AvatarWithOptions = avatar.AvatarWithOptions;
 pub const avatar_optimizer = @import("avatar_optimizer.zig");
 pub const AvatarOptimizer = avatar_optimizer.AvatarOptimizer;
+pub const generated_zig = @import("generated_zig.zig");
 pub const tpe_int = @import("tpe_int.zig");
 pub const bootstrap_optuna = @import("bootstrap_optuna.zig");
 pub const BootstrapFewShotWithOptuna = bootstrap_optuna.BootstrapFewShotWithOptuna;
@@ -129,4 +130,6 @@ test {
     _ = @import("bootstrap_finetune_data.zig");
     _ = @import("avatar.zig");
     _ = @import("avatar_optimizer.zig");
+    _ = @import("generated_zig_source.zig");
+    _ = @import("generated_zig_session.zig");
 }

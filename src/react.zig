@@ -65,6 +65,12 @@ pub const Tool = struct {
     func: *const fn (ctx: Context, args: *const Record) ToolError!Value,
     has_kwargs: bool = false,
 
+    /// Shared native invocation, including typed argument normalization.
+    pub fn call(comptime self: Tool, ctx: Context, input: *const Record) ToolError!Value {
+        const normalized = try normalizeArgs(self, ctx.arena, input);
+        return self.func(ctx, &normalized);
+    }
+
     /// `str(dspy.Tool)`, including full typed argument schemas.
     pub fn format(comptime self: Tool, arena: Allocator) adapter.Error![]const u8 {
         return tool_protocol.formatToolValue(arena, try self.toValue(arena));
@@ -330,10 +336,7 @@ pub fn ReActIters(comptime Sig: type, comptime user_tools: []const Tool, comptim
         fn observe(ctx: Context, call: ToolCall) Allocator.Error!Observation {
             inline for (tools) |tool| {
                 if (std.mem.eql(u8, tool.name, call.name)) {
-                    const result = blk: {
-                        const args = normalizeArgs(tool, ctx.arena, &call.args) catch |err| break :blk @as(ToolError!Value, err);
-                        break :blk tool.func(ctx, &args);
-                    };
+                    const result = tool.call(ctx, &call.args);
                     return .{ .value = result catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
                         else => return .{

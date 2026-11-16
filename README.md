@@ -119,6 +119,7 @@ retain the actual continuation and raw provider response independently.
 | Optimizer composition | Native `BetterTogether`, real default prompt/weight optimization, typed custom registries, retained candidate LM snapshots and joined lifecycle cleanup |
 | Instruction optimization | `InferRules`; `MIPROv2`, its program-aware proposer and an Optuna 4.5.0 TPE port; `COPRO`; `SIMBA`; supported instance-frontier `GEPA` paths against gepa 0.1.4 |
 | Agents and tools | `ReAct`, bounded native `Avatar` and `AvatarOptimizer`, comptime `Tool`, `History`, `ToolCalls`, tool results, native declarations and text tool calls, typed submit, retained history |
+| Generated native execution | `generated_zig.Generator` (`Predict(Code[zig])`) and fixed-storage Linux `Executor`: restricted compiler, kernel-confined guest, exact native capability RPC, pending output and whole-tree join; not Python RLM/Flex |
 | Voting | `Ensemble`, `ensemble.majority`, Unicode text normalization; exact Python numeric equality, NaN object identity and source-order fallback behavior |
 | Answer metrics | `metrics.emScore`, `f1Score`, `hotpotF1Score`, `precisionScore`, multi-reference `em`/`f1`/`hotpotF1`, thresholded and record-based answer matching, DPR-token passage matching |
 | LM boundary | `LM`, native `lm.OpenAI` Chat Completions/Responses and `lm.TypeSafe` SystemOne, shared bounded `http.Transport`, scripted/keyword LMs, recording/replay wrappers and typed native protocol metadata |
@@ -1449,6 +1450,143 @@ Candidate clone invariants were checked separately. Eight additional lifecycle
 control cases exercised failure cleanup with synchronous resource tokens; those
 are not inference, actual worker-join or subprocess-isolation evidence.
 
+## Isolated generated native Zig
+
+`dszig.generated_zig` composes a genuine `Predict(CodeWithLanguage("zig"))`
+with compilation and execution of native Zig. `Generator` has ordinary
+discoverable predictor state, demos, LM bindings, adapters and tracing.
+`generateAndRun(&generator, &executor, context, input)` generates code through
+that predictor, then executes it; it adds no execution retry or alternate model.
+`input` contains `task`, `input_json` and `capabilities` (exact native names and
+argument/result descriptions). The returned JSON borrows executor storage until
+its next run.
+
+This is **not** an arbitrary Python interpreter or an implementation of Python
+RLM/Flex. There is no unsafe in-process or Darwin fallback. Execution requires
+64-bit aarch64/x86_64 Linux, working unprivileged user/PID/network/mount namespaces,
+Landlock ABI 7 or newer, seccomp, and an owned delegated cgroup-v2 domain with
+memory and pids controllers. Supply the pinned Zig compiler and its complete
+immutable `/nix/store/...` runtime closure. Nix is used to prepare that closure,
+not invoked for individual executions. Missing prerequisites refuse execution.
+
+At startup, create a private owner-only directory directly under `/tmp/dszig-*`
+and an **empty, owned** delegated child cgroup. Open its directory with CLOEXEC
+and initialize `generated_zig.Lane.configure(fd, limits)`. This verifies the
+cgroup-v2 filesystem, configures and reads back `memory.max`, `memory.swap.max=0`,
+`memory.oom.group=1` and `pids.max`. The executor stays outside that lane.
+Initialize the large `Executor` **in place** with `Options`:
+
+- `lane`: a borrowed initialized lane.
+- `worker`: `workspace`, absolute `compiler`, exact `read_only_roots`, and
+  `artifact_bytes` (default 128 MiB, maximum 256 MiB).
+- `tools`: a startup registry of exact names, native context pointers and bounded
+  callbacks. A callback writes one JSON value into the supplied fixed buffer and
+  returns its byte length; its final argument is an absolute monotonic deadline.
+- `timeout_ms`: one absolute deadline covering preparation, compiler and runtime,
+  not an inactivity timeout (default 60 seconds, maximum 120 seconds).
+- `max_calls`, `max_frame_bytes`, `max_work_bytes`: cumulative RPC limits;
+  hard maxima are 256 calls, 8 MiB framed bytes and 16 MiB validation work.
+
+Options, closure paths, lane and native callback contexts must remain stable for
+the executor's lifetime. Each executor/lane has one exclusive owner; do not run
+the same executor concurrently or share its lane with another active executor.
+An earlier result expires when the next run starts: copy it into caller-owned
+startup-provisioned storage before using it as that next run's input.
+The lane retains the kernel's effective page-rounded memory bound, never a value
+larger than requested. Registered native callbacks are **trusted bounded host
+code**, not sandboxed code: they must honor the supplied deadline. The executor
+checks before/after dispatch but cannot preempt a noncooperative native callback.
+`Tool.call(context, &arguments)` is the shared typed-argument normalization path
+also used by ReAct; the qualification consumer uses it for native capability RPC.
+
+The compiler and guest have different kernel policies. A startup-gated direct
+PID1 child receives its UID/GID mappings and aggregate cgroup membership before
+work begins. It mounts a fresh quota-limited tmpfs and proc, installs resource
+limits, and validates source inside the child using fixed parser scratch.
+Compiler subprocesses can read/execute only the immutable closure and
+read/write the private workspace; sockets, new namespaces and tracing are
+denied. Compiler output goes only to bounded diagnostics. The supervisor kills
+and reaps remaining compiler descendants **before** starting the runtime.
+The statically compiled guest enters a second syscall allowlist before generated
+code: only stdin reads, stdout/stderr writes, basic exit and signal-return/mask
+operations remain. Heap mappings, file access, sockets and process creation
+terminate it.
+
+Generated source has a 64 KiB / 4096-token / 4096-node limit and must contain
+exactly `const guest = @import("guest");` plus the sole public entrypoint
+`pub fn run(ctx: *guest.Context) !void`. Other imports, assembly, extern/export
+and unsupported builtins are rejected. This source guard is **not the sandbox**:
+`guest.std` reaches operating-system APIs, so the kernel policy remains required.
+Guest methods use fixed buffers:
+
+```zig
+const guest = @import("guest");
+pub fn run(ctx: *guest.Context) !void {
+    const reply = try ctx.tool("lookup", try ctx.input());
+    try ctx.finish(reply);
+}
+```
+
+Arguments, replies and final output must be complete bounded UTF-8 JSON values.
+Names are matched exactly; unknown tools never dispatch. JSON depth, total work,
+call count and frame bytes are checked independently by the host. A finish frame
+is pending, not success: publication requires successful process exit, the direct
+namespace PID1 reaped, the lane empty, and both streams drained through EOF with
+no trailing or partial frame. Finish-then-crash, finish-then-hang and extra bytes
+revoke output. An unread/reset protocol stream also prevents publication, even
+when the child exits zero. Ordinary source/compile failures retain diagnostics and
+report `ChildFailed` after joining, rather than hiding them as socket resets.
+Failure attempts both recursive cgroup kill and direct PID1 kill and joins before
+reuse. If cleanup cannot be proved within its bounded attempts, the executor returns
+`ExecutorQuarantined`, retains its child handle and refuses subsequent runs;
+it never reports a clean join or reuses that storage.
+
+The executor/session/guest use startup-provisioned fixed storage; this does not
+claim the ordinary model client, all optimizers or the whole runtime are
+allocation-free. Authenticated model inference remains a separate gate.
+A localhost HTTP provider fixture proves transport, typed `Code[zig]` decoding,
+actual isolated compilation and native execution, **not** real-model inference.
+
+`tools/generated_zig_consumer.zig` is the Linux qualification CLI. Supply a
+`compiler_closure` module containing `pub const paths = [_][:0]const u8{ ... };`
+from the compiler's actual recursive Nix closure. Build with the pinned compiler:
+
+```sh
+zig build-exe -O ReleaseSafe --dep dszig --dep compiler_closure \
+  -Mroot=tools/generated_zig_consumer.zig \
+  -O ReleaseSafe -Mdszig=src/root.zig \
+  -O ReleaseSafe -Mcompiler_closure=/absolute/path/compiler-closure.zig \
+  -femit-bin=/tmp/generated-zig-consumer
+```
+
+Run `/tmp/generated-zig-consumer LANE WORKSPACE COMPILER CASE TIMEOUT_MS [BASE_URL]`.
+`success` and the malformed-frame/tool/OS/finalization cases each verify successful
+reuse of the same executor; `generated` calls an explicit OpenAI-compatible
+endpoint. The CLI's default key is explicitly fixture-only; use an explicit
+endpoint and `OPENAI_API_KEY` for an authorized real provider. Its native tool
+checks that only the supervisor and runtime remain at dispatch: no compiler
+descendant may survive into the runtime phase.
+
+The finite qualification for this slice passed the pinned repository's
+512 tests / 34 build steps plus examples in both Debug and ReleaseSafe.
+On aarch64 Linux, 18 distinct execution/refusal cases per host mode verify
+same-engine recovery, including diagnostic overflow and a successful child exit
+with unread reply bytes. One HTTP fixture request per mode also generated typed
+Zig, compiled it, called the native typed tool and returned `42`; fixture serving
+and non-daemon request threads were closed and joined. Guests are always compiled
+ReleaseSafe, independently of the host mode.
+
+Separate real kernel controls exercised aggregate OOM group termination,
+1 MiB tmpfs exhaustion, an eight-process cap, three/eight live pidfds becoming
+dead after PID1 join, direct-kill fallback after cgroup control failure and
+non-page-aligned memory limits. An immutable compiler wrapper deliberately left
+an acknowledged live descendant; runtime tool dispatch still saw only PID1 and
+the runtime. Planted removal of compiler reaping failed the process invariant,
+and planted acceptance of an unclean reset failed with `UnexpectedPublication`.
+x86_64 Linux received semantic-only checking, not runtime qualification; Darwin
+was actually run and refused with `UnsupportedPlatform`. These results are
+finite native proof, not full DSPy parity or authenticated inference.
+
 ## Native parallel composition
 
 `Parallel(Result, limits)` runs native programs or callbacks on a persistent worker
@@ -1966,6 +2104,9 @@ The following prevent a claim that DSZig can do everything DSPy can:
   LocalInterpreter, InterpreterPool or complete Python execution environment.
   DSPy's RLM/Flex execute arbitrary Python and can import real DSPy inside the
   guest. A restricted expression evaluator is not an identical implementation.
+  The separate Linux generated-Zig executor above compiles native programs and
+  capability RPC; it does not claim arbitrary Python execution or full RLM/Flex
+  behavior.
 - **Other modules and optimizers:** bounded native Avatar/AvatarOptimizer follow
   Source methods, with broken Source constructors and the explicit native
   capacity, class-identity, callback-ownership and serial-execution boundaries
