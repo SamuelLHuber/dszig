@@ -2113,3 +2113,407 @@ test "native provider calls reject unnamed functions" {
         try testing.expectError(error.LMFailure, dszig.lm.OpenAI.parseCompletions(arena, invalid));
     }
 }
+
+const FinetuneSignature = dszig.Signature(struct {
+    pub const Input = struct { question: []const u8 };
+    pub const Output = struct { answer: []const u8, count: i64 };
+});
+
+const finetune_view: dszig.adapter.View = .{
+    .instructions = "Answer the question.",
+    .inputs = FinetuneSignature.input_fields_list,
+    .outputs = FinetuneSignature.output_fields_list,
+};
+
+const finetune_adapters = [_]dszig.Adapter{ .chat, .xml };
+
+fn finetuneMessages(training: dszig.Value) ![]const dszig.Value {
+    try testing.expectEqual(@as(usize, 1), training.object.count());
+    return training.object.get("messages").?.array.items;
+}
+
+fn expectFinetuneMessage(message: dszig.Value, role: []const u8, content: []const u8) !void {
+    try testing.expectEqual(@as(usize, 2), message.object.count());
+    try testing.expectEqualStrings(role, message.object.get("role").?.string);
+    try testing.expectEqualStrings(content, message.object.get("content").?.string);
+}
+
+// Expected strings are DSPy 3.5.0 `format_finetune_data` results for the same
+// signature and records: a training answer renders every declared output, and
+// an absent one is Python None rather than the demo placeholder or "".
+test "finetune data renders missing and null training outputs as None" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var inputs: dszig.value.Record = .empty;
+    try inputs.put(arena, "question", .{ .string = "Why?" });
+    var complete: dszig.value.Record = .empty;
+    try complete.put(arena, "answer", .{ .string = "because\n<yes>" });
+    try complete.put(arena, "count", .{ .integer = 3 });
+    var missing: dszig.value.Record = .empty;
+    try missing.put(arena, "count", .{ .integer = 3 });
+    var explicit_null: dszig.value.Record = .empty;
+    try explicit_null.put(arena, "answer", .null);
+    try explicit_null.put(arena, "count", .null);
+    const absent: dszig.value.Record = .empty;
+
+    const users = [finetune_adapters.len][]const u8{
+        "[[ ## question ## ]]\nWhy?\n\nRespond with the corresponding output fields, starting with the field `[[ ## answer ## ]]`, then `[[ ## count ## ]]` (must be formatted as a valid Python int), and then ending with the marker for `[[ ## completed ## ]]`.",
+        "<question>\nWhy?\n</question>\n\nOutput format (replace placeholders):\n<answer>\n{answer}\n</answer>\n\n<count>\n{count}\n</count>\n\nUse this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping.",
+    };
+    const outputs = [_]*const dszig.value.Record{ &complete, &missing, &explicit_null, &absent };
+    const assistants = [finetune_adapters.len][outputs.len][]const u8{
+        .{
+            "[[ ## answer ## ]]\nbecause\n<yes>\n\n[[ ## count ## ]]\n3\n\n[[ ## completed ## ]]\n",
+            "[[ ## answer ## ]]\nNone\n\n[[ ## count ## ]]\n3\n\n[[ ## completed ## ]]\n",
+            "[[ ## answer ## ]]\nNone\n\n[[ ## count ## ]]\nNone\n\n[[ ## completed ## ]]\n",
+            "[[ ## answer ## ]]\nNone\n\n[[ ## count ## ]]\nNone\n\n[[ ## completed ## ]]\n",
+        },
+        .{
+            "<answer>\nbecause\n<yes>\n</answer>\n\n<count>\n3\n</count>",
+            "<answer />\n\n<count>\n3\n</count>",
+            "<answer />\n\n<count />",
+            "<answer />\n\n<count />",
+        },
+    };
+    for (finetune_adapters, users, assistants) |adapter, user, expected| {
+        const prompt = try adapter.format(arena, finetune_view, &.{}, &inputs);
+        for (outputs, expected) |record, assistant| {
+            const count_before = record.count();
+            const training = try adapter.formatFinetuneData(
+                arena,
+                testing.io,
+                finetune_view,
+                &.{},
+                &inputs,
+                record,
+            );
+            const messages = try finetuneMessages(training);
+            try testing.expectEqual(@as(usize, 3), messages.len);
+            // The training prompt is the ordinary native prompt, unchanged.
+            try expectFinetuneMessage(messages[0], "system", prompt[0].content.text);
+            try expectFinetuneMessage(messages[1], "user", user);
+            try expectFinetuneMessage(messages[2], "assistant", assistant);
+            // Completing a partial record must not write into the caller's record.
+            try testing.expectEqual(count_before, record.count());
+        }
+    }
+}
+
+// Demos keep their own "Not supplied" placeholders; only the training answer
+// uses None. Expected strings are the DSPy 3.5.0 results for these records.
+test "finetune data keeps demo placeholders and appends the training answer" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var past: dszig.value.Record = .empty;
+    try past.put(arena, "question", .{ .string = "past" });
+    try past.put(arena, "answer", .{ .string = "old" });
+    try past.put(arena, "count", .{ .integer = 1 });
+    var partial: dszig.value.Record = .empty;
+    try partial.put(arena, "question", .{ .string = "partial" });
+    try partial.put(arena, "answer", .{ .string = "half" });
+    var inputs: dszig.value.Record = .empty;
+    try inputs.put(arena, "question", .{ .string = "now" });
+    var outputs: dszig.value.Record = .empty;
+    try outputs.put(arena, "answer", .{ .string = "new" });
+    try outputs.put(arena, "count", .{ .integer = 2 });
+
+    const expected = [finetune_adapters.len][5][]const u8{
+        .{
+            "This is an example of the task, though some input or output fields are not supplied.\n\n[[ ## question ## ]]\npartial",
+            "[[ ## answer ## ]]\nhalf\n\n[[ ## count ## ]]\nNot supplied for this particular example.\n\n[[ ## completed ## ]]\n",
+            "[[ ## question ## ]]\npast",
+            "[[ ## answer ## ]]\nold\n\n[[ ## count ## ]]\n1\n\n[[ ## completed ## ]]\n",
+            "[[ ## answer ## ]]\nnew\n\n[[ ## count ## ]]\n2\n\n[[ ## completed ## ]]\n",
+        },
+        .{
+            "This is an example of the task, though some input or output fields are not supplied.\n\n<question>\npartial\n</question>",
+            "<answer>\nhalf\n</answer>\n\n<count>\nNot supplied for this particular example. \n</count>",
+            "<question>\npast\n</question>",
+            "<answer>\nold\n</answer>\n\n<count>\n1\n</count>",
+            "<answer>\nnew\n</answer>\n\n<count>\n2\n</count>",
+        },
+    };
+    for (finetune_adapters, expected) |adapter, contents| {
+        const training = try adapter.formatFinetuneData(
+            arena,
+            testing.io,
+            finetune_view,
+            &.{ past, partial },
+            &inputs,
+            &outputs,
+        );
+        const messages = try finetuneMessages(training);
+        try testing.expectEqual(@as(usize, 7), messages.len);
+        try expectFinetuneMessage(messages[1], "user", contents[0]);
+        try expectFinetuneMessage(messages[2], "assistant", contents[1]);
+        try expectFinetuneMessage(messages[3], "user", contents[2]);
+        try expectFinetuneMessage(messages[4], "assistant", contents[3]);
+        try testing.expectEqualStrings("user", messages[5].object.get("role").?.string);
+        try expectFinetuneMessage(messages[6], "assistant", contents[4]);
+    }
+}
+
+// Actual DSPy retains all declared answer fields in ordinary history, including
+// an event with no answer. Dropping those fields changed the training dialogue.
+test "finetune history retains absent answers as None before the current answer" {
+    const Chat = dszig.Signature(struct {
+        pub const Input = struct { question: []const u8, history: dszig.History };
+        pub const Output = struct { answer: []const u8, count: i64 };
+    });
+    const view: dszig.adapter.View = .{
+        .instructions = "Answer the question.",
+        .inputs = Chat.input_fields_list,
+        .outputs = Chat.output_fields_list,
+    };
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var complete: dszig.value.Record = .empty;
+    try complete.put(arena, "question", .{ .string = "before" });
+    try complete.put(arena, "answer", .{ .string = "yes" });
+    try complete.put(arena, "count", .{ .integer = 4 });
+    var incomplete: dszig.value.Record = .empty;
+    try incomplete.put(arena, "question", .{ .string = "half" });
+    const history: dszig.History = .{ .messages = &.{ complete, incomplete } };
+    const inputs = try dszig.value.toRecord(arena, Chat.Input, .{
+        .question = "now",
+        .history = history,
+    });
+    const outputs = try dszig.value.toRecord(arena, Chat.Output, .{
+        .answer = "new",
+        .count = 5,
+    });
+    const expected = [finetune_adapters.len][3][]const u8{
+        .{
+            "[[ ## answer ## ]]\nyes\n\n[[ ## count ## ]]\n4\n\n[[ ## completed ## ]]\n",
+            "[[ ## answer ## ]]\nNone\n\n[[ ## count ## ]]\nNone\n\n[[ ## completed ## ]]\n",
+            "[[ ## answer ## ]]\nnew\n\n[[ ## count ## ]]\n5\n\n[[ ## completed ## ]]\n",
+        },
+        .{
+            "<answer>\nyes\n</answer>\n\n<count>\n4\n</count>",
+            "<answer />\n\n<count />",
+            "<answer>\nnew\n</answer>\n\n<count>\n5\n</count>",
+        },
+    };
+    for (finetune_adapters, expected) |adapter, answers| {
+        const training = try adapter.formatFinetuneData(
+            arena,
+            testing.io,
+            view,
+            &.{},
+            &inputs,
+            &outputs,
+        );
+        const messages = try finetuneMessages(training);
+        try testing.expectEqual(@as(usize, 7), messages.len);
+        for (answers, [_]usize{ 2, 4, 6 }) |answer, index| {
+            try expectFinetuneMessage(messages[index], "assistant", answer);
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), incomplete.count());
+    try testing.expect(!incomplete.contains("answer"));
+    try testing.expect(!incomplete.contains("count"));
+}
+
+// The SDK training projection must retain native calls and their paired result
+// IDs. Source uses null assistant content when the native call has no text.
+test "finetune native tool history preserves calls result IDs and null content" {
+    const Tools = dszig.Signature(struct {
+        pub const Input = struct { question: []const u8, history: dszig.History };
+        pub const Output = struct { answer: ?[]const u8, calls: dszig.ToolCalls };
+    });
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var args: dszig.value.Record = .empty;
+    try args.put(arena, "q", .{ .string = "x" });
+    var result: dszig.value.Record = .empty;
+    try result.put(arena, "answer", .{ .integer = 3 });
+    const calls: dszig.ToolCalls = .{
+        .tool_calls = &.{.{ .id = "call_1", .name = "lookup", .args = args }},
+        .tool_call_results = .{ .tool_call_results = &.{.{
+            .call_id = "call_1",
+            .name = "lookup",
+            .value = .{ .object = result },
+            .is_error = true,
+        }} },
+    };
+    var event: dszig.value.Record = .empty;
+    try event.put(arena, "question", .{ .string = "before" });
+    try event.put(arena, "answer", .null);
+    try event.put(arena, "calls", try calls.toValue(arena));
+    const inputs = try dszig.value.toRecord(arena, Tools.Input, .{
+        .question = "now",
+        .history = .{ .messages = &.{event} },
+    });
+    const outputs = try dszig.value.toRecord(arena, Tools.Output, .{
+        .answer = "done",
+        .calls = .{},
+    });
+    for (finetune_adapters) |adapter| {
+        const training = try adapter.formatFinetuneData(arena, testing.io, .{
+            .instructions = "Use recorded tools.",
+            .inputs = Tools.input_fields_list,
+            .outputs = Tools.output_fields_list,
+            .use_native_function_calling = true,
+        }, &.{}, &inputs, &outputs);
+        const messages = try finetuneMessages(training);
+        try testing.expectEqual(@as(usize, 6), messages.len);
+        const assistant = messages[2].object;
+        try testing.expectEqualStrings("assistant", assistant.get("role").?.string);
+        try testing.expect(assistant.get("content").? == .null);
+        const native_calls = assistant.get("tool_calls").?.array.items;
+        try testing.expectEqual(@as(usize, 1), native_calls.len);
+        try testing.expectEqualStrings("call_1", native_calls[0].object.get("id").?.string);
+        try testing.expectEqualStrings("function", native_calls[0].object.get("type").?.string);
+        const function = native_calls[0].object.get("function").?.object;
+        try testing.expectEqualStrings("lookup", function.get("name").?.string);
+        try testing.expectEqualStrings("{\"q\":\"x\"}", function.get("arguments").?.string);
+        const tool_result = messages[3].object;
+        try testing.expectEqualStrings("tool", tool_result.get("role").?.string);
+        try testing.expectEqualStrings("call_1", tool_result.get("tool_call_id").?.string);
+        try testing.expectEqualStrings("[error] {\"answer\": 3}", tool_result.get("content").?.string);
+    }
+}
+
+// The native prompt keeps canonical document parts; only the training record
+// carries the OpenAI file block DSPy 3.5.0 writes for the same File input.
+test "finetune data projects File inputs to provider blocks, not canonical parts" {
+    const Files = dszig.Signature(struct {
+        pub const Input = struct { question: []const u8, document: dszig.File };
+        pub const Output = struct { answer: []const u8 };
+    });
+    const view: dszig.adapter.View = .{
+        .instructions = "Read the document.",
+        .inputs = Files.input_fields_list,
+        .outputs = Files.output_fields_list,
+    };
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const file = try dszig.File.fromBytes(arena, "hello", .{
+        .filename = "ignored.txt",
+        .mime_type = "text/plain",
+    });
+    var inputs: dszig.value.Record = .empty;
+    try inputs.put(arena, "question", .{ .string = "read" });
+    try inputs.put(arena, "document", try file.toRuntime(arena));
+    var outputs: dszig.value.Record = .empty;
+    try outputs.put(arena, "answer", .{ .string = "done" });
+
+    const expected = [finetune_adapters.len][3][]const u8{
+        .{
+            "[[ ## question ## ]]\nread\n\n[[ ## document ## ]]\n",
+            "\n\nRespond with the corresponding output fields, starting with the field `[[ ## answer ## ]]`, and then ending with the marker for `[[ ## completed ## ]]`.",
+            "[[ ## answer ## ]]\ndone\n\n[[ ## completed ## ]]\n",
+        },
+        .{
+            "<question>\nread\n</question>\n\n<document>\n",
+            "\n</document>\n\nOutput format (replace placeholders):\n<answer>\n{answer}\n</answer>\n\nUse this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping.",
+            "<answer>\ndone\n</answer>",
+        },
+    };
+    for (finetune_adapters, expected) |adapter, texts| {
+        const training = try adapter.formatFinetuneData(
+            arena,
+            testing.io,
+            view,
+            &.{},
+            &inputs,
+            &outputs,
+        );
+        const messages = try finetuneMessages(training);
+        try testing.expectEqual(@as(usize, 3), messages.len);
+        try testing.expectEqualStrings("user", messages[1].object.get("role").?.string);
+        const blocks = messages[1].object.get("content").?.array.items;
+        try testing.expectEqual(@as(usize, 3), blocks.len);
+        try testing.expectEqualStrings("text", blocks[0].object.get("type").?.string);
+        try testing.expectEqualStrings(texts[0], blocks[0].object.get("text").?.string);
+        try testing.expectEqual(@as(usize, 2), blocks[1].object.count());
+        try testing.expectEqualStrings("file", blocks[1].object.get("type").?.string);
+        const block = blocks[1].object.get("file").?.object;
+        try testing.expectEqual(@as(usize, 2), block.count());
+        try testing.expectEqualStrings(
+            "data:text/plain;base64,aGVsbG8=",
+            block.get("file_data").?.string,
+        );
+        try testing.expectEqualStrings("file.txt", block.get("filename").?.string);
+        try testing.expectEqualStrings("text", blocks[2].object.get("type").?.string);
+        try testing.expectEqualStrings(texts[1], blocks[2].object.get("text").?.string);
+        try expectFinetuneMessage(messages[2], "assistant", texts[2]);
+
+        // The ordinary prompt still carries the canonical raw-payload part.
+        const prompt = try adapter.format(arena, view, &.{}, &inputs);
+        const part = prompt[1].content.parts[1].object;
+        try testing.expectEqualStrings("document", part.get("type").?.string);
+        try testing.expectEqualStrings("text/plain", part.get("media_type").?.string);
+        try testing.expectEqualStrings("aGVsbG8=", part.get("data").?.string);
+        try testing.expect(!part.contains("file"));
+    }
+}
+
+// JSONAdapter raises NotImplementedError and TwoStepAdapter has no formatter
+// at all, so both refuse before any prompt or media is examined. Chat and XML
+// do format, and so surface the malformed prompt and unsupported URL source.
+test "finetune data refuses JSON and TwoStep before malformed prompts or media" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var outputs: dszig.value.Record = .empty;
+    try outputs.put(arena, "answer", .{ .string = "done" });
+    try outputs.put(arena, "count", .{ .integer = 1 });
+    var malformed: dszig.value.Record = .empty;
+    try malformed.put(arena, "question", .{
+        .string = dszig.File.marker_start ++ "[{\"type\": \"document\"}]" ++ dszig.File.marker_end,
+    });
+    var remote: dszig.value.Record = .empty;
+    try remote.put(arena, "question", .{
+        .string = dszig.File.marker_start ++
+            "[{\"type\": \"document\", \"media_type\": \"application/pdf\", " ++
+            "\"url\": \"https://example.invalid/a.pdf\"}]" ++ dszig.File.marker_end,
+    });
+    var valid: dszig.value.Record = .empty;
+    try valid.put(arena, "question", .{ .string = "Why?" });
+
+    for ([_]*const dszig.value.Record{ &valid, &malformed, &remote }) |inputs| {
+        try testing.expectError(error.FinetuneNotImplemented, dszig.Adapter.json.formatFinetuneData(
+            arena,
+            testing.io,
+            finetune_view,
+            &.{},
+            inputs,
+            &outputs,
+        ));
+        try testing.expectError(
+            error.MissingFinetuneFormatter,
+            dszig.Adapter.two_step.formatFinetuneData(
+                arena,
+                testing.io,
+                finetune_view,
+                &.{},
+                inputs,
+                &outputs,
+            ),
+        );
+    }
+    for (finetune_adapters) |adapter| {
+        try testing.expectError(error.AdapterParse, adapter.formatFinetuneData(
+            arena,
+            testing.io,
+            finetune_view,
+            &.{},
+            &malformed,
+            &outputs,
+        ));
+        try testing.expectError(error.UnsupportedFeature, adapter.formatFinetuneData(
+            arena,
+            testing.io,
+            finetune_view,
+            &.{},
+            &remote,
+            &outputs,
+        ));
+    }
+}

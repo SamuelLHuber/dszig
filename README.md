@@ -6,7 +6,7 @@ allocators and execution context are explicit.
 
 **This is not a feature-complete or fully identical implementation of DSPy.** The
 cross-runtime gates cover the behaviors below, not every DSPy capability. In
-particular, the Python-executing RLM/Flex stack, fine-tuning, images/audio,
+particular, the Python-executing RLM/Flex stack, provider fine-tuning jobs, images/audio,
 full provider SDK coverage, and streaming are not implemented. Native File and
 bounded Responses document support are implemented, not general multimodal
 parity. See [Compatibility limits](#compatibility-limits).
@@ -115,6 +115,7 @@ retain the actual continuation and raw provider response independently.
 | Typed decisions | `Noul`, configured `Score`/`Choice`, generative evidence classes, criteria/state snapshots, native Annotated metadata, owning evidence collectors and TypeSafe SystemOne prediction; finite coverage and unsupported rows below |
 | Retrieval and embeddings | `Retrieve`, lexical `InMemoryRetriever`, HTTP `ColBERTv2` with shared mutable-graph memory caching, custom/OpenAI/Azure `Embedder`, float32 `KNN`, per-query `KNNFewShot`, and brute-force `Embeddings`/`EmbeddingsWithScores` with NumPy persistence |
 | Evaluation and few-shot search | `optimize.evaluate`, concurrent `parallel.Evaluator`, `bootstrapTraceData` with real parse-failure capture and ordered native rollouts, `LabeledFewShot`, `BootstrapFewShot`, `BootstrapFewShotWithRandomSearch`, `BootstrapFewShotWithOptuna`, teacher context, zero thresholds and positional multi-use trace selection |
+| Fine-tuning data | `Adapter.formatFinetuneData` for Chat/XML, including native File provider blocks, typed answers, demos and History; no provider training jobs or `BootstrapFinetune` |
 | Instruction optimization | `InferRules`; `MIPROv2`, its program-aware proposer and an Optuna 4.5.0 TPE port; `COPRO`; `SIMBA`; supported instance-frontier `GEPA` paths against gepa 0.1.4 |
 | Agents and tools | `ReAct`, comptime `Tool`, `History`, `ToolCalls`, tool results, native declarations and text tool calls, typed submit, retained history |
 | Voting | `Ensemble`, `ensemble.majority`, Unicode text normalization; exact Python numeric equality, NaN object identity and source-order fallback behavior |
@@ -1250,6 +1251,49 @@ wrapping and two native decision-box failures. Four configured evidence-signatur
 lookup-failure policies also matched. These finite checks do not supply
 fine-tuning, BetterTogether or whole-library static-memory parity.
 
+### Fine-tuning training records
+
+`Adapter.formatFinetuneData(arena, io, view, demos, &inputs, &outputs)` formats
+one successful call as OpenAI-shaped `{"messages": [...]}` training data.
+Chat and XML reuse their existing system, demo, history and request rendering,
+then append the assistant answer. Missing declared answer fields become Python
+`None` in Chat and self-closing tags in XML, including incomplete ordinary
+history events. Explicitly filtered native-tool history retains its filtered
+field set. Native-tool history keeps assistant `tool_calls`, paired
+`tool_call_id` values, error-result text and null content for calls without
+assistant text. Formatting does not validate the answer as a prediction or
+submit a training job.
+
+This mirrors the actual DSPy adapter boundary: JSON reports
+`error.FinetuneNotImplemented`, and TwoStep reports
+`error.MissingFinetuneFormatter` because its source class has no such method.
+Both refuse before formatting inputs or accessing media. These are source
+limitations, not fallbacks to another adapter.
+
+Training/display serialization is deliberately separate from canonical lm15
+serialization and the live OpenAI Chat HTTP policy. Native documents become
+OpenAI `file` blocks, with `file_id` or inline `file_data`; generated filenames
+use the pinned CPython MIME-extension ordering, not the caller's filename.
+Raw canonical local-path documents are read through the explicit `std.Io`,
+and file errors propagate; URL documents report `error.UnsupportedFeature`.
+`Content.toOpenAIChatValue(arena, io)` exposes this training/display projection.
+It does **not** enable document requests on the live Chat transport.
+
+Containers, encoded data and generated names use the supplied arena. Other
+string leaves borrow input, demo or history storage; clone before retaining
+the record beyond those lifetimes. A fixed-capacity arena bounds formatter
+memory, not all allocations inside the caller's I/O implementation.
+
+An independent DSPy 3.5 comparison matched 60 cases: 26 complete training
+records and 34 source refusals or file errors. It includes missing/null answers,
+incomplete demos/history, Code, Reasoning, fixed tuples, optional fields and
+in-memory/local-file documents. A separate comparison matched 1,086 actual
+source document blocks across MIME types. Sixteen additional complete tool
+dialogues matched native/text policies, result errors, null assistant text and
+mismatched call IDs. These are finite formatter proofs,
+not provider training, `BootstrapFinetune`, full DSPy parity or whole-library
+static-memory proof.
+
 ### Concurrent optimizer evaluation
 
 Optimizers take DSPy's `num_threads` as `concurrent_evaluation`:
@@ -1539,7 +1583,9 @@ The following prevent a claim that DSZig can do everything DSPy can:
   DSPy's RLM/Flex execute arbitrary Python and can import real DSPy inside the
   guest. A restricted expression evaluator is not an identical implementation.
 - **Other modules and optimizers:** no AvatarOptimizer, BetterTogether,
-  BootstrapFinetune. Trace bootstrapping is implemented as described above.
+  BootstrapFinetune. Trace bootstrapping and Chat/XML fine-tuning data formatting
+  are implemented as described above; native LM training bindings, provider job
+  lifecycle and optimizer training orchestration are not.
   Native Parallel uses explicit typed
   tasks and contexts, not Python callback objects or ambient thread-local settings.
   Its startup capacities and cooperative join contract are described above.

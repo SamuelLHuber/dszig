@@ -311,7 +311,7 @@ test "Code typed nested values validate and round trip as raw strings" {
     const view: adapter.View = .{ .instructions = "", .inputs = Sig.input_fields_list, .outputs = Sig.output_fields_list };
     const output = try value.toRecord(arena, Sig.Output, .{ .bundle = decoded });
     inline for (.{ adapter.Adapter.chat, adapter.Adapter.json, adapter.Adapter.xml }) |which| {
-        const text = try adapter.formatAssistantPartial(which, arena, view, &output);
+        const text = try adapter.formatAssistant(which, arena, view, &output);
         const parsed = try which.parse(arena, view, text);
         const restored = try value.fromRecord(arena, Sig.Output, &parsed);
         try testing.expectEqualStrings("run();", restored.bundle.primary.code);
@@ -362,7 +362,7 @@ test "Code JSON chat and XML adapters validate actual custom values and format r
         try expectCode(Java, "run();", parsed.get("result").?);
         try testing.expectEqualStrings("run();", (try value.fromRecord(arena, Sig.Output, &parsed)).result.code);
         try testing.expectEqualStrings(case[2], try adapter.formatUser(case[0], arena, view, &inputs, false));
-        try testing.expectEqualStrings(case[3], try adapter.formatAssistantPartial(case[0], arena, view, &outputs));
+        try testing.expectEqualStrings(case[3], try adapter.formatAssistant(case[0], arena, view, &outputs));
     }
     for ([_][]const u8{
         "{\"result\":{\"code\":7}}",
@@ -424,7 +424,7 @@ test "Code optional and collection adapters keep null empty and invalid values d
     const typed = try value.fromRecord(arena, Collection.Output, &collection);
     try testing.expectEqualStrings("x", typed.snippets[0].code);
     try testing.expectEqualStrings("y", typed.snippets[1].code);
-    try testing.expectEqualStrings("<snippets>\n[\"x\", \"y\"]\n</snippets>", try adapter.formatAssistantPartial(.xml, arena, list_view, &collection));
+    try testing.expectEqualStrings("<snippets>\n[\"x\", \"y\"]\n</snippets>", try adapter.formatAssistant(.xml, arena, list_view, &collection));
     try testing.expectError(error.AdapterParse, adapter.Adapter.xml.parse(arena, list_view, "<snippets>[{\"code\":7}]</snippets>"));
 }
 
@@ -459,7 +459,7 @@ test "Code XML literal selection stops at the immediate list item" {
         const expected = try std.json.parseFromSliceLeaky(Value, arena, case[1], .{});
         const typed = try value.fromValue(arena, case[0], expected);
         const outputs = try value.toRecord(arena, Sig.Output, .{ .result = typed });
-        const text = try adapter.formatAssistantPartial(.xml, arena, view, &outputs);
+        const text = try adapter.formatAssistant(.xml, arena, view, &outputs);
         try testing.expectEqualStrings(case[2], text);
         const parsed = try adapter.Adapter.xml.parse(arena, view, text);
         try testing.expect(try value.pyEqual(expected, try value.serializedValue(arena, parsed.get("result").?)));

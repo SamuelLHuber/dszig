@@ -949,13 +949,13 @@ pub const OpenAI = struct {
                 if (self.api == .chat_completions and message.tool_calls.len != 0) {
                     var calls: @import("runtime_value.zig").Array = .init(arena);
                     try calls.ensureTotalCapacity(message.tool_calls.len);
-                    for (message.tool_calls) |call| calls.appendAssumeCapacity(try self.wireToolCall(arena, call));
+                    for (message.tool_calls) |call| calls.appendAssumeCapacity(try toolCallValue(arena, self.api, call));
                     try object.put(arena, "tool_calls", .{ .array = calls });
                 }
                 try out.append(.{ .object = object });
             }
             if (self.api == .responses) {
-                for (message.tool_calls) |call| try out.append(try self.wireToolCall(arena, call));
+                for (message.tool_calls) |call| try out.append(try toolCallValue(arena, self.api, call));
             }
         }
         return out;
@@ -1046,12 +1046,14 @@ pub const OpenAI = struct {
         return .{ .object = object };
     }
 
-    fn wireToolCall(self: *const OpenAI, arena: Allocator, call: ToolCall) Error!@import("runtime_value.zig").Value {
+    /// Shared provider encoding for HTTP requests and native training records.
+    /// Containers use arena; ID, name and serialized arguments remain borrowed.
+    pub fn toolCallValue(arena: Allocator, api: Api, call: ToolCall) Error!@import("runtime_value.zig").Value {
         // OpenAI's function-call mapping has no native per-call opaque state.
         // Preserve it in metadata, but refuse a wire that cannot carry it.
         if (call.continuation.len != 0 or call.id.len == 0 or call.name.len == 0) return error.LMFailure;
         var object: @import("runtime_value.zig").ObjectMap = .empty;
-        if (self.api == .responses) {
+        if (api == .responses) {
             try object.put(arena, "type", .{ .string = "function_call" });
             try object.put(arena, "call_id", .{ .string = call.id });
             try object.put(arena, "name", .{ .string = call.name });

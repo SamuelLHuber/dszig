@@ -124,6 +124,70 @@ pub const Adapter = enum {
         return messages.items;
     }
 
+    /// DSPy training-data projection, not an LM request or a training job.
+    /// Containers and encoded media use the caller's arena; text leaves borrow.
+    pub fn formatFinetuneData(
+        adapter: Adapter,
+        arena: Allocator,
+        io: std.Io,
+        view: View,
+        demos: []const Record,
+        inputs: *const Record,
+        outputs: *const Record,
+    ) !Value {
+        switch (adapter) {
+            .json => return error.FinetuneNotImplemented,
+            .two_step => return error.MissingFinetuneFormatter,
+            .chat, .xml => {},
+        }
+        const prompt = try adapter.format(arena, view, demos, inputs);
+        const assistant = try formatAssistant(adapter, arena, view, outputs);
+        var messages: @import("runtime_value.zig").Array = .init(arena);
+        try messages.ensureTotalCapacity(prompt.len + 1);
+        for (prompt) |message| {
+            var projected: Record = .empty;
+            try projected.ensureTotalCapacity(arena, @as(usize, 2) +
+                @intFromBool(message.tool_call_id != null) +
+                @intFromBool(message.tool_calls.len != 0));
+            projected.putAssumeCapacity("role", .{ .string = message.role.name() });
+            projected.putAssumeCapacity(
+                "content",
+                if (message.role == .assistant and message.tool_calls.len != 0 and message.content.isEmpty())
+                    .null
+                else
+                    try message.content.toOpenAIChatValue(arena, io),
+            );
+            if (message.tool_call_id) |id| {
+                assert(message.role == .tool);
+                projected.putAssumeCapacity("tool_call_id", .{ .string = id });
+            }
+            if (message.tool_calls.len != 0) {
+                assert(message.role == .assistant);
+                var calls: @import("runtime_value.zig").Array = .init(arena);
+                try calls.ensureTotalCapacity(message.tool_calls.len);
+                for (message.tool_calls) |call| {
+                    calls.appendAssumeCapacity(@import("lm.zig").OpenAI.toolCallValue(
+                        arena,
+                        .chat_completions,
+                        call,
+                    ) catch |err| return if (err == error.LMFailure) error.UnsupportedFeature else err);
+                }
+                projected.putAssumeCapacity("tool_calls", .{ .array = calls });
+            }
+            messages.appendAssumeCapacity(.{ .object = projected });
+        }
+        var answer: Record = .empty;
+        try answer.ensureTotalCapacity(arena, 2);
+        answer.putAssumeCapacity("role", .{ .string = "assistant" });
+        answer.putAssumeCapacity("content", .{ .string = assistant });
+        messages.appendAssumeCapacity(.{ .object = answer });
+        var record: Record = .empty;
+        try record.put(arena, "messages", .{ .array = messages });
+        assert(messages.items.len == prompt.len + 1);
+        assert(record.count() == 1);
+        return .{ .object = record };
+    }
+
     pub fn parse(adapter: Adapter, arena: Allocator, view: View, completion: []const u8) Error!Record {
         return adapter.parseWithFailure(arena, view, completion, null);
     }
@@ -621,13 +685,21 @@ pub fn formatUser(adapter: Adapter, arena: Allocator, view: View, inputs: *const
     return userMessage(adapter, arena, view, inputs, "", main_request);
 }
 
-/// History assistant turns contain only fields actually supplied by that turn.
-pub fn formatAssistantPartial(adapter: Adapter, arena: Allocator, view: View, outputs: *const Record) Error![]const u8 {
-    var present: std.ArrayList(Field) = .empty;
-    for (view.outputs) |field| if (outputs.contains(field.name)) try present.append(arena, field);
-    var partial_view = view;
-    partial_view.outputs = present.items;
-    return assistantMessage(adapter, arena, partial_view, outputs, "");
+/// Render the declared answer fields, defaulting absent values to Python None.
+/// Native-tool history passes an explicitly filtered view; TwoStep alone omits
+/// absent fields, matching its separate upstream assistant formatter.
+pub fn formatAssistant(adapter: Adapter, arena: Allocator, view: View, outputs: *const Record) Error![]const u8 {
+    if (adapter == .two_step) return assistantMessage(adapter, arena, view, outputs, "");
+    var missing_outputs: Record = .empty;
+    for (view.outputs) |field| {
+        if (outputs.contains(field.name)) continue;
+        try missing_outputs.ensureTotalCapacity(arena, view.outputs.len);
+        for (view.outputs) |output| {
+            missing_outputs.putAssumeCapacity(output.name, outputs.get(output.name) orelse .null);
+        }
+        return assistantMessage(adapter, arena, view, &missing_outputs, "");
+    }
+    return assistantMessage(adapter, arena, view, outputs, "");
 }
 
 fn userMessage(adapter: Adapter, arena: Allocator, view: View, inputs: *const Record, prefix: []const u8, main_request: bool) Error![]const u8 {
