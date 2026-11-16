@@ -111,6 +111,7 @@ retain the actual continuation and raw provider response independently.
 | Runtime values and documents | `Value`, `Array`, `ObjectMap`, boxed native Code/File/Reasoning/BoundingBox/Citations/decision/evidence identity, recursive typed-class serialization, text/canonical-document content union and bounded Responses `input_file` translation |
 | Chat, JSON, XML and two-stage adapters | `Adapter.chat`, `.json`, `.xml`, `.two_step`; `TwoStepAdapter` with a separate extraction LM; independent prompt/parse fixtures, strict response-schema construction, JSON fallback, typed XML and Unicode key handling |
 | Prediction and reasoning | `Predict`, `ChainOfThought`, `BestOfN`, `Refine`, `MultiChainComparison`, explicit `Context`, typed outputs, serialized `Trace`, named predictor/parameter discovery |
+| Parallel composition | Startup-created `Parallel(Result, limits)` workers, typed program/Example/tuple bindings, ordered result slots, speculative straggler retries, bounded accumulated failure reports and joined cooperative cancellation |
 | Typed decisions | `Noul`, configured `Score`/`Choice`, generative evidence classes, criteria/state snapshots, native Annotated metadata, owning evidence collectors and TypeSafe SystemOne prediction; finite coverage and unsupported rows below |
 | Retrieval and embeddings | `Retrieve`, lexical `InMemoryRetriever`, HTTP `ColBERTv2` with shared mutable-graph memory caching, custom/OpenAI/Azure `Embedder`, float32 `KNN`, per-query `KNNFewShot`, and brute-force `Embeddings`/`EmbeddingsWithScores` with NumPy persistence |
 | Evaluation and few-shot search | `optimize.evaluate`, `LabeledFewShot`, `BootstrapFewShot`, `BootstrapFewShotWithRandomSearch`, `BootstrapFewShotWithOptuna`, teacher context, zero thresholds and positional multi-use trace selection |
@@ -1034,6 +1035,79 @@ and ReleaseSafe, including the explicit unsupported-row failure. The pinned
 344-test/28-step Debug and ReleaseSafe gates, actual RAG/bootstrap, 687-request
 replay and independent Python fixture/artifact/reference gate also passed.
 
+## Native parallel composition
+
+`Parallel(Result, limits)` runs native programs or callbacks on a persistent worker
+pool. Initialize it **in place and do not move it**. The compile-time limits specify
+`workers`, `tasks`, total `attempts` (including speculative duplicates), and retained
+`failures`. Threads are created only by `init(io, spawn_config)` and joined by
+`deinit()`. Queues, scheduling metadata and typed output slots are inline; dispatch
+does not use an allocator. A pool permits one forward at a time; use distinct
+startup-created pools for nested or concurrent batches.
+
+`Pool.Program(P)` binds a borrowed `*const P`, `arguments` and per-attempt `contexts`.
+Its `task()` is a native task descriptor:
+
+- `.arguments = .{ .input = typed_input }` passes `P.Input` directly. Named structs,
+  tuple structs and a whole borrowed `*const Example` are ordinary native inputs.
+- `.arguments = .{ .example = &example }` decodes a struct input from
+  `Example.input_keys`, using the same declaration-order role checks and codecs as
+  evaluation, without materializing an input or output dictionary.
+- Custom `Pool.Task` callbacks receive attempt/task/worker indices, a cancellation
+  token and stable `*Result` storage. `Result` may be optional or a tagged union;
+  a successful null is distinct from a failed slot.
+
+Provide at least `limits.attempts` contexts. **Copying Context does not isolate its
+pointees.** Scratch, mutable LM state, traces and mutable retrievers must be private
+to each simultaneously running attempt or explicitly synchronized. Do not mutate
+shared program configuration while calls run. In particular, do not freeze or
+globally roll back live InferRules instruction identities to make concurrency
+appear safe. Scratch-backed children must survive until the returned results are
+discarded; resetting a worker arena between tasks would invalidate earlier outputs.
+
+`forward(tasks, options)` returns input-ordered `.results`: each slot is `.failed`
+or `.value = *const Result`. Output slots are valid until the next forward or
+deinitialization, and borrowed children retain their own lifetime requirements.
+Failures below `max_errors` leave a slot available for a later successful duplicate.
+The first accepted success wins; raised errors from losing attempts still count
+toward the budget while the run is active. Zero errors allowed means the first
+actual error cancels execution. With `return_failed_tasks = true`, `.failures` is
+a borrowed handle whose `items()` observes accumulated failed descriptors across
+calls. Repeated failures of an unresolved task retain the last accepted error for
+each occurrence, as in DSPy's failed-index/exception-map pairing. Its frame pointers
+must stay alive until `clearFailures()` or deinitialization. A full failure buffer
+returns `FailureCapacity` without partially appending that call's failures.
+
+`straggler_timeout_ns` is a speculative retry threshold, **not a task deadline**;
+zero disables retries. As in DSPy, a duplicate future can itself be retried while
+few attempts remain pending. Unlike the source's unbounded chain, exhausting the
+startup attempt capacity returns `AttemptCapacity`. Terminal success/error/cancel
+decisions are fixed before joining late callbacks; losing callbacks cannot rewrite
+accepted output slots or retroactively change a terminal decision.
+
+Every return, including cancellation and capacity/error-budget failures, waits for
+all running callbacks. `cancel()` can be called from another thread; custom
+callbacks must check their cancellation token and bound their work/I/O.
+`Program(P)` checks cancellation before entering `P.forward`; the program itself
+must finish or cooperate through its own inputs/I/O policy. This is trusted native
+execution, not a sandbox for generated code, and a non-cooperating callback delays
+return. DSPy's executor can return while abandoned originals still run; that
+lifetime hazard is deliberately not copied.
+
+Run the actual native program example:
+
+```sh
+devenv shell -- zig build parallel
+```
+
+It compares every one of 8,192 parallel typed arithmetic outputs to serial native
+execution, using zero-byte per-attempt scratch and no LM calls, and reports both
+elapsed times. This is a CPU dispatch example, not authenticated inference or a
+whole-runtime allocation/performance proof. The ordinary test suite also exercises
+actual concurrent typed Predict with separate scripted LMs and scratch, joined
+stragglers/cancellation, and seeded scheduling properties. Existing evaluation and
+optimizer loops are not automatically parallelized.
+
 ## Native seeded evaluation campaigns
 
 The native simulation harness executes real `dszig.optimize.evaluate` calls with
@@ -1271,8 +1345,10 @@ The following prevent a claim that DSZig can do everything DSPy can:
   LocalInterpreter, InterpreterPool or complete Python execution environment.
   DSPy's RLM/Flex execute arbitrary Python and can import real DSPy inside the
   guest. A restricted expression evaluator is not an identical implementation.
-- **Other modules and optimizers:** no Parallel,
-  AvatarOptimizer, BetterTogether, BootstrapFinetune or bootstrap_trace_data.
+- **Other modules and optimizers:** no AvatarOptimizer, BetterTogether,
+  BootstrapFinetune or bootstrap_trace_data. Native Parallel uses explicit typed
+  tasks and contexts, not Python callback objects or ambient thread-local settings.
+  Its startup capacities and cooperative join contract are described above.
 - **Optimizer execution and shared identity:** `InferRules` and
   `BootstrapFewShotWithOptuna` currently support serial evaluation
   (`num_threads = null` or `1`), rejecting other explicit

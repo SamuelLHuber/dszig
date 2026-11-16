@@ -142,7 +142,9 @@ pub fn runProgramInto(
     try value.toRecordInto(ctx.arena, P.Output, output, prediction);
 }
 
-fn forwardProgram(comptime P: type, ctx: Context, program: *const P, example: *const Example) !P.Output {
+/// Execute a typed program directly from borrowed Example input roles, without
+/// materializing either an input dictionary or an outer prediction dictionary.
+pub fn forwardProgram(comptime P: type, ctx: Context, program: *const P, example: *const Example) !P.Output {
     // Decode only declared input roles, directly from borrowed training storage.
     // Interleave role checks and conversion to preserve declaration-order failures.
     var input: P.Input = undefined;
