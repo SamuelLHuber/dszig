@@ -570,6 +570,14 @@ signature equality.
 ties-to-even, binary decimal boundaries such as `2.675 → 2.67`, signed zero
 and nonfinite scores. It does not round an already-rounded `score * 100`.
 
+Native optimizer execution decodes `P.Input` directly from the example's
+borrowed record, without allocating a temporary input dictionary. Only fields
+explicitly named by `input_keys` are eligible: an existing training label
+cannot silently become an input. Role checks and typed conversions follow
+declaration order, preserving which failure is reported first. Nested decoding,
+output records, program execution and metrics can still allocate; this change
+does not establish an allocator-free runtime.
+
 `optimize.Metric` and GEPA feedback callbacks can return `ParseValue` or
 `OutOfMemory`. Evaluate and bootstrap apply their existing error budgets to
 metric failures as well as program failures; bootstrap restores temporary

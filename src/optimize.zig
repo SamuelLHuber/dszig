@@ -113,8 +113,15 @@ fn roundScore(score: f64) f64 {
 }
 
 pub fn runProgram(comptime P: type, ctx: Context, program: *const P, example: *const Example) !Record {
-    const inputs = try example.inputs(ctx.arena);
-    const input = try value.fromRecord(ctx.arena, P.Input, &inputs);
+    // Decode only declared input roles, directly from borrowed training storage.
+    // Interleave role checks and conversion to preserve declaration-order failures.
+    var input: P.Input = undefined;
+    const fields = @typeInfo(P.Input).@"struct";
+    inline for (fields.field_names, fields.field_types) |name, T| {
+        if (!example.isInput(name)) return error.MissingField;
+        const item = example.record.get(name) orelse return error.MissingField;
+        @field(input, name) = try value.fromValue(ctx.arena, T, item);
+    }
     const output = try program.forward(ctx, input);
     return value.toRecord(ctx.arena, P.Output, output);
 }

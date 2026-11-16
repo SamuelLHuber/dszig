@@ -111,10 +111,12 @@ const Program = struct {
         const fault = example.record.get("metric_fault").?.integer;
         assert(fault >= 0);
         assert(fault <= @backingInt(Fault.out_of_memory));
-        switch (@as(Fault, @fromBackingInt(@intCast(fault)))) {
-            .none => {},
-            .failure => return error.ParseValue,
-            .out_of_memory => return error.OutOfMemory,
+        // Match the validated wire integer without narrowing it to an enum tag.
+        switch (fault) {
+            @backingInt(Fault.none) => {},
+            @backingInt(Fault.failure) => return error.ParseValue,
+            @backingInt(Fault.out_of_memory) => return error.OutOfMemory,
+            else => unreachable,
         }
         const answer = output.get("answer") orelse return error.ParseValue;
         if (answer != .integer) return error.ParseValue;

@@ -77,6 +77,50 @@ test "Evaluate uses Python decimal ties-to-even without intermediate rounding or
     try testing.expect(std.math.isNan(result.score));
 }
 
+test "native input decoding needs no projection allocation and never admits labels" {
+    const P = struct {
+        product: *i64,
+        pub const Input = struct { number: i64, text: []const u8 };
+        pub const Output = struct {};
+
+        pub fn forward(self: *const @This(), _: dszig.Context, input: Input) !Output {
+            self.product.* = input.number * @as(i64, @intCast(input.text.len));
+            return .{};
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var example = try dszig.Example.fromJson(
+        arena,
+        "{\"number\":7,\"text\":\"abc\",\"answer\":\"private\"}",
+        &.{ "text", "unknown", "number", "text" },
+    );
+    var unused: dszig.lm.ScriptedLM = .{ .responses = &.{} };
+    const ctx: dszig.Context = .{ .arena = testing.failing_allocator, .lm = unused.lm() };
+    var product: i64 = -1;
+    const program: P = .{ .product = &product };
+    _ = try dszig.optimize.runProgram(P, ctx, &program, &example);
+    try testing.expectEqual(@as(i64, 21), product);
+
+    // An existing training label is not an input just because the program asks for it.
+    example.input_keys = &.{"number"};
+    product = -1;
+    try testing.expectError(
+        error.MissingField,
+        dszig.optimize.runProgram(P, ctx, &program, &example),
+    );
+    try testing.expectEqual(@as(i64, -1), product);
+
+    // Decode in declaration order: an earlier invalid input precedes a later missing role.
+    try example.record.put(arena, "number", .{ .bool = true });
+    try testing.expectError(
+        error.TypeMismatch,
+        dszig.optimize.runProgram(P, ctx, &program, &example),
+    );
+    try testing.expectEqual(@as(i64, -1), product);
+}
+
 test "Evaluate counts program and metric failures together and keeps allocation failures fatal" {
     const P = struct {
         calls: *usize,
