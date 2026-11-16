@@ -32,6 +32,71 @@ pub const Attempt = struct {
     cancellation: Cancellation,
 };
 
+/// Task descriptors and result slots depend only on Result, so components that
+/// do not choose a pool's compile-time limits can still build and read them.
+pub fn TaskFor(comptime Result: type) type {
+    return struct {
+        ptr: *anyopaque,
+        /// Must initialize output on success and cooperate with cancellation.
+        /// Attempt.index selects private scratch/context/output-child storage.
+        invoke: *const fn (*anyopaque, Attempt, *Result) anyerror!void,
+    };
+}
+
+pub fn SlotFor(comptime Result: type) type {
+    return union(enum) { failed, value: *const Result };
+}
+
+/// Limits-independent handle to a startup-created pool, for optimizers that
+/// accept DSPy-style `num_threads`. Slots are valid until the next forward.
+pub fn Runner(comptime Result: type) type {
+    return struct {
+        ptr: *anyopaque,
+        tasks: u32,
+        attempts: u32,
+        forward: *const fn (*anyopaque, []const TaskFor(Result), Options) anyerror![]const SlotFor(Result),
+    };
+}
+
+/// Optimizer `num_threads` for retained rollouts (SIMBA, GEPA): a pool runner
+/// and per-attempt contexts supplying LM and retriever pointees.
+pub fn Rollouts(comptime Result: type) type {
+    return struct {
+        runner: Runner(Result),
+        contexts: []const Context,
+        options: Options = .{ .straggler_timeout_ns = 0 },
+
+        /// Runs tasks in pool-sized chunks, copying results in task order.
+        /// Callers' callbacks absorb program and metric failures, so a failed
+        /// slot means exhausted memory.
+        pub fn run(self: @This(), tasks: []const TaskFor(Result), results: []Result) !void {
+            assert(tasks.len == results.len);
+            assert(self.contexts.len >= self.runner.attempts);
+            assert(self.runner.tasks > 0);
+            var start: usize = 0;
+            while (start < tasks.len) {
+                const count = @min(self.runner.tasks, tasks.len - start);
+                const slots = try self.runner.forward(self.runner.ptr, tasks[start..][0..count], self.options);
+                for (slots, results[start..][0..count]) |slot, *result| switch (slot) {
+                    .failed => return error.OutOfMemory,
+                    .value => |output| result.* = output.*,
+                };
+                start += count;
+            }
+        }
+
+        /// Attempt context with this rollout's settings and the attempt's own
+        /// LM (unless shared) and retriever.
+        pub fn context(self: @This(), rollout: Context, attempt: Attempt, shared_lm: bool) Context {
+            const own = self.contexts[attempt.index];
+            var c = rollout;
+            if (!shared_lm) c.lm = own.lm;
+            c.retriever = own.retriever;
+            return c;
+        }
+    };
+}
+
 /// Result can be any native type, including optional values or a heterogeneous
 /// tagged union. Callback output storage is stable until the next forward.
 /// Callback-owned children and program/context pointees are borrowed, not cloned.
@@ -54,13 +119,8 @@ pub fn Parallel(comptime Result: type, comptime limits: Limits) type {
         results: [limits.tasks]Slot = undefined,
         failures: Failures = .{},
 
-        pub const Task = struct {
-            ptr: *anyopaque,
-            /// Must initialize output on success and cooperate with cancellation.
-            /// Attempt.index selects private scratch/context/output-child storage.
-            invoke: *const fn (*anyopaque, Attempt, *Result) anyerror!void,
-        };
-        pub const Slot = union(enum) { failed, value: *const Result };
+        pub const Task = TaskFor(Result);
+        pub const Slot = SlotFor(Result);
         pub const Failure = struct { task: Task, err: anyerror };
         pub const Failures = struct {
             buffer: [limits.failures]Failure = undefined,
@@ -114,6 +174,17 @@ pub fn Parallel(comptime Result: type, comptime limits: Limits) type {
                 self.cancellation.store(true, .release);
                 self.changed.signal(self.io);
             }
+        }
+
+        pub fn runner(self: *Self) Runner(Result) {
+            assert(self.address == self);
+            return .{ .ptr = self, .tasks = limits.tasks, .attempts = limits.attempts, .forward = forwardErased };
+        }
+
+        fn forwardErased(ptr: *anyopaque, tasks: []const Task, options: Options) anyerror![]const Slot {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            assert(!options.return_failed_tasks);
+            return (try self.forward(tasks, options)).results;
         }
 
         pub fn clearFailures(self: *Self) void {

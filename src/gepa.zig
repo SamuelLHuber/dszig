@@ -10,8 +10,10 @@
 //!
 //! Not supported: custom proposers, `dspy.Flex` code components, frontier
 //! types other than `"instance"`, `"epsilon_greedy"`/`"top_k_pareto"`,
-//! `add_format_failure_as_feedback`, `log_dir`, parallel threads. CPython
-//! iterates small-int sets in ascending order; DSZig assumes it always does.
+//! `add_format_failure_as_feedback`, `log_dir`. DSPy `num_threads` maps to
+//! `rollouts`: each minibatch/valset evaluation then runs on a native pool,
+//! results in example order. CPython iterates small-int sets in ascending
+//! order; DSZig assumes it always does.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -19,6 +21,7 @@ const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
 
 const optimize = @import("optimize.zig");
+const parallel = @import("parallel.zig");
 const predict = @import("predict.zig");
 const pyjson = @import("pyjson.zig");
 const pyrandom = @import("pyrandom.zig");
@@ -70,6 +73,13 @@ pub const GEPA = struct {
     failure_score: f64 = 0.0,
     perfect_score: f64 = 1.0,
     seed: u32 = 0,
+    /// DSPy `num_threads`: a `parallel.Parallel(GEPA.Run, limits).runner()`
+    /// plus per-attempt contexts. Program and metric must be thread-safe, and
+    /// `out`, which retains predictions and traces, must then be thread-safe
+    /// (an ArenaAllocator over a thread-safe child is). null runs serially.
+    rollouts: ?Rollouts = null,
+
+    pub const Rollouts = parallel.Rollouts(Run);
 
     pub const Auto = enum { light, medium, heavy };
     pub const Selection = enum { pareto, current_best };
@@ -105,7 +115,7 @@ pub const GEPA = struct {
     const merge_subsample = 5;
     const max_attempts = 10;
 
-    const Run = struct { prediction: ?Record, trace: *const Trace, score: f64 };
+    pub const Run = struct { prediction: ?Record, trace: *const Trace, score: f64 };
 
     const Desc = struct { id1: usize, id2: usize, picks: []const usize };
 
@@ -181,10 +191,10 @@ pub const GEPA = struct {
                 };
             }
 
-            fn runOne(e: *const Self, program: *const P, example: *const Example, capture: bool) Allocator.Error!Run {
+            fn runOne(e: *const Self, ctx: Context, program: *const P, example: *const Example, capture: bool) Allocator.Error!Run {
                 const trace = try e.out.create(Trace);
                 trace.* = .{ .arena = e.out };
-                var c = e.ctx;
+                var c = ctx;
                 c.arena = e.out;
                 c.trace = if (capture) trace else null;
                 const prediction = optimize.runProgram(P, c, program, example) catch |err| {
@@ -198,15 +208,39 @@ pub const GEPA = struct {
                 return .{ .prediction = prediction, .trace = trace, .score = feedback.score };
             }
 
-            fn evalIds(e: *Self, candidate: []const []const u8, set: []const Example, ids: []const usize, capture: bool) Allocator.Error![]Run {
+            fn evalIds(e: *Self, candidate: []const []const u8, set: []const Example, ids: []const usize, capture: bool) ![]Run {
                 const program = try e.build(candidate);
                 const runs = try e.out.alloc(Run, ids.len);
-                for (runs, ids) |*r, id| r.* = try e.runOne(program, &set[id], capture);
+                if (e.gepa.rollouts) |rollouts| {
+                    const Call = struct {
+                        engine: *const Self,
+                        program: *const P,
+                        example: *const Example,
+                        capture: bool,
+
+                        fn invoke(ptr: *anyopaque, attempt: parallel.Attempt, run: *Run) anyerror!void {
+                            const call: *const @This() = @ptrCast(@alignCast(ptr));
+                            try attempt.cancellation.check();
+                            const en = call.engine;
+                            const c = en.gepa.rollouts.?.context(en.ctx, attempt, false);
+                            run.* = try en.runOne(c, call.program, call.example, call.capture);
+                        }
+                    };
+                    const calls = try e.out.alloc(Call, ids.len);
+                    const tasks = try e.out.alloc(parallel.TaskFor(Run), ids.len);
+                    for (calls, tasks, ids) |*call, *task, id| {
+                        call.* = .{ .engine = e, .program = program, .example = &set[id], .capture = capture };
+                        task.* = .{ .ptr = call, .invoke = Call.invoke };
+                    }
+                    try rollouts.run(tasks, runs);
+                } else {
+                    for (runs, ids) |*r, id| r.* = try e.runOne(e.ctx, program, &set[id], capture);
+                }
                 e.total_evals += ids.len;
                 return runs;
             }
 
-            fn addProgram(e: *Self, candidate: []const []const u8, parent_ids: []const ?usize) Allocator.Error!void {
+            fn addProgram(e: *Self, candidate: []const []const u8, parent_ids: []const ?usize) !void {
                 const all = try e.out.alloc(usize, e.valset.len);
                 for (all, 0..) |*a, k| a.* = k;
                 const discovered = e.total_evals;
@@ -785,7 +819,7 @@ test "GEPA scoring failures preserve capture-specific outputs while feedback err
     };
 
     for ([_]bool{ false, true }) |capture| {
-        const run = try engine.runOne(&program, &examples[0], capture);
+        const run = try engine.runOne(engine.ctx, &program, &examples[0], capture);
         try std.testing.expectEqual(@as(f64, 0.125), run.score);
         if (capture) {
             try std.testing.expect(run.prediction == null);
@@ -799,7 +833,7 @@ test "GEPA scoring failures preserve capture-specific outputs while feedback err
     var program_failure: @import("lm.zig").ScriptedLM = .{ .responses = &.{} };
     engine.ctx.lm = program_failure.lm();
     for ([_]bool{ false, true }) |capture| {
-        const run = try engine.runOne(&program, &examples[0], capture);
+        const run = try engine.runOne(engine.ctx, &program, &examples[0], capture);
         try std.testing.expectEqual(@as(f64, 0.125), run.score);
         if (capture) {
             try std.testing.expect(run.prediction == null);
@@ -811,14 +845,14 @@ test "GEPA scoring failures preserve capture-specific outputs while feedback err
 
     engine.ctx = ctx;
     engine.gepa.metric = FailingMetric.feedbackFailure;
-    const successful = try engine.runOne(&program, &examples[0], true);
+    const successful = try engine.runOne(engine.ctx, &program, &examples[0], true);
     try std.testing.expectEqualStrings("ok", successful.prediction.?.get("answer").?.string);
     try std.testing.expectEqual(@as(usize, 1), successful.trace.steps.items.len);
     try std.testing.expectError(error.ParseValue, engine.reflectiveDataset(&.{program.state.instructions}, &.{successful}, &.{0}, &.{0}));
 
     engine.gepa.metric = FailingMetric.allocationFailure;
     for ([_]bool{ false, true }) |capture| {
-        try std.testing.expectError(error.OutOfMemory, engine.runOne(&program, &examples[0], capture));
+        try std.testing.expectError(error.OutOfMemory, engine.runOne(engine.ctx, &program, &examples[0], capture));
     }
     try std.testing.expectEqual(@as(usize, 5), script.index);
 }

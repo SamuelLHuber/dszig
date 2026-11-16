@@ -10,8 +10,11 @@
 //! With `teacher_settings`, the first trajectory sampler runs under the
 //! teacher (its LM keeps its temperature), as `prepare_models_for_resampling`
 //! does; DSZig does not mutate the teacher LM's `rollout_id` afterwards.
-//! Not supported: parallel threads, metrics returning a
-//! `dspy.Prediction` with feedback. `np.exp` is Zig's `@exp`.
+//! DSPy `num_threads` maps to `rollouts`: trajectory, candidate and final
+//! evaluations then run on a startup-created native pool, results kept in
+//! submission order, with every random draw made before execution as in DSPy.
+//! Not supported: metrics returning a `dspy.Prediction` with feedback.
+//! `np.exp` is Zig's `@exp`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -21,6 +24,7 @@ const Writer = std.Io.Writer;
 const adapter = @import("adapter.zig");
 const nprandom = @import("nprandom.zig");
 const optimize = @import("optimize.zig");
+const parallel = @import("parallel.zig");
 const predict = @import("predict.zig");
 const pyjson = @import("pyjson.zig");
 const pyrandom = @import("pyrandom.zig");
@@ -94,6 +98,15 @@ pub const SIMBA = struct {
     temperature_for_sampling: f64 = 0.2,
     temperature_for_candidates: f64 = 0.2,
     teacher_settings: ?optimize.TeacherSettings = null,
+    /// DSPy `num_threads`; null runs rollouts serially.
+    rollouts: ?Rollouts = null,
+
+    /// A `parallel.Parallel(SIMBA.Run, limits).runner()` plus per-attempt
+    /// contexts; other settings come from each rollout. A teacher LM, when
+    /// configured, is shared by its rollouts and must be thread-safe, as must
+    /// the metric. Predictions and traces are allocated from `out`, which must
+    /// then be thread-safe (an ArenaAllocator over a thread-safe child is).
+    pub const Rollouts = parallel.Rollouts(Run);
 
     pub const Options = struct {
         seed: u32 = 0,
@@ -113,7 +126,7 @@ pub const SIMBA = struct {
         };
     }
 
-    const Run = struct {
+    pub const Run = struct {
         prediction: ?Record,
         steps: []const predict.Trace.Step,
         names: []const predict.NamedParam,
@@ -242,20 +255,24 @@ pub const SIMBA = struct {
 
             const top = try st.topK(out, self.num_candidates);
             const runs = try out.alloc(Run, self.num_candidates * self.bsize);
+            const rollout_jobs = try out.alloc(Job(P), runs.len);
             for (0..self.num_candidates) |model| {
                 var c = base;
                 c.lm_options.rollout_id = .{ .integer = std.math.add(i64, start_rollout, @as(i64, @intCast(model))) catch return error.InvalidRolloutId };
+                var shared_lm = false;
                 if (model == 0 and self.teacher_settings != null) {
                     self.teacher_settings.?.apply(&c);
+                    shared_lm = self.teacher_settings.?.lm != null;
                 } else {
                     c.lm_options.temperature = 1.0;
                 }
                 for (batch, 0..) |ex_i, j| {
                     const chosen = try st.softmaxSample(out, &rng, top, self.temperature_for_sampling);
                     const copy = try clone(P, out, st.programs.items[chosen]);
-                    runs[model * self.bsize + j] = try self.wrap(P, out, c, copy, &trainset[ex_i]);
+                    rollout_jobs[model * self.bsize + j] = .{ .ctx = c, .shared_lm = shared_lm, .program = copy, .example = &trainset[ex_i] };
                 }
             }
+            try self.runAll(P, out, rollout_jobs, runs);
 
             const all_scores = try out.alloc(f64, runs.len);
             for (all_scores, runs) |*s, r| s.* = r.score.?;
@@ -312,10 +329,11 @@ pub const SIMBA = struct {
 
             var best: ?usize = null;
             var best_score: f64 = 0;
+            const candidate_runs = try self.runPrograms(P, out, base, candidates.items, trainset, batch);
             const candidate_scores = try out.alloc([]const f64, candidates.items.len);
-            for (candidates.items, candidate_scores, 0..) |cand, *scores, i| {
+            for (candidate_scores, 0..) |*scores, i| {
                 const list = try out.alloc(f64, batch.len);
-                for (batch, list) |ex_i, *s| s.* = (try self.wrap(P, out, base, cand, &trainset[ex_i])).score.?;
+                for (list, candidate_runs[i * batch.len ..][0..batch.len]) |*s, r| s.* = r.score.?;
                 scores.* = list;
                 const avg = mean(list);
                 if (best == null or avg > best_score) {
@@ -340,10 +358,13 @@ pub const SIMBA = struct {
         const scores = try out.alloc(f64, idxs.items.len);
         const programs = try out.alloc(*P, idxs.items.len);
         var best_idx: usize = 0;
-        for (idxs.items, scores, programs, 0..) |w, *s, *prog, i| {
-            prog.* = try clone(P, out, winning.items[w]);
+        for (idxs.items, programs) |w, *prog| prog.* = try clone(P, out, winning.items[w]);
+        const all = try out.alloc(usize, trainset.len);
+        for (all, 0..) |*index, i| index.* = i;
+        const final_runs = try self.runPrograms(P, out, base, programs, trainset, all);
+        for (scores, 0..) |*s, i| {
             const list = try out.alloc(f64, trainset.len);
-            for (trainset, list) |*ex, *x| x.* = (try self.wrap(P, out, base, prog.*, ex)).score.?;
+            for (list, final_runs[i * trainset.len ..][0..trainset.len]) |*x, r| x.* = r.score.?;
             s.* = mean(list);
             if (i != 0) train_scores[i - 1] = s.*;
             if (s.* > scores[best_idx]) best_idx = i;
@@ -351,6 +372,68 @@ pub const SIMBA = struct {
         const sorted = try out.dupe(f64, scores);
         std.sort.insertion(f64, sorted, {}, std.sort.desc(f64));
         return .{ .program = programs[best_idx].*, .scores = sorted, .train_scores = train_scores };
+    }
+
+    fn Job(comptime P: type) type {
+        return struct {
+            ctx: Context,
+            /// A teacher LM is shared; otherwise each attempt brings its own.
+            shared_lm: bool,
+            program: *P,
+            example: *const Example,
+        };
+    }
+
+    /// Every program on `indices` of trainset, program-major, under ctx.
+    fn runPrograms(
+        self: *const SIMBA,
+        comptime P: type,
+        out: Allocator,
+        ctx: Context,
+        programs: []const *P,
+        trainset: []const Example,
+        indices: []const usize,
+    ) ![]Run {
+        const jobs = try out.alloc(Job(P), programs.len * indices.len);
+        for (programs, 0..) |program, p| {
+            for (indices, 0..) |index, i| jobs[p * indices.len + i] = .{
+                .ctx = ctx,
+                .shared_lm = false,
+                .program = program,
+                .example = &trainset[index],
+            };
+        }
+        const runs = try out.alloc(Run, jobs.len);
+        try self.runAll(P, out, jobs, runs);
+        return runs;
+    }
+
+    /// DSPy `dspy.Parallel(...)(exec_pairs)`: ordered results.
+    fn runAll(self: *const SIMBA, comptime P: type, out: Allocator, jobs: []const Job(P), runs: []Run) !void {
+        assert(jobs.len == runs.len);
+        const rollouts = self.rollouts orelse {
+            for (jobs, runs) |job, *run| run.* = try self.wrap(P, out, job.ctx, job.program, job.example);
+            return;
+        };
+        const Call = struct {
+            simba: *const SIMBA,
+            out: Allocator,
+            job: *const Job(P),
+
+            fn invoke(ptr: *anyopaque, attempt: parallel.Attempt, run: *Run) anyerror!void {
+                const call: *const @This() = @ptrCast(@alignCast(ptr));
+                try attempt.cancellation.check();
+                const c = call.simba.rollouts.?.context(call.job.ctx, attempt, call.job.shared_lm);
+                run.* = try call.simba.wrap(P, call.out, c, call.job.program, call.job.example);
+            }
+        };
+        const calls = try out.alloc(Call, jobs.len);
+        const tasks = try out.alloc(parallel.TaskFor(Run), jobs.len);
+        for (calls, tasks, jobs) |*call, *task, *job| {
+            call.* = .{ .simba = self, .out = out, .job = job };
+            task.* = .{ .ptr = call, .invoke = Call.invoke };
+        }
+        try rollouts.run(tasks, runs);
     }
 
     /// `wrap_program(program, metric)(example)`.

@@ -1132,8 +1132,19 @@ candidates through it, each call using the optimizer's own `max_errors`; a
 program-type mismatch returns `error.ProgramTypeMismatch`, and null keeps serial
 `optimize.evaluate`. Candidate evaluation is sequential between candidates, as in
 DSPy; only examples within one evaluation run concurrently. `BootstrapFewShot`
-has no DSPy thread option and stays serial; SIMBA and GEPA batch rollouts remain
-serial.
+has no DSPy thread option and stays serial.
+
+SIMBA's `num_threads` is `rollouts`: a `Parallel(SIMBA.Run, limits).runner()` and
+per-attempt contexts supplying LM and retriever pointees. Trajectory sampling,
+candidate scoring and final trainset scoring then run on the pool in submission
+order, with every random draw made beforehand, as DSPy does. Because SIMBA
+retains predictions and traces, they are allocated from `out`, which must then be
+thread-safe (an `ArenaAllocator` over a thread-safe child is); a configured
+teacher LM is shared and must be thread-safe. GEPA's `rollouts` field
+(`Parallel(GEPA.Run, limits)`) runs each minibatch and valset evaluation the
+same way, under the same `out` requirement. Golden tests check that concurrent
+SIMBA and GEPA (including merge) issue DSPy's exact multiset of requests and
+select DSPy's programs and scores.
 
 ## Native seeded evaluation campaigns
 
@@ -1391,8 +1402,7 @@ The following prevent a claim that DSZig can do everything DSPy can:
   BootstrapFinetune or bootstrap_trace_data. Native Parallel uses explicit typed
   tasks and contexts, not Python callback objects or ambient thread-local settings.
   Its startup capacities and cooperative join contract are described above.
-- **Optimizer execution and shared identity:** SIMBA and GEPA batch rollouts
-  run serially. InferRules' signature-alias propagation does not update arbitrary external
+- **Optimizer execution and shared identity:** InferRules' signature-alias propagation does not update arbitrary external
   instances outside the reachable program graph. Canonical Zig signature/Code
   types and default CoT construction do not reproduce every fresh dynamic Python
   class identity; Refine shares this boundary. Mid-bootstrap mutation of a
