@@ -434,8 +434,12 @@ fn borrowedFieldValue(arena: Allocator, comptime T: type, input: *const T) Alloc
     {
         return input.borrowedRuntime();
     }
+    // Scalar wrappers and raw Value may retain a caller-owned runtime box.
+    // The prepared prediction borrows it just like the typed models above.
+    const result = try toValue(arena, T, input.*);
+    if (result == .custom) return .{ .custom = result.custom.borrowed() };
     // Other containers retain their existing codec and scratch ownership.
-    return toValue(arena, T, input.*);
+    return result;
 }
 
 pub fn toValue(arena: Allocator, comptime T: type, v: T) Allocator.Error!Value {

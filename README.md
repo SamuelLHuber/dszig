@@ -592,6 +592,12 @@ must not alias program inputs or outputs. Both the typed output slot and its
 borrowed children must remain alive until the prediction is discarded or
 reused. Evaluation and bootstrap reserve their typed slots before their loops.
 
+Prepared output records also borrow runtime boxes retained by scalar wrappers
+(including Decimal) and raw `Value` fields. Releasing those borrowed handles
+cannot destroy the caller's scalar object; cloning still produces an
+independently owned box and data. This does not change nested container
+allocation or aliasing limits.
+
 Direct Code, BoundingBox, Reasoning, File, Citation, Citations and decision
 fields, including optional fields, borrow those typed slots instead of
 allocating model boxes. Nominal class identity, projected specializations and

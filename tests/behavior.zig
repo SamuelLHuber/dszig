@@ -390,6 +390,47 @@ test "cloned borrowed model fields own their data after frame and source destruc
     try testing.expect(clones[6].get(dszig.decision.Noul).?.value);
 }
 
+test "prepared Decimal and raw scalar outputs borrow boxes while clones retain ownership" {
+    const Fields = struct {
+        amount: dszig.Decimal,
+        optional: ?dszig.Decimal,
+        raw: dszig.Value,
+    };
+    var source: std.heap.ArenaAllocator = .init(testing.allocator);
+    var source_live = true;
+    defer if (source_live) source.deinit();
+    const original = try dszig.Decimal.coerce(source.allocator(), .{ .string = "12.50" });
+    var fields: Fields = .{ .amount = original, .optional = original, .raw = original.value };
+    var storage: dszig.value.RecordStorage(3) = undefined;
+    try storage.init();
+    try dszig.value.toRecordInto(testing.failing_allocator, Fields, &fields, &storage.record);
+    var clones: [3]dszig.runtime_value.Custom = undefined;
+    var count: usize = 0;
+    defer for (clones[0..count]) |clone| clone.deinit(testing.allocator);
+    for (storage.record.values()) |item| {
+        try testing.expect(!item.custom.owns_box);
+        try testing.expect(!item.custom.owns_data);
+        clones[count] = try item.custom.clone(testing.allocator);
+        count += 1;
+        item.custom.deinit(testing.failing_allocator);
+    }
+    const decimal = dszig.python_value.view(original.value).?.decimal;
+    try testing.expectEqualStrings("1250", decimal.digits);
+    // Reuse the frame and clear an optional without touching retained clones.
+    fields.optional = null;
+    try dszig.value.toRecordInto(testing.failing_allocator, Fields, &fields, &storage.record);
+    try testing.expect(storage.record.get("optional").? == .null);
+    source.deinit();
+    source_live = false;
+    for (clones) |clone| {
+        try testing.expect(clone.owns_box);
+        try testing.expect(clone.owns_data);
+        const retained = dszig.python_value.view(.{ .custom = clone }).?.decimal;
+        try testing.expectEqualStrings("1250", retained.digits);
+        try testing.expectEqual(@as(i64, -2), retained.exponent);
+    }
+}
+
 test "prepared native output storage supports indexed fields and reuse" {
     const P = struct {
         pub const Input = struct { number: i64 };
