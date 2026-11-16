@@ -275,7 +275,8 @@ pub fn Parallel(comptime Result: type, comptime limits: Limits) type {
             // Persistent lifecycle loop: only deinit ends a worker. Each callback
             // and each queue are independently bounded by the caller's contract.
             while (self.live) {
-                const id = self.scheduler.start(now(self.io)) orelse {
+                const timed = self.scheduler.options.straggler_timeout_ns != 0;
+                const id = self.scheduler.start(if (timed) now(self.io) else 0) orelse {
                     self.work.waitUncancelable(self.io, &self.mutex);
                     continue;
                 };
@@ -288,7 +289,9 @@ pub fn Parallel(comptime Result: type, comptime limits: Limits) type {
                     .worker_index = worker_index,
                     .cancellation = .{ .flag = &self.cancellation },
                 };
-                self.changed.signal(self.io);
+                // Without speculative deadlines, the owner only needs the
+                // terminal decision, not two wakeups for every short task.
+                if (timed) self.changed.signal(self.io);
                 self.mutex.unlock(self.io);
                 const failure: ?anyerror = if (task.invoke(task.ptr, attempt, &self.outputs[id]))
                     null
@@ -296,8 +299,11 @@ pub fn Parallel(comptime Result: type, comptime limits: Limits) type {
                     err;
                 self.mutex.lockUncancelable(self.io);
                 self.scheduler.complete(id, failure);
-                if (self.scheduler.terminal != .running) self.cancellation.store(true, .release);
-                self.changed.signal(self.io);
+                if (self.scheduler.terminal != .running) {
+                    self.cancellation.store(true, .release);
+                    // Includes late completions needed by the join barrier.
+                    self.changed.signal(self.io);
+                } else if (timed) self.changed.signal(self.io);
             }
             assert(!self.live);
         }

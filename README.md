@@ -1113,6 +1113,19 @@ whole-runtime allocation/performance proof. The ordinary test suite also exercis
 actual concurrent typed Predict with separate scripted LMs and scratch, joined
 stragglers/cancellation, and seeded scheduling properties.
 
+With speculative retries disabled (`straggler_timeout_ns = 0`), workers avoid
+per-task clock reads and notify the owner only on a terminal decision or a late
+completion needed by the join barrier. Timed runs retain start/completion
+notifications so retry deadlines are recalculated.
+
+A local ReleaseSafe A/B of `examples/parallel.zig` used 20 interleaved runs per
+binary, each checking 8,192 results against serial execution. Median pool time
+fell from 20.54 ms to 15.19 ms; serial medians were 43.63 ms and 43.49 ms.
+Both versions retained the same checksum, zero scratch bytes and zero LM calls.
+This is a short CPU-workload observation, not a general throughput or tail-latency
+guarantee: the candidate's slowest sample was 54.84 ms versus 24.70 ms for the
+baseline, on a non-isolated workstation.
+
 `parallel.Evaluator(P, limits)` is the native counterpart of
 `dspy.Evaluate(num_threads=...)`. After initialization, set `failure_score`
 (default zero) to score recoverable program or metric failures; error-budget
