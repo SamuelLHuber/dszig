@@ -380,13 +380,15 @@ pub fn toRecord(arena: Allocator, comptime T: type, value: T) Allocator.Error!Re
     var record: Record = .empty;
     errdefer record.deinit(arena);
     try record.ensureTotalCapacity(arena, @typeInfo(T).@"struct".field_names.len);
-    try toRecordInto(arena, T, &value, &record);
+    try toRecordFields(arena, T, &value, &record, false);
     return record;
 }
 
 /// Replace a prepared record without allocating its outer dictionary. The caller
 /// owns its backing and must provision at least T's field count before execution.
 /// Values may allocate in arena and must not alias the dictionary being replaced.
+/// Direct model fields (including optionals) borrow input's stable typed slots;
+/// input and its children must remain alive and unmoved until record reuse.
 /// Failure leaves the record empty; nested scratch still belongs to arena.
 pub fn toRecordInto(
     arena: Allocator,
@@ -394,14 +396,46 @@ pub fn toRecordInto(
     input: *const T,
     record: *Record,
 ) Allocator.Error!void {
+    return toRecordFields(arena, T, input, record, true);
+}
+
+fn toRecordFields(
+    arena: Allocator,
+    comptime T: type,
+    input: *const T,
+    record: *Record,
+    comptime borrow_models: bool,
+) Allocator.Error!void {
     const fields = @typeInfo(T).@"struct";
     std.debug.assert(record.capacity() >= fields.field_names.len);
     record.clearRetainingCapacity();
     errdefer record.clearRetainingCapacity();
     inline for (fields.field_names) |name| {
-        record.putAssumeCapacity(name, try toValue(arena, @TypeOf(@field(input.*, name)), @field(input.*, name)));
+        const FieldType = @TypeOf(@field(input.*, name));
+        const item = if (comptime borrow_models)
+            try borrowedFieldValue(arena, FieldType, &@field(input.*, name))
+        else
+            try toValue(arena, FieldType, @field(input.*, name));
+        record.putAssumeCapacity(name, item);
     }
     std.debug.assert(record.count() == fields.field_names.len);
+}
+
+fn borrowedFieldValue(arena: Allocator, comptime T: type, input: *const T) Allocator.Error!Value {
+    if (comptime @typeInfo(T) == .optional) {
+        return if (input.*) |*child|
+            borrowedFieldValue(arena, @typeInfo(T).optional.child, child)
+        else
+            .null;
+    }
+    if (comptime code.isCode(T) or decision.isDecision(T) or citation.isCitation(T) or
+        T == @import("file.zig").File or T == @import("bounding_box.zig").BoundingBox or
+        T == signature.Reasoning)
+    {
+        return input.borrowedRuntime();
+    }
+    // Other containers retain their existing codec and scratch ownership.
+    return toValue(arena, T, input.*);
 }
 
 pub fn toValue(arena: Allocator, comptime T: type, v: T) Allocator.Error!Value {

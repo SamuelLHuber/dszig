@@ -94,6 +94,15 @@ pub const BoundingBox = struct {
         return .{ .custom = .{ .ptr = boxed, .vtable = &runtime_vtable } };
     }
 
+    /// The caller retains the typed slot for the lifetime of the returned handle.
+    pub fn borrowedRuntime(self: *const BoundingBox) Value {
+        return .{ .custom = .{
+            .ptr = self,
+            .vtable = &runtime_vtable,
+            .owns_box = false,
+        } };
+    }
+
     const runtime_vtable: runtime.CustomVTable = .{
         .type_name = @typeName(BoundingBox),
         .type_identity = runtime.typeIdentity(BoundingBox),

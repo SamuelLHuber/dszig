@@ -584,20 +584,32 @@ unchanged. SIMBA and GEPA retain predictions, so those paths still materialize
 separate outer dictionaries rather than aliasing reusable storage.
 
 For explicit startup preparation, initialize `value.RecordStorage(field_count)`
-**in place and do not move it**, then pass `&storage.record` to
-`optimize.runProgramInto(P, ctx, program, example, prediction)`. The record must
-have capacity for every declared output field. Its backing must not alias
-program inputs or outputs. Values retain their existing borrowed/scratch
-lifetimes, and reuse invalidates the previous prediction. Any input, program
-or conversion failure leaves the prepared record empty, including a conversion
-failure after earlier fields were written. Metrics keep the ordinary `Record`
+**in place and do not move it**, and reserve a stable `P.Output` slot. Call
+`optimize.runProgramInto(P, ctx, program, example, &output, &storage.record)`.
+The record must have capacity for every declared output field. Its backing
+must not alias program inputs or outputs. Both the typed output slot and its
+borrowed children must remain alive until the prediction is discarded or
+reused. Evaluation and bootstrap reserve their typed slots before their loops.
+
+Direct Code, BoundingBox, Reasoning, File, Citation, Citations and decision
+fields, including optional fields, borrow those typed slots instead of
+allocating model boxes. Nominal class identity, projected specializations and
+class-specific serializers remain intact. Borrowed runtime handles own neither
+their boxes nor their children; releasing a handle cannot destroy the typed
+slot. Cloning still invokes the original class's owning clone protocol.
+
+Reuse invalidates the previous prediction. Any input, program or conversion
+failure leaves the prepared record empty, including a conversion failure
+after earlier fields were written. Metrics keep the ordinary `Record`
 interface, including mutation of existing values through `getPtr`.
 
 `optimize.runProgram` remains the materialization API for separately retained
 outer dictionaries; both execution paths share input decoding and field codecs.
 Use `value.cloneRecord` with an appropriate owning lifetime when retaining
-borrowed nested values beyond their source lifetime. Nested conversions,
-retained predictions, program execution and metrics can still allocate.
+borrowed model or nested values beyond their source lifetime; copying only
+the outer dictionary does not extend a borrowed model's lifetime.
+Nested container conversions, retained predictions, program execution and
+metrics can still allocate.
 This is not a whole-runtime allocator-free proof.
 
 `optimize.Metric` and GEPA feedback callbacks can return `ParseValue` or

@@ -135,6 +135,16 @@ fn CodeType(comptime language_name: []const u8, comptime is_default: bool, compt
             return .{ .custom = .{ .ptr = boxed, .vtable = &runtime_vtable } };
         }
 
+        /// Borrow a stable typed slot without erasing a projected specialization.
+        pub fn borrowedRuntime(self: *const Self) Value {
+            if (self.runtime_origin) |origin| return .{ .custom = origin.borrowed() };
+            return .{ .custom = .{
+                .ptr = self,
+                .vtable = &runtime_vtable,
+                .owns_box = false,
+            } };
+        }
+
         pub fn writeStr(self: Self, writer: *Writer) runtime.CustomWriteError!void {
             if (self.runtime_origin) |origin| return origin.writeStr(writer);
             try writer.writeAll("code=");

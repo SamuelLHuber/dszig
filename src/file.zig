@@ -212,6 +212,15 @@ pub const File = struct {
         return .{ .custom = .{ .ptr = boxed, .vtable = &runtime_vtable } };
     }
 
+    /// Borrow the typed slot; cloning the handle still owns an independent File.
+    pub fn borrowedRuntime(self: *const File) Value {
+        return .{ .custom = .{
+            .ptr = self,
+            .vtable = &runtime_vtable,
+            .owns_box = false,
+        } };
+    }
+
     const runtime_vtable: runtime.CustomVTable = .{
         .type_name = @typeName(File),
         .type_identity = runtime.typeIdentity(File),

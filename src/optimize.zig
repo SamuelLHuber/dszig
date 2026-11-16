@@ -72,6 +72,7 @@ pub fn evaluate(
     // per-example backing budget. Retained optimizer runs use runProgram.
     var storage: value.RecordStorage(@typeInfo(P.Output).@"struct".field_names.len) = undefined;
     try storage.init();
+    var output: P.Output = undefined;
     var sum: f64 = 0;
     var errors: usize = 0;
     for (devset) |*example| {
@@ -80,7 +81,7 @@ pub fn evaluate(
         var c = ctx;
         c.arena = scratch.allocator();
         c.trace = null;
-        const score: anyerror!f64 = if (runProgramInto(P, c, program, example, &storage.record))
+        const score: anyerror!f64 = if (runProgramInto(P, c, program, example, &output, &storage.record))
             metric(c.arena, example, &storage.record, null)
         else |err|
             err;
@@ -124,19 +125,21 @@ pub fn runProgram(comptime P: type, ctx: Context, program: *const P, example: *c
 /// Execute into caller-provisioned outer storage. Values borrow program output
 /// or ctx.arena until its reset; callers must copy any result they retain across
 /// reuse. Input/program failure also clears stale predictions.
+/// output must remain alive and unmoved until prediction is discarded or reused.
 pub fn runProgramInto(
     comptime P: type,
     ctx: Context,
     program: *const P,
     example: *const Example,
+    output: *P.Output,
     prediction: *Record,
 ) !void {
     assert(prediction.capacity() >= @typeInfo(P.Output).@"struct".field_names.len);
-    const output = forwardProgram(P, ctx, program, example) catch |err| {
+    output.* = forwardProgram(P, ctx, program, example) catch |err| {
         prediction.clearRetainingCapacity();
         return err;
     };
-    try value.toRecordInto(ctx.arena, P.Output, &output, prediction);
+    try value.toRecordInto(ctx.arena, P.Output, output, prediction);
 }
 
 fn forwardProgram(comptime P: type, ctx: Context, program: *const P, example: *const Example) !P.Output {
@@ -259,13 +262,14 @@ pub const BootstrapFewShot = struct {
         var errors: usize = 0;
         var storage: value.RecordStorage(@typeInfo(P.Output).@"struct".field_names.len) = undefined;
         try storage.init();
+        var output: P.Output = undefined;
 
         for (trainset, 0..) |*example, example_idx| {
             if (n_bootstrapped >= self.max_bootstrapped_demos) break;
             var round_idx: usize = 0;
             while (round_idx < self.max_rounds) : (round_idx += 1) {
                 attempts += 1;
-                const ok = try self.bootstrapOne(P, out, gpa, ctx, &teacher, teacher_preds, example, round_idx, name2traces, &errors, &storage.record);
+                const ok = try self.bootstrapOne(P, out, gpa, ctx, &teacher, teacher_preds, example, round_idx, name2traces, &errors, &output, &storage.record);
                 if (ok) {
                     bootstrapped[example_idx] = true;
                     n_bootstrapped += 1;
@@ -310,6 +314,7 @@ pub const BootstrapFewShot = struct {
         round_idx: usize,
         name2traces: []std.ArrayList(Record),
         errors: *usize,
+        output: *P.Output,
         prediction: *Record,
     ) !bool {
         var scratch: std.heap.ArenaAllocator = .init(gpa);
@@ -338,7 +343,7 @@ pub const BootstrapFewShot = struct {
                 }
                 p.param.predict.demos = kept.items;
             }
-            break :blk runProgramInto(P, c, teacher, example, prediction);
+            break :blk runProgramInto(P, c, teacher, example, output, prediction);
         };
         const success: anyerror!bool = if (run) metric_result: {
             if (self.metric) |metric| {

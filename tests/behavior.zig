@@ -155,9 +155,10 @@ test "prepared native predictions preserve mutable metrics and retained results"
     var unused: dszig.lm.ScriptedLM = .{ .responses = &.{} };
     const ctx: dszig.Context = .{ .arena = testing.failing_allocator, .lm = unused.lm() };
     const program: P = .{};
+    var output: P.Output = undefined;
 
     // The actual runner must use only provisioned outer storage for scalar fields.
-    try dszig.optimize.runProgramInto(P, ctx, &program, &example, &prediction);
+    try dszig.optimize.runProgramInto(P, ctx, &program, &example, &output, &prediction);
     try testing.expectEqual(@as(i64, 21), prediction.get("answer").?.integer);
     try testing.expectEqualStrings("abc", prediction.get("echo").?.string);
     const retained = try dszig.optimize.runProgram(
@@ -173,7 +174,7 @@ test "prepared native predictions preserve mutable metrics and retained results"
 
     try example.record.put(arena, "number", .{ .integer = 8 });
     try example.record.put(arena, "text", .{ .string = "xy" });
-    try dszig.optimize.runProgramInto(P, ctx, &program, &example, &prediction);
+    try dszig.optimize.runProgramInto(P, ctx, &program, &example, &output, &prediction);
     try testing.expectEqual(@as(i64, 16), prediction.get("answer").?.integer);
     try testing.expectEqualStrings("xy", prediction.get("echo").?.string);
     try testing.expectEqual(@as(i64, 21), retained.get("answer").?.integer);
@@ -201,15 +202,16 @@ test "prepared prediction failures clear stale records and partial conversions" 
     var unused: dszig.lm.ScriptedLM = .{ .responses = &.{} };
     const ctx: dszig.Context = .{ .arena = testing.failing_allocator, .lm = unused.lm() };
     const program: P = .{};
+    var output: P.Output = undefined;
 
-    try dszig.optimize.runProgramInto(P, ctx, &program, &example, &prediction);
+    try dszig.optimize.runProgramInto(P, ctx, &program, &example, &output, &prediction);
     try example.record.put(arena, "number", .{ .bool = true });
-    try testing.expectError(error.TypeMismatch, dszig.optimize.runProgramInto(P, ctx, &program, &example, &prediction));
+    try testing.expectError(error.TypeMismatch, dszig.optimize.runProgramInto(P, ctx, &program, &example, &output, &prediction));
     try testing.expectEqual(@as(usize, 0), prediction.count());
     try example.record.put(arena, "number", .{ .integer = 7 });
-    try dszig.optimize.runProgramInto(P, ctx, &program, &example, &prediction);
+    try dszig.optimize.runProgramInto(P, ctx, &program, &example, &output, &prediction);
     try example.record.put(arena, "number", .{ .integer = -1 });
-    try testing.expectError(error.LMFailure, dszig.optimize.runProgramInto(P, ctx, &program, &example, &prediction));
+    try testing.expectError(error.LMFailure, dszig.optimize.runProgramInto(P, ctx, &program, &example, &output, &prediction));
     try testing.expectEqual(@as(usize, 0), prediction.count());
 
     // A later conversion failure must discard already-written earlier fields.
@@ -222,8 +224,170 @@ test "prepared prediction failures clear stale records and partial conversions" 
     ));
     try testing.expectEqual(@as(usize, 0), prediction.count());
     try example.record.put(arena, "number", .{ .integer = 8 });
-    try dszig.optimize.runProgramInto(P, ctx, &program, &example, &prediction);
+    try dszig.optimize.runProgramInto(P, ctx, &program, &example, &output, &prediction);
     try testing.expectEqual(@as(i64, 16), prediction.get("answer").?.integer);
+}
+
+test "Evaluate borrows stable native model outputs without allocating boxes" {
+    const P = struct {
+        pub const Input = struct { number: i64, text: []const u8 };
+        pub const Output = struct {
+            code: dszig.Code,
+            reasoning: dszig.Reasoning,
+            file: dszig.File,
+            box: dszig.BoundingBox,
+            citations: dszig.Citations,
+            citation: dszig.Citations.Citation,
+            decision: dszig.decision.Noul,
+            optional_code: ?dszig.Code,
+            absent_code: ?dszig.Code,
+        };
+
+        pub fn forward(_: *const @This(), _: dszig.Context, input: Input) !Output {
+            return .{
+                .code = .init(input.text),
+                .reasoning = .{ .content = input.text },
+                .file = .{ .file_id = input.text },
+                .box = .{
+                    .top = @as(f64, @floatFromInt(input.number)) / 100,
+                    .bottom = 1,
+                    .left = 0,
+                    .right = 1,
+                },
+                .citations = .{ .citations = &.{} },
+                .citation = .{ .cited_text = input.text },
+                .decision = .{ .confidence = 1, .value = input.number > 0 },
+                .optional_code = if (input.number == 7) .init(input.text) else null,
+                .absent_code = null,
+            };
+        }
+
+        fn metric(arena: Allocator, example: *const dszig.Example, prediction: ?*const dszig.value.Record, _: ?*const dszig.Trace) dszig.value.ParseError!f64 {
+            const record = prediction orelse return error.ParseValue;
+            const text = example.record.get("text").?.string;
+            if (!std.mem.eql(u8, text, record.get("code").?.custom.get(dszig.Code).?.code)) return 0;
+            if (!std.mem.eql(u8, text, record.get("reasoning").?.custom.get(dszig.Reasoning).?.content)) return 0;
+            if (!std.mem.eql(u8, text, record.get("file").?.custom.get(dszig.File).?.file_id.?)) return 0;
+            const top = @as(f64, @floatFromInt(example.record.get("number").?.integer)) / 100;
+            if (top != record.get("box").?.custom.get(dszig.BoundingBox).?.top) return 0;
+            if (record.get("citations").?.custom.get(dszig.Citations).?.citations.len != 0) return 0;
+            if (!std.mem.eql(u8, text, record.get("citation").?.custom.get(dszig.Citations.Citation).?.cited_text)) return 0;
+            if (!record.get("decision").?.custom.get(dszig.decision.Noul).?.value) return 0;
+            const optional = record.get("optional_code").?;
+            if (example.record.get("number").?.integer == 7) {
+                if (!std.mem.eql(u8, text, optional.custom.get(dszig.Code).?.code)) return 0;
+            } else if (optional != .null) return 0;
+            if (record.get("absent_code").? != .null) return 0;
+            // A metric may release a borrowed handle, but cannot destroy its frame.
+            for (record.values()) |item| {
+                if (item == .custom) item.custom.deinit(arena);
+            }
+            if (!std.mem.eql(u8, text, record.get("code").?.custom.get(dszig.Code).?.code)) return 0;
+            return 1;
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const examples = [_]dszig.Example{
+        try dszig.Example.fromJson(memory.allocator(), "{\"number\":7,\"text\":\"first\"}", &.{ "number", "text" }),
+        try dszig.Example.fromJson(memory.allocator(), "{\"number\":21,\"text\":\"second\"}", &.{ "number", "text" }),
+    };
+    var unused: dszig.lm.ScriptedLM = .{ .responses = &.{} };
+    const program: P = .{};
+    const result = try dszig.optimize.evaluate(
+        P,
+        testing.failing_allocator,
+        .{ .arena = testing.failing_allocator, .lm = unused.lm() },
+        &program,
+        &examples,
+        P.metric,
+        1,
+    );
+    try testing.expectEqual(@as(f64, 100), result.score);
+    try testing.expectEqual(@as(usize, 0), result.errors);
+}
+
+test "borrowed model clones survive typed slot reuse and preserve projected classes" {
+    const Java = dszig.CodeWithLanguage("java");
+    var source: std.heap.ArenaAllocator = .init(testing.allocator);
+    const text = try source.allocator().dupe(u8, "first");
+    const original = try Java.init(text).toRuntime(source.allocator());
+    var projected = try dszig.Code.fromValue(original);
+    const borrowed = projected.borrowedRuntime();
+    const owned = try borrowed.custom.clone(testing.allocator);
+    defer owned.deinit(testing.allocator);
+
+    try testing.expect(!borrowed.custom.owns_box);
+    try testing.expectEqual(original.custom.ptr, borrowed.custom.ptr);
+    try testing.expectEqualStrings("java", borrowed.custom.vtable.code.?.language);
+    borrowed.custom.deinit(testing.failing_allocator);
+    // The borrowed projection cannot destroy the original specialized object.
+    try testing.expectEqualStrings("first", original.custom.get(Java).?.code);
+    @memcpy(text, "other");
+    projected = .init("replacement");
+    source.deinit();
+
+    try testing.expectEqualStrings("java", owned.vtable.code.?.language);
+    try testing.expectEqualStrings("first", owned.get(Java).?.code);
+    try testing.expect(owned.get(dszig.Code) == null);
+    try testing.expect(owned.owns_box);
+    try testing.expect(owned.owns_data);
+}
+
+test "cloned borrowed model fields own their data after frame and source destruction" {
+    const Models = struct {
+        code: dszig.Code,
+        reasoning: dszig.Reasoning,
+        file: dszig.File,
+        box: dszig.BoundingBox,
+        citation: dszig.Citations.Citation,
+        citations: dszig.Citations,
+        decision: dszig.decision.Noul,
+    };
+    var source: std.heap.ArenaAllocator = .init(testing.allocator);
+    var source_live = true;
+    defer if (source_live) source.deinit();
+    const text = try source.allocator().dupe(u8, "source");
+    var children = [_]dszig.Citations.Citation{.{ .cited_text = text }};
+    var models: Models = .{
+        .code = .init(text),
+        .reasoning = .{ .content = text },
+        .file = .{ .file_id = text },
+        .box = .{ .top = 0, .bottom = 1, .left = 0, .right = 1 },
+        .citation = .{ .cited_text = text },
+        .citations = .{ .citations = &children },
+        .decision = .{ .confidence = 1, .value = true },
+    };
+    var storage: dszig.value.RecordStorage(7) = undefined;
+    try storage.init();
+    try dszig.value.toRecordInto(testing.failing_allocator, Models, &models, &storage.record);
+    var clones: [7]dszig.runtime_value.Custom = undefined;
+    var initialized: usize = 0;
+    defer for (clones[0..initialized]) |item| item.deinit(testing.allocator);
+    for (storage.record.values(), &clones) |item, *clone| {
+        clone.* = try item.custom.clone(testing.allocator);
+        initialized += 1;
+        item.custom.deinit(testing.failing_allocator);
+    }
+
+    models.code = .init("changed");
+    models.reasoning.content = "changed";
+    models.file.file_id = "changed";
+    models.box.top = 0.25;
+    models.citation.cited_text = "changed";
+    children[0].cited_text = "changed";
+    models.decision.value = false;
+    @memset(text, 'x');
+    source.deinit();
+    source_live = false;
+
+    try testing.expectEqualStrings("source", clones[0].get(dszig.Code).?.code);
+    try testing.expectEqualStrings("source", clones[1].get(dszig.Reasoning).?.content);
+    try testing.expectEqualStrings("source", clones[2].get(dszig.File).?.file_id.?);
+    try testing.expectEqual(@as(f64, 0), clones[3].get(dszig.BoundingBox).?.top);
+    try testing.expectEqualStrings("source", clones[4].get(dszig.Citations.Citation).?.cited_text);
+    try testing.expectEqualStrings("source", clones[5].get(dszig.Citations).?.citations[0].cited_text);
+    try testing.expect(clones[6].get(dszig.decision.Noul).?.value);
 }
 
 test "prepared native output storage supports indexed fields and reuse" {
@@ -258,13 +422,14 @@ test "prepared native output storage supports indexed fields and reuse" {
     var unused: dszig.lm.ScriptedLM = .{ .responses = &.{} };
     const ctx: dszig.Context = .{ .arena = testing.failing_allocator, .lm = unused.lm() };
     const program: P = .{};
+    var output: P.Output = undefined;
 
-    try dszig.optimize.runProgramInto(P, ctx, &program, &example, &storage.record);
+    try dszig.optimize.runProgramInto(P, ctx, &program, &example, &output, &storage.record);
     try testing.expectEqual(@as(i64, 21), storage.record.get("a").?.integer);
     try testing.expectEqual(@as(i64, 29), storage.record.get("i").?.integer);
     try testing.expectEqual(@as(usize, 9), storage.record.count());
     try example.record.put(arena, "number", .{ .integer = -21 });
-    try dszig.optimize.runProgramInto(P, ctx, &program, &example, &storage.record);
+    try dszig.optimize.runProgramInto(P, ctx, &program, &example, &output, &storage.record);
     try testing.expectEqual(@as(i64, -21), storage.record.get("a").?.integer);
     try testing.expectEqual(@as(i64, -13), storage.record.get("i").?.integer);
 }
