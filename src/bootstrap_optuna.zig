@@ -2,8 +2,8 @@
 //! independent integer TPE (not categorical/multivariate search).
 //!
 //! `compile` requires explicit I/O. A null seed obtains real entropy lazily;
-//! set a seed only for reproducible experiments. Native evaluation is serial:
-//! num_threads=null/1 is supported, any other explicit value is rejected.
+//! set a seed only for reproducible experiments. DSPy `num_threads` maps to
+//! `concurrent_evaluation` (a bound `parallel.Evaluator`); null is serial.
 //! Integer-TPE numerical parity remains incomplete: see `tpe_int.zig` for the
 //! known logarithm-rounding discrepancy that can change a selected candidate.
 //!
@@ -58,7 +58,7 @@ pub const BootstrapFewShotWithOptuna = struct {
     max_labeled_demos: usize = 16,
     max_rounds: usize = 1,
     num_candidate_programs: usize = 16,
-    num_threads: ?usize = null,
+    concurrent_evaluation: ?optimize.ConcurrentEvaluation = null,
     /// Native counterpart of DSPy settings.max_errors, for bootstrap/evaluate.
     max_errors: usize = 10,
     seed: ?u32 = null,
@@ -99,7 +99,6 @@ pub const BootstrapFewShotWithOptuna = struct {
         trainset: []const Example,
         valset: ?[]const Example,
     ) !Result(P) {
-        if (self.num_threads) |threads| if (threads != 1) return error.UnsupportedNumThreads;
         var workspace: std.heap.ArenaAllocator = .init(gpa);
         defer workspace.deinit();
         const arena = workspace.allocator();
@@ -155,7 +154,7 @@ pub const BootstrapFewShotWithOptuna = struct {
             }
             // No catch-and-continue: study.optimize's default catch=() aborts
             // on objective exceptions, including a later failed candidate.
-            const evaluation = try optimize.evaluate(P, gpa, ctx, &program, val, self.metric, self.max_errors);
+            const evaluation = try optimize.evaluateWith(P, self.concurrent_evaluation, gpa, ctx, &program, val, self.metric, self.max_errors);
             const failed = std.math.isNan(evaluation.score);
             const state: tpe.State = if (failed) .fail else .complete;
             trial.* = .{ .number = number, .program = program, .params = saved, .score = if (failed) null else evaluation.score, .state = state };
@@ -313,7 +312,6 @@ test "BootstrapOptuna selects one demo in predictor order and retains every tria
         .max_bootstrapped_demos = 99,
         .max_labeled_demos = 5,
         .num_candidate_programs = 20,
-        .num_threads = 1,
     };
     const result = try optimizer.compile(TestProgram, out.allocator(), testing.allocator, testing.io, ctx, student, null, 3, trainset, valset);
     try testing.expect(try value.recordEqual(&original, &student.z.state.demos[0]));
@@ -454,9 +452,6 @@ test "BootstrapOptuna source errors precede study lookup and NaN never wins" {
     try testing.expectError(error.InvalidBounds, empty_demos.compile(TestProgram, arena, testing.allocator, testing.io, ctx, .{}, null, 0, trainset, null));
     const nan_optimizer: BootstrapFewShotWithOptuna = .{ .metric = nanMetric, .seed = 9, .num_candidate_programs = 3 };
     try testing.expectError(error.NoCompletedTrials, nan_optimizer.compile(TestProgram, arena, testing.allocator, testing.io, ctx, .{}, null, 3, trainset, null));
-    var unsupported = optimizer;
-    unsupported.num_threads = 2;
-    try testing.expectError(error.UnsupportedNumThreads, unsupported.compile(TestProgram, arena, testing.allocator, testing.io, ctx, .{}, null, 3, trainset, null));
 }
 
 test "BootstrapOptuna catches individual evaluation failures but never swallows an aborted later trial" {

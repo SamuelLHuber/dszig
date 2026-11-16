@@ -97,6 +97,38 @@ pub fn evaluate(
     return summarize(sum, devset.len, errors);
 }
 
+/// Optimizer counterpart of DSPy `num_threads`: a startup-created
+/// `parallel.Evaluator` bound to one program type, per-attempt contexts and
+/// options (see `parallel.Evaluator.concurrent`). null keeps serial `evaluate`.
+pub const ConcurrentEvaluation = struct {
+    ptr: *anyopaque,
+    program_type: []const u8,
+    run: *const fn (
+        ptr: *anyopaque,
+        program: *const anyopaque,
+        devset: []const Example,
+        metric: Metric,
+        max_errors: usize,
+    ) anyerror!Evaluation,
+};
+
+/// Evaluate serially or with the configured concurrent evaluator. The
+/// concurrent path replaces ctx with its own bound per-attempt contexts.
+pub fn evaluateWith(
+    comptime P: type,
+    concurrent: ?ConcurrentEvaluation,
+    gpa: Allocator,
+    ctx: Context,
+    program: *const P,
+    devset: []const Example,
+    metric: Metric,
+    max_errors: usize,
+) !Evaluation {
+    const bound = concurrent orelse return evaluate(P, gpa, ctx, program, devset, metric, max_errors);
+    if (!std.mem.eql(u8, bound.program_type, @typeName(P))) return error.ProgramTypeMismatch;
+    return bound.run(bound.ptr, program, devset, metric, max_errors);
+}
+
 /// Report an ordered devset score sum as `dspy.Evaluate` does.
 pub fn summarize(sum: f64, total: usize, errors: usize) Evaluation {
     assert(total > 0);
@@ -418,6 +450,8 @@ pub const BootstrapFewShotWithRandomSearch = struct {
     num_candidate_programs: usize = 16,
     max_errors: usize = 10,
     stop_at_score: ?f64 = null,
+    /// DSPy `num_threads`; null evaluates candidates serially.
+    concurrent_evaluation: ?ConcurrentEvaluation = null,
     teacher_settings: TeacherSettings = .{},
 
     pub const Candidate = struct { seed: i64, score: f64 };
@@ -456,7 +490,7 @@ pub const BootstrapFewShotWithRandomSearch = struct {
             var kept = false;
             defer if (!kept) arena_state.deinit();
             const program = try self.candidate(P, arena_state.allocator(), gpa, ctx, student, teacher, trainset, seed);
-            const result = try evaluate(P, gpa, ctx, &program, val, self.metric, self.max_errors);
+            const result = try evaluateWith(P, self.concurrent_evaluation, gpa, ctx, &program, val, self.metric, self.max_errors);
             if (count == 0 or result.score > best_score) {
                 best_score = result.score;
                 if (best_arena) |*a| a.deinit();

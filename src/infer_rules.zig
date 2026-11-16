@@ -11,9 +11,9 @@
 //! Other live instances outside that graph cannot share instructions without a
 //! general shared-signature storage API; this is an explicit parity boundary.
 //!
-//! `num_threads = null` uses the existing native sequential evaluator. Explicit
-//! values other than one fail at evaluation: exact DSPy threaded evaluation
-//! requires a general context-safe executor/metric API, not a fake thread option.
+//! DSPy `num_threads` maps to `concurrent_evaluation`, a bound startup-created
+//! `parallel.Evaluator`; null uses the native sequential evaluator. A missing
+//! metric fails every item either way, so that source path stays sequential.
 //! Generation LM errors erase provider exception types. Recoverable failures
 //! therefore require an explicit classifier backed by the provider's real error
 //! metadata; an opaque LMFailure is never assumed to be a context-window error.
@@ -107,8 +107,8 @@ pub const InferRules = struct {
         metric: ?optimize.Metric = null,
         num_candidates: isize = 10,
         num_rules: i64 = 10,
-        /// null deliberately retains the native sequential evaluator boundary.
-        num_threads: ?usize = null,
+        /// DSPy `num_threads`; null evaluates sequentially.
+        concurrent_evaluation: ?optimize.ConcurrentEvaluation = null,
         teacher_settings: optimize.TeacherSettings = .{},
         /// Bind an actual mutable settings object to model Python dictionary
         /// aliasing. The pointee must outlive this optimizer. Value settings are
@@ -128,7 +128,7 @@ pub const InferRules = struct {
     num_candidates: isize,
     /// Constructor input, not a live reconfiguration of the rules program.
     num_rules: i64,
-    num_threads: ?usize,
+    concurrent_evaluation: ?optimize.ConcurrentEvaluation,
     teacher_settings: optimize.TeacherSettings,
     teacher_settings_ref: ?*const optimize.TeacherSettings,
     metric_threshold: ?f64,
@@ -155,7 +155,7 @@ pub const InferRules = struct {
             .metric = options.metric,
             .num_candidates = options.num_candidates,
             .num_rules = options.num_rules,
-            .num_threads = options.num_threads,
+            .concurrent_evaluation = options.concurrent_evaluation,
             .teacher_settings = options.teacher_settings,
             .teacher_settings_ref = options.teacher_settings_ref,
             .metric_threshold = options.metric_threshold,
@@ -335,9 +335,8 @@ pub const InferRules = struct {
         // Evaluate checks this after induction, not at compile entry. Avoid the
         // existing sequential evaluator's nonempty-devset assertion.
         if (dataset.len == 0) return error.EmptyValidationSet;
-        if (self.num_threads) |threads| if (threads != 1) return error.ConcurrentEvaluationUnsupported;
         if (self.metric) |metric| {
-            return (try optimize.evaluate(P, gpa, ctx, program, dataset, metric, self.max_errors)).score;
+            return (try optimize.evaluateWith(P, self.concurrent_evaluation, gpa, ctx, program, dataset, metric, self.max_errors)).score;
         }
         // Source allows metric=None at construction. It still runs the program
         // for each example, then fails calling the missing metric; failed items
@@ -711,7 +710,6 @@ test "InferRules splits once bootstraps once snapshots resets strict ties and fi
         .metric = testMetric,
         .num_candidates = 3,
         .num_rules = 7,
-        .num_threads = 1,
         .max_bootstrapped_demos = 1,
         .max_labeled_demos = 0,
         .teacher_settings = .{ .lm = teacher_lm.lm(), .adapter = .xml },
@@ -776,7 +774,6 @@ test "InferRules eagerly captures persistent rules metadata settings binding and
         .metric = testMetric,
         .num_candidates = 1,
         .num_rules = 7,
-        .num_threads = 1,
         .max_bootstrapped_demos = 0,
         .max_labeled_demos = 0,
         .teacher_settings_ref = &original_settings,
@@ -832,7 +829,7 @@ test "InferRules distinct signature earlier winner retains identity but acquires
     var model: TestLM = .{ .state = &state };
     const ctx: Context = .{ .arena = a, .lm = model.lm() };
     var student: TestProgram = .{};
-    var optimizer = try InferRules.init(a, .{ .metric = testMetric, .num_candidates = 3, .num_threads = 1, .max_bootstrapped_demos = 0, .max_labeled_demos = 0 });
+    var optimizer = try InferRules.init(a, .{ .metric = testMetric, .num_candidates = 3, .max_bootstrapped_demos = 0, .max_labeled_demos = 0 });
     const result = try optimizer.compile(TestProgram, a, testing.allocator, ctx, &student, null, try testExamples(a, 2), try testExamples(a, 1));
     try testing.expectEqual(@as(?usize, 0), result.best_candidate);
     for (result.candidates, [_]f64{ 100, 0, 0 }) |candidate, score| try testing.expectEqual(score, candidate.score);
@@ -853,7 +850,7 @@ test "InferRules shared signature classes mutate caller teacher bootstrap and ea
     const ctx: Context = .{ .arena = a, .lm = model.lm() };
     var student: TestSharedProgram = .{};
     var teacher: TestSharedProgram = .{};
-    var optimizer = try InferRules.init(a, .{ .metric = testMetric, .num_candidates = 3, .num_threads = 1, .max_bootstrapped_demos = 0, .max_labeled_demos = 0 });
+    var optimizer = try InferRules.init(a, .{ .metric = testMetric, .num_candidates = 3, .max_bootstrapped_demos = 0, .max_labeled_demos = 0 });
     const result = try optimizer.compile(TestSharedProgram, a, testing.allocator, ctx, &student, &teacher, try testExamples(a, 2), try testExamples(a, 1));
     try testing.expectEqual(@as(?usize, 0), result.best_candidate);
     for (result.candidates, [_]f64{ 100, 0, 0 }, 0..) |candidate, score, index| {
@@ -878,7 +875,7 @@ test "InferRules second induction failure retains precisely the preceding source
         var model: TestLM = .{ .state = &state };
         const ctx: Context = .{ .arena = a, .lm = model.lm() };
         var student: P = .{};
-        var optimizer = try InferRules.init(a, .{ .metric = testMetric, .num_candidates = 2, .num_threads = 1, .max_bootstrapped_demos = 0, .max_labeled_demos = 0 });
+        var optimizer = try InferRules.init(a, .{ .metric = testMetric, .num_candidates = 2, .max_bootstrapped_demos = 0, .max_labeled_demos = 0 });
         try testing.expectError(error.UnacceptedRulesInductionFailure, optimizer.compile(P, a, testing.allocator, ctx, &student, null, try testExamples(a, 2), try testExamples(a, 1)));
         try testing.expectEqual(@as(usize, 2), state.history.requests.items.len);
         try testing.expectEqual(@as(usize, 1), state.induction_count);
@@ -1002,7 +999,7 @@ test "InferRules only classified source errors shrink the final training example
     }
 }
 
-test "InferRules missing metric runs prediction before evaluation errors and threads never silently pretend concurrency" {
+test "InferRules missing metric runs prediction before evaluation errors" {
     var memory: std.heap.ArenaAllocator = .init(testing.allocator);
     defer memory.deinit();
     const a = memory.allocator();
@@ -1016,9 +1013,6 @@ test "InferRules missing metric runs prediction before evaluation errors and thr
     try testing.expectEqual(@as(usize, 2), state.history.requests.items.len);
     optimizer.max_errors = 1;
     try testing.expectError(error.MissingMetric, optimizer.evaluateProgram(TestProgram, testing.allocator, ctx, &student, dataset));
-    try testing.expectEqual(@as(usize, 4), state.history.requests.items.len);
-    optimizer.num_threads = 2;
-    try testing.expectError(error.ConcurrentEvaluationUnsupported, optimizer.evaluateProgram(TestProgram, testing.allocator, ctx, &student, dataset));
     try testing.expectEqual(@as(usize, 4), state.history.requests.items.len);
     try testing.expectError(error.EmptyValidationSet, optimizer.evaluateProgram(TestProgram, testing.allocator, ctx, &student, &.{}));
 }

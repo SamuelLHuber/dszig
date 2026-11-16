@@ -56,6 +56,8 @@ pub const COPRO = struct {
     depth: usize = 3,
     init_temperature: f64 = 1.4,
     max_errors: usize = 10,
+    /// DSPy `eval_kwargs.num_threads`; null evaluates serially.
+    concurrent_evaluation: ?optimize.ConcurrentEvaluation = null,
 
     /// One entry of `best_program.candidate_programs`, without the program.
     pub const Candidate = struct {
@@ -130,7 +132,7 @@ pub const COPRO = struct {
                     const instruction = value.pyStrip(std.mem.trim(u8, c.instruction, "\""));
                     const prefix = value.pyStrip(std.mem.trim(u8, c.prefix, "\""));
                     try setSignature(out, p.param.predict, instruction, prefix);
-                    const score = (try optimize.evaluate(P, gpa, ctx, &clone, trainset, self.metric, self.max_errors)).score;
+                    const score = (try optimize.evaluateWith(P, self.concurrent_evaluation, gpa, ctx, &clone, trainset, self.metric, self.max_errors)).score;
                     total_calls += 1;
                     const entry: E = .{
                         .candidate = .{ .predictor = p_i, .instruction = instruction, .prefix = prefix, .score = score, .depth = d },
