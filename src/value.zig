@@ -472,6 +472,12 @@ pub fn toValue(arena: Allocator, comptime T: type, v: T) Allocator.Error!Value {
         .float => .{ .float = @floatCast(v) },
         .@"enum" => .{ .string = @tagName(v) },
         .optional => |o| if (v) |x| try toValue(arena, o.child, x) else .null,
+        .array => |a| blk: {
+            const items = try arena.alloc(Value, a.len);
+            errdefer arena.free(items);
+            for (v, items) |item, *target| target.* = try toValue(arena, a.child, item);
+            break :blk try @import("python_value.zig").tupleFromOwnedSlice(arena, items);
+        },
         .pointer => |p| blk: {
             var array: @import("runtime_value.zig").Array = .init(arena);
             try array.ensureTotalCapacity(v.len);
@@ -562,6 +568,19 @@ pub fn fromValue(arena: Allocator, comptime T: type, v: Value) ConvertError!T {
             return std.meta.stringToEnum(T, v.string) orelse error.TypeMismatch;
         },
         .optional => |o| return if (v == .null) null else try fromValue(arena, o.child, v),
+        .array => |a| {
+            const items = if (v == .array) v.array.items else blk: {
+                const builtin = @import("python_value.zig").view(v) orelse
+                    return error.TypeMismatch;
+                break :blk if (builtin == .tuple) builtin.tuple else return error.TypeMismatch;
+            };
+            if (items.len != a.len) return error.TypeMismatch;
+            var out: T = undefined;
+            for (items, &out) |item, *target|
+                target.* = try fromValue(arena, a.child, item);
+            if (comptime a.sentinel()) |sentinel| out[a.len] = sentinel;
+            return out;
+        },
         .pointer => |p| {
             if (v != .array) return error.TypeMismatch;
             const out = try arena.alloc(p.child, v.array.items.len);

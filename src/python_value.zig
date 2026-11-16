@@ -172,7 +172,7 @@ fn cloneStaticBytes(a: Allocator, ptr: *const anyopaque) Allocator.Error!runtime
 
 fn deinitStaticBytes(_: Allocator, _: *const anyopaque, _: bool) void {}
 
-pub fn tuple(a: Allocator, items: []const Value) Error!Value {
+pub fn tuple(a: Allocator, items: []const Value) Allocator.Error!Value {
     const hashable = for (items) |item| {
         if (!hashAdmissible(item)) break false;
     } else true;
@@ -182,7 +182,7 @@ pub fn tuple(a: Allocator, items: []const Value) Error!Value {
 /// Adopt the slice storage only; tuple members remain borrowed. The caller
 /// retains the slice if construction fails. An owning clone deep-copies both
 /// the slice and its members; the borrowed tuple must not outlive its members.
-pub fn tupleFromOwnedSlice(a: Allocator, items: []Value) Error!Value {
+pub fn tupleFromOwnedSlice(a: Allocator, items: []Value) Allocator.Error!Value {
     const result = try tuple(a, items);
     runtimeBox(result.custom.ptr).owns_storage = true;
     return result;

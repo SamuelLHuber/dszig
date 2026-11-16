@@ -233,6 +233,8 @@ fn customXmlLiteral(comptime T: type) bool {
     const annotation = if (@typeInfo(T) == .optional) @typeInfo(T).optional.child else T;
     if (code.isCode(annotation) or annotation == BoundingBox or annotation == File or citation.isCitation(annotation) or decision.isDecision(annotation)) return true;
     return switch (@typeInfo(annotation)) {
+        // DSPy's fixed tuples use a JSON body even in XML prompts.
+        .array => true,
         .pointer => |p| p.size == .slice and (code.isCode(p.child) or p.child == BoundingBox or p.child == File or citation.isCitation(p.child) or decision.isDecision(p.child)),
         else => false,
     };

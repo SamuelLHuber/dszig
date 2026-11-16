@@ -79,6 +79,7 @@ pub fn annotationType(comptime T: type) ?type {
     if (comptime types.isDict(T)) return annotationType(T.dszig_dict_value);
     return switch (@typeInfo(T)) {
         .optional => |o| annotationType(o.child),
+        .array => |a| if (a.len == 0) null else annotationType(a.child),
         .pointer => |p| if (p.size == .slice and T != []const u8 and T != []u8) annotationType(p.child) else null,
         else => null,
     };

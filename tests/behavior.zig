@@ -7,6 +7,103 @@ const rag = @import("rag_program");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 
+const FixedTupleSignature = dszig.Signature(struct {
+    pub const Input = struct { source: [2]i64 };
+    pub const Output = struct {
+        matrix: [2][2]i64,
+        snippets: [2]dszig.Code,
+        optional: ?[2]i64,
+        empty: [0]bool,
+    };
+});
+
+test "fixed tuple Predict preserves nested values and rejects incorrect cardinality" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const body =
+        \\{"matrix":[["1",true],[3,4]],"snippets":["first()","second()"],"optional":[5,6],"empty":[]}
+    ;
+    const completions = [_][]const u8{
+        \\[[ ## matrix ## ]]
+        \\[["1",true],[3,4]]
+        \\[[ ## snippets ## ]]
+        \\["first()","second()"]
+        \\[[ ## optional ## ]]
+        \\[5,6]
+        \\[[ ## empty ## ]]
+        \\[]
+        \\[[ ## completed ## ]]
+        ,
+        body,
+        \\<matrix>[["1",true],[3,4]]</matrix>
+        \\<snippets>["first()","second()"]</snippets>
+        \\<optional>[5,6]</optional>
+        \\<empty>[]</empty>
+        ,
+    };
+    const predict: dszig.Predict(FixedTupleSignature) = .{};
+    for ([_]dszig.Adapter{ .chat, .json, .xml }, completions) |adapter, completion| {
+        var scripted: dszig.lm.ScriptedLM = .{ .responses = &.{completion} };
+        const output = try predict.forward(
+            .{ .arena = arena, .lm = scripted.lm(), .adapter = adapter },
+            .{ .source = .{ 10, 20 } },
+        );
+        try testing.expectEqual([2][2]i64{ .{ 1, 1 }, .{ 3, 4 } }, output.matrix);
+        try testing.expectEqualStrings("first()", output.snippets[0].code);
+        try testing.expectEqualStrings("second()", output.snippets[1].code);
+        try testing.expectEqual([2]i64{ 5, 6 }, output.optional.?);
+    }
+    const validate = FixedTupleSignature.output_fields_list[0].validate.?;
+    for ([_][]const u8{ "[]", "[[1,2]]", "[[1,2],[3,4],[5,6]]", "[[1],[2,3]]" }) |text| {
+        const input = try std.json.parseFromSliceLeaky(dszig.Value, arena, text, .{});
+        try testing.expectError(error.ParseValue, validate(arena, input));
+        try testing.expectError(error.TypeMismatch, dszig.value.fromValue(arena, [2][2]i64, input));
+    }
+    const empty = try dszig.value.toValue(arena, [0]bool, .{});
+    try testing.expectEqual([0]bool{}, try dszig.value.fromValue(arena, [0]bool, empty));
+    const pair = try dszig.value.toValue(arena, [2]i64, .{ 7, 8 });
+    const sentinel = try dszig.value.fromValue(arena, [2:99]i64, pair);
+    try testing.expectEqual(@as(i64, 99), sentinel[2]);
+}
+
+test "fixed model tuples preserve typed feedback and owning clones after source destruction" {
+    const Point = struct {
+        pub const model_name = "Point";
+        x: i64,
+        name: []const u8,
+    };
+    const S = dszig.Signature(struct {
+        pub const Input = struct {};
+        pub const Output = struct { points: ?[1][1]Point };
+    });
+    const clone = block: {
+        var source: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer source.deinit();
+        const arena = source.allocator();
+        const name = try arena.dupe(u8, "A");
+        const runtime = try dszig.value.toValue(arena, ?[1][1]Point, .{.{.{ .x = 3, .name = name }}});
+        const field = S.output_fields_list[0];
+        try testing.expectEqualStrings(
+            "((Point(x=3, name='A'),),)",
+            try field.python_str.?(arena, runtime),
+        );
+        const masked = (try field.refine_mask.?(arena, runtime)).?;
+        const outer = dszig.python_value.view(masked).?.tuple;
+        const inner = dszig.python_value.view(outer[0]).?.tuple;
+        try testing.expectEqualStrings("<non-serializable: Point>", inner[0].string);
+        // Cloning must own every tuple, dictionary and string child.
+        const owned = try runtime.custom.clone(testing.allocator);
+        name[0] = 'Z';
+        break :block owned;
+    };
+    defer clone.deinit(testing.allocator);
+    const outer = dszig.python_value.view(.{ .custom = clone }).?.tuple;
+    const inner = dszig.python_value.view(outer[0]).?.tuple;
+    try testing.expectEqualStrings("A", inner[0].object.get("name").?.string);
+    try testing.expectEqual(@as(i64, 3), inner[0].object.get("x").?.integer);
+}
+
 /// Mock LM that answers a question correctly only when the prompt carries at
 /// least `difficulty` demos: few-shot demos genuinely improve it.
 const LearningLM = struct {

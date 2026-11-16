@@ -107,7 +107,7 @@ retain the actual continuation and raw provider response independently.
 
 | DSPy surface | Native Zig surface and coverage |
 |---|---|
-| Class-style signatures and typed fields | `Signature`, `Dict`, `Code`, `CodeWithLanguage`, `BoundingBox`, `File`, `Citations` and `Citations.Citation`, scalar/string/list/optional/model fields, string literal enums and mixed scalar/Enum/bytes `Literal`, field descriptions/defaults, compile-time rejection of invalid signatures |
+| Class-style signatures and typed fields | `Signature`, `Dict`, `Code`, `CodeWithLanguage`, `BoundingBox`, `File`, `Citations` and `Citations.Citation`, scalar/string/list/fixed-array/optional/model fields, string literal enums and mixed scalar/Enum/bytes `Literal`, field descriptions/defaults, compile-time rejection of invalid signatures |
 | Runtime values and documents | `Value`, `Array`, `ObjectMap`, boxed native Code/File/Reasoning/BoundingBox/Citations/decision/evidence identity, recursive typed-class serialization, text/canonical-document content union and bounded Responses `input_file` translation |
 | Chat, JSON, XML and two-stage adapters | `Adapter.chat`, `.json`, `.xml`, `.two_step`; `TwoStepAdapter` with a separate extraction LM; independent prompt/parse fixtures, strict response-schema construction, JSON fallback, typed XML and Unicode key handling |
 | Prediction and reasoning | `Predict`, `ChainOfThought`, `BestOfN`, `Refine`, `MultiChainComparison`, explicit `Context`, typed outputs, serialized `Trace`, named predictor/parameter discovery |
@@ -125,6 +125,32 @@ retain the actual continuation and raw provider response independently.
 
 A named surface in this table is not a claim that every Python option or provider
 route is implemented. The limits below are part of the compatibility contract.
+
+### Fixed-size native signature fields
+
+A field `[N]T` is a homogeneous fixed-length Python tuple annotation, not a
+variable-length list. For example, `[2]i64` renders as `tuple[int, int]` with
+`prefixItems` and equal `minItems`/`maxItems`; `[0]T` is the empty tuple.
+Arrays compose with optional, list, dictionary, model and other array fields.
+Validation applies the element codec and rejects missing or extra elements.
+Typed decoding writes into the fixed array, including its sentinel when present.
+
+Erased values retain genuine runtime tuple metadata. Chat/JSON/XML formatting
+and typed Predict work through the same field codecs; XML prompts use a JSON
+tuple body, matching DSPy's tuple annotation behavior rather than its nested-list
+prompt syntax. Owning clones copy tuple children; source-backed tuples and their
+children retain the existing arena lifetime requirements. The nested conversion
+still provisions runtime tuple storage: static Zig output arrays alone do **not**
+make the full prediction path allocation-free. This does not add heterogeneous
+tuple annotations or native union annotations.
+
+A native probe matched six actual DSPy 3.5 schemas/annotation names, nine
+validation cases and all 12 Chat/JSON/XML prompt messages, then executed all
+three typed Predict paths. Additional empty-rich-tuple, sentinel, model-feedback
+and clone-lifetime checks passed. A separate native Evaluate probe ran 8,192
+fixed-array-input/scalar-output calls in each of Debug and ReleaseSafe with a
+zero-byte general allocator backing, checksum 262,144 and no LM calls. That
+narrow execution proof does not cover nested runtime output allocation.
 
 ### LM text and non-text results
 

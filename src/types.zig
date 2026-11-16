@@ -1,6 +1,7 @@
 //! Nested field types, as DSPy types them with Pydantic: a Zig struct is a
 //! `BaseModel` (named by its `model_name` decl or its type name), a slice is
-//! `list[T]`, an optional is `Optional[T]`. This file gives their Python
+//! `list[T]`, a fixed array is a homogeneous fixed tuple, and an optional is
+//! `Optional[T]`. This file gives their Python
 //! annotation names, their Pydantic JSON schemas with keys in DSPy's
 //! `move_type_to_front` order, and Pydantic's lax validation, which also
 //! normalizes a value to declaration order with defaults filled in.
@@ -51,7 +52,7 @@ pub fn isNested(comptime T: type) bool {
     if (T == Integer) return false;
     if (T == []const u8 or T == []const []const u8 or T == @import("runtime_value.zig").ObjectMap) return false;
     return switch (@typeInfo(T)) {
-        .optional => true,
+        .optional, .array => true,
         .@"struct" => !@hasField(T, "map"),
         .pointer => |p| p.size == .slice,
         else => false,
@@ -90,6 +91,12 @@ pub fn pyName(comptime T: type) []const u8 {
                 break :blk s ++ "]";
             },
             .optional => |o| "Union[" ++ pyName(o.child) ++ ", NoneType]",
+            .array => |a| blk: {
+                var name: []const u8 = "tuple[";
+                for (0..a.len) |i| name = name ++
+                    (if (i == 0) "" else ", ") ++ pyName(a.child);
+                break :blk name ++ "]";
+            },
             .pointer => |p| "list[" ++ pyName(p.child) ++ "]",
             .@"struct" => modelName(T),
             else => @compileError("dszig: unsupported nested type " ++ @typeName(T)),
@@ -179,6 +186,21 @@ fn entriesOf(comptime T: type) []const Entry {
                 break :blk &.{ .{ .key = "type", .val = quote("string") }, .{ .key = "enum", .val = s ++ "]" } };
             },
             .optional => |o| &.{.{ .key = "anyOf", .val = "[" ++ render(entriesOf(o.child)) ++ ", {\"type\": \"null\"}]" }},
+            .array => |a| blk: {
+                const length = std.fmt.comptimePrint("{d}", .{a.len});
+                const bounds: []const Entry = &.{
+                    .{ .key = "type", .val = quote("array") },
+                    .{ .key = "maxItems", .val = length },
+                    .{ .key = "minItems", .val = length },
+                };
+                if (a.len == 0) break :blk bounds;
+                var prefix: []const u8 = "[";
+                for (0..a.len) |i| prefix = prefix ++
+                    (if (i == 0) "" else ", ") ++ render(entriesOf(a.child));
+                break :blk bounds ++ &[_]Entry{
+                    .{ .key = "prefixItems", .val = prefix ++ "]" },
+                };
+            },
             .pointer => |p| &.{ .{ .key = "type", .val = quote("array") }, .{ .key = "items", .val = render(entriesOf(p.child)) } },
             .@"struct" => &.{.{ .key = "$ref", .val = quote("#/$defs/" ++ definitionName(T)) }},
             else => @compileError("dszig: unsupported nested type " ++ @typeName(T)),
@@ -379,6 +401,9 @@ fn collectDefs(comptime T: type, comptime seen: []const type) []const type {
         if (isDict(T)) return collectDefs(T.dszig_dict_value, out);
         switch (@typeInfo(T)) {
             .optional => |o| out = collectDefs(o.child, out),
+            .array => |a| if (a.len != 0) {
+                out = collectDefs(a.child, out);
+            },
             .pointer => |p| if (T != []const u8) {
                 out = collectDefs(p.child, out);
             },
@@ -558,6 +583,22 @@ fn validateMode(comptime T: type, arena: Allocator, input: Value, comptime xml_l
             return v;
         },
         .optional => |o| return if (v == .null) v else validateMode(o.child, arena, v, xml_lax),
+        .array => |a| {
+            const python = @import("python_value.zig");
+            const items = if (v == .array) v.array.items else blk: {
+                const builtin = python.view(v) orelse return error.ParseValue;
+                break :blk switch (builtin) {
+                    .tuple, .set, .frozen_set => |items| items,
+                    else => return error.ParseValue,
+                };
+            };
+            if (items.len != a.len) return error.ParseValue;
+            const normalized = try arena.alloc(Value, a.len);
+            errdefer arena.free(normalized);
+            for (items, normalized) |item, *target|
+                target.* = try validateMode(a.child, arena, item, xml_lax);
+            return python.tupleFromOwnedSlice(arena, normalized);
+        },
         .pointer => |p| {
             const items = if (v == .array) v.array.items else blk: {
                 if (v != .custom) return error.ParseValue;
