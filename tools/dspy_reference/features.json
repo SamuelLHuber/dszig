@@ -332,9 +332,10 @@
    "name": "Evaluate",
    "status": "partial",
    "dszig": [
-    "optimize.zig"
+    "optimize.zig",
+    "parallel.zig"
    ],
-   "checks": "bootstrap_rag_eval scores, suite replay (serial only)",
+   "checks": "bootstrap_rag_eval scores, suite replay (serial); `parallel.Evaluator` devset-order sums vs serial in tests/parallel.zig",
    "bench": [
     "rag",
     "dates"

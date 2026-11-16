@@ -1121,7 +1121,7 @@ Regenerate this table with
 | `dspy.Embeddings` (`retrievers/embeddings.py`) | native | `embeddings.zig` | embeddings_oracle.py | – |
 | `dspy.EmbeddingsWithScores` (`retrievers/embeddings.py`) | native | `embeddings.zig` | embeddings_oracle.py | – |
 | `dspy.Ensemble` (`teleprompt/ensemble.py`) | native | `ensemble.zig` | ensemble.json | – |
-| `dspy.Evaluate` (`evaluate/evaluate.py`) | partial | `optimize.zig` | bootstrap_rag_eval scores, suite replay (serial only) | rag: 52 ms → 0.24 ms; dates: 116 ms → 0.43 ms |
+| `dspy.Evaluate` (`evaluate/evaluate.py`) | partial | `optimize.zig`, `parallel.zig` | bootstrap_rag_eval scores, suite replay (serial); `parallel.Evaluator` devset-order sums vs serial in tests/parallel.zig | rag: 52 ms → 0.24 ms; dates: 116 ms → 0.43 ms |
 | `dspy.Example` (`primitives/example.py`) | partial | `predict.zig` | suite replay | – |
 | `dspy.File` (`adapters/types/file.py`) | native | `file.zig` | file_oracle.py | – |
 | `dspy.FinalOutput` (`primitives/code_interpreter.py`) | missing | – | – | – |
