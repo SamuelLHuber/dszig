@@ -356,7 +356,7 @@ Debug and ReleaseSafe, with byte-identical output between modes:
 
 | Native consumer | Compared / Source rows | Outcome/value/identity/signal observations | Normalized exception identities unobserved |
 | --- | ---: | ---: | ---: |
-| IntEnum runtime operations | 2,294 / 2,324 | 24,577 | 657 |
+| IntEnum runtime operations | 2,324 / 2,324 | 24,901 | 663 |
 | IntEnum scalar validation | 35 / 35 | 379 | 6 |
 | Builtin IntEnum declarations | 19 / 19 | 134 | 0 |
 | Builtin bytes IntEnum declarations | 7 / 7 | 50 | 0 |
@@ -364,11 +364,15 @@ Debug and ReleaseSafe, with byte-identical output between modes:
 
 The historical runtime consumer exited nonzero with 30 sequence-repetition rows
 unsupported. `value.numericProduct` now repeats immutable text and genuine bytes
-with integer/IntEnum multipliers in either order. A focused native consumer
-compares all 30 previously unsupported frozen Source rows: 24 results and six
-ordinary-Enum refusals. This does not rerun or expand the historical 24,577
-observations above. One-fold results may borrow their input; repeated bytes own
-their new buffer. Use caller-provided startup storage through a fixed allocator
+with integer/IntEnum multipliers in either order. After a focused comparison of
+those 30 rows, the complete frozen runtime/scalar/Decimal-policy corpus was
+recompared against the current native implementation in Debug and ReleaseSafe.
+All rows are now consumed with zero mismatches and byte-identical mode output;
+the table reports these current observations, not their sum with old runs.
+No Source oracle was rerun. The restored historical driver was verified against
+its original archive hash before removing its obsolete repetition skip and
+adding genuine bytes-result encoding. One-fold results may borrow their input;
+repeated bytes own their new buffer. Use caller-provided startup storage through a fixed allocator
 when runtime heap allocation is prohibited. Index and output-size overflow are
 refused before allocation, including out-of-range counts on empty sequences.
 Unsafe unbounded repetitions were separately left unattempted by the Source
