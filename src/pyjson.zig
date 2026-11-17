@@ -60,6 +60,27 @@ test "ASCII JSON preserves lone surrogates and escapes surrogate keys as strings
     try std.testing.expectError(error.ParseValue, writeJsonAscii(&writer, .{ .string = "\xff" }));
 }
 
+test "builtin float boxes format as JSON numbers in every flavor" {
+    const python = @import("python_value.zig");
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var items: @import("runtime_value.zig").Array = .init(a);
+    try items.append(try python.float(a, 1.5));
+    try items.append(try python.float(a, std.math.nan(f64)));
+    const list: Value = .{ .array = items };
+    var buffer: [64]u8 = undefined;
+    var writer: Writer = .fixed(&buffer);
+    try writeJsonAscii(&writer, list);
+    try std.testing.expectEqualStrings("[1.5, NaN]", writer.buffered());
+    writer.end = 0;
+    try writeJsonProjection(&writer, list, .compact, 0);
+    try std.testing.expectEqualStrings("[1.5, null]", writer.buffered());
+    writer.end = 0;
+    try writeJsonDepth(&writer, list, .orjson_indent2, 0, false);
+    try std.testing.expectEqualStrings("[\n  1.5,\n  null\n]", writer.buffered());
+}
+
 pub fn writeJsonDepth(w: *Writer, v: Value, style: Style, depth: u32, comptime ascii: bool) Error!void {
     return writeJsonOptions(w, v, style, depth, ascii, false);
 }
@@ -96,6 +117,13 @@ fn writeJsonOptions(w: *Writer, v: Value, style: Style, depth: u32, comptime asc
             if (ascii) try writeJsonAsciiString(w, s) else try writeJsonString(w, s);
         },
         .custom => |custom| {
+            if (custom.vtable.python) |inspect| {
+                const view = inspect(custom.ptr);
+                // An actual builtin float is a JSON number in every flavor;
+                // the class-object refusals below never apply to it.
+                if (view == .float)
+                    return writeJsonOptions(w, .{ .float = view.float }, style, depth, ascii, projection);
+            }
             if (ascii) {
                 const inspect = custom.vtable.python orelse return error.ParseValue;
                 return switch (inspect(custom.ptr)) {

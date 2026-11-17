@@ -58,6 +58,12 @@ const Mode = enum { str, repr };
 
 fn write(comptime T: type, w: *Writer, v: Value, mode: Mode, depth: u32) WriteError!void {
     if (depth >= pyjson.max_depth) return error.JsonTooDeep;
+    if (comptime @typeInfo(T) == .optional) {
+        if (v == .null) return w.writeAll("None");
+        return write(@typeInfo(T).optional.child, w, v, mode, depth);
+    }
+    if (comptime @typeInfo(T) == .array and needsRendering(T))
+        return writeTuple(@typeInfo(T).array.child, w, v, depth);
     if (v == .custom) {
         return if (mode == .str) pyjson.writeStr(w, v) else pyjson.writeRepr(w, v, depth);
     }
@@ -71,7 +77,7 @@ fn write(comptime T: type, w: *Writer, v: Value, mode: Mode, depth: u32) WriteEr
     return switch (@typeInfo(T)) {
         .optional => |o| write(o.child, w, v, mode, depth),
         .pointer => |p| writeList(p.child, w, v, depth),
-        .array => |a| writeList(a.child, w, v, depth),
+        .array => |a| writeTuple(a.child, w, v, depth),
         .@"struct" => writeModel(T, w, v, mode, depth),
         else => pyjson.writeRepr(w, v, depth),
     };
@@ -85,6 +91,21 @@ fn writeList(comptime Child: type, w: *Writer, v: Value, depth: u32) WriteError!
         try write(Child, w, item, .repr, depth + 1);
     }
     try w.writeByte(']');
+}
+
+fn writeTuple(comptime Child: type, w: *Writer, v: Value, depth: u32) WriteError!void {
+    const items = if (v == .array) v.array.items else blk: {
+        const builtin = @import("python_value.zig").view(v) orelse
+            return pyjson.writeRepr(w, v, depth);
+        break :blk if (builtin == .tuple) builtin.tuple else return pyjson.writeRepr(w, v, depth);
+    };
+    try w.writeByte('(');
+    for (items, 0..) |item, i| {
+        if (i != 0) try w.writeAll(", ");
+        try write(Child, w, item, .repr, depth + 1);
+    }
+    if (items.len == 1) try w.writeByte(',');
+    try w.writeByte(')');
 }
 
 fn writeDict(comptime Child: type, w: *Writer, v: Value, depth: u32) WriteError!void {

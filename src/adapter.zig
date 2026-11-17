@@ -67,6 +67,21 @@ pub const View = struct {
 
 pub const Error = error{ AdapterParse, JsonTooDeep } || value.ParseError;
 
+/// DSPy AdapterParseError payload for one failed parse. Both members borrow:
+/// the text from the parsed completion, the record from the parse arena.
+pub const ParseFailure = struct {
+    /// JSONAdapter reports its extracted object span instead of the completion.
+    completion_text: []const u8 = "",
+    /// Null for unusable structure and Chat/XML invalid values. JSON type
+    /// failures retain converted predecessors and raw remaining values.
+    parsed_result: ?Record = null,
+};
+
+fn fail(failure: ?*ParseFailure, completion_text: []const u8, parsed_result: ?Record) error{AdapterParse} {
+    if (failure) |f| f.* = .{ .completion_text = completion_text, .parsed_result = parsed_result };
+    return error.AdapterParse;
+}
+
 /// Expand media where DSPy constructs user/tool parts; assistant/system stay text.
 pub fn renderedContent(arena: Allocator, rendered: []const u8) Error!Content {
     return Content.fromRendered(arena, rendered) catch |err| return switch (err) {
@@ -111,13 +126,94 @@ pub const Adapter = enum {
         return messages.items;
     }
 
+    /// DSPy training-data projection, not an LM request or a training job.
+    /// Containers and encoded media use the caller's arena; text leaves borrow.
+    pub fn formatFinetuneData(
+        adapter: Adapter,
+        arena: Allocator,
+        io: std.Io,
+        view: View,
+        demos: []const Record,
+        inputs: *const Record,
+        outputs: *const Record,
+    ) !Value {
+        switch (adapter) {
+            .json => return error.FinetuneNotImplemented,
+            .two_step => return error.MissingFinetuneFormatter,
+            .chat, .xml => {},
+        }
+        const prompt = try adapter.format(arena, view, demos, inputs);
+        const assistant = try formatAssistant(adapter, arena, view, outputs);
+        var messages: @import("runtime_value.zig").Array = .init(arena);
+        try messages.ensureTotalCapacity(prompt.len + 1);
+        for (prompt) |message| {
+            var projected: Record = .empty;
+            try projected.ensureTotalCapacity(arena, @as(usize, 2) +
+                @intFromBool(message.tool_call_id != null) +
+                @intFromBool(message.tool_calls.len != 0));
+            projected.putAssumeCapacity("role", .{ .string = message.role.name() });
+            projected.putAssumeCapacity(
+                "content",
+                if (message.role == .assistant and message.tool_calls.len != 0 and message.content.isEmpty())
+                    .null
+                else
+                    try message.content.toOpenAIChatValue(arena, io),
+            );
+            if (message.tool_call_id) |id| {
+                assert(message.role == .tool);
+                projected.putAssumeCapacity("tool_call_id", .{ .string = id });
+            }
+            if (message.tool_calls.len != 0) {
+                assert(message.role == .assistant);
+                var calls: @import("runtime_value.zig").Array = .init(arena);
+                try calls.ensureTotalCapacity(message.tool_calls.len);
+                for (message.tool_calls) |call| {
+                    calls.appendAssumeCapacity(@import("lm.zig").OpenAI.toolCallValue(
+                        arena,
+                        .chat_completions,
+                        call,
+                    ) catch |err| return if (err == error.LMFailure) error.UnsupportedFeature else err);
+                }
+                projected.putAssumeCapacity("tool_calls", .{ .array = calls });
+            }
+            messages.appendAssumeCapacity(.{ .object = projected });
+        }
+        var answer: Record = .empty;
+        try answer.ensureTotalCapacity(arena, 2);
+        answer.putAssumeCapacity("role", .{ .string = "assistant" });
+        answer.putAssumeCapacity("content", .{ .string = assistant });
+        messages.appendAssumeCapacity(.{ .object = answer });
+        var record: Record = .empty;
+        try record.put(arena, "messages", .{ .array = messages });
+        assert(messages.items.len == prompt.len + 1);
+        assert(record.count() == 1);
+        return .{ .object = record };
+    }
+
     pub fn parse(adapter: Adapter, arena: Allocator, view: View, completion: []const u8) Error!Record {
-        return switch (adapter) {
-            .chat => parseChat(arena, view, completion),
-            .json => parseJson(arena, view, completion),
-            .xml => XmlAdapter.parse(arena, view, completion),
+        return adapter.parseWithFailure(arena, view, completion, null);
+    }
+
+    /// `parse` that also describes an `error.AdapterParse` in `failure`.
+    /// Every other outcome leaves a supplied `failure` empty.
+    pub fn parseWithFailure(adapter: Adapter, arena: Allocator, view: View, completion: []const u8, failure: ?*ParseFailure) Error!Record {
+        if (failure) |f| f.* = .{};
+        const result: Error!Record = switch (adapter) {
+            .chat => parseChat(arena, view, completion, failure),
+            .json => parseJson(arena, view, completion, failure),
+            .xml => XmlAdapter.parseWithFailure(arena, view, completion, failure),
             // Extraction needs its separate LM; use TwoStepAdapter.parse.
             .two_step => error.AdapterParse,
+        };
+        return result catch |err| {
+            if (failure) |f| {
+                if (err != error.AdapterParse) {
+                    f.* = .{};
+                } else if (f.completion_text.len == 0) {
+                    f.completion_text = completion;
+                }
+            }
+            return err;
         };
     }
 
@@ -591,13 +687,21 @@ pub fn formatUser(adapter: Adapter, arena: Allocator, view: View, inputs: *const
     return userMessage(adapter, arena, view, inputs, "", main_request);
 }
 
-/// History assistant turns contain only fields actually supplied by that turn.
-pub fn formatAssistantPartial(adapter: Adapter, arena: Allocator, view: View, outputs: *const Record) Error![]const u8 {
-    var present: std.ArrayList(Field) = .empty;
-    for (view.outputs) |field| if (outputs.contains(field.name)) try present.append(arena, field);
-    var partial_view = view;
-    partial_view.outputs = present.items;
-    return assistantMessage(adapter, arena, partial_view, outputs, "");
+/// Render the declared answer fields, defaulting absent values to Python None.
+/// Native-tool history passes an explicitly filtered view; TwoStep alone omits
+/// absent fields, matching its separate upstream assistant formatter.
+pub fn formatAssistant(adapter: Adapter, arena: Allocator, view: View, outputs: *const Record) Error![]const u8 {
+    if (adapter == .two_step) return assistantMessage(adapter, arena, view, outputs, "");
+    var missing_outputs: Record = .empty;
+    for (view.outputs) |field| {
+        if (outputs.contains(field.name)) continue;
+        try missing_outputs.ensureTotalCapacity(arena, view.outputs.len);
+        for (view.outputs) |output| {
+            missing_outputs.putAssumeCapacity(output.name, outputs.get(output.name) orelse .null);
+        }
+        return assistantMessage(adapter, arena, view, &missing_outputs, "");
+    }
+    return assistantMessage(adapter, arena, view, outputs, "");
 }
 
 fn userMessage(adapter: Adapter, arena: Allocator, view: View, inputs: *const Record, prefix: []const u8, main_request: bool) Error![]const u8 {
@@ -706,7 +810,7 @@ pub fn parseFieldValue(arena: Allocator, field: Field, input: Value) Error!Value
     };
 }
 
-fn parseChat(arena: Allocator, view: View, completion: []const u8) Error!Record {
+fn parseChat(arena: Allocator, view: View, completion: []const u8, failure: ?*ParseFailure) Error!Record {
     var sections: std.ArrayList(Section) = .empty;
     try sections.append(arena, .{ .header = null, .lines = .empty });
     var lines = LineIterator{ .text = completion };
@@ -727,36 +831,63 @@ fn parseChat(arena: Allocator, view: View, completion: []const u8) Error!Record 
         if (fields.contains(header)) continue;
         const field = view.findOutput(header) orelse continue;
         const joined = try std.mem.join(arena, "\n", section.lines.items);
+        // An invalid value fails without a partial result, as in DSPy.
         const parsed = try parseFieldValue(arena, field, .{ .string = value.pyStrip(joined) });
         try fields.put(arena, field.name, parsed);
     }
-    try requireAllOutputs(arena, view, &fields);
+    try requireAllOutputs(arena, view, &fields, completion, failure);
     return fields;
 }
 
-fn requireAllOutputs(arena: Allocator, view: View, fields: *Record) Error!void {
+/// `apply_output_field_defaults` plus the missing-output check. A requested
+/// failure receives every present or defaulted field in signature order.
+fn requireAllOutputs(arena: Allocator, view: View, fields: *Record, completion_text: []const u8, failure: ?*ParseFailure) Error!void {
     var completed: Record = .empty;
+    var missing = false;
     for (view.outputs) |field| {
-        const supplied = fields.get(field.name);
-        const parsed = supplied orelse (try signature.outputDefault(arena, field)) orelse return error.AdapterParse;
+        const parsed = fields.get(field.name) orelse (try signature.outputDefault(arena, field)) orelse {
+            if (failure == null) return error.AdapterParse;
+            missing = true;
+            continue;
+        };
         try completed.put(arena, field.name, parsed);
     }
+    if (missing) return fail(failure, completion_text, completed);
     fields.* = completed;
 }
 
-fn parseJson(arena: Allocator, view: View, completion: []const u8) Error!Record {
+fn parseJson(arena: Allocator, view: View, completion: []const u8, failure: ?*ParseFailure) Error!Record {
+    // DSPy rebinds the completion to the extracted object before later errors.
+    var response = completion;
     const object = (try parseObject(arena, completion)) orelse blk: {
-        const span = firstBalancedBraces(completion) orelse return error.AdapterParse;
-        break :blk (try parseObject(arena, span)) orelse return error.AdapterParse;
+        response = firstBalancedBraces(completion) orelse return error.AdapterParse;
+        const extracted = parseObject(arena, response) catch |err| switch (err) {
+            error.AdapterParse => return fail(failure, response, null),
+            else => |other| return other,
+        };
+        break :blk extracted orelse return fail(failure, response, null);
     };
     var fields: Record = .empty;
     var it = object.iterator();
     while (it.next()) |entry| {
         const field = view.findOutput(entry.key_ptr.*) orelse continue;
-        const parsed = try parseFieldValue(arena, field, entry.value_ptr.*);
+        const parsed = parseFieldValue(arena, field, entry.value_ptr.*) catch |err| switch (err) {
+            error.AdapterParse => {
+                if (failure == null) return error.AdapterParse;
+                // DSPy converts its filtered dictionary in place: predecessors
+                // are converted, the failing and following values stay raw.
+                try fields.put(arena, field.name, entry.value_ptr.*);
+                while (it.next()) |rest| {
+                    const known = view.findOutput(rest.key_ptr.*) orelse continue;
+                    try fields.put(arena, known.name, rest.value_ptr.*);
+                }
+                return fail(failure, response, fields);
+            },
+            else => |other| return other,
+        };
         try fields.put(arena, field.name, parsed);
     }
-    try requireAllOutputs(arena, view, &fields);
+    try requireAllOutputs(arena, view, &fields, response, failure);
     return fields;
 }
 

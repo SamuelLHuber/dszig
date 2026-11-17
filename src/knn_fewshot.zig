@@ -102,7 +102,7 @@ pub fn KNNFewShot(comptime P: type) type {
         ) anyerror!Program {
             _ = ctx;
             var visible = student.*;
-            try predict.resetDemos(out, &visible);
+            try predict.resetPredictors(out, &visible);
             const captured = try out.create(Captured);
             captured.* = .{
                 .optimizer = self,

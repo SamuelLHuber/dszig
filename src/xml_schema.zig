@@ -60,7 +60,11 @@ fn exactType(schema: Value, input: Value) bool {
     if (std.mem.eql(u8, tag, "string")) return input == .string;
     if (std.mem.eql(u8, tag, "integer")) return input == .integer or
         (input == .number_string and std.mem.indexOfAny(u8, input.number_string, ".eE") == null);
-    if (std.mem.eql(u8, tag, "number")) return input == .float;
+    if (std.mem.eql(u8, tag, "number")) {
+        if (input == .float) return true;
+        const builtin = @import("python_value.zig").view(input) orelse return false;
+        return builtin == .float;
+    }
     if (std.mem.eql(u8, tag, "boolean")) return input == .bool;
     if (std.mem.eql(u8, tag, "null")) return input == .null;
     if (std.mem.eql(u8, tag, "object")) return input == .object;

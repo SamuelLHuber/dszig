@@ -92,7 +92,7 @@ pub const Reasoning = struct {
         return @ptrCast(@alignCast(ptr));
     }
 
-    fn runtimeTruthy(ptr: *const anyopaque) bool {
+    fn runtimeTruthy(ptr: *const anyopaque) error{ParseValue}!bool {
         return runtimeReasoning(ptr).content.len != 0;
     }
 
@@ -133,7 +133,8 @@ pub const Reasoning = struct {
         try pyjson.writeJsonString(writer, runtimeReasoning(ptr).content);
     }
 
-    fn cloneRuntime(allocator: Allocator, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+    fn cloneRuntime(context: *runtime.CloneContext, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+        const allocator = context.allocator;
         const copy = try allocator.create(Reasoning);
         errdefer allocator.destroy(copy);
         copy.* = .{ .content = try allocator.dupe(u8, runtimeReasoning(ptr).content) };

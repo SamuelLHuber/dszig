@@ -24,6 +24,7 @@ pub fn annotationType(comptime T: type) ?type {
     if (comptime types.isDict(T)) return annotationType(T.dszig_dict_value);
     return switch (@typeInfo(T)) {
         .optional => |o| annotationType(o.child),
+        .array => |a| if (a.len == 0) null else annotationType(a.child),
         .pointer => |p| if (p.size == .slice and T != []const u8 and T != []u8) annotationType(p.child) else null,
         else => null,
     };
@@ -294,6 +295,15 @@ pub const Citations = struct {
 
         /// This result owns all fields and can be released with deinit().
         pub fn clone(self: Citation, allocator: Allocator) Allocator.Error!Citation {
+            var context: runtime.CloneContext = .init(allocator);
+            defer context.deinit();
+            return self.cloneWithContext(&context);
+        }
+
+        /// Integer fields can retain arbitrary runtime values, so one erased
+        /// clone must keep sharing the caller's box memo across all fields.
+        fn cloneWithContext(self: Citation, context: *runtime.CloneContext) Allocator.Error!Citation {
+            const allocator = context.allocator;
             var copy: Citation = .{ .type = "", .cited_text = "" };
             errdefer copy.deinit(allocator);
             inline for (field_names) |name| {
@@ -305,7 +315,7 @@ pub const Citations = struct {
                 } else {
                     if (@field(self, name)) |integer| {
                         // Clone first: a failed in-place clone would leave a non-null optional with an undefined payload.
-                        const value = try cloneField(allocator, integer.value);
+                        const value = try cloneField(context, integer.value);
                         @field(copy, name) = .{ .value = value };
                     }
                 }
@@ -383,10 +393,11 @@ pub const Citations = struct {
             if (depth >= pyjson.max_depth) return error.JsonTooDeep;
             try Citation.actual(ptr).writeFields(writer, style, @intCast(depth), true, true);
         }
-        fn cloneRuntime(allocator: Allocator, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+        fn cloneRuntime(context: *runtime.CloneContext, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+            const allocator = context.allocator;
             const copy = try allocator.create(Citation);
             errdefer allocator.destroy(copy);
-            copy.* = try Citation.actual(ptr).clone(allocator);
+            copy.* = try Citation.actual(ptr).cloneWithContext(context);
             return .{ .ptr = copy, .vtable = &Citation.runtime_vtable, .owns_data = true };
         }
         fn deinitRuntime(allocator: Allocator, ptr: *const anyopaque, owns_data: bool) void {
@@ -635,6 +646,13 @@ pub const Citations = struct {
     }
 
     pub fn clone(self: Citations, allocator: Allocator) Allocator.Error!Citations {
+        var context: runtime.CloneContext = .init(allocator);
+        defer context.deinit();
+        return self.cloneWithContext(&context);
+    }
+
+    fn cloneWithContext(self: Citations, context: *runtime.CloneContext) Allocator.Error!Citations {
+        const allocator = context.allocator;
         const result = try allocator.alloc(Citation, self.len());
         var initialized: usize = 0;
         errdefer {
@@ -642,7 +660,7 @@ pub const Citations = struct {
             allocator.free(result);
         }
         for (self.citations, result) |item, *slot| {
-            slot.* = try item.clone(allocator);
+            slot.* = try item.cloneWithContext(context);
             initialized += 1;
         }
         return .{ .citations = result };
@@ -674,7 +692,7 @@ pub const Citations = struct {
     fn actual(ptr: *const anyopaque) *const Citations {
         return @ptrCast(@alignCast(ptr));
     }
-    fn runtimeTruthy(ptr: *const anyopaque) bool {
+    fn runtimeTruthy(ptr: *const anyopaque) error{ParseValue}!bool {
         return actual(ptr).truthy();
     }
     fn iterateRuntime(arena: Allocator, ptr: *const anyopaque) Error![]Value {
@@ -705,10 +723,11 @@ pub const Citations = struct {
         try actual(ptr).writeFormat(&escaped.writer, @intCast(depth));
         try writer.writeByte('"');
     }
-    fn cloneRuntime(allocator: Allocator, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+    fn cloneRuntime(context: *runtime.CloneContext, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+        const allocator = context.allocator;
         const copy = try allocator.create(Citations);
         errdefer allocator.destroy(copy);
-        copy.* = try actual(ptr).clone(allocator);
+        copy.* = try actual(ptr).cloneWithContext(context);
         return .{ .ptr = copy, .vtable = &runtime_vtable, .owns_data = true };
     }
     fn deinitRuntime(allocator: Allocator, ptr: *const anyopaque, owns_data: bool) void {
@@ -767,7 +786,7 @@ pub const Citations = struct {
                 .engine_chunk => &engine_chunk_vtable,
             };
         }
-        fn boolValue(ptr: *const anyopaque) bool {
+        fn boolValue(ptr: *const anyopaque) error{ParseValue}!bool {
             return object(ptr).kind == .namespace or object(ptr).attributes.count() != 0;
         }
         fn iterate(arena: Allocator, ptr: *const anyopaque) Error![]Value {
@@ -809,10 +828,11 @@ pub const Citations = struct {
             if (depth >= pyjson.max_depth) return error.JsonTooDeep;
             try pyjson.writeJsonProjection(writer, .{ .object = object(ptr).attributes }, style, @intCast(depth));
         }
-        fn cloneObject(allocator: Allocator, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+        fn cloneObject(context: *runtime.CloneContext, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+            const allocator = context.allocator;
             const copy = try allocator.create(StreamObject);
             errdefer allocator.destroy(copy);
-            copy.* = .{ .attributes = (try cloneField(allocator, .{ .object = object(ptr).attributes })).object, .kind = object(ptr).kind };
+            copy.* = .{ .attributes = (try cloneField(context, .{ .object = object(ptr).attributes })).object, .kind = object(ptr).kind };
             return .{ .ptr = copy, .vtable = table(copy.kind), .owns_data = true };
         }
         fn deinitObject(allocator: Allocator, ptr: *const anyopaque, owns_data: bool) void {
@@ -830,13 +850,13 @@ pub const Citations = struct {
 
     pub fn parseStreamChunk(arena: Allocator, chunk: Value) runtime.CustomError!?Citations {
         const choices = attribute(chunk, "choices") orelse return null;
-        if (!truth(choices)) return null;
+        if (!try truth(choices)) return null;
         const first = try indexZero(choices) orelse return null;
         const delta = attribute(first, "delta") orelse return null;
         const fields = attribute(delta, "provider_specific_fields") orelse return null;
-        if (!truth(fields)) return null;
+        if (!try truth(fields)) return null;
         const data = dictionaryGet(fields, "citation") orelse return null;
-        if (!truth(data) or !isDictionary(data)) return null;
+        if (!try truth(data) or !isDictionary(data)) return null;
         var part: inference.CitationPart = .{};
         inline for (.{ "text", "title", "url" }) |name| {
             if (dictionaryGet(data, name)) |item| {
@@ -975,7 +995,7 @@ fn indexZero(input: Value) runtime.CustomError!?Value {
     };
 }
 
-fn truth(input: Value) bool {
+fn truth(input: Value) error{ParseValue}!bool {
     return switch (input) {
         .null => false,
         .bool => |b| b,
@@ -985,7 +1005,7 @@ fn truth(input: Value) bool {
         .string => |s| s.len != 0,
         .array => |a| a.items.len != 0,
         .object => |o| o.count() != 0,
-        .custom => |custom| custom.truthy(),
+        .custom => |custom| try custom.truthy(),
     };
 }
 
@@ -1063,6 +1083,7 @@ fn writePlainJson(writer: *Writer, input: Value, style: runtime.JsonStyle, depth
                     }
                     try closeContainer(writer, style, depth, entries.len == 0, '}');
                 },
+                .float => try pyjson.writeJsonDepth(writer, input, style, depth, false),
                 else => return error.ParseValue,
             }
         },
@@ -1072,7 +1093,8 @@ fn writePlainJson(writer: *Writer, input: Value, style: runtime.JsonStyle, depth
 
 /// The generic arena clone is intentionally leaky on allocation failure.
 /// Owning model clones instead unwind every initialized nested allocation.
-fn cloneField(allocator: Allocator, input: Value) Allocator.Error!Value {
+fn cloneField(context: *runtime.CloneContext, input: Value) Allocator.Error!Value {
+    const allocator = context.allocator;
     switch (input) {
         .array => |array| {
             var copy: runtime.Array = .init(allocator);
@@ -1081,7 +1103,7 @@ fn cloneField(allocator: Allocator, input: Value) Allocator.Error!Value {
                 copy.deinit();
             }
             try copy.ensureTotalCapacity(array.items.len);
-            for (array.items) |item| copy.appendAssumeCapacity(try cloneField(allocator, item));
+            for (array.items) |item| copy.appendAssumeCapacity(try cloneField(context, item));
             return .{ .array = copy };
         },
         .object => |object| {
@@ -1091,11 +1113,11 @@ fn cloneField(allocator: Allocator, input: Value) Allocator.Error!Value {
             for (object.keys(), object.values()) |key, item| {
                 const owned_key = try allocator.dupe(u8, key);
                 errdefer allocator.free(owned_key);
-                copy.putAssumeCapacity(owned_key, try cloneField(allocator, item));
+                copy.putAssumeCapacity(owned_key, try cloneField(context, item));
             }
             return .{ .object = copy };
         },
-        else => return values.cloneValue(allocator, input),
+        else => return context.cloneValue(input),
     }
 }
 
@@ -1160,7 +1182,7 @@ test "Citations source validator differs from from_dict_list and preserves neste
     try std.testing.expectEqual(child.custom.ptr, (try collection.getRuntime(0)).custom.ptr);
     try std.testing.expectEqual(child.custom.ptr, (try collection.getRuntime(-1)).custom.ptr);
     try std.testing.expect(try collection.contains(child));
-    try std.testing.expect(parent.custom.truthy());
+    try std.testing.expect(try parent.custom.truthy());
     try std.testing.expectEqual(parent.custom.ptr, (try types.validate(Citations, arena, parent)).custom.ptr);
     const iterator = try parent.custom.vtable.iterate.?(arena, parent.custom.ptr);
     try std.testing.expectEqual(child.custom.ptr, iterator[0].custom.ptr);

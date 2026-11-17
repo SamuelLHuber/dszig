@@ -255,6 +255,24 @@ pub const XmlAdapter = struct {
     }
 
     pub fn parse(arena: Allocator, view: adapter.View, completion: []const u8) Error!Record {
+        return parseWithFailure(arena, view, completion, null);
+    }
+
+    /// `parse` that also describes an `error.AdapterParse` in `failure`.
+    /// Every other outcome leaves a supplied `failure` empty.
+    pub fn parseWithFailure(arena: Allocator, view: adapter.View, completion: []const u8, failure: ?*adapter.ParseFailure) Error!Record {
+        if (failure) |f| f.* = .{};
+        return parseFields(arena, view, completion, failure) catch |err| {
+            if (failure) |f| {
+                if (err == error.AdapterParse) f.completion_text = completion else f.* = .{};
+            }
+            return err;
+        };
+    }
+
+    /// A requested failure receives `parsed_result` only for missing outputs,
+    /// after every supplied field has been validated.
+    fn parseFields(arena: Allocator, view: adapter.View, completion: []const u8, failure: ?*adapter.ParseFailure) Error!Record {
         var schemas: Record = .empty;
         for (view.outputs) |field| {
             // Unlike JSONAdapter's provider schema, XML parsing uses the
@@ -277,11 +295,16 @@ pub const XmlAdapter = struct {
         for (nodes) |node| if (view.findOutput(node.name) == null) return error.AdapterParse;
         if (std.mem.indexOfScalar(u8, text[parser.pos..], '<') != null) return error.AdapterParse;
         var result: Record = .empty;
+        var missing = false;
         for (view.outputs) |field| {
             const schema = schemas.get(field.name).?;
             const group = try groupNamed(arena, nodes, field.name);
             if (group.len == 0) {
-                const fallback = (try signature.outputDefault(arena, field)) orelse return error.AdapterParse;
+                const fallback = (try signature.outputDefault(arena, field)) orelse {
+                    if (failure == null) return error.AdapterParse;
+                    missing = true;
+                    continue;
+                };
                 try result.put(arena, field.name, fallback);
                 continue;
             }
@@ -292,6 +315,10 @@ pub const XmlAdapter = struct {
             }
             const parsed = try adapter.parseFieldValue(arena, parsing_field, decoded);
             try result.put(arena, field.name, parsed);
+        }
+        if (missing) {
+            failure.?.parsed_result = result;
+            return error.AdapterParse;
         }
         return result;
     }

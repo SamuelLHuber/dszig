@@ -20,6 +20,11 @@ pub const Binding = struct {
 };
 
 pub fn annotation(comptime T: type, comptime metadata: []const type) ?Binding {
+    if (comptime decision.annotationError(T, metadata)) |message| @compileError(message);
+    const automatic = comptime activation: {
+        for (metadata) |M| if (decision.isDecision(M)) break :activation true;
+        break :activation false;
+    };
     if (comptime decision.modelInfo(T) != null) return bind(T, true);
     if (T == bool) {
         inline for (metadata) |M| {
@@ -29,7 +34,9 @@ pub fn annotation(comptime T: type, comptime metadata: []const type) ?Binding {
                 return binding;
             }
         }
-        return bind(decision.Noul, false);
+        var binding = bind(decision.Noul, false);
+        binding.automatic = automatic;
+        return binding;
     }
     if (comptime @import("literal.zig").isLiteral(T)) {
         comptime {
@@ -52,15 +59,26 @@ pub fn annotation(comptime T: type, comptime metadata: []const type) ?Binding {
             }
             var options: [T.dszig_literal_values.len]decision.Option = undefined;
             for (T.dszig_literal_values, &options) |v, *option| option.* = .{ .value = v, .description_json = "\"\"" };
-            return bind(decision.ChoiceWithOptions(&options), false);
+            var binding = bind(decision.ChoiceWithOptions(&options), false);
+            binding.automatic = automatic;
+            return binding;
         }
     }
     if (@typeInfo(T) == .@"enum") {
         comptime {
+            for (metadata) |M| {
+                if (decision.isDecision(M) and M.kind == .choice and M.configured) {
+                    var binding = bind(M, false);
+                    binding.automatic = true;
+                    return binding;
+                }
+            }
             const names = std.meta.fieldNames(T);
             var options: [names.len]decision.Option = undefined;
             for (names, &options) |name, *option| option.* = .{ .value = .{ .string = name }, .description_json = "\"\"" };
-            return bind(decision.ChoiceWithOptions(&options), false);
+            var binding = bind(decision.ChoiceWithOptions(&options), false);
+            binding.automatic = automatic;
+            return binding;
         }
     }
     return null;
@@ -330,10 +348,11 @@ fn Generated(comptime T: type, comptime probabilities: bool) type {
             try pyjson.writeJsonProjection(writer, actual(ptr).toValue(), style, @intCast(depth));
         }
 
-        fn clone(arena: Allocator, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+        fn clone(context: *runtime.CloneContext, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+            const arena = context.allocator;
             const result = try arena.create(Self);
             errdefer arena.destroy(result);
-            const data = try @import("inference.zig").cloneJsonValue(arena, actual(ptr).toValue());
+            const data = try context.cloneValue(actual(ptr).toValue());
             result.* = .{ .fields = data.object };
             return .{ .ptr = result, .vtable = &vtable, .owns_data = true };
         }
@@ -379,7 +398,11 @@ fn Generated(comptime T: type, comptime probabilities: bool) type {
 
 fn probabilityMode(arena: Allocator, input: Value, strict: bool) types.Error!Value {
     if (strict and input != .integer and input != .float and input != .number_string) {
-        if (input != .custom or input.custom.vtable.float_value == null) return error.ParseValue;
+        if (input != .custom) return error.ParseValue;
+        if (input.custom.vtable.float_value == null) {
+            const builtin = @import("python_value.zig").view(input) orelse return error.ParseValue;
+            if (builtin != .float) return error.ParseValue;
+        }
     }
     return probability(arena, input);
 }

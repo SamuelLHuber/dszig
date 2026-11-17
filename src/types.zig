@@ -1,6 +1,7 @@
 //! Nested field types, as DSPy types them with Pydantic: a Zig struct is a
 //! `BaseModel` (named by its `model_name` decl or its type name), a slice is
-//! `list[T]`, an optional is `Optional[T]`. This file gives their Python
+//! `list[T]`, a fixed array is a homogeneous fixed tuple, and an optional is
+//! `Optional[T]`. This file gives their Python
 //! annotation names, their Pydantic JSON schemas with keys in DSPy's
 //! `move_type_to_front` order, and Pydantic's lax validation, which also
 //! normalizes a value to declaration order with defaults filled in.
@@ -53,7 +54,7 @@ pub fn isNested(comptime T: type) bool {
     if (T == Integer) return false;
     if (T == []const u8 or T == []const []const u8 or T == @import("runtime_value.zig").ObjectMap) return false;
     return switch (@typeInfo(T)) {
-        .optional => true,
+        .optional, .array => true,
         .@"struct" => !@hasField(T, "map"),
         .pointer => |p| p.size == .slice,
         else => false,
@@ -92,6 +93,12 @@ pub fn pyName(comptime T: type) []const u8 {
                 break :blk s ++ "]";
             },
             .optional => |o| "Union[" ++ pyName(o.child) ++ ", NoneType]",
+            .array => |a| blk: {
+                var name: []const u8 = "tuple[";
+                for (0..a.len) |i| name = name ++
+                    (if (i == 0) "" else ", ") ++ pyName(a.child);
+                break :blk name ++ "]";
+            },
             .pointer => |p| "list[" ++ pyName(p.child) ++ "]",
             .@"struct" => modelName(T),
             else => @compileError("dszig: unsupported nested type " ++ @typeName(T)),
@@ -181,6 +188,21 @@ fn entriesOf(comptime T: type) []const Entry {
                 break :blk &.{ .{ .key = "type", .val = quote("string") }, .{ .key = "enum", .val = s ++ "]" } };
             },
             .optional => |o| &.{.{ .key = "anyOf", .val = "[" ++ render(entriesOf(o.child)) ++ ", {\"type\": \"null\"}]" }},
+            .array => |a| blk: {
+                const length = std.fmt.comptimePrint("{d}", .{a.len});
+                const bounds: []const Entry = &.{
+                    .{ .key = "type", .val = quote("array") },
+                    .{ .key = "maxItems", .val = length },
+                    .{ .key = "minItems", .val = length },
+                };
+                if (a.len == 0) break :blk bounds;
+                var prefix: []const u8 = "[";
+                for (0..a.len) |i| prefix = prefix ++
+                    (if (i == 0) "" else ", ") ++ render(entriesOf(a.child));
+                break :blk bounds ++ &[_]Entry{
+                    .{ .key = "prefixItems", .val = prefix ++ "]" },
+                };
+            },
             .pointer => |p| &.{ .{ .key = "type", .val = quote("array") }, .{ .key = "items", .val = render(entriesOf(p.child)) } },
             .@"struct" => &.{.{ .key = "$ref", .val = quote("#/$defs/" ++ definitionName(T)) }},
             else => @compileError("dszig: unsupported nested type " ++ @typeName(T)),
@@ -381,6 +403,9 @@ fn collectDefs(comptime T: type, comptime seen: []const type) []const type {
         if (isDict(T)) return collectDefs(T.dszig_dict_value, out);
         switch (@typeInfo(T)) {
             .optional => |o| out = collectDefs(o.child, out),
+            .array => |a| if (a.len != 0) {
+                out = collectDefs(a.child, out);
+            },
             .pointer => |p| if (T != []const u8) {
                 out = collectDefs(p.child, out);
             },
@@ -401,15 +426,22 @@ fn collectDefs(comptime T: type, comptime seen: []const type) []const type {
 
 /// `json.dumps(_get_json_schema(T))`.
 pub fn schema(comptime T: type) []const u8 {
-    return comptime schemaImpl(T, false);
+    return comptime schemaImpl(T, false, &.{});
 }
 
 /// XML and native schemas preserve the model's field declaration order.
 pub fn schemaXml(comptime T: type) []const u8 {
-    return comptime schemaImpl(T, true);
+    return comptime schemaImpl(T, true, &.{});
 }
 
-fn schemaImpl(comptime T: type, comptime ordered_properties: bool) []const u8 {
+/// Standalone Annotated schema, using Signature.Description's metadata convention.
+/// Invalid combinations refuse here, before schema generation or value validation.
+pub fn schemaAnnotated(comptime T: type, comptime metadata: []const type) Error![]const u8 {
+    if (comptime decision.annotationError(T, metadata) != null) return error.ParseValue;
+    return comptime schemaImpl(T, false, metadata);
+}
+
+fn schemaImpl(comptime T: type, comptime ordered_properties: bool, comptime metadata: []const type) []const u8 {
     comptime {
         @setEvalBranchQuota(1_000_000);
         const is_model = isModel(T);
@@ -425,8 +457,45 @@ fn schemaImpl(comptime T: type, comptime ordered_properties: bool) []const u8 {
             const final = d;
             top = top ++ &[_]Entry{.{ .key = "$defs", .val = render(&final) }};
         }
+        if (decision.annotationDescription(metadata)) |description| {
+            var described: []const Entry = &.{};
+            for (top) |entry| {
+                if (!std.mem.eql(u8, entry.key, "description")) described = described ++ &[_]Entry{entry};
+            }
+            top = described ++ &[_]Entry{.{ .key = "description", .val = quote(description) }};
+        }
         return render(top);
     }
+}
+
+/// Validate Annotated values without boxing or wrapping the underlying native type.
+/// Metadata errors precede input validation, as in TypeAdapter construction.
+pub fn validateAnnotated(comptime T: type, comptime metadata: []const type, arena: Allocator, v: Value) Error!Value {
+    if (comptime decision.annotationError(T, metadata) != null) return error.ParseValue;
+    return validate(T, arena, v);
+}
+
+test "Annotated decisions enforce typed member sets before validating values" {
+    const Literal = @import("literal.zig").Literal;
+    const One = decision.ChoiceWithOptions(&.{.{ .value = .{ .integer = 1 }, .description_json = "\"one\"" }});
+    const Truth = Literal(&.{.{ .bool = true }});
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.ParseValue, validateAnnotated(Truth, &.{One}, a, .{ .bool = true }));
+    try std.testing.expectError(error.ParseValue, schemaAnnotated(Truth, &.{One}));
+    try std.testing.expectError(error.ParseValue, validateAnnotated(f64, &.{decision.Score}, a, .{ .float = 0.5 }));
+    try std.testing.expectError(error.ParseValue, schemaAnnotated(f64, &.{decision.Score}));
+
+    const Choice = decision.ChoiceWithOptions(&.{
+        .{ .value = .{ .string = "first" }, .description_json = "\"one\"" },
+        .{ .value = .{ .string = "second" }, .description_json = "\"two\"" },
+    });
+    const Reordered = Literal(&.{ .{ .string = "second" }, .{ .string = "first" } });
+    const result = try validateAnnotated(Reordered, &.{Choice}, a, .{ .string = "first" });
+    try std.testing.expectEqualStrings("first", result.string);
+    try std.testing.expectError(error.ParseValue, validateAnnotated(Reordered, &.{Choice}, a, .{ .string = "other" }));
+    try std.testing.expect((try validateAnnotated(bool, &.{decision.Noul}, a, .{ .integer = 1 })).bool);
+    const Wrong = enum { first, other };
+    try std.testing.expectError(error.ParseValue, validateAnnotated(Wrong, &.{Choice}, a, .{ .string = "first" }));
 }
 
 /// `TypeAdapter(T).validate_python(v)`, including configured model strictness.
@@ -489,6 +558,9 @@ fn validateMode(comptime T: type, arena: Allocator, input: Value, comptime xml_l
             // Pydantic's lax bool validator uses Decimal's binary64 conversion,
             // including rounding to one and underflow to signed zero.
             .decimal => |data| if (T == bool) .{ .float = try data.toFloat() } else return error.ParseValue,
+            // An actual builtin float validates like a primitive float. The
+            // primitive result cannot carry the box's identity.
+            .float => |number| if (T == []const u8) return error.ParseValue else .{ .float = number },
             else => return error.ParseValue,
         };
     }
@@ -560,6 +632,22 @@ fn validateMode(comptime T: type, arena: Allocator, input: Value, comptime xml_l
             return v;
         },
         .optional => |o| return if (v == .null) v else validateMode(o.child, arena, v, xml_lax),
+        .array => |a| {
+            const python = @import("python_value.zig");
+            const items = if (v == .array) v.array.items else blk: {
+                const builtin = python.view(v) orelse return error.ParseValue;
+                break :blk switch (builtin) {
+                    .tuple, .set, .frozen_set => |items| items,
+                    else => return error.ParseValue,
+                };
+            };
+            if (items.len != a.len) return error.ParseValue;
+            const normalized = try arena.alloc(Value, a.len);
+            errdefer arena.free(normalized);
+            for (items, normalized) |item, *target|
+                target.* = try validateMode(a.child, arena, item, xml_lax);
+            return python.tupleFromOwnedSlice(arena, normalized);
+        },
         .pointer => |p| {
             const items = if (v == .array) v.array.items else blk: {
                 if (v != .custom) return error.ParseValue;

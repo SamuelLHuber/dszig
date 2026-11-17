@@ -24,10 +24,38 @@ const Record = value.Record;
 
 pub const Error = adapter_mod.Error || lm_mod.Error || value.ConvertError || @import("decision_state.zig").Error || error{NoRetriever};
 
+/// The final failed completion parse of one predictor call, as DSPy's
+/// AdapterParseError exposes it. Contents borrow the call's arena.
+pub const ParseFailure = struct {
+    /// Prepared signature identity; non-null exactly when a failure is captured.
+    signature_class: ?*const anyopaque = null,
+    /// Output field count of the failed prepared signature.
+    expected_count: u32 = 0,
+    failure: adapter_mod.ParseFailure = .{},
+
+    var derived_signature_token: u8 = 0;
+
+    /// DSPy's decision evidence translation hands the chat adapter a signature
+    /// class derived per call, so its parse errors name a class that no
+    /// predictor owns. This identity equals no `PredictState.signature_class`.
+    pub const derived_signature: *const anyopaque = &derived_signature_token;
+
+    /// Predictor calls empty the capture themselves. Call this after handling
+    /// an error when a later `error.AdapterParse` may come from code that
+    /// makes no predictor call; the error value alone cannot tell them apart.
+    pub fn reset(capture: *ParseFailure) void {
+        capture.* = .{};
+    }
+};
+
 pub const Context = struct {
     /// Per-call scratch: prompts, completions, parsed outputs.
     arena: Allocator,
-    lm: lm_mod.LM,
+    /// Settings-level fallback; bound predictors can run without one.
+    lm: lm_mod.LM = lm_mod.LM.unconfigured,
+    /// Privileged per-call override. Explicit null selects the settings LM.
+    lm_override: ?lm_mod.LM = null,
+    lm_override_present: bool = false,
     adapter: Adapter = .xml,
     /// Borrowed extraction configuration when adapter is .two_step.
     two_step: ?*const TwoStepAdapter = null,
@@ -43,6 +71,10 @@ pub const Context = struct {
     preparation: ?Preparation = null,
     /// Independent scoped evidence collectors share this handle with workers.
     decision_evidence: ?*DecisionEvidence = null,
+    /// Opt-in parse diagnostics. Each predictor call and adapter attempt
+    /// empties it first, so only a final `error.AdapterParse` from parsing a
+    /// completion leaves it set. One capture per concurrently running context.
+    parse_failure: ?*ParseFailure = null,
 };
 
 /// Source record_evidence entries are captured before decision decoding.
@@ -124,8 +156,11 @@ pub const TwoStepAdapter = struct {
             .adapter = .chat,
             .lm_options = self.extraction_options,
         };
-        const parsed = runAdapterMany(ctx, .chat, extractor, &.{}, &inputs) catch |err| switch (err) {
-            error.AdapterParse => try runAdapterMany(ctx, .json, extractor, &.{}, &inputs),
+        // Extraction failures are reported against the outer signature and the
+        // main completion by the caller, so this context captures nothing.
+        assert(ctx.parse_failure == null);
+        const parsed = runAdapterMany(ctx, null, .chat, extractor, &.{}, &inputs) catch |err| switch (err) {
+            error.AdapterParse => try runAdapterMany(ctx, null, .json, extractor, &.{}, &inputs),
             else => return err,
         };
         if (parsed.len == 0) return error.AdapterParse;
@@ -205,10 +240,12 @@ pub const PredictState = struct {
     descs: []const []const u8,
     prefixes: []const []const u8,
     demos: []const Record = &.{},
+    /// Borrowed model identity survives program copies; reset clears it.
+    lm: ?lm_mod.LM = null,
     /// Persisted Predict.fields overrides, distinct from signature metadata.
     decision_fields: @import("runtime_value.zig").Value = .{ .object = .empty },
 
-    pub fn hasDecisionFields(state: *const PredictState) bool {
+    pub fn hasDecisionFields(state: *const PredictState) error{ParseValue}!bool {
         return switch (state.decision_fields) {
             .null => false,
             .bool => |b| b,
@@ -218,7 +255,7 @@ pub const PredictState = struct {
             .string => |text| text.len != 0,
             .array => |items| items.items.len != 0,
             .object => |items| items.count() != 0,
-            .custom => |custom| custom.truthy(),
+            .custom => |custom| try custom.truthy(),
         };
     }
 
@@ -257,6 +294,18 @@ pub const PredictState = struct {
 
     pub fn reset(state: *PredictState) void {
         state.demos = &.{};
+        state.lm = null;
+    }
+
+    fn resolveContext(state: *const PredictState, base: Context) Error!Context {
+        var ctx = base;
+        if (base.lm_override_present or base.lm_override != null) {
+            ctx.lm = base.lm_override orelse base.lm;
+        } else {
+            ctx.lm = state.lm orelse base.lm;
+        }
+        if (ctx.lm.sameInstance(lm_mod.LM.unconfigured)) return error.NoLM;
+        return ctx;
     }
 
     /// Signature.with_instructions/with_updated_fields/load_state return a new
@@ -268,7 +317,9 @@ pub const PredictState = struct {
     }
 
     /// Run one LM call: format, complete, parse (with JSON fallback), trace.
-    pub fn call(state: *const PredictState, ctx: Context, inputs: *const Record) Error!Record {
+    pub fn call(state: *const PredictState, ctx_in: Context, inputs: *const Record) Error!Record {
+        if (ctx_in.parse_failure) |capture| capture.* = .{};
+        const ctx = try state.resolveContext(ctx_in);
         const prepared = try state.prepare(ctx, inputs);
         const outputs = (try runPredict(state, ctx, prepared))[0];
         if (ctx.trace) |t| try t.record(state, prepared.inputs, &outputs);
@@ -280,7 +331,8 @@ pub const PredictState = struct {
     /// DSPy, a temperature that is unset or at most 0.15 becomes 0.7.
     pub fn callMany(state: *const PredictState, ctx_in: Context, inputs: *const Record, n: u32) Error![]const Record {
         assert(n >= 1);
-        var ctx = ctx_in;
+        if (ctx_in.parse_failure) |capture| capture.* = .{};
+        var ctx = try state.resolveContext(ctx_in);
         ctx.lm_options.n = n;
         if (n > 1 and (ctx.lm_options.temperature orelse 0) <= 0.15) ctx.lm_options.temperature = 0.7;
         const prepared = try state.prepare(ctx, inputs);
@@ -299,10 +351,10 @@ pub const PredictState = struct {
     }
 };
 
-fn runWithFallback(ctx: Context, view_: adapter_mod.View, demos: []const Record, inputs: *const Record) Error![]const Record {
-    return runAdapterMany(ctx, ctx.adapter, view_, demos, inputs) catch |err| switch (err) {
+fn runWithFallback(ctx: Context, signature_class: *const anyopaque, view_: adapter_mod.View, demos: []const Record, inputs: *const Record) Error![]const Record {
+    return runAdapterMany(ctx, signature_class, ctx.adapter, view_, demos, inputs) catch |err| switch (err) {
         error.AdapterParse => if ((ctx.adapter == .chat or ctx.adapter == .xml) and ctx.json_fallback)
-            try runAdapterMany(ctx, .json, view_, demos, inputs)
+            try runAdapterMany(ctx, signature_class, .json, view_, demos, inputs)
         else
             return err,
         else => return err,
@@ -316,7 +368,7 @@ fn runPredict(predictor: *const PredictState, ctx: Context, prepared: PreparedCa
     for (prepared.view.outputs) |field| {
         if (field.decision) |binding| active = active or binding.automatic;
     }
-    if (!active) return runWithFallback(ctx, prepared.view, predictor.demos, prepared.inputs);
+    if (!active) return runWithFallback(ctx, prepared.signature_class, prepared.view, predictor.demos, prepared.inputs);
     const declared = if (predictor.decision_fields == .object and predictor.decision_fields.object.count() != 0)
         try predictor.view(ctx.arena)
     else
@@ -359,7 +411,9 @@ fn runPredict(predictor: *const PredictState, ctx: Context, prepared: PreparedCa
             @import("pyjson.zig").writeJsonAscii(&instructions.writer, .{ .array = examples }) catch |err| return adapter_mod.mapWriteError(err);
             wire.instructions = instructions.written();
         }
-        break :blk try runWithFallback(ctx, wire, &.{}, prepared.inputs);
+        // with_updated_fields creates a new class whenever evidence is requested.
+        const wire_class = if (snapshot.types.len != 0) ParseFailure.derived_signature else prepared.signature_class;
+        break :blk try runWithFallback(ctx, wire_class, wire, &.{}, prepared.inputs);
     };
     const outputs = try ctx.arena.alloc(Record, completions.len);
     for (completions, outputs) |completion, *output| {
@@ -386,9 +440,12 @@ fn runPredict(predictor: *const PredictState, ctx: Context, prepared: PreparedCa
             const answer = completion.get(field.name) orelse return error.InvalidDecision;
             if (answer != .object) return error.InvalidDecision;
             const raw_box = answer.object.get("box") orelse return error.InvalidDecision;
-            const parsed_box = @import("types.zig").validate(@import("bounding_box.zig").BoundingBox, ctx.arena, raw_box) catch |err| return switch (err) {
-                error.OutOfMemory => error.OutOfMemory,
-                else => error.AdapterParse,
+            const parsed_box = @import("types.zig").validate(@import("bounding_box.zig").BoundingBox, ctx.arena, raw_box) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    try captureBoxFailure(ctx, prepared, completion);
+                    return error.AdapterParse;
+                },
             };
             try output.put(ctx.arena, field.name, parsed_box);
             try answers.put(ctx.arena, field.name, try value.cloneValue(ctx.arena, answer));
@@ -429,6 +486,21 @@ fn runPredict(predictor: *const PredictState, ctx: Context, prepared: PreparedCa
         for (decoded.keys(), decoded.values()) |name, result| try output.put(ctx.arena, name, result);
     }
     return outputs;
+}
+
+/// DecisionAdapter's only AdapterParseError: an invalid native bounding box.
+/// It names the call signature and `json.dumps` of the answers, with no
+/// partial result.
+fn captureBoxFailure(ctx: Context, prepared: PreparedCall, answers: Record) Error!void {
+    const capture = ctx.parse_failure orelse return;
+    assert(capture.signature_class == null);
+    var text: std.Io.Writer.Allocating = .init(ctx.arena);
+    @import("pyjson.zig").writeJsonAscii(&text.writer, .{ .object = answers }) catch |err| return adapter_mod.mapWriteError(err);
+    capture.* = .{
+        .signature_class = prepared.signature_class,
+        .expected_count = @intCast(prepared.view.outputs.len),
+        .failure = .{ .completion_text = text.written() },
+    };
 }
 
 fn decisionDemos(arena: Allocator, view_: adapter_mod.View, demos: []const Record) Error!@import("runtime_value.zig").Array {
@@ -550,7 +622,10 @@ fn runSystemOne(ctx: Context, prepared: PreparedCall, demos: []const Record, sna
     return result;
 }
 
-fn runAdapterMany(ctx: Context, adapter: Adapter, original: adapter_mod.View, demos: []const Record, inputs: *const Record) Error![]const Record {
+/// `signature_class` identifies the prepared signature for `ctx.parse_failure`.
+fn runAdapterMany(ctx: Context, signature_class: ?*const anyopaque, adapter: Adapter, original: adapter_mod.View, demos: []const Record, inputs: *const Record) Error![]const Record {
+    // An earlier attempt's failure must not outlive this attempt's outcome.
+    if (ctx.parse_failure) |capture| capture.* = .{};
     if (adapter == .two_step and ctx.two_step == null) return error.AdapterParse;
     var options = ctx.lm_options;
     var request_tools: []const inference.FunctionTool = &.{};
@@ -645,15 +720,23 @@ fn runAdapterMany(ctx: Context, adapter: Adapter, original: adapter_mod.View, de
     for (original.outputs) |field| has_citation_field = has_citation_field or field.native_citations;
     for (completions, outputs) |c, *o| {
         const has_tool_calls = use_native_tools and c.tool_calls.len > 0;
-        if (adapter == .two_step and !has_tool_calls and (c.text == null or c.text.?.len == 0)) return error.AdapterParse;
+        if (!has_tool_calls and (c.text == null or c.text.?.len == 0)) return emptyResponse(ctx, signature_class, original);
         const parsed = if (has_tool_calls) blk: {
             const text = c.text orelse break :blk Record.empty;
             if (text.len == 0 or processed.outputs.len == 0) break :blk Record.empty;
-            break :blk parseCompletion(ctx, adapter, processed, text) catch |err| switch (err) {
+            // A tolerated failure beside native tool calls is never captured.
+            break :blk parseCompletion(ctx, adapter, processed, text, null) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => Record.empty,
             };
-        } else try parseCompletion(ctx, adapter, processed, c.text orelse return error.AdapterParse);
+        } else blk: {
+            const text = c.text orelse return emptyResponse(ctx, signature_class, original);
+            const capture = ctx.parse_failure orelse break :blk try parseCompletion(ctx, adapter, processed, text, null);
+            break :blk parseCompletion(ctx, adapter, processed, text, &capture.failure) catch |err| {
+                if (err == error.AdapterParse) try finishParseFailure(ctx.arena, capture, signature_class, original, native);
+                return err;
+            };
+        };
         if (!needs_preprocess and !use_native_tools and !has_citation_field and adapter != .two_step) {
             o.* = parsed;
             continue;
@@ -680,9 +763,50 @@ fn runAdapterMany(ctx: Context, adapter: Adapter, original: adapter_mod.View, de
     return outputs;
 }
 
-fn parseCompletion(ctx: Context, adapter: Adapter, view_: adapter_mod.View, text: []const u8) Error!Record {
-    if (adapter == .two_step) return ctx.two_step.?.parse(ctx, view_, text);
-    return adapter.parse(ctx.arena, view_, text);
+fn parseCompletion(ctx: Context, adapter: Adapter, view_: adapter_mod.View, text: []const u8, failure: ?*adapter_mod.ParseFailure) Error!Record {
+    if (adapter != .two_step) return adapter.parseWithFailure(ctx.arena, view_, text, failure);
+    // DSPy rewraps an extraction parse error around the main completion,
+    // without the extractor's partial result.
+    return ctx.two_step.?.parse(ctx, view_, text) catch |err| {
+        if (err == error.AdapterParse) if (failure) |f| {
+            f.* = .{ .completion_text = text };
+        };
+        return err;
+    };
+}
+
+/// DSPy rejects a null or empty response before any parsing.
+fn emptyResponse(ctx: Context, signature_class: ?*const anyopaque, original: adapter_mod.View) error{AdapterParse} {
+    if (ctx.parse_failure) |capture| {
+        assert(signature_class != null);
+        capture.* = .{ .signature_class = signature_class, .expected_count = @intCast(original.outputs.len) };
+    }
+    return error.AdapterParse;
+}
+
+/// Mirrors `_call_postprocess`: report the original signature and restore
+/// the original names of reasoning fallback fields in the partial result.
+fn finishParseFailure(
+    arena: Allocator,
+    capture: *ParseFailure,
+    signature_class: ?*const anyopaque,
+    original: adapter_mod.View,
+    native: bool,
+) Allocator.Error!void {
+    assert(signature_class != null);
+    assert(capture.signature_class == null);
+    errdefer capture.* = .{};
+    if (capture.failure.parsed_result) |*partial| {
+        for (original.outputs) |f| {
+            if (!f.native_reasoning or native) continue;
+            const name = try fallbackName(arena, original, f);
+            if (std.mem.eql(u8, name, f.name)) continue;
+            const entry = partial.fetchOrderedRemove(name) orelse continue;
+            try partial.put(arena, f.name, entry.value);
+        }
+    }
+    capture.signature_class = signature_class;
+    capture.expected_count = @intCast(original.outputs.len);
 }
 
 fn fallbackName(arena: Allocator, view_: adapter_mod.View, f: Field) Allocator.Error![]const u8 {
@@ -1021,11 +1145,83 @@ fn joinName(arena: Allocator, prefix: []const u8, name: []const u8) Allocator.Er
 
 /// Reset every reachable predictor (DSPy `reset_copy` minus the copy:
 /// programs are values, so `var copy = program;` is the copy).
-pub fn resetDemos(arena: Allocator, program: anytype) Allocator.Error!void {
+pub fn resetPredictors(arena: Allocator, program: anytype) Allocator.Error!void {
     for (try namedPredictors(arena, program)) |p| p.param.predict.reset();
 }
 
+/// Bind every reachable predictor, preserving the caller-owned LM identity.
+pub fn setLM(arena: Allocator, program: anytype, model: ?lm_mod.LM) Allocator.Error!void {
+    for (try namedPredictors(arena, program)) |p| p.param.predict.lm = model;
+}
+
+/// Empty modules and mixed bound/unbound models have no unique LM.
+pub fn getLM(arena: Allocator, program: anytype) (Allocator.Error || error{MultipleLMs})!?lm_mod.LM {
+    const predictors = try namedPredictors(arena, program);
+    if (predictors.len == 0) return error.MultipleLMs;
+    const first = predictors[0].param.predict.lm;
+    for (predictors[1..]) |p| {
+        const next = p.param.predict.lm;
+        if ((first == null) != (next == null)) return error.MultipleLMs;
+        if (first) |model| if (!model.sameInstance(next.?)) return error.MultipleLMs;
+    }
+    return first;
+}
+
 const testing = std.testing;
+
+test "bound LM precedence includes explicit null and fanout and resets without changing copies" {
+    const Sig = signature.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: i64 };
+    });
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var bound: lm_mod.ScriptedLM = .{ .responses = &.{ "<answer>1</answer>", "<answer>4</answer>", "<answer>5</answer>", "<answer>6</answer>" } };
+    var fallback: lm_mod.ScriptedLM = .{ .responses = &.{ "<answer>2</answer>", "<answer>2</answer>" } };
+    var override: lm_mod.ScriptedLM = .{ .responses = &.{"<answer>3</answer>"} };
+    var program: Predict(Sig) = .{};
+    program.state.lm = bound.lm();
+    const input: Sig.Input = .{ .question = "q" };
+    try testing.expectEqual(@as(i64, 1), (try program.forward(.{ .arena = arena, .lm = fallback.lm() }, input)).answer);
+    try testing.expectEqual(@as(i64, 3), (try program.forward(.{ .arena = arena, .lm_override = override.lm() }, input)).answer);
+    try testing.expectEqual(@as(i64, 2), (try program.forward(.{ .arena = arena, .lm = fallback.lm(), .lm_override_present = true }, input)).answer);
+    const inputs = try value.toRecord(arena, Sig.Input, input);
+    const many = try program.state.callMany(.{ .arena = arena }, &inputs, 2);
+    try testing.expectEqual(@as(i64, 4), many[0].get("answer").?.integer);
+    try testing.expectEqual(@as(i64, 5), many[1].get("answer").?.integer);
+    const copy = program;
+    program.state.reset();
+    var capture: ParseFailure = .{ .expected_count = 99 };
+    try testing.expectError(error.NoLM, program.forward(.{ .arena = arena, .parse_failure = &capture }, input));
+    try testing.expectEqual(@as(u32, 0), capture.expected_count);
+    try testing.expectEqual(@as(i64, 6), (try copy.forward(.{ .arena = arena }, input)).answer);
+    try testing.expectEqual(@as(i64, 2), (try program.forward(.{ .arena = arena, .lm = fallback.lm() }, input)).answer);
+}
+
+test "module LM aggregation distinguishes shared identities mixed bindings and no predictors" {
+    const Sig = signature.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: i64 };
+    });
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var first: lm_mod.ScriptedLM = .{ .responses = &.{} };
+    var second: lm_mod.ScriptedLM = .{ .responses = &.{} };
+    var pair: struct { a: Predict(Sig) = .{}, b: Predict(Sig) = .{}, retrieve: Retrieve = .{} } = .{};
+    try testing.expect((try getLM(arena, &pair)) == null);
+    try setLM(arena, &pair, first.lm());
+    try testing.expect((try getLM(arena, &pair)).?.sameInstance(first.lm()));
+    pair.b.state.lm = second.lm();
+    try testing.expectError(error.MultipleLMs, getLM(arena, &pair));
+    pair.b.state.lm = null;
+    try testing.expectError(error.MultipleLMs, getLM(arena, &pair));
+    try resetPredictors(arena, &pair);
+    try testing.expect((try getLM(arena, &pair)) == null);
+    var empty: struct {} = .{};
+    try testing.expectError(error.MultipleLMs, getLM(arena, &empty));
+}
 
 test "TwoStepAdapter isolates extraction options and retries only the extraction stage" {
     const CountSignature = signature.Signature(struct {

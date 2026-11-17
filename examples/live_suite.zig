@@ -315,7 +315,7 @@ fn pipeline(
     }
     const search = @TypeOf(optimizer) == dszig.BootstrapFewShotWithRandomSearch;
     const compiled = if (search)
-        try optimizer.compile(P, arena, gpa, ctx, student, null, trainset, null)
+        try optimizer.compile(P, arena, gpa, ctx, student, null, trainset, null, .{ .restrict = null, .labeled_sample = true })
     else
         try optimizer.compile(P, arena, gpa, ctx, student, null, trainset);
     const optimized = try dszig.optimize.evaluate(P, gpa, ctx, &compiled.program, devset, metric, 10);
@@ -423,6 +423,15 @@ pub fn parseCalls(arena: Allocator, transcript: Value) ![]const Call {
             if (list.len != 0 and list.len != (if (completions.len > 0) completions.len else 1)) return error.BadTranscript;
             provider_data = list;
         }
+        // Transcripts recorded before response metadata have no such key.
+        var metadata: []const dszig.lm.ResponseMetadata = &.{};
+        if (item.object.get("metadata")) |all| {
+            if (all != .array) return error.BadTranscript;
+            const list = try arena.alloc(dszig.lm.ResponseMetadata, all.array.items.len);
+            for (all.array.items, list) |entry, *dst| dst.* = try dszig.lm.responseMetadataFromValue(arena, entry);
+            if (list.len != 0 and list.len != (if (completions.len > 0) completions.len else 1)) return error.BadTranscript;
+            metadata = list;
+        }
         const options: ?dszig.lm.Options = if (item.object.get("options")) |raw|
             if (raw == .null) null else try dszig.lm.optionsFromValue(arena, raw)
         else
@@ -451,6 +460,7 @@ pub fn parseCalls(arena: Allocator, transcript: Value) ![]const Call {
             .citations = citations,
             .continuation = continuation,
             .provider_data = provider_data,
+            .metadata = metadata,
         };
     }
     return calls;
@@ -493,6 +503,11 @@ pub fn writeTranscript(arena: Allocator, runtime: []const u8, model: []const u8,
         var provider_data: dszig.Array = .init(arena);
         for (call.provider_data) |data| try provider_data.append(data orelse .null);
         try obj.put(arena, "provider_data", .{ .array = provider_data });
+        if (call.metadata.len != 0) {
+            var metadata: dszig.Array = .init(arena);
+            for (call.metadata) |entry| try metadata.append(try dszig.lm.responseMetadataValue(arena, entry));
+            try obj.put(arena, "metadata", .{ .array = metadata });
+        }
         if (call.options) |options| try obj.put(arena, "options", try dszig.lm.optionsValue(arena, options));
         try call_values.append(.{ .object = obj });
     }

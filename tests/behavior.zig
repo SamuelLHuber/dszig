@@ -7,6 +7,406 @@ const rag = @import("rag_program");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 
+const BootstrapTraceSignature = dszig.Signature(struct {
+    pub const Input = struct { token: []const u8 };
+    pub const Output = struct { first: i64, second: i64, third: i64 = 9 };
+});
+
+const BootstrapTracePair = struct {
+    left: dszig.Predict(BootstrapTraceSignature) = .{},
+    right: dszig.Predict(BootstrapTraceSignature) = .{},
+    pub const Input = struct { question: []const u8 };
+    pub const Output = BootstrapTraceSignature.Output;
+
+    pub fn forward(self: *const @This(), ctx: dszig.Context, _: Input) !Output {
+        _ = try self.left.forward(ctx, .{ .token = "good" });
+        return self.right.forward(ctx, .{ .token = "bad" });
+    }
+};
+
+fn bootstrapTraceMetric(
+    _: Allocator,
+    _: *const dszig.Example,
+    prediction: ?*const dszig.value.Record,
+    trace: ?*const dszig.Trace,
+) dszig.value.ParseError!f64 {
+    if (trace != null or prediction == null) return error.ParseValue;
+    return @as(f64, @floatFromInt(prediction.?.get("first").?.integer)) / 10;
+}
+
+test "trace bootstrap retains preceding calls and attributes failure by signature class" {
+    var retained: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer retained.deinit();
+    const out = retained.allocator();
+    const example = try dszig.Example.fromJson(out, "{\"question\":\"outer\"}", &.{"question"});
+    var program: BootstrapTracePair = .{};
+    const responses = [_][2][]const u8{
+        .{
+            "[[ ## first ## ]]\n1\n[[ ## second ## ]]\n2",
+            "[[ ## second ## ]]\n2",
+        },
+        .{ "{\"first\":1,\"second\":2}", "{\"second\":\"2\"}" },
+        .{ "<first>1</first><second>2</second>", "<second>2</second>" },
+    };
+    for ([_]dszig.Adapter{ .chat, .json, .xml }, responses) |adapter, bodies| {
+        const result = block: {
+            var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer scratch.deinit();
+            var lm: dszig.lm.ScriptedLM = .{ .responses = &bodies };
+            break :block try dszig.bootstrap_trace.bootstrapTraceData(
+                BootstrapTracePair,
+                out,
+                .{
+                    .arena = scratch.allocator(),
+                    .lm = lm.lm(),
+                    .adapter = adapter,
+                    .json_fallback = false,
+                },
+                &program,
+                &.{example},
+                .{ .metric = bootstrapTraceMetric, .failure_score = 0.5 },
+            );
+        };
+        const row = result[0];
+        try testing.expectEqual(@as(usize, 0), row.example_ind);
+        // One supplied field plus the default gives 2/3 partial format credit.
+        try testing.expectEqual(@as(?f64, 0), row.score);
+        try testing.expectEqualStrings(bodies[1], row.prediction.failed.completion_text);
+        try testing.expectEqual(@as(?f64, 0), row.prediction.failed.format_reward);
+        try testing.expectEqual(@as(usize, 2), row.trace.len);
+        try testing.expect(row.trace[0].predictor == &program.left.state);
+        try testing.expectEqual(@as(i64, 9), row.trace[0].prediction.success.get("third").?.integer);
+        // The right call failed, but DSPy selects the first equal signature class.
+        try testing.expect(row.trace[1].predictor == &program.left.state);
+        try testing.expectEqualStrings("outer", row.trace[1].inputs.get("question").?.string);
+        try testing.expect(!row.trace[1].inputs.contains("token"));
+        try testing.expectEqualStrings(bodies[1], row.trace[1].prediction.failed.completion_text);
+    }
+}
+
+test "empty predictor completions fail before applying output defaults" {
+    const S = dszig.Signature(struct {
+        pub const Input = struct {};
+        pub const Output = struct { answer: i64 = 9 };
+    });
+    const program: dszig.Predict(S) = .{};
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    for ([_]dszig.Adapter{ .chat, .json, .xml }) |adapter| {
+        var lm: dszig.lm.ScriptedLM = .{ .responses = &.{""} };
+        var capture: dszig.predict.ParseFailure = .{};
+        try testing.expectError(error.AdapterParse, program.forward(
+            .{
+                .arena = memory.allocator(),
+                .lm = lm.lm(),
+                .adapter = adapter,
+                .json_fallback = false,
+                .parse_failure = &capture,
+            },
+            .{},
+        ));
+        try testing.expect(capture.signature_class == program.state.signature_class);
+        try testing.expect(capture.failure.parsed_result == null);
+        try testing.expectEqualStrings("", capture.failure.completion_text);
+    }
+}
+
+test "JSON parse failure retains converted predecessors and raw invalid siblings" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var failure: dszig.adapter.ParseFailure = .{};
+    const view: dszig.adapter.View = .{
+        .instructions = "",
+        .inputs = BootstrapTraceSignature.input_fields_list,
+        .outputs = BootstrapTraceSignature.output_fields_list,
+    };
+    try testing.expectError(error.AdapterParse, dszig.Adapter.json.parseWithFailure(
+        arena,
+        view,
+        "{\"second\":\"2\",\"first\":\"wrong\",\"third\":\"3\",\"extra\":0}",
+        &failure,
+    ));
+    const partial = failure.parsed_result.?;
+    try testing.expectEqual(@as(usize, 3), partial.count());
+    for ([_][]const u8{ "second", "first", "third" }, partial.keys()) |expected, actual| {
+        try testing.expectEqualStrings(expected, actual);
+    }
+    try testing.expectEqual(@as(i64, 2), partial.get("second").?.integer);
+    try testing.expectEqualStrings("wrong", partial.get("first").?.string);
+    try testing.expectEqualStrings("3", partial.get("third").?.string);
+    // A successful parse must not leak this failed completion into a later call.
+    _ = try dszig.Adapter.json.parseWithFailure(
+        arena,
+        view,
+        "{\"first\":4,\"second\":5}",
+        &failure,
+    );
+    try testing.expect(failure.parsed_result == null);
+    try testing.expectEqualStrings("", failure.completion_text);
+}
+
+const BootstrapTraceSingle = struct {
+    predict: dszig.Predict(BootstrapTraceSignature) = .{},
+    pub const Input = struct { question: []const u8 };
+    pub const Output = BootstrapTraceSignature.Output;
+
+    pub fn forward(self: *const @This(), ctx: dszig.Context, input: Input) !Output {
+        return self.predict.forward(ctx, .{ .token = input.question });
+    }
+};
+
+const BootstrapTraceLM = struct {
+    fn complete(
+        _: *anyopaque,
+        arena: Allocator,
+        request: dszig.lm.Request,
+    ) dszig.lm.Error![]const dszig.lm.Completion {
+        const text = request.messages[request.messages.len - 1].content.text;
+        const body = if (std.mem.indexOf(u8, text, "q0") != null)
+            "{\"first\":1,\"second\":2}"
+        else if (std.mem.indexOf(u8, text, "q1") != null)
+            "{\"second\":7}"
+        else if (std.mem.indexOf(u8, text, "q2") != null)
+            "{\"first\":8,\"second\":9}"
+        else
+            "{\"second\":\"2\",\"first\":\"wrong\",\"third\":\"3\"}";
+        const output = try arena.alloc(dszig.lm.Completion, 1);
+        output[0] = .{ .text = try arena.dupe(u8, body) };
+        return output;
+    }
+
+    fn lm(self: *@This()) dszig.LM {
+        return .{ .ptr = self, .vtable = &.{ .complete = complete } };
+    }
+};
+
+test "concurrent trace bootstrap retains ordered failures across joined scratch reuse" {
+    const Pool = dszig.Parallel(dszig.bootstrap_trace.Run, .{
+        .workers = 2,
+        .tasks = 2,
+        .attempts = 2,
+        .failures = 2,
+    });
+    const Scratch = struct {
+        allocators: [2]std.heap.FixedBufferAllocator,
+
+        fn reset(ptr: *anyopaque, index: u32) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.allocators[index].reset();
+        }
+    };
+    var retained: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer retained.deinit();
+    const out = retained.allocator();
+    var pool: Pool = undefined;
+    try pool.init(testing.io, .{});
+    defer pool.deinit();
+    var buffers: [2][131072]u8 = undefined;
+    var scratch: Scratch = undefined;
+    var models: [2]BootstrapTraceLM = .{ .{}, .{} };
+    var contexts: [2]dszig.Context = undefined;
+    for (&contexts, &scratch.allocators, &buffers, &models) |*ctx, *allocator, *buffer, *model| {
+        allocator.* = .init(buffer);
+        ctx.* = .{ .arena = allocator.allocator(), .lm = model.lm(), .adapter = .json };
+    }
+    const dataset = [_]dszig.Example{
+        try dszig.Example.fromJson(out, "{\"question\":\"q0\"}", &.{"question"}),
+        try dszig.Example.fromJson(out, "{\"question\":\"q1\"}", &.{"question"}),
+        try dszig.Example.fromJson(out, "{\"question\":\"q2\"}", &.{"question"}),
+        try dszig.Example.fromJson(out, "{\"question\":\"q3\"}", &.{"question"}),
+    };
+    var program: BootstrapTraceSingle = .{};
+    const result = try dszig.bootstrap_trace.bootstrapTraceData(
+        BootstrapTraceSingle,
+        out,
+        contexts[0],
+        &program,
+        &dataset,
+        .{
+            .metric = bootstrapTraceMetric,
+            .failure_score = 0.5,
+            .rollouts = .{ .runner = pool.runner(), .contexts = &contexts },
+            .scratch_reset = .{ .ptr = &scratch, .reset = Scratch.reset },
+        },
+    );
+    for (&buffers, scratch.allocators) |*buffer, allocator| {
+        try testing.expectEqual(@as(usize, 0), allocator.end_index);
+        @memset(buffer, 0xff);
+    }
+    try testing.expectEqual(@as(u32, 0), pool.scheduler.running_count);
+    try testing.expectEqual(@as(usize, 4), result.len);
+    for (result, [_]f64{ 0.1, 0, 0.8, 0.5 }, 0..) |row, score, index| {
+        try testing.expectEqual(index, row.example_ind);
+        try testing.expectEqual(@as(?f64, score), row.score);
+    }
+    try testing.expectEqual(@as(i64, 1), result[0].prediction.success.get("first").?.integer);
+    try testing.expectEqual(@as(i64, 8), result[2].prediction.success.get("first").?.integer);
+    try testing.expectEqualStrings("q0", result[0].trace[0].inputs.get("token").?.string);
+    try testing.expectEqualStrings("q2", result[2].trace[0].inputs.get("token").?.string);
+    try testing.expectEqualStrings("{\"second\":7}", result[1].prediction.failed.completion_text);
+    try testing.expectEqualStrings("q1", result[1].trace[0].inputs.get("question").?.string);
+    try testing.expectEqual(@as(?f64, 0.5), result[3].prediction.failed.format_reward);
+}
+
+test "trace metric failure reports successful evaluation before unpacking fails" {
+    const Hooks = struct {
+        call_id: u64 = 0,
+        ended: bool = false,
+        evaluation: ?dszig.optimize.Evaluation = null,
+
+        fn start(ptr: *anyopaque, event: dszig.bootstrap_trace.EvaluateStart) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.call_id = event.call_id;
+            return error.CallbackStartFailure;
+        }
+
+        fn end(ptr: *anyopaque, event: dszig.bootstrap_trace.EvaluateEnd) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.ended = event.call_id == self.call_id and event.err == null;
+            if (event.result) |result| self.evaluation = result.evaluation;
+            return error.CallbackEndFailure;
+        }
+
+        fn metric(
+            _: Allocator,
+            _: *const dszig.Example,
+            _: ?*const dszig.value.Record,
+            _: ?*const dszig.Trace,
+        ) dszig.value.ParseError!f64 {
+            return error.ParseValue;
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var lm: dszig.lm.ScriptedLM = .{ .responses = &.{"{\"first\":1,\"second\":2}"} };
+    var program: BootstrapTraceSingle = .{};
+    var hooks: Hooks = .{};
+    var failure: ?dszig.bootstrap_trace.Unhandled = null;
+    const example = try dszig.Example.fromJson(arena, "{\"question\":\"metric\"}", &.{"question"});
+    try testing.expectError(error.UnpackPredictionAndTrace, dszig.bootstrap_trace.bootstrapTraceData(
+        BootstrapTraceSingle,
+        arena,
+        .{ .arena = arena, .lm = lm.lm(), .adapter = .json },
+        &program,
+        &.{example},
+        .{
+            .metric = Hooks.metric,
+            .failure_score = 0.5,
+            .capture_crashes = true,
+            .unhandled = &failure,
+            .callbacks = &.{.{
+                .ptr = &hooks,
+                .on_evaluate_start = Hooks.start,
+                .on_evaluate_end = Hooks.end,
+            }},
+        },
+    ));
+    try testing.expect(hooks.ended);
+    try testing.expectEqual(@as(f64, 50), hooks.evaluation.?.score);
+    try testing.expectEqual(@as(usize, 1), hooks.evaluation.?.errors);
+    try testing.expectEqual(dszig.bootstrap_trace.Stage.metric, failure.?.stage);
+    try testing.expectEqual(error.ParseValue, failure.?.err);
+}
+
+const FixedTupleSignature = dszig.Signature(struct {
+    pub const Input = struct { source: [2]i64 };
+    pub const Output = struct {
+        matrix: [2][2]i64,
+        snippets: [2]dszig.Code,
+        optional: ?[2]i64,
+        empty: [0]bool,
+    };
+});
+
+test "fixed tuple Predict preserves nested values and rejects incorrect cardinality" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const body =
+        \\{"matrix":[["1",true],[3,4]],"snippets":["first()","second()"],"optional":[5,6],"empty":[]}
+    ;
+    const completions = [_][]const u8{
+        \\[[ ## matrix ## ]]
+        \\[["1",true],[3,4]]
+        \\[[ ## snippets ## ]]
+        \\["first()","second()"]
+        \\[[ ## optional ## ]]
+        \\[5,6]
+        \\[[ ## empty ## ]]
+        \\[]
+        \\[[ ## completed ## ]]
+        ,
+        body,
+        \\<matrix>[["1",true],[3,4]]</matrix>
+        \\<snippets>["first()","second()"]</snippets>
+        \\<optional>[5,6]</optional>
+        \\<empty>[]</empty>
+        ,
+    };
+    const predict: dszig.Predict(FixedTupleSignature) = .{};
+    for ([_]dszig.Adapter{ .chat, .json, .xml }, completions) |adapter, completion| {
+        var scripted: dszig.lm.ScriptedLM = .{ .responses = &.{completion} };
+        const output = try predict.forward(
+            .{ .arena = arena, .lm = scripted.lm(), .adapter = adapter },
+            .{ .source = .{ 10, 20 } },
+        );
+        try testing.expectEqual([2][2]i64{ .{ 1, 1 }, .{ 3, 4 } }, output.matrix);
+        try testing.expectEqualStrings("first()", output.snippets[0].code);
+        try testing.expectEqualStrings("second()", output.snippets[1].code);
+        try testing.expectEqual([2]i64{ 5, 6 }, output.optional.?);
+    }
+    const validate = FixedTupleSignature.output_fields_list[0].validate.?;
+    for ([_][]const u8{ "[]", "[[1,2]]", "[[1,2],[3,4],[5,6]]", "[[1],[2,3]]" }) |text| {
+        const input = try std.json.parseFromSliceLeaky(dszig.Value, arena, text, .{});
+        try testing.expectError(error.ParseValue, validate(arena, input));
+        try testing.expectError(error.TypeMismatch, dszig.value.fromValue(arena, [2][2]i64, input));
+    }
+    const empty = try dszig.value.toValue(arena, [0]bool, .{});
+    try testing.expectEqual([0]bool{}, try dszig.value.fromValue(arena, [0]bool, empty));
+    const pair = try dszig.value.toValue(arena, [2]i64, .{ 7, 8 });
+    const sentinel = try dszig.value.fromValue(arena, [2:99]i64, pair);
+    try testing.expectEqual(@as(i64, 99), sentinel[2]);
+}
+
+test "fixed model tuples preserve typed feedback and owning clones after source destruction" {
+    const Point = struct {
+        pub const model_name = "Point";
+        x: i64,
+        name: []const u8,
+    };
+    const S = dszig.Signature(struct {
+        pub const Input = struct {};
+        pub const Output = struct { points: ?[1][1]Point };
+    });
+    const clone = block: {
+        var source: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer source.deinit();
+        const arena = source.allocator();
+        const name = try arena.dupe(u8, "A");
+        const runtime = try dszig.value.toValue(arena, ?[1][1]Point, .{.{.{ .x = 3, .name = name }}});
+        const field = S.output_fields_list[0];
+        try testing.expectEqualStrings(
+            "((Point(x=3, name='A'),),)",
+            try field.python_str.?(arena, runtime),
+        );
+        const masked = (try field.refine_mask.?(arena, runtime)).?;
+        const outer = dszig.python_value.view(masked).?.tuple;
+        const inner = dszig.python_value.view(outer[0]).?.tuple;
+        try testing.expectEqualStrings("<non-serializable: Point>", inner[0].string);
+        // Cloning must own every tuple, dictionary and string child.
+        const owned = try runtime.custom.clone(testing.allocator);
+        name[0] = 'Z';
+        break :block owned;
+    };
+    defer clone.deinit(testing.allocator);
+    const outer = dszig.python_value.view(.{ .custom = clone }).?.tuple;
+    const inner = dszig.python_value.view(outer[0]).?.tuple;
+    try testing.expectEqualStrings("A", inner[0].object.get("name").?.string);
+    try testing.expectEqual(@as(i64, 3), inner[0].object.get("x").?.integer);
+}
+
 /// Mock LM that answers a question correctly only when the prompt carries at
 /// least `difficulty` demos: few-shot demos genuinely improve it.
 const LearningLM = struct {
@@ -388,6 +788,47 @@ test "cloned borrowed model fields own their data after frame and source destruc
     try testing.expectEqualStrings("source", clones[4].get(dszig.Citations.Citation).?.cited_text);
     try testing.expectEqualStrings("source", clones[5].get(dszig.Citations).?.citations[0].cited_text);
     try testing.expect(clones[6].get(dszig.decision.Noul).?.value);
+}
+
+test "prepared Decimal and raw scalar outputs borrow boxes while clones retain ownership" {
+    const Fields = struct {
+        amount: dszig.Decimal,
+        optional: ?dszig.Decimal,
+        raw: dszig.Value,
+    };
+    var source: std.heap.ArenaAllocator = .init(testing.allocator);
+    var source_live = true;
+    defer if (source_live) source.deinit();
+    const original = try dszig.Decimal.coerce(source.allocator(), .{ .string = "12.50" });
+    var fields: Fields = .{ .amount = original, .optional = original, .raw = original.value };
+    var storage: dszig.value.RecordStorage(3) = undefined;
+    try storage.init();
+    try dszig.value.toRecordInto(testing.failing_allocator, Fields, &fields, &storage.record);
+    var clones: [3]dszig.runtime_value.Custom = undefined;
+    var count: usize = 0;
+    defer for (clones[0..count]) |clone| clone.deinit(testing.allocator);
+    for (storage.record.values()) |item| {
+        try testing.expect(!item.custom.owns_box);
+        try testing.expect(!item.custom.owns_data);
+        clones[count] = try item.custom.clone(testing.allocator);
+        count += 1;
+        item.custom.deinit(testing.failing_allocator);
+    }
+    const decimal = dszig.python_value.view(original.value).?.decimal;
+    try testing.expectEqualStrings("1250", decimal.digits);
+    // Reuse the frame and clear an optional without touching retained clones.
+    fields.optional = null;
+    try dszig.value.toRecordInto(testing.failing_allocator, Fields, &fields, &storage.record);
+    try testing.expect(storage.record.get("optional").? == .null);
+    source.deinit();
+    source_live = false;
+    for (clones) |clone| {
+        try testing.expect(clone.owns_box);
+        try testing.expect(clone.owns_data);
+        const retained = dszig.python_value.view(.{ .custom = clone }).?.decimal;
+        try testing.expectEqualStrings("1250", retained.digits);
+        try testing.expectEqual(@as(i64, -2), retained.exponent);
+    }
 }
 
 test "prepared native output storage supports indexed fields and reuse" {
@@ -807,7 +1248,7 @@ test "random search scores every seed, ranks them and keeps the best" {
         .max_labeled_demos = 2,
         .num_candidate_programs = 3,
     };
-    const result = try search.compile(rag.RAG, out.allocator(), testing.allocator, ctx, .{}, null, trainset, null);
+    const result = try search.compile(rag.RAG, out.allocator(), testing.allocator, ctx, .{}, null, trainset, null, .{ .restrict = null, .labeled_sample = true });
     try testing.expectEqual(@as(usize, 6), result.candidates.len);
     var seen: [6]bool = @splat(false);
     for (result.candidates, 0..) |c, i| {
@@ -831,7 +1272,7 @@ test "random search with concurrent evaluation ranks the same candidates as seri
         .max_labeled_demos = 2,
         .num_candidate_programs = 3,
     };
-    const serial = try search.compile(rag.RAG, out.allocator(), testing.allocator, ctx, .{}, null, trainset, null);
+    const serial = try search.compile(rag.RAG, out.allocator(), testing.allocator, ctx, .{}, null, trainset, null, .{ .restrict = null, .labeled_sample = true });
 
     const limits: dszig.parallel.Limits = .{ .workers = 3, .tasks = 8, .attempts = 8, .failures = 1 };
     const Evaluator = dszig.parallel.Evaluator(rag.RAG, limits);
@@ -846,7 +1287,7 @@ test "random search with concurrent evaluation ranks the same candidates as seri
     try evaluator.init(testing.io, .{}, &backing);
     defer evaluator.deinit();
     search.concurrent_evaluation = evaluator.concurrent(&contexts, .{ .straggler_timeout_ns = 0 });
-    const concurrent = try search.compile(rag.RAG, out.allocator(), testing.allocator, ctx, .{}, null, trainset, null);
+    const concurrent = try search.compile(rag.RAG, out.allocator(), testing.allocator, ctx, .{}, null, trainset, null, .{ .restrict = null, .labeled_sample = true });
 
     try testing.expectEqual(serial.candidates.len, concurrent.candidates.len);
     for (serial.candidates, concurrent.candidates) |expected, actual| {
@@ -883,9 +1324,492 @@ test "random search stops at stop_at_score" {
         .num_candidate_programs = 3,
         .stop_at_score = 0.0,
     };
-    const result = try search.compile(rag.RAG, out.allocator(), testing.allocator, ctx, .{}, null, trainset, null);
+    const result = try search.compile(rag.RAG, out.allocator(), testing.allocator, ctx, .{}, null, trainset, null, .{ .restrict = null, .labeled_sample = true });
     try testing.expectEqual(@as(usize, 1), result.candidates.len);
     try testing.expectEqual(@as(i64, -3), result.candidates[0].seed);
+}
+
+const FewShotOptionsSignature = dszig.Signature(struct {
+    pub const Input = struct { question: []const u8 };
+    pub const Output = struct { answer: []const u8 };
+});
+
+/// Native mirror of DemoProgram in tools/dspy_reference/fewshot_options_oracle.py.
+/// Every expected demo, score and call count in the tests below is that probe's
+/// actual DSPy 3.5 receipt, never a value generated by native code.
+const FewShotOptionsProgram = struct {
+    z: dszig.Predict(FewShotOptionsSignature) = .{},
+    a: dszig.Predict(FewShotOptionsSignature) = .{},
+    compiled: bool = false,
+
+    var forward_calls: u32 = 0;
+
+    pub const Input = FewShotOptionsSignature.Input;
+    pub const Output = struct { answer: []const u8, z: i64, a: i64, nz: i64, na: i64 };
+
+    pub fn forward(self: *const FewShotOptionsProgram, ctx: dszig.Context, input: Input) !Output {
+        forward_calls += 1;
+        if (ctx.trace) |trace| {
+            const inputs = try dszig.value.toRecord(ctx.arena, Input, input);
+            const outputs = try dszig.value.toRecord(ctx.arena, FewShotOptionsSignature.Output, .{ .answer = input.question });
+            try trace.record(&self.z.state, &inputs, &outputs);
+            try trace.record(&self.a.state, &inputs, &outputs);
+        }
+        return .{
+            .answer = input.question,
+            .z = try firstAnswer(self.z.state.demos),
+            .a = try firstAnswer(self.a.state.demos),
+            .nz = @intCast(self.z.state.demos.len),
+            .na = @intCast(self.a.state.demos.len),
+        };
+    }
+
+    fn firstAnswer(demos: []const dszig.value.Record) !i64 {
+        if (demos.len == 0) return -1;
+        return std.fmt.parseInt(i64, demos[0].get("answer").?.string, 10);
+    }
+};
+
+fn fewShotOptionsMetric(_: Allocator, example: *const dszig.Example, prediction: ?*const dszig.value.Record, trace: ?*const dszig.Trace) dszig.value.ParseError!f64 {
+    if (trace != null) return 1;
+    const row = prediction orelse return error.ParseValue;
+    const question = std.fmt.parseInt(i64, example.record.get("question").?.string, 10) catch return error.ParseValue;
+    const sum = 2 * row.get("z").?.integer + row.get("a").?.integer + row.get("nz").?.integer + question;
+    return @floatFromInt(@mod(sum, 7));
+}
+
+fn fewShotOptionsTiedMetric(_: Allocator, _: *const dszig.Example, _: ?*const dszig.value.Record, _: ?*const dszig.Trace) dszig.value.ParseError!f64 {
+    return 1;
+}
+
+/// Bootstrap accepts a trace only when the supplied teacher actually ran.
+fn fewShotOptionsTeacherMetric(_: Allocator, _: *const dszig.Example, prediction: ?*const dszig.value.Record, trace: ?*const dszig.Trace) dszig.value.ParseError!f64 {
+    const row = prediction orelse return error.ParseValue;
+    if (trace == null) return @floatFromInt(row.get("nz").?.integer);
+    return if (row.get("z").?.integer == 88 and row.get("a").?.integer == 77) 1 else 0;
+}
+
+/// Examples `question == answer == str(i)` for `i` in `0..count`.
+fn fewShotOptionsExamples(arena: Allocator, count: usize) ![]dszig.Example {
+    const rows = try arena.alloc(dszig.Example, count);
+    for (rows, 0..) |*row, index| {
+        const text = try std.fmt.allocPrint(arena, "{d}", .{index});
+        var record: dszig.value.Record = .empty;
+        try record.put(arena, "question", .{ .string = text });
+        try record.put(arena, "answer", .{ .string = text });
+        row.* = .{ .record = record, .input_keys = &.{"question"} };
+    }
+    return rows;
+}
+
+fn fewShotOptionsDemo(arena: Allocator, answer: []const u8) ![]const dszig.value.Record {
+    const demos = try arena.alloc(dszig.value.Record, 1);
+    demos[0] = .empty;
+    try demos[0].put(arena, "question", .{ .string = "preset" });
+    try demos[0].put(arena, "answer", .{ .string = answer });
+    return demos;
+}
+
+/// The student's preset demo must be discarded by every successful compile.
+fn fewShotOptionsStudent(arena: Allocator) !FewShotOptionsProgram {
+    var student: FewShotOptionsProgram = .{};
+    student.z.state.demos = try fewShotOptionsDemo(arena, "99");
+    return student;
+}
+
+fn expectFewShotDemos(program: *const FewShotOptionsProgram, z: []const []const u8, a: []const []const u8) !void {
+    try testing.expectEqual(z.len, program.z.state.demos.len);
+    try testing.expectEqual(a.len, program.a.state.demos.len);
+    for (z, program.z.state.demos) |expected, demo| try testing.expectEqualStrings(expected, demo.get("answer").?.string);
+    for (a, program.a.state.demos) |expected, demo| try testing.expectEqualStrings(expected, demo.get("answer").?.string);
+}
+
+const FewShotCandidate = dszig.BootstrapFewShotWithRandomSearch.Candidate;
+
+fn expectFewShotCandidates(expected: []const FewShotCandidate, actual: []const FewShotCandidate) !void {
+    try testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |want, got| {
+        try testing.expectEqual(want.seed, got.seed);
+        try testing.expectEqual(want.score, got.score);
+    }
+}
+
+fn fewShotOptionsSearch(metric: dszig.optimize.Metric) dszig.BootstrapFewShotWithRandomSearch {
+    return .{ .metric = metric, .max_bootstrapped_demos = 2, .max_labeled_demos = 3, .num_candidate_programs = 4 };
+}
+
+test "LabeledFewShot sample shares one RNG across predictors and prefix mode owns the trainset head" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    var inputs: std.heap.ArenaAllocator = .init(testing.allocator);
+    var inputs_live = true;
+    defer if (inputs_live) inputs.deinit();
+    const student = try fewShotOptionsStudent(inputs.allocator());
+    const trainset = try fewShotOptionsExamples(inputs.allocator(), 6);
+    const optimizer: dszig.LabeledFewShot = .{ .k = 3 };
+
+    const sampled = try optimizer.compile(FewShotOptionsProgram, out.allocator(), student, trainset, .{ .sample = true });
+    const prefix = try optimizer.compile(FewShotOptionsProgram, out.allocator(), student, trainset, .{ .sample = false });
+    // Compiled demos must not borrow the caller's trainset or student.
+    inputs.deinit();
+    inputs_live = false;
+    // The second predictor continues the first predictor's random.Random(0) stream.
+    try expectFewShotDemos(&sampled, &.{ "3", "5", "0" }, &.{ "2", "4", "3" });
+    try expectFewShotDemos(&prefix, &.{ "0", "1", "2" }, &.{ "0", "1", "2" });
+}
+
+test "LabeledFewShot negative k slices like Python in prefix mode and fails only when sampling draws" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    const arena = out.allocator();
+    const student = try fewShotOptionsStudent(arena);
+    const trainset = try fewShotOptionsExamples(arena, 6);
+    const all = [_][]const u8{ "0", "1", "2", "3", "4", "5" };
+    const prefix_cases = [_]struct { k: i128, count: usize }{
+        .{ .k = 0, .count = 0 },
+        .{ .k = 1, .count = 1 },
+        .{ .k = 6, .count = 6 },
+        .{ .k = 16, .count = 6 },
+        .{ .k = 1 << 63, .count = 6 },
+        .{ .k = -1, .count = 5 },
+        .{ .k = -2, .count = 4 },
+        .{ .k = -5, .count = 1 },
+        .{ .k = -6, .count = 0 },
+        .{ .k = -7, .count = 0 },
+        .{ .k = -100, .count = 0 },
+        .{ .k = std.math.minInt(i128), .count = 0 },
+    };
+    for (prefix_cases) |case| {
+        const optimizer: dszig.LabeledFewShot = .{ .k = case.k };
+        const compiled = try optimizer.compile(FewShotOptionsProgram, arena, student, trainset, .{ .sample = false });
+        try expectFewShotDemos(&compiled, all[0..case.count], all[0..case.count]);
+    }
+    for ([_]i128{ -1, -6, -7, std.math.minInt(i128) }) |k| {
+        const optimizer: dszig.LabeledFewShot = .{ .k = k };
+        try testing.expectError(error.InvalidSampleCount, optimizer.compile(FewShotOptionsProgram, arena, student, trainset, .{ .sample = true }));
+        // Source returns the reset copy before reaching rng.sample for an empty trainset.
+        const reset = try optimizer.compile(FewShotOptionsProgram, arena, student, &.{}, .{ .sample = true });
+        try expectFewShotDemos(&reset, &.{}, &.{});
+    }
+    const wide: dszig.LabeledFewShot = .{ .k = 1 << 63 };
+    const sampled = try wide.compile(FewShotOptionsProgram, arena, student, trainset, .{ .sample = true });
+    try expectFewShotDemos(&sampled, &.{ "3", "5", "0", "1", "2", "4" }, &.{ "2", "3", "5", "4", "0", "1" });
+
+    // Source validates the count inside its predictor loop: no predictor, no failure.
+    const Bare = struct {
+        compiled: bool = false,
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: []const u8 };
+        pub fn forward(_: *const @This(), _: dszig.Context, input: Input) !Output {
+            return .{ .answer = input.question };
+        }
+    };
+    const negative: dszig.LabeledFewShot = .{ .k = -1 };
+    _ = try negative.compile(Bare, arena, .{}, trainset, .{ .sample = true });
+}
+
+// Actual DSPy 3.5 zero-bootstrap observations: fixed seeds remain usable,
+// while a random seed consumes an empty randint range only when reached.
+test "random search validates zero bootstrap range only for consumed random seeds" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    const arena = out.allocator();
+    var silent: dszig.lm.ScriptedLM = .{ .responses = &.{} };
+    const ctx: dszig.Context = .{ .arena = arena, .lm = silent.lm() };
+    const student = try fewShotOptionsStudent(arena);
+    const trainset = try fewShotOptionsExamples(arena, 6);
+    const valset = try fewShotOptionsExamples(arena, 5);
+    const P = FewShotOptionsProgram;
+    var search = fewShotOptionsSearch(fewShotOptionsMetric);
+    search.max_bootstrapped_demos = 0;
+
+    const fixed = try search.compile(P, arena, testing.allocator, ctx, student, null, trainset, valset, .{
+        .restrict = &.{ -3, -2, -1 },
+        .labeled_sample = true,
+    });
+    try expectFewShotCandidates(&.{
+        .{ .seed = -3, .score = 320 },
+        .{ .seed = -2, .score = 320 },
+        .{ .seed = -1, .score = 320 },
+    }, fixed.candidates);
+    try expectFewShotDemos(&fixed.program, &.{}, &.{});
+    P.forward_calls = 0;
+    const bootstrap = try search.compile(P, arena, testing.allocator, ctx, student, null, trainset, valset, .{
+        .restrict = &.{-1},
+        .labeled_sample = true,
+    });
+    try expectFewShotDemos(&bootstrap.program, &.{ "0", "3", "4" }, &.{ "1", "5", "0" });
+    try testing.expectEqual(@as(u32, 5), P.forward_calls);
+
+    search.stop_at_score = 0;
+    const stopped = try search.compile(P, arena, testing.allocator, ctx, student, null, trainset, valset, .{
+        .restrict = null,
+        .labeled_sample = true,
+    });
+    try expectFewShotCandidates(&.{.{ .seed = -3, .score = 320 }}, stopped.candidates);
+    search.stop_at_score = null;
+    P.forward_calls = 0;
+    try testing.expectError(error.InvalidBootstrapRange, search.compile(P, arena, testing.allocator, ctx, student, null, trainset, valset, .{
+        .restrict = &.{0},
+        .labeled_sample = true,
+    }));
+    try testing.expectEqual(@as(u32, 0), P.forward_calls);
+    try testing.expectError(error.InvalidBootstrapRange, search.compile(P, arena, testing.allocator, ctx, student, null, trainset, valset, .{
+        .restrict = &.{ -3, -2, -1, 0 },
+        .labeled_sample = true,
+    }));
+    try testing.expectEqual(@as(u32, 15), P.forward_calls);
+    P.forward_calls = 0;
+    try testing.expectError(error.RestrictMatchesNoSeed, search.compile(P, arena, testing.allocator, ctx, student, null, trainset, valset, .{
+        .restrict = &.{},
+        .labeled_sample = true,
+    }));
+    try testing.expectEqual(@as(u32, 0), P.forward_calls);
+}
+
+test "random search restrict is a seed set applied before any candidate is built" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    const arena = out.allocator();
+    var silent: dszig.lm.ScriptedLM = .{ .responses = &.{} };
+    const ctx: dszig.Context = .{ .arena = arena, .lm = silent.lm() };
+    const student = try fewShotOptionsStudent(arena);
+    const trainset = try fewShotOptionsExamples(arena, 6);
+    const valset = try fewShotOptionsExamples(arena, 5);
+    const P = FewShotOptionsProgram;
+    var search = fewShotOptionsSearch(fewShotOptionsMetric);
+
+    // Duplicates and out-of-range seeds are ignored; order follows the seed range.
+    P.forward_calls = 0;
+    const filtered = try search.compile(P, arena, testing.allocator, ctx, student, null, trainset, valset, .{
+        .restrict = &.{ 3, -3, 3, -3, 99, -99, 4, -4 },
+        .labeled_sample = true,
+    });
+    try expectFewShotCandidates(&.{ .{ .seed = 3, .score = 360 }, .{ .seed = -3, .score = 320 } }, filtered.candidates);
+    try expectFewShotDemos(&filtered.program, &.{ "0", "1", "4" }, &.{ "0", "5", "2" });
+    try testing.expectEqual(@as(u32, 11), P.forward_calls);
+
+    // No matching seed fails before any program runs, including an empty set.
+    P.forward_calls = 0;
+    for ([_][]const i64{ &.{}, &.{ 4, -4, 100 } }) |restrict| {
+        try testing.expectError(error.RestrictMatchesNoSeed, search.compile(P, arena, testing.allocator, ctx, student, null, trainset, valset, .{
+            .restrict = restrict,
+            .labeled_sample = true,
+        }));
+    }
+    try testing.expectEqual(@as(u32, 0), P.forward_calls);
+
+    // The early stop sees only selected seeds: seed 2 is the first to reach 360.
+    const stopped = block: {
+        var stopping = search;
+        stopping.stop_at_score = 360;
+        break :block try stopping.compile(P, arena, testing.allocator, ctx, student, null, trainset, valset, .{
+            .restrict = &.{ 3, 2, 0, -3 },
+            .labeled_sample = true,
+        });
+    };
+    try expectFewShotCandidates(&.{
+        .{ .seed = 2, .score = 400 },
+        .{ .seed = -3, .score = 320 },
+        .{ .seed = 0, .score = 300 },
+    }, stopped.candidates);
+    try expectFewShotDemos(&stopped.program, &.{ "2", "0", "5" }, &.{ "2", "4", "3" });
+
+    // Equal scores keep seed order and the first selected candidate wins.
+    search.metric = fewShotOptionsTiedMetric;
+    const tied = try search.compile(P, arena, testing.allocator, ctx, student, null, trainset, valset, .{
+        .restrict = &.{ 2, 0, -2, 3 },
+        .labeled_sample = true,
+    });
+    try expectFewShotCandidates(&.{
+        .{ .seed = -2, .score = 100 },
+        .{ .seed = 0, .score = 100 },
+        .{ .seed = 2, .score = 100 },
+        .{ .seed = 3, .score = 100 },
+    }, tied.candidates);
+    try expectFewShotDemos(&tied.program, &.{ "3", "5", "0" }, &.{ "2", "4", "3" });
+
+    // With no shuffled seeds only -3..-1 can match.
+    search.metric = fewShotOptionsMetric;
+    search.num_candidate_programs = 0;
+    try testing.expectError(error.RestrictMatchesNoSeed, search.compile(P, arena, testing.allocator, ctx, student, null, trainset, valset, .{
+        .restrict = &.{0},
+        .labeled_sample = true,
+    }));
+    const fixed = try search.compile(P, arena, testing.allocator, ctx, student, null, trainset, valset, .{
+        .restrict = &.{ -1, -2, -3, 0 },
+        .labeled_sample = true,
+    });
+    try expectFewShotCandidates(&.{
+        .{ .seed = -1, .score = 360 },
+        .{ .seed = -3, .score = 320 },
+        .{ .seed = -2, .score = 320 },
+    }, fixed.candidates);
+}
+
+test "random search labeled_sample changes only the labeled seed" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    const arena = out.allocator();
+    var silent: dszig.lm.ScriptedLM = .{ .responses = &.{} };
+    const ctx: dszig.Context = .{ .arena = arena, .lm = silent.lm() };
+    const student = try fewShotOptionsStudent(arena);
+    const trainset = try fewShotOptionsExamples(arena, 6);
+    const valset = try fewShotOptionsExamples(arena, 5);
+    const P = FewShotOptionsProgram;
+    const search = fewShotOptionsSearch(fewShotOptionsMetric);
+
+    const sampled = try search.compile(P, arena, testing.allocator, ctx, student, null, trainset, valset, .{ .restrict = null, .labeled_sample = true });
+    try expectFewShotCandidates(&.{
+        .{ .seed = 1, .score = 400 },  .{ .seed = 2, .score = 400 },
+        .{ .seed = -1, .score = 360 }, .{ .seed = 3, .score = 360 },
+        .{ .seed = -3, .score = 320 }, .{ .seed = -2, .score = 320 },
+        .{ .seed = 0, .score = 300 },
+    }, sampled.candidates);
+    // Only seed -2 moves: its prefix demos score 360 instead of 320.
+    const prefix = try search.compile(P, arena, testing.allocator, ctx, student, null, trainset, valset, .{ .restrict = null, .labeled_sample = false });
+    try expectFewShotCandidates(&.{
+        .{ .seed = 1, .score = 400 },  .{ .seed = 2, .score = 400 },
+        .{ .seed = -2, .score = 360 }, .{ .seed = -1, .score = 360 },
+        .{ .seed = 3, .score = 360 },  .{ .seed = -3, .score = 320 },
+        .{ .seed = 0, .score = 300 },
+    }, prefix.candidates);
+    try expectFewShotDemos(&prefix.program, &.{ "2", "1", "4" }, &.{ "2", "0", "3" });
+
+    const labeled = try search.compile(P, arena, testing.allocator, ctx, student, null, trainset, valset, .{ .restrict = &.{-2}, .labeled_sample = false });
+    try expectFewShotCandidates(&.{.{ .seed = -2, .score = 360 }}, labeled.candidates);
+    try expectFewShotDemos(&labeled.program, &.{ "0", "1", "2" }, &.{ "0", "1", "2" });
+
+    // Bootstrap seeds still sample their labeled demos when labeled_sample is false.
+    const bootstrap = try search.compile(P, arena, testing.allocator, ctx, student, null, trainset, valset, .{ .restrict = &.{ -3, -1, 1 }, .labeled_sample = false });
+    try expectFewShotCandidates(&.{
+        .{ .seed = 1, .score = 400 },
+        .{ .seed = -1, .score = 360 },
+        .{ .seed = -3, .score = 320 },
+    }, bootstrap.candidates);
+    try expectFewShotDemos(&bootstrap.program, &.{ "2", "1", "4" }, &.{ "2", "0", "3" });
+
+    // A missing or empty valset evaluates on the trainset.
+    const fallback = try search.compile(P, arena, testing.allocator, ctx, student, null, trainset, &.{}, .{ .restrict = &.{ -3, -2 }, .labeled_sample = false });
+    try expectFewShotCandidates(&.{ .{ .seed = -2, .score = 316.67 }, .{ .seed = -3, .score = 300 } }, fallback.candidates);
+}
+
+test "random search consumes its teacher only at a selected bootstrap seed" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    const arena = out.allocator();
+    var silent: dszig.lm.ScriptedLM = .{ .responses = &.{} };
+    const ctx: dszig.Context = .{ .arena = arena, .lm = silent.lm() };
+    const student = try fewShotOptionsStudent(arena);
+    const trainset = try fewShotOptionsExamples(arena, 6);
+    const valset = try fewShotOptionsExamples(arena, 5);
+    const P = FewShotOptionsProgram;
+    var search = fewShotOptionsSearch(fewShotOptionsMetric);
+    const teacher_list: []const P = &.{.{}};
+    const teacher_none: []const P = &.{};
+
+    // A teacher list is a Source failure only where BootstrapFewShot deep-copies it.
+    P.forward_calls = 0;
+    const unconsumed = try search.compile(P, arena, testing.allocator, ctx, student, teacher_list, trainset, valset, .{ .restrict = &.{ -3, -2 }, .labeled_sample = true });
+    try expectFewShotCandidates(&.{ .{ .seed = -3, .score = 320 }, .{ .seed = -2, .score = 320 } }, unconsumed.candidates);
+    try testing.expectEqual(@as(u32, 10), P.forward_calls);
+    const empty = try search.compile(P, arena, testing.allocator, ctx, student, teacher_none, trainset, valset, .{ .restrict = &.{-2}, .labeled_sample = false });
+    try expectFewShotDemos(&empty.program, &.{ "0", "1", "2" }, &.{ "0", "1", "2" });
+
+    // Seed -2 is fully evaluated before seed -1 meets the list.
+    P.forward_calls = 0;
+    try testing.expectError(error.OptimizerTeacherListUnsupported, search.compile(P, arena, testing.allocator, ctx, student, teacher_list, trainset, valset, .{ .restrict = &.{ -2, -1 }, .labeled_sample = true }));
+    try testing.expectEqual(@as(u32, 5), P.forward_calls);
+    P.forward_calls = 0;
+    try testing.expectError(error.OptimizerTeacherListUnsupported, search.compile(P, arena, testing.allocator, ctx, student, teacher_list, trainset, valset, .{ .restrict = &.{1}, .labeled_sample = true }));
+    try testing.expectEqual(@as(u32, 0), P.forward_calls);
+
+    // An early stop at the zero-shot seed never reaches the list either.
+    search.stop_at_score = 0;
+    P.forward_calls = 0;
+    const early = try search.compile(P, arena, testing.allocator, ctx, student, teacher_list, trainset, valset, .{ .restrict = null, .labeled_sample = true });
+    try expectFewShotCandidates(&.{.{ .seed = -3, .score = 320 }}, early.candidates);
+    try testing.expectEqual(@as(u32, 5), P.forward_calls);
+
+    // A real teacher is run by the selected bootstrap seeds: only its preset
+    // demos satisfy the trace metric, so the first two examples bootstrap.
+    search.stop_at_score = null;
+    search.metric = fewShotOptionsTeacherMetric;
+    var teacher: P = .{ .compiled = true };
+    teacher.z.state.demos = try fewShotOptionsDemo(arena, "88");
+    teacher.a.state.demos = try fewShotOptionsDemo(arena, "77");
+    P.forward_calls = 0;
+    const taught = try search.compile(P, arena, testing.allocator, ctx, student, teacher, trainset, valset, .{ .restrict = &.{ -1, 0 }, .labeled_sample = true });
+    try expectFewShotCandidates(&.{ .{ .seed = -1, .score = 300 }, .{ .seed = 0, .score = 300 } }, taught.candidates);
+    try expectFewShotDemos(&taught.program, &.{ "0", "1", "5" }, &.{ "0", "1", "5" });
+    try testing.expectEqual(@as(u32, 14), P.forward_calls);
+    // Without it the student copy teaches and nothing bootstraps.
+    P.forward_calls = 0;
+    const untaught = try search.compile(P, arena, testing.allocator, ctx, student, null, trainset, valset, .{ .restrict = &.{ -1, 0 }, .labeled_sample = true });
+    try expectFewShotDemos(&untaught.program, &.{ "0", "3", "4" }, &.{ "1", "5", "0" });
+    try testing.expectEqual(@as(u32, 22), P.forward_calls);
+}
+
+test "BetterTogether keys and default prompt carry typed compile options" {
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    const arena = out.allocator();
+    const P = FewShotOptionsProgram;
+    const optimizers = dszig.better_together.optimizers;
+    var model: dszig.lm.OpenAI = .{ .client = undefined, .base_url = "http://unused", .model = "base" };
+    const ctx: dszig.Context = .{ .arena = arena, .lm = model.lm() };
+    const trainset = try fewShotOptionsExamples(arena, 6);
+    const meta: dszig.BetterTogether = .{
+        .metric = fewShotOptionsMetric,
+        .limits = .{ .max_steps = 4, .max_examples = 8, .max_predictors = 2, .max_teachers = 2, .max_strategy_bytes = 64 },
+    };
+    const options: dszig.better_together.Options = .{
+        .seed = 9,
+        .valset_ratio = 0,
+        .shuffle_trainset_between_steps = false,
+        .strategy = "labeled -> search",
+    };
+
+    // Each registry key owns its compile options: Python-sliced prefix labels,
+    // then a search restricted to its own prefix-labeled seed.
+    var labeled: optimizers.LabeledFewShot = .{ .optimizer = .{ .k = -2 }, .compile_options = .{ .sample = false } };
+    var search: optimizers.RandomSearch = .{
+        .optimizer = fewShotOptionsSearch(fewShotOptionsMetric),
+        .compile_options = .{ .restrict = &.{ -2, 7 }, .labeled_sample = false },
+    };
+    var student = try fewShotOptionsStudent(arena);
+    try dszig.predict.setLM(arena, &student, model.lm());
+    const keyed = try meta.compileWith(P, arena, testing.allocator, testing.io, ctx, &student, trainset, options, .{
+        .labeled = &labeled,
+        .search = &search,
+    });
+    try testing.expect(!keyed.flag_compilation_error_occurred);
+    try testing.expectEqual(@as(usize, 3), keyed.candidate_programs.len);
+    try expectFewShotDemos(&keyed.candidate_programs[1].program, &.{ "0", "1", "2", "3" }, &.{ "0", "1", "2", "3" });
+    try expectFewShotDemos(&keyed.program, &.{ "0", "1", "2" }, &.{ "0", "1", "2" });
+
+    // The default prompt optimizer receives the same typed options.
+    var prompt_student = try fewShotOptionsStudent(arena);
+    try dszig.predict.setLM(arena, &prompt_student, model.lm());
+    var prompt_options = options;
+    prompt_options.strategy = "p";
+    var defaults: dszig.better_together.Defaults = .{
+        .weight_limits = .{ .max_teachers = 1, .max_examples = 8, .max_predictors = 2, .data = .{ .max_rows = 8, .max_trace_steps = 16 } },
+        .weight_slot_sets = &.{},
+        .prompt = fewShotOptionsSearch(fewShotOptionsMetric),
+        .prompt_compile_options = .{ .restrict = &.{-2}, .labeled_sample = false },
+    };
+    const prompted = try meta.compile(P, arena, testing.allocator, testing.io, ctx, &prompt_student, trainset, prompt_options, defaults);
+    try testing.expect(!prompted.flag_compilation_error_occurred);
+    try expectFewShotDemos(&prompted.program, &.{ "0", "1", "2" }, &.{ "0", "1", "2" });
+
+    // A restriction matching no seed fails that step before any candidate runs.
+    defaults.prompt_compile_options = .{ .restrict = &.{4}, .labeled_sample = false };
+    P.forward_calls = 0;
+    const refused = try meta.compile(P, arena, testing.allocator, testing.io, ctx, &prompt_student, trainset, prompt_options, defaults);
+    try testing.expect(refused.flag_compilation_error_occurred);
+    try testing.expectEqual(@as(usize, 1), refused.candidate_programs.len);
+    try testing.expectEqual(@as(u32, 0), P.forward_calls);
 }
 
 test "Chat Completions retain native reasoning without inventing absent summaries" {
@@ -1670,5 +2594,409 @@ test "native provider calls reject unnamed functions" {
         "{\"choices\":[{\"message\":{\"content\":null,\"tool_calls\":[{\"id\":\"call\",\"type\":\"function\",\"function\":{\"arguments\":\"{}\"}}]}}]}",
     }) |invalid| {
         try testing.expectError(error.LMFailure, dszig.lm.OpenAI.parseCompletions(arena, invalid));
+    }
+}
+
+const FinetuneSignature = dszig.Signature(struct {
+    pub const Input = struct { question: []const u8 };
+    pub const Output = struct { answer: []const u8, count: i64 };
+});
+
+const finetune_view: dszig.adapter.View = .{
+    .instructions = "Answer the question.",
+    .inputs = FinetuneSignature.input_fields_list,
+    .outputs = FinetuneSignature.output_fields_list,
+};
+
+const finetune_adapters = [_]dszig.Adapter{ .chat, .xml };
+
+fn finetuneMessages(training: dszig.Value) ![]const dszig.Value {
+    try testing.expectEqual(@as(usize, 1), training.object.count());
+    return training.object.get("messages").?.array.items;
+}
+
+fn expectFinetuneMessage(message: dszig.Value, role: []const u8, content: []const u8) !void {
+    try testing.expectEqual(@as(usize, 2), message.object.count());
+    try testing.expectEqualStrings(role, message.object.get("role").?.string);
+    try testing.expectEqualStrings(content, message.object.get("content").?.string);
+}
+
+// Expected strings are DSPy 3.5.0 `format_finetune_data` results for the same
+// signature and records: a training answer renders every declared output, and
+// an absent one is Python None rather than the demo placeholder or "".
+test "finetune data renders missing and null training outputs as None" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var inputs: dszig.value.Record = .empty;
+    try inputs.put(arena, "question", .{ .string = "Why?" });
+    var complete: dszig.value.Record = .empty;
+    try complete.put(arena, "answer", .{ .string = "because\n<yes>" });
+    try complete.put(arena, "count", .{ .integer = 3 });
+    var missing: dszig.value.Record = .empty;
+    try missing.put(arena, "count", .{ .integer = 3 });
+    var explicit_null: dszig.value.Record = .empty;
+    try explicit_null.put(arena, "answer", .null);
+    try explicit_null.put(arena, "count", .null);
+    const absent: dszig.value.Record = .empty;
+
+    const users = [finetune_adapters.len][]const u8{
+        "[[ ## question ## ]]\nWhy?\n\nRespond with the corresponding output fields, starting with the field `[[ ## answer ## ]]`, then `[[ ## count ## ]]` (must be formatted as a valid Python int), and then ending with the marker for `[[ ## completed ## ]]`.",
+        "<question>\nWhy?\n</question>\n\nOutput format (replace placeholders):\n<answer>\n{answer}\n</answer>\n\n<count>\n{count}\n</count>\n\nUse this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping.",
+    };
+    const outputs = [_]*const dszig.value.Record{ &complete, &missing, &explicit_null, &absent };
+    const assistants = [finetune_adapters.len][outputs.len][]const u8{
+        .{
+            "[[ ## answer ## ]]\nbecause\n<yes>\n\n[[ ## count ## ]]\n3\n\n[[ ## completed ## ]]\n",
+            "[[ ## answer ## ]]\nNone\n\n[[ ## count ## ]]\n3\n\n[[ ## completed ## ]]\n",
+            "[[ ## answer ## ]]\nNone\n\n[[ ## count ## ]]\nNone\n\n[[ ## completed ## ]]\n",
+            "[[ ## answer ## ]]\nNone\n\n[[ ## count ## ]]\nNone\n\n[[ ## completed ## ]]\n",
+        },
+        .{
+            "<answer>\nbecause\n<yes>\n</answer>\n\n<count>\n3\n</count>",
+            "<answer />\n\n<count>\n3\n</count>",
+            "<answer />\n\n<count />",
+            "<answer />\n\n<count />",
+        },
+    };
+    for (finetune_adapters, users, assistants) |adapter, user, expected| {
+        const prompt = try adapter.format(arena, finetune_view, &.{}, &inputs);
+        for (outputs, expected) |record, assistant| {
+            const count_before = record.count();
+            const training = try adapter.formatFinetuneData(
+                arena,
+                testing.io,
+                finetune_view,
+                &.{},
+                &inputs,
+                record,
+            );
+            const messages = try finetuneMessages(training);
+            try testing.expectEqual(@as(usize, 3), messages.len);
+            // The training prompt is the ordinary native prompt, unchanged.
+            try expectFinetuneMessage(messages[0], "system", prompt[0].content.text);
+            try expectFinetuneMessage(messages[1], "user", user);
+            try expectFinetuneMessage(messages[2], "assistant", assistant);
+            // Completing a partial record must not write into the caller's record.
+            try testing.expectEqual(count_before, record.count());
+        }
+    }
+}
+
+// Demos keep their own "Not supplied" placeholders; only the training answer
+// uses None. Expected strings are the DSPy 3.5.0 results for these records.
+test "finetune data keeps demo placeholders and appends the training answer" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var past: dszig.value.Record = .empty;
+    try past.put(arena, "question", .{ .string = "past" });
+    try past.put(arena, "answer", .{ .string = "old" });
+    try past.put(arena, "count", .{ .integer = 1 });
+    var partial: dszig.value.Record = .empty;
+    try partial.put(arena, "question", .{ .string = "partial" });
+    try partial.put(arena, "answer", .{ .string = "half" });
+    var inputs: dszig.value.Record = .empty;
+    try inputs.put(arena, "question", .{ .string = "now" });
+    var outputs: dszig.value.Record = .empty;
+    try outputs.put(arena, "answer", .{ .string = "new" });
+    try outputs.put(arena, "count", .{ .integer = 2 });
+
+    const expected = [finetune_adapters.len][5][]const u8{
+        .{
+            "This is an example of the task, though some input or output fields are not supplied.\n\n[[ ## question ## ]]\npartial",
+            "[[ ## answer ## ]]\nhalf\n\n[[ ## count ## ]]\nNot supplied for this particular example.\n\n[[ ## completed ## ]]\n",
+            "[[ ## question ## ]]\npast",
+            "[[ ## answer ## ]]\nold\n\n[[ ## count ## ]]\n1\n\n[[ ## completed ## ]]\n",
+            "[[ ## answer ## ]]\nnew\n\n[[ ## count ## ]]\n2\n\n[[ ## completed ## ]]\n",
+        },
+        .{
+            "This is an example of the task, though some input or output fields are not supplied.\n\n<question>\npartial\n</question>",
+            "<answer>\nhalf\n</answer>\n\n<count>\nNot supplied for this particular example. \n</count>",
+            "<question>\npast\n</question>",
+            "<answer>\nold\n</answer>\n\n<count>\n1\n</count>",
+            "<answer>\nnew\n</answer>\n\n<count>\n2\n</count>",
+        },
+    };
+    for (finetune_adapters, expected) |adapter, contents| {
+        const training = try adapter.formatFinetuneData(
+            arena,
+            testing.io,
+            finetune_view,
+            &.{ past, partial },
+            &inputs,
+            &outputs,
+        );
+        const messages = try finetuneMessages(training);
+        try testing.expectEqual(@as(usize, 7), messages.len);
+        try expectFinetuneMessage(messages[1], "user", contents[0]);
+        try expectFinetuneMessage(messages[2], "assistant", contents[1]);
+        try expectFinetuneMessage(messages[3], "user", contents[2]);
+        try expectFinetuneMessage(messages[4], "assistant", contents[3]);
+        try testing.expectEqualStrings("user", messages[5].object.get("role").?.string);
+        try expectFinetuneMessage(messages[6], "assistant", contents[4]);
+    }
+}
+
+// Actual DSPy retains all declared answer fields in ordinary history, including
+// an event with no answer. Dropping those fields changed the training dialogue.
+test "finetune history retains absent answers as None before the current answer" {
+    const Chat = dszig.Signature(struct {
+        pub const Input = struct { question: []const u8, history: dszig.History };
+        pub const Output = struct { answer: []const u8, count: i64 };
+    });
+    const view: dszig.adapter.View = .{
+        .instructions = "Answer the question.",
+        .inputs = Chat.input_fields_list,
+        .outputs = Chat.output_fields_list,
+    };
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var complete: dszig.value.Record = .empty;
+    try complete.put(arena, "question", .{ .string = "before" });
+    try complete.put(arena, "answer", .{ .string = "yes" });
+    try complete.put(arena, "count", .{ .integer = 4 });
+    var incomplete: dszig.value.Record = .empty;
+    try incomplete.put(arena, "question", .{ .string = "half" });
+    const history: dszig.History = .{ .messages = &.{ complete, incomplete } };
+    const inputs = try dszig.value.toRecord(arena, Chat.Input, .{
+        .question = "now",
+        .history = history,
+    });
+    const outputs = try dszig.value.toRecord(arena, Chat.Output, .{
+        .answer = "new",
+        .count = 5,
+    });
+    const expected = [finetune_adapters.len][3][]const u8{
+        .{
+            "[[ ## answer ## ]]\nyes\n\n[[ ## count ## ]]\n4\n\n[[ ## completed ## ]]\n",
+            "[[ ## answer ## ]]\nNone\n\n[[ ## count ## ]]\nNone\n\n[[ ## completed ## ]]\n",
+            "[[ ## answer ## ]]\nnew\n\n[[ ## count ## ]]\n5\n\n[[ ## completed ## ]]\n",
+        },
+        .{
+            "<answer>\nyes\n</answer>\n\n<count>\n4\n</count>",
+            "<answer />\n\n<count />",
+            "<answer>\nnew\n</answer>\n\n<count>\n5\n</count>",
+        },
+    };
+    for (finetune_adapters, expected) |adapter, answers| {
+        const training = try adapter.formatFinetuneData(
+            arena,
+            testing.io,
+            view,
+            &.{},
+            &inputs,
+            &outputs,
+        );
+        const messages = try finetuneMessages(training);
+        try testing.expectEqual(@as(usize, 7), messages.len);
+        for (answers, [_]usize{ 2, 4, 6 }) |answer, index| {
+            try expectFinetuneMessage(messages[index], "assistant", answer);
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), incomplete.count());
+    try testing.expect(!incomplete.contains("answer"));
+    try testing.expect(!incomplete.contains("count"));
+}
+
+// The SDK training projection must retain native calls and their paired result
+// IDs. Source uses null assistant content when the native call has no text.
+test "finetune native tool history preserves calls result IDs and null content" {
+    const Tools = dszig.Signature(struct {
+        pub const Input = struct { question: []const u8, history: dszig.History };
+        pub const Output = struct { answer: ?[]const u8, calls: dszig.ToolCalls };
+    });
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var args: dszig.value.Record = .empty;
+    try args.put(arena, "q", .{ .string = "x" });
+    var result: dszig.value.Record = .empty;
+    try result.put(arena, "answer", .{ .integer = 3 });
+    const calls: dszig.ToolCalls = .{
+        .tool_calls = &.{.{ .id = "call_1", .name = "lookup", .args = args }},
+        .tool_call_results = .{ .tool_call_results = &.{.{
+            .call_id = "call_1",
+            .name = "lookup",
+            .value = .{ .object = result },
+            .is_error = true,
+        }} },
+    };
+    var event: dszig.value.Record = .empty;
+    try event.put(arena, "question", .{ .string = "before" });
+    try event.put(arena, "answer", .null);
+    try event.put(arena, "calls", try calls.toValue(arena));
+    const inputs = try dszig.value.toRecord(arena, Tools.Input, .{
+        .question = "now",
+        .history = .{ .messages = &.{event} },
+    });
+    const outputs = try dszig.value.toRecord(arena, Tools.Output, .{
+        .answer = "done",
+        .calls = .{},
+    });
+    for (finetune_adapters) |adapter| {
+        const training = try adapter.formatFinetuneData(arena, testing.io, .{
+            .instructions = "Use recorded tools.",
+            .inputs = Tools.input_fields_list,
+            .outputs = Tools.output_fields_list,
+            .use_native_function_calling = true,
+        }, &.{}, &inputs, &outputs);
+        const messages = try finetuneMessages(training);
+        try testing.expectEqual(@as(usize, 6), messages.len);
+        const assistant = messages[2].object;
+        try testing.expectEqualStrings("assistant", assistant.get("role").?.string);
+        try testing.expect(assistant.get("content").? == .null);
+        const native_calls = assistant.get("tool_calls").?.array.items;
+        try testing.expectEqual(@as(usize, 1), native_calls.len);
+        try testing.expectEqualStrings("call_1", native_calls[0].object.get("id").?.string);
+        try testing.expectEqualStrings("function", native_calls[0].object.get("type").?.string);
+        const function = native_calls[0].object.get("function").?.object;
+        try testing.expectEqualStrings("lookup", function.get("name").?.string);
+        try testing.expectEqualStrings("{\"q\":\"x\"}", function.get("arguments").?.string);
+        const tool_result = messages[3].object;
+        try testing.expectEqualStrings("tool", tool_result.get("role").?.string);
+        try testing.expectEqualStrings("call_1", tool_result.get("tool_call_id").?.string);
+        try testing.expectEqualStrings("[error] {\"answer\": 3}", tool_result.get("content").?.string);
+    }
+}
+
+// The native prompt keeps canonical document parts; only the training record
+// carries the OpenAI file block DSPy 3.5.0 writes for the same File input.
+test "finetune data projects File inputs to provider blocks, not canonical parts" {
+    const Files = dszig.Signature(struct {
+        pub const Input = struct { question: []const u8, document: dszig.File };
+        pub const Output = struct { answer: []const u8 };
+    });
+    const view: dszig.adapter.View = .{
+        .instructions = "Read the document.",
+        .inputs = Files.input_fields_list,
+        .outputs = Files.output_fields_list,
+    };
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const file = try dszig.File.fromBytes(arena, "hello", .{
+        .filename = "ignored.txt",
+        .mime_type = "text/plain",
+    });
+    var inputs: dszig.value.Record = .empty;
+    try inputs.put(arena, "question", .{ .string = "read" });
+    try inputs.put(arena, "document", try file.toRuntime(arena));
+    var outputs: dszig.value.Record = .empty;
+    try outputs.put(arena, "answer", .{ .string = "done" });
+
+    const expected = [finetune_adapters.len][3][]const u8{
+        .{
+            "[[ ## question ## ]]\nread\n\n[[ ## document ## ]]\n",
+            "\n\nRespond with the corresponding output fields, starting with the field `[[ ## answer ## ]]`, and then ending with the marker for `[[ ## completed ## ]]`.",
+            "[[ ## answer ## ]]\ndone\n\n[[ ## completed ## ]]\n",
+        },
+        .{
+            "<question>\nread\n</question>\n\n<document>\n",
+            "\n</document>\n\nOutput format (replace placeholders):\n<answer>\n{answer}\n</answer>\n\nUse this format for text outputs. Put field tags on separate lines. Write string values literally, without XML or JSON escaping.",
+            "<answer>\ndone\n</answer>",
+        },
+    };
+    for (finetune_adapters, expected) |adapter, texts| {
+        const training = try adapter.formatFinetuneData(
+            arena,
+            testing.io,
+            view,
+            &.{},
+            &inputs,
+            &outputs,
+        );
+        const messages = try finetuneMessages(training);
+        try testing.expectEqual(@as(usize, 3), messages.len);
+        try testing.expectEqualStrings("user", messages[1].object.get("role").?.string);
+        const blocks = messages[1].object.get("content").?.array.items;
+        try testing.expectEqual(@as(usize, 3), blocks.len);
+        try testing.expectEqualStrings("text", blocks[0].object.get("type").?.string);
+        try testing.expectEqualStrings(texts[0], blocks[0].object.get("text").?.string);
+        try testing.expectEqual(@as(usize, 2), blocks[1].object.count());
+        try testing.expectEqualStrings("file", blocks[1].object.get("type").?.string);
+        const block = blocks[1].object.get("file").?.object;
+        try testing.expectEqual(@as(usize, 2), block.count());
+        try testing.expectEqualStrings(
+            "data:text/plain;base64,aGVsbG8=",
+            block.get("file_data").?.string,
+        );
+        try testing.expectEqualStrings("file.txt", block.get("filename").?.string);
+        try testing.expectEqualStrings("text", blocks[2].object.get("type").?.string);
+        try testing.expectEqualStrings(texts[1], blocks[2].object.get("text").?.string);
+        try expectFinetuneMessage(messages[2], "assistant", texts[2]);
+
+        // The ordinary prompt still carries the canonical raw-payload part.
+        const prompt = try adapter.format(arena, view, &.{}, &inputs);
+        const part = prompt[1].content.parts[1].object;
+        try testing.expectEqualStrings("document", part.get("type").?.string);
+        try testing.expectEqualStrings("text/plain", part.get("media_type").?.string);
+        try testing.expectEqualStrings("aGVsbG8=", part.get("data").?.string);
+        try testing.expect(!part.contains("file"));
+    }
+}
+
+// JSONAdapter raises NotImplementedError and TwoStepAdapter has no formatter
+// at all, so both refuse before any prompt or media is examined. Chat and XML
+// do format, and so surface the malformed prompt and unsupported URL source.
+test "finetune data refuses JSON and TwoStep before malformed prompts or media" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var outputs: dszig.value.Record = .empty;
+    try outputs.put(arena, "answer", .{ .string = "done" });
+    try outputs.put(arena, "count", .{ .integer = 1 });
+    var malformed: dszig.value.Record = .empty;
+    try malformed.put(arena, "question", .{
+        .string = dszig.File.marker_start ++ "[{\"type\": \"document\"}]" ++ dszig.File.marker_end,
+    });
+    var remote: dszig.value.Record = .empty;
+    try remote.put(arena, "question", .{
+        .string = dszig.File.marker_start ++
+            "[{\"type\": \"document\", \"media_type\": \"application/pdf\", " ++
+            "\"url\": \"https://example.invalid/a.pdf\"}]" ++ dszig.File.marker_end,
+    });
+    var valid: dszig.value.Record = .empty;
+    try valid.put(arena, "question", .{ .string = "Why?" });
+
+    for ([_]*const dszig.value.Record{ &valid, &malformed, &remote }) |inputs| {
+        try testing.expectError(error.FinetuneNotImplemented, dszig.Adapter.json.formatFinetuneData(
+            arena,
+            testing.io,
+            finetune_view,
+            &.{},
+            inputs,
+            &outputs,
+        ));
+        try testing.expectError(
+            error.MissingFinetuneFormatter,
+            dszig.Adapter.two_step.formatFinetuneData(
+                arena,
+                testing.io,
+                finetune_view,
+                &.{},
+                inputs,
+                &outputs,
+            ),
+        );
+    }
+    for (finetune_adapters) |adapter| {
+        try testing.expectError(error.AdapterParse, adapter.formatFinetuneData(
+            arena,
+            testing.io,
+            finetune_view,
+            &.{},
+            &malformed,
+            &outputs,
+        ));
+        try testing.expectError(error.UnsupportedFeature, adapter.formatFinetuneData(
+            arena,
+            testing.io,
+            finetune_view,
+            &.{},
+            &remote,
+            &outputs,
+        ));
     }
 }

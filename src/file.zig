@@ -277,7 +277,8 @@ pub const File = struct {
         try writer.writeByte('"');
     }
 
-    fn cloneRuntime(arena: Allocator, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+    fn cloneRuntime(context: *runtime.CloneContext, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+        const arena = context.allocator;
         const source = runtimeFile(ptr);
         const copy = try arena.create(File);
         copy.* = .{};

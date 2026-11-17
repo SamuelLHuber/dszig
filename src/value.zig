@@ -8,8 +8,9 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
-const Value = @import("runtime_value.zig").Value;
-const ObjectMap = @import("runtime_value.zig").ObjectMap;
+const runtime = @import("runtime_value.zig");
+const Value = runtime.Value;
+const ObjectMap = runtime.ObjectMap;
 const Writer = std.Io.Writer;
 
 const pyjson = @import("pyjson.zig");
@@ -225,7 +226,8 @@ pub fn parseInteger(v: Value) error{ParseValue}!Value {
             break :blk Value.parseFromNumberSlice(s);
         },
         .float => |f| floatToInt(f),
-        .custom => |custom| custom.integerValue() orelse error.ParseValue,
+        .custom => |custom| custom.integerValue() orelse
+            if (builtinFloat(v)) |f| floatToInt(f) else error.ParseValue,
         else => error.ParseValue,
     };
 }
@@ -243,6 +245,7 @@ pub fn coerceInteger(arena: Allocator, input: Value) ParseError!Value {
         v = switch (view) {
             .bytes => |data| .{ .string = data },
             .decimal => |data| return coerceDecimalInteger(arena, data),
+            .float => |number| .{ .float = number },
             else => return error.ParseValue,
         };
     }
@@ -434,8 +437,12 @@ fn borrowedFieldValue(arena: Allocator, comptime T: type, input: *const T) Alloc
     {
         return input.borrowedRuntime();
     }
+    // Scalar wrappers and raw Value may retain a caller-owned runtime box.
+    // The prepared prediction borrows it just like the typed models above.
+    const result = try toValue(arena, T, input.*);
+    if (result == .custom) return .{ .custom = result.custom.borrowed() };
     // Other containers retain their existing codec and scratch ownership.
-    return toValue(arena, T, input.*);
+    return result;
 }
 
 pub fn toValue(arena: Allocator, comptime T: type, v: T) Allocator.Error!Value {
@@ -468,6 +475,12 @@ pub fn toValue(arena: Allocator, comptime T: type, v: T) Allocator.Error!Value {
         .float => .{ .float = @floatCast(v) },
         .@"enum" => .{ .string = @tagName(v) },
         .optional => |o| if (v) |x| try toValue(arena, o.child, x) else .null,
+        .array => |a| blk: {
+            const items = try arena.alloc(Value, a.len);
+            errdefer arena.free(items);
+            for (v, items) |item, *target| target.* = try toValue(arena, a.child, item);
+            break :blk try @import("python_value.zig").tupleFromOwnedSlice(arena, items);
+        },
         .pointer => |p| blk: {
             var array: @import("runtime_value.zig").Array = .init(arena);
             try array.ensureTotalCapacity(v.len);
@@ -558,6 +571,19 @@ pub fn fromValue(arena: Allocator, comptime T: type, v: Value) ConvertError!T {
             return std.meta.stringToEnum(T, v.string) orelse error.TypeMismatch;
         },
         .optional => |o| return if (v == .null) null else try fromValue(arena, o.child, v),
+        .array => |a| {
+            const items = if (v == .array) v.array.items else blk: {
+                const builtin = @import("python_value.zig").view(v) orelse
+                    return error.TypeMismatch;
+                break :blk if (builtin == .tuple) builtin.tuple else return error.TypeMismatch;
+            };
+            if (items.len != a.len) return error.TypeMismatch;
+            var out: T = undefined;
+            for (items, &out) |item, *target|
+                target.* = try fromValue(arena, a.child, item);
+            if (comptime a.sentinel()) |sentinel| out[a.len] = sentinel;
+            return out;
+        },
         .pointer => |p| {
             if (v != .array) return error.TypeMismatch;
             const out = try arena.alloc(p.child, v.array.items.len);
@@ -687,7 +713,59 @@ test "Decimal identity shortcuts belong to container elements, not direct equali
 /// Arithmetic and builtin numeric protocols operate on an integer subclass's
 /// exact base, while records and typed enum decoding retain the original box.
 fn numericBase(input: Value) Value {
-    return if (input == .custom) input.custom.integerValue() orelse input else input;
+    if (input != .custom) return input;
+    if (input.custom.integerValue()) |integer| return integer;
+    if (builtinFloat(input)) |number| return .{ .float = number };
+    return input;
+}
+
+/// Borrowed payload of an actual builtin float box. Custom.float_value is
+/// Python __float__ and deliberately does not qualify: a Score is convertible
+/// to float without being one. The projection drops the box's identity, so
+/// container and model comparisons must run before it.
+fn builtinFloat(input: Value) ?f64 {
+    const builtin = python.view(input) orelse return null;
+    return if (builtin == .float) builtin.float else null;
+}
+
+test "builtin float boxes are numeric operands while NaN stays unequal to itself" {
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const a = memory.allocator();
+    const half = try python.float(a, 2.5);
+    const three = try python.float(a, 3);
+    try std.testing.expect(half == .custom);
+    try std.testing.expect(try pyEqual(half, .{ .float = 2.5 }));
+    try std.testing.expect(try pyEqual(.{ .float = 2.5 }, half));
+    try std.testing.expect(try pyEqual(three, .{ .integer = 3 }));
+    try std.testing.expect(try pyEqual(.{ .number_string = "3" }, three));
+    try std.testing.expect(!try pyEqual(three, .{ .string = "3.0" }));
+    try std.testing.expectEqual(@as(f64, 2.5), try numericFloat(half));
+    try std.testing.expectEqual(@as(f64, 2.5), try fromValue(a, f64, half));
+    try std.testing.expectError(error.TypeMismatch, fromValue(a, i64, three));
+    try std.testing.expectEqual(@as(i64, 3), (try coerceInteger(a, three)).integer);
+    try std.testing.expectEqual(@as(i64, 3), (try parseInteger(three)).integer);
+    try std.testing.expectError(error.ParseValue, coerceInteger(a, half));
+    try std.testing.expectEqual(std.math.Order.lt, (try numericOrder(half, three)).?);
+    try std.testing.expectEqual(std.math.Order.gt, (try numericOrder(half, .{ .number_string = "-18446744073709551616" })).?);
+    try std.testing.expect(try floatAtLeast(2.5, half));
+    try std.testing.expectEqual(@as(f64, 7.5), (try numericProduct(a, half, three)).float);
+    try std.testing.expectEqual(@as(f64, 5.5), (try numericSum(a, half, .{ .integer = 3 })).float);
+    // Decimal comparison sees the exact binary64 value, as for a primitive.
+    const decimal = try python.decimal(a, "2.5");
+    try std.testing.expectEqual(std.math.Order.eq, (try numericOrder(half, decimal)).?);
+    try std.testing.expectError(error.InvalidNumber, numericSum(a, half, decimal));
+    // A __float__ protocol alone (Decimal here, Score likewise) is not a float.
+    try std.testing.expectError(error.TypeMismatch, fromValue(a, f64, decimal));
+
+    const nan = try python.float(a, std.math.nan(f64));
+    try std.testing.expect(!try pyEqual(nan, nan));
+    try std.testing.expect(!try pyEqual(nan, .{ .float = std.math.nan(f64) }));
+    try std.testing.expect((try numericOrder(nan, three)) == null);
+    try std.testing.expectError(error.ParseValue, coerceInteger(a, nan));
+    // Validation of an untyped Value keeps the original box, not a projection.
+    const kept = try types.validate(Value, a, nan);
+    try std.testing.expectEqual(nan.custom.ptr, kept.custom.ptr);
 }
 
 const IntegerText = struct {
@@ -744,7 +822,9 @@ fn integerStringEqualsValue(text: []const u8, v: Value) bool {
     return a.eql(IntegerText.parse(other) orelse return false);
 }
 
-fn integralFloatText(f: f64, buffer: *[310]u8) ?[]const u8 {
+/// Exact decimal integer spelling for a finite integral binary64 value.
+/// The returned slice borrows buffer; fractional and nonfinite inputs refuse.
+pub fn integralFloatText(f: f64, buffer: *[310]u8) ?[]const u8 {
     if (!std.math.isFinite(f) or f != @trunc(f)) return null;
     // Reconstruct binary64's exact integer without unsupported wide casts.
     const bits: u64 = @bitCast(@abs(f));
@@ -837,12 +917,15 @@ pub fn numericOrder(a_input: Value, b_input: Value) error{InvalidNumber}!?std.ma
     return std.math.order(f, g);
 }
 
-/// Python numeric multiplication. Integer-only products remain exact; float
-/// products first convert BOTH operands, even when the other operand is zero.
-/// Zero/one integer products borrow unchanged numeric text without allocation.
+/// Python numeric multiplication, including integer repetition of text/bytes.
+/// Integer-only products remain exact; float products first convert BOTH
+/// operands, even when the other operand is zero. Zero/one numeric products
+/// and one-fold immutable sequences may borrow their unchanged input.
 pub fn numericProduct(arena: Allocator, a_input: Value, b_input: Value) (Allocator.Error || error{InvalidNumber})!Value {
     const a = numericBase(a_input);
     const b = numericBase(b_input);
+    if (sequenceData(a)) |data| return repeatSequence(arena, a, data, b);
+    if (sequenceData(b)) |data| return repeatSequence(arena, b, data, a);
     if (decimalView(a) != null or decimalView(b) != null)
         return decimalBinary(arena, a, b, .multiply);
     if (complexView(a) != null or complexView(b) != null)
@@ -887,6 +970,88 @@ pub fn numericProduct(arena: Allocator, a_input: Value, b_input: Value) (Allocat
     const left = try numericFloat(a);
     const right = try numericFloat(b);
     return .{ .float = left * right };
+}
+
+test "IntEnum repetition preserves sequence kind, order and exact index bounds" {
+    const Counts = @import("enum.zig").IntEnum("Counts", &.{
+        .{ .name = "two", .value = .{ .integer = 2 } },
+    });
+    const a = std.testing.allocator;
+    const two = try Counts.member("two");
+    const text: Value = .{ .string = "é🙂" };
+    const repeated = try numericProduct(a, text, two);
+    defer a.free(repeated.string);
+    try std.testing.expectEqualStrings("é🙂é🙂", repeated.string);
+    const reversed = try numericProduct(a, two, text);
+    defer a.free(reversed.string);
+    try std.testing.expectEqualStrings(repeated.string, reversed.string);
+    const binary = python.staticBytes("\x00\xff");
+    const repeated_bytes = try numericProduct(a, binary, two);
+    defer repeated_bytes.custom.deinit(a);
+    try std.testing.expectEqualSlices(u8, "\x00\xff\x00\xff", python.view(repeated_bytes).?.bytes);
+    try std.testing.expectError(error.InvalidNumber, numericProduct(a, text, .{ .float = 2 }));
+    for ([_][]const u8{ "9223372036854775808", "-9223372036854775809" }) |wide| {
+        try std.testing.expectError(error.InvalidNumber, numericProduct(a, .{ .string = "" }, .{ .number_string = wide }));
+    }
+    const minimum = try numericProduct(a, text, .{ .number_string = "-9223372036854775808" });
+    try std.testing.expectEqualStrings("", minimum.string);
+    try std.testing.expectError(error.InvalidNumber, numericProduct(a, text, .{ .integer = std.math.maxInt(i64) }));
+}
+
+test "repeated bytes release storage on success and every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, repeatBytesAllocation, .{});
+}
+
+fn repeatBytesAllocation(a: Allocator) !void {
+    const repeated = try numericProduct(a, python.staticBytes("\x00\xff"), .{ .integer = 3 });
+    defer repeated.custom.deinit(a);
+    try std.testing.expectEqualSlices(u8, "\x00\xff\x00\xff\x00\xff", python.view(repeated).?.bytes);
+}
+
+fn sequenceData(input: Value) ?[]const u8 {
+    if (input == .string) return input.string;
+    const builtin = python.view(input) orelse return null;
+    return if (builtin == .bytes) builtin.bytes else null;
+}
+
+fn repeatSequence(
+    arena: Allocator,
+    sequence: Value,
+    data: []const u8,
+    multiplier: Value,
+) (Allocator.Error || error{InvalidNumber})!Value {
+    var buffer: [20]u8 = undefined;
+    const integer = IntegerText.fromValue(multiplier, &buffer) orelse return error.InvalidNumber;
+    const magnitude = std.fmt.parseUnsigned(usize, integer.digits, 10) catch
+        return error.InvalidNumber;
+    // Python checks __index__ against Py_ssize_t even for empty sequences and
+    // negative multipliers. Do not silently clamp an out-of-range integer.
+    const maximum: usize = std.math.maxInt(isize);
+    if (magnitude > maximum + @intFromBool(integer.negative)) return error.InvalidNumber;
+    const count = if (integer.negative) 0 else magnitude;
+    if (count == 0 or data.len == 0)
+        return if (sequence == .string) .{ .string = "" } else python.staticBytes("");
+    if (count == 1) return sequence;
+    const length, const overflow = @mulWithOverflow(data.len, count);
+    if (overflow != 0 or length > maximum) return error.InvalidNumber;
+    const storage = try arena.alloc(u8, length);
+    errdefer arena.free(storage);
+    @memcpy(storage[0..data.len], data);
+    var filled = data.len;
+    while (filled < storage.len) {
+        std.debug.assert(filled > 0);
+        const amount = @min(filled, storage.len - filled);
+        @memcpy(storage[filled..][0..amount], storage[0..amount]);
+        filled += amount;
+    }
+    std.debug.assert(filled == length);
+    if (sequence == .string) return .{ .string = storage };
+    var result = python.bytes(arena, storage) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidNumber,
+    };
+    result.custom.owns_data = true;
+    return result;
 }
 
 const NumericError = Allocator.Error || error{InvalidNumber};
@@ -1194,6 +1359,15 @@ fn serializeDepth(arena: Allocator, input: Value, depth: u32) @import("runtime_v
         else
             .{ .value = input, .changed = false },
         .custom => |custom| blk: {
+            // A builtin float box serializes exactly like a primitive float,
+            // except that the projection is a new JSON value, not the box.
+            if (builtinFloat(input)) |number| {
+                const nested_nonfinite = depth > 0 and !std.math.isFinite(number);
+                break :blk .{
+                    .value = if (nested_nonfinite) .null else .{ .float = number },
+                    .changed = true,
+                };
+            }
             if (custom.vtable.python) |inspect| {
                 if (inspect(custom.ptr) == .ellipsis)
                     break :blk if (depth == 0)
@@ -1243,31 +1417,18 @@ fn serializeDepth(arena: Allocator, input: Value, depth: u32) @import("runtime_v
     };
 }
 
-/// Deep copy of a value into `arena` (strings included).
+/// Deep copy of a value into `arena` (strings included). One context spans the
+/// tree, so a custom box repeated in it is cloned once and stays shared.
 pub fn cloneValue(arena: Allocator, v: Value) Allocator.Error!Value {
-    return switch (v) {
-        .custom => |custom| .{ .custom = try custom.clone(arena) },
-        .string => |s| .{ .string = try arena.dupe(u8, s) },
-        .number_string => |s| .{ .number_string = try arena.dupe(u8, s) },
-        .array => |a| blk: {
-            var out: @import("runtime_value.zig").Array = .init(arena);
-            try out.ensureTotalCapacity(a.items.len);
-            for (a.items) |item| out.appendAssumeCapacity(try cloneValue(arena, item));
-            break :blk .{ .array = out };
-        },
-        .object => |o| .{ .object = try cloneRecord(arena, &o) },
-        else => v,
-    };
+    var context: runtime.CloneContext = .init(arena);
+    defer context.deinit();
+    return context.cloneValue(v);
 }
 
 pub fn cloneRecord(arena: Allocator, r: *const Record) Allocator.Error!Record {
-    var out: Record = .empty;
-    try out.ensureTotalCapacity(arena, r.count());
-    var it = r.iterator();
-    while (it.next()) |entry| {
-        out.putAssumeCapacity(try arena.dupe(u8, entry.key_ptr.*), try cloneValue(arena, entry.value_ptr.*));
-    }
-    return out;
+    var context: runtime.CloneContext = .init(arena);
+    defer context.deinit();
+    return (try context.cloneValue(.{ .object = r.* })).object;
 }
 
 const testing = std.testing;
@@ -1501,4 +1662,58 @@ test "typed record round trip" {
     try testing.expectEqualStrings("y", back.ctx[1]);
     try testing.expectEqual(in.e, back.e);
     try testing.expect(try recordEqual(&r, &(try cloneRecord(arena, &r))));
+}
+
+// One mutable box reachable from a field, a nested mapping and a list must
+// stay one box after a record clone. Every allocation in the clone is failed in
+// turn; the leak-checking allocator proves each alias holds its own reference
+// and that the cloned box is destroyed exactly once by the last release.
+test "record clone shares one mutable box across fields and survives its source arena" {
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(gpa: Allocator) !void {
+            const copy: Record = blk: {
+                var source: std.heap.ArenaAllocator = .init(testing.allocator);
+                defer source.deinit();
+                const arena = source.allocator();
+                const box = try python.bytearray(arena, "ab");
+                var nested: Record = .empty;
+                try nested.put(arena, "alias", box);
+                var items: runtime.Array = .init(arena);
+                try items.append(box);
+                var record: Record = .empty;
+                try record.put(arena, "value", box);
+                try record.put(arena, "probabilities", .{ .object = nested });
+                try record.put(arena, "items", .{ .array = items });
+                break :blk try cloneRecord(gpa, &record);
+            };
+            defer runtime.freeValue(gpa, .{ .object = copy });
+
+            // The source arena and the clone context are both gone here.
+            const field = copy.get("value").?;
+            const nested = copy.get("probabilities").?.object.get("alias").?;
+            try testing.expect(field.custom.owns_box);
+            try testing.expect(field.custom.ptr == nested.custom.ptr);
+            try testing.expect(field.custom.vtable == nested.custom.vtable);
+
+            // A borrowed view holds no reference: releasing it frees nothing.
+            const view = field.custom.borrowed();
+            try testing.expect(!view.owns_box);
+            view.deinit(testing.failing_allocator);
+
+            // Releasing one alias must leave the box alive for the others.
+            const released = copy.getPtr("items").?.array.pop().?;
+            try testing.expect(released.custom.ptr == field.custom.ptr);
+            released.custom.deinit(gpa);
+            try python.bytearraySet(field, 0, 'z');
+            try testing.expectEqualStrings("zb", python.view(nested).?.bytearray);
+
+            // A later clone is a new context, hence a new independent box.
+            const second = try cloneValue(gpa, nested);
+            defer runtime.freeValue(gpa, second);
+            try testing.expect(second.custom.ptr != nested.custom.ptr);
+            try python.bytearraySet(second, 1, 'y');
+            try testing.expectEqualStrings("zb", python.view(field).?.bytearray);
+            try testing.expectEqualStrings("zy", python.view(second).?.bytearray);
+        }
+    }.run, .{});
 }

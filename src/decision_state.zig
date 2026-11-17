@@ -376,7 +376,10 @@ fn finiteJson(entry: Value, depth: usize) bool {
         .object => |object| for (object.values()) |item| {
             if (!finiteJson(item, depth + 1)) break false;
         } else true,
-        .custom => false,
+        .custom => if (@import("python_value.zig").view(entry)) |builtin|
+            builtin == .float and std.math.isFinite(builtin.float)
+        else
+            false,
     };
 }
 
@@ -440,6 +443,9 @@ fn parseCriteria(arena: Allocator, text: []const u8) Error!Value {
 const Number = struct { f: f64, integer: bool };
 
 fn exactNumber(v: Value) ?Number {
+    if (@import("python_value.zig").view(v)) |builtin| {
+        if (builtin == .float) return .{ .f = builtin.float, .integer = false };
+    }
     return switch (v) {
         .integer => |i| .{ .f = @floatFromInt(i), .integer = true },
         .float => |f| .{ .f = f, .integer = false },
@@ -494,6 +500,35 @@ fn labelIndex(labels: []const []const u8, key: []const u8) ?usize {
 
 fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
+}
+
+test "explicit bare metadata activates primitive evidence without activating ordinary fields" {
+    const decisions = @import("decision.zig");
+    const Text = @import("literal.zig").Literal(&.{ .{ .string = "first" }, .{ .string = "second" } });
+    const Sig = signature.Signature(struct {
+        pub const Input = struct {};
+        pub const Output = struct { flag: bool, category: Text, ordinary: bool };
+        pub const descriptions = .{
+            .flag = .{ .text = "Flag.", .metadata = &.{decisions.Score} },
+            .category = .{ .text = "Category.", .metadata = &.{decisions.Choice} },
+        };
+    });
+    const view: adapter.View = .{ .instructions = Sig.instructions, .inputs = Sig.input_fields_list, .outputs = Sig.output_fields_list };
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const a = memory.allocator();
+    const state = try State.init(a, view, .{ .object = .empty }, false, null);
+    const evidence = try json_repair.parseJson(a,
+        \\{"flag":{"noul":0.75},"category":{"probabilities":{"first":0.25,"second":0.75},"confidence":0.8},"ordinary":true}
+    );
+    const outputs = try state.decode(a, &evidence.object);
+    try std.testing.expect(outputs.get("flag").?.bool);
+    try std.testing.expectEqualStrings("second", outputs.get("category").?.string);
+    try std.testing.expect(!outputs.contains("ordinary"));
+    const criteria = try state.getCriteria(a, "category");
+    try std.testing.expect(criteria.object.get("first").? == .null);
+    try std.testing.expect(criteria.object.get("second").? == .null);
+    try std.testing.expectError(error.InvalidDecision, state.getCriteria(a, "ordinary"));
 }
 
 test "Choice weights retain exact integers and distinguish integer zero from float zero" {

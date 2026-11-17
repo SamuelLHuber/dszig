@@ -97,7 +97,7 @@ pub const History = struct {
                 assistant_values = try event.clone(arena);
                 try assistant_values.put(arena, calls_field.?, try calls.formatValue(arena));
             }
-            const assistant_content = try adapter.formatAssistantPartial(selected_adapter, arena, view, &assistant_values);
+            const assistant_content = try adapter.formatAssistant(selected_adapter, arena, view, &assistant_values);
             if (assistant_content.len > 0) try messages.append(arena, .{ .role = .assistant, .content = .{ .text = assistant_content } });
 
             if (results) |tool_results| {
@@ -142,7 +142,7 @@ fn appendNativeEvent(
     }
     var content_view = view;
     content_view.outputs = fields[0..count];
-    const content = if (count == 0) "" else try adapter.formatAssistantPartial(selected_adapter, arena, content_view, event);
+    const content = if (count == 0) "" else try adapter.formatAssistant(selected_adapter, arena, content_view, event);
     var valid_results = false;
     if (calls.tool_call_results) |results| {
         valid_results = calls.tool_calls.len == results.tool_call_results.len;

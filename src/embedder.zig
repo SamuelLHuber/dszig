@@ -239,7 +239,7 @@ pub const Embedder = struct {
             if (!nonnull(merged.get("azure_ad_token")) and provider == null and env(hosted.environment, "AZURE_OPENAI_AD_TOKEN") == null) {
                 try environmentDefault(arena, &merged, "api_key", envOr(hosted.environment, "AZURE_OPENAI_API_KEY", "AZURE_API_KEY"));
             }
-            if (!truthy(merged.get("base_url"))) {
+            if (!try truthy(merged.get("base_url"))) {
                 try environmentDefault(arena, &merged, "azure_endpoint", envOr(hosted.environment, "AZURE_OPENAI_ENDPOINT", "AZURE_API_BASE"));
             }
         } else {
@@ -317,7 +317,7 @@ fn nonnull(item: ?Value) bool {
     return if (item) |v| v != .null else false;
 }
 
-fn truthy(item: ?Value) bool {
+fn truthy(item: ?Value) error{ParseValue}!bool {
     const v = item orelse return false;
     return switch (v) {
         .null => false,
@@ -327,7 +327,7 @@ fn truthy(item: ?Value) bool {
         .string, .number_string => |s| s.len != 0,
         .array => |a| a.items.len != 0,
         .object => |o| o.count() != 0,
-        .custom => |custom| custom.truthy(),
+        .custom => |custom| try custom.truthy(),
     };
 }
 
@@ -336,7 +336,7 @@ fn mergeRecord(arena: Allocator, output: *Record, input: Record) Allocator.Error
 }
 
 fn environmentDefault(arena: Allocator, kwargs: *Record, name: []const u8, fallback: ?[]const u8) !void {
-    if (!truthy(kwargs.get(name))) try kwargs.put(arena, name, if (fallback) |s| .{ .string = s } else .null);
+    if (!try truthy(kwargs.get(name))) try kwargs.put(arena, name, if (fallback) |s| .{ .string = s } else .null);
 }
 
 fn nativeTokenProvider(hosted: HostedOptions, kwargs: Record) !?TokenProvider {

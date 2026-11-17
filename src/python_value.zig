@@ -21,6 +21,9 @@
 //! mutable state. CPython address hashes (None/Ellipsis/NaNs) necessarily use
 //! native identities, not a different Python process's addresses. Value.float
 //! has no object identity token, so separately stored NaNs remain distinct.
+//! Boxed immutable float/Decimal/complex/bytes/Ellipsis objects instead carry a
+//! logical identity that owning clones copy, as Python deepcopy returns the
+//! same immutable object. It is never derived from float bits or an address.
 //! Opaque classes may supply CustomVTable.python_hash. Without it, class-only
 //! equality admits a coherent native hash but unproved Source iteration order;
 //! cross-value equality without a hash callback is rejected. Shared/cyclic
@@ -59,7 +62,69 @@ const Box = struct {
     table: []const Slot = &.{},
     owns_table: bool = false,
     hash_seed: u32 = 0,
+    identity: Identity = .none,
 };
+
+/// Logical object identity of an immutable builtin, independent of the box
+/// address so that an owning clone remains "the same object" after its source
+/// storage is gone. Mutable and container boxes stay .none: physical only.
+const Identity = union(enum) {
+    none,
+    /// Process-unique sequence number, never reused.
+    minted: u64,
+    /// Static-lifetime token: comptime bytes and the Ellipsis singleton.
+    static: *const anyopaque,
+};
+
+/// Zero is never issued. Sequences at or above the limit are never issued
+/// either: that half of the range only absorbs concurrent overshoot.
+var identity_sequence_next: std.atomic.Value(u64) = .init(1);
+const identity_sequence_limit: u64 = 1 << 63;
+
+/// Identity storage is a bounded resource, just like box storage. Exhaustion
+/// refuses construction rather than silently changing deepcopy semantics.
+/// One wait-free increment, no retry loop. Each concurrent caller can overshoot
+/// only once; the unused half of the range prevents sequence reuse.
+fn mintIdentity(counter: *std.atomic.Value(u64)) Allocator.Error!Identity {
+    if (counter.load(.monotonic) >= identity_sequence_limit) return error.OutOfMemory;
+    const sequence = counter.fetchAdd(1, .monotonic);
+    std.debug.assert(sequence != 0);
+    if (sequence >= identity_sequence_limit) return error.OutOfMemory;
+    return .{ .minted = sequence };
+}
+
+/// Python `is` for boxed values. Immutable builtins compare their logical
+/// identity, which owning clones retain; a NaN is never identified by its bits.
+/// Every other object is the same only as one physical box of one layout.
+pub fn sameIdentity(a: Value, b: Value) bool {
+    if (a != .custom or b != .custom) return false;
+    if (ownBox(a)) |left| {
+        if (ownBox(b)) |right| {
+            switch (left.identity) {
+                .none => {},
+                .minted => |sequence| return right.identity == .minted and
+                    right.identity.minted == sequence and
+                    std.meta.activeTag(left.payload) == std.meta.activeTag(right.payload),
+                .static => |token| return right.identity == .static and
+                    right.identity.static == token and
+                    std.meta.activeTag(left.payload) == std.meta.activeTag(right.payload),
+            }
+        }
+    }
+    if (a.custom.ptr != b.custom.ptr) return false;
+    if (!a.custom.sameType(b.custom)) return false;
+    // One address is one object only if both handles claim the same layout.
+    return if (a.custom.vtable.type_identity) |layout|
+        b.custom.vtable.type_identity == layout
+    else
+        a.custom.vtable == b.custom.vtable;
+}
+
+/// An actual builtin float object with its own identity, e.g. a NaN that is
+/// unequal to itself yet found in containers. Not an arbitrary __float__ class.
+pub fn float(a: Allocator, number: f64) Allocator.Error!Value {
+    return boxed(a, .{ .float = number }, &float_vtable);
+}
 
 /// Borrowed metadata, never a JSON-shape heuristic or a converted value.
 pub fn view(v: Value) ?PythonValue {
@@ -158,13 +223,19 @@ pub fn staticBytes(comptime data: []const u8) Value {
             result.deinit = deinitStaticBytes;
             break :blk result;
         };
-        const box: Box = .{ .payload = .{ .bytes = data }, .vtable = &vtable };
+        // Mutable so that distinct literals cannot be merged into one token.
+        var token: u8 = 0;
+        const box: Box = .{
+            .payload = .{ .bytes = data },
+            .vtable = &vtable,
+            .identity = .{ .static = &token },
+        };
     };
     return .{ .custom = .{ .ptr = &Storage.box, .vtable = &Storage.vtable } };
 }
 
-fn cloneStaticBytes(a: Allocator, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
-    var result = try clone(a, ptr);
+fn cloneStaticBytes(context: *runtime.CloneContext, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+    var result = try clone(context, ptr);
     result.vtable = &bytes_vtable;
     runtimeBox(result.ptr).vtable = &bytes_vtable;
     return result;
@@ -172,7 +243,7 @@ fn cloneStaticBytes(a: Allocator, ptr: *const anyopaque) Allocator.Error!runtime
 
 fn deinitStaticBytes(_: Allocator, _: *const anyopaque, _: bool) void {}
 
-pub fn tuple(a: Allocator, items: []const Value) Error!Value {
+pub fn tuple(a: Allocator, items: []const Value) Allocator.Error!Value {
     const hashable = for (items) |item| {
         if (!hashAdmissible(item)) break false;
     } else true;
@@ -182,7 +253,7 @@ pub fn tuple(a: Allocator, items: []const Value) Error!Value {
 /// Adopt the slice storage only; tuple members remain borrowed. The caller
 /// retains the slice if construction fails. An owning clone deep-copies both
 /// the slice and its members; the borrowed tuple must not outlive its members.
-pub fn tupleFromOwnedSlice(a: Allocator, items: []Value) Error!Value {
+pub fn tupleFromOwnedSlice(a: Allocator, items: []Value) Allocator.Error!Value {
     const result = try tuple(a, items);
     runtimeBox(result.custom.ptr).owns_storage = true;
     return result;
@@ -379,7 +450,12 @@ pub fn dictionary(a: Allocator, pairs: []const PythonEntry) Error!Value {
 
 fn boxed(a: Allocator, payload: PythonValue, vtable: *const runtime.CustomVTable) Allocator.Error!Value {
     const box = try a.create(Box);
-    box.* = .{ .payload = payload, .vtable = vtable };
+    errdefer a.destroy(box);
+    box.* = .{ .payload = payload, .vtable = vtable, .identity = switch (payload) {
+        .bytes, .float, .complex, .decimal => try mintIdentity(&identity_sequence_next),
+        .ellipsis => .{ .static = &ellipsis_identity },
+        .bytearray, .tuple, .set, .frozen_set, .dictionary => .none,
+    } };
     return .{ .custom = .{ .ptr = box, .vtable = vtable } };
 }
 
@@ -392,10 +468,15 @@ fn ownBox(v: Value) ?*const Box {
     return runtimeBox(v.custom.ptr);
 }
 
+// Builtins share one physical Box layout, not one nominal Python class.
+// Mutable storage gives every kind a distinct, non-mergeable static token.
+var builtin_class_tokens: [@typeInfo(Kind).@"enum".field_names.len]u8 = @splat(0);
+
 fn makeVTable(comptime kind: Kind, comptime hashable: bool) runtime.CustomVTable {
     const name = switch (kind) {
         .bytes => "bytes",
         .bytearray => "bytearray",
+        .float => "float",
         .tuple => "tuple",
         .set => "set",
         .frozen_set => "frozenset",
@@ -407,10 +488,15 @@ fn makeVTable(comptime kind: Kind, comptime hashable: bool) runtime.CustomVTable
     return .{
         .type_name = if (kind == .decimal) "decimal.Decimal" else "python.builtins." ++ name,
         .type_identity = runtime.typeIdentity(Box),
+        .class_identity = &builtin_class_tokens[@backingInt(kind)],
         .model_name = name,
         .hashable = hashable,
         .bool_value = truthy,
-        .float_value = if (kind == .decimal) decimalFloat else null,
+        .float_value = switch (kind) {
+            .decimal => decimalFloat,
+            .float => builtinFloat,
+            else => null,
+        },
         .python = pythonView,
         .raw_value = rawValue,
         .serialized = serialized,
@@ -427,6 +513,7 @@ fn makeVTable(comptime kind: Kind, comptime hashable: bool) runtime.CustomVTable
 
 const bytes_vtable = makeVTable(.bytes, true);
 const bytearray_vtable = makeVTable(.bytearray, false);
+const float_vtable = makeVTable(.float, true);
 const tuple_vtable = makeVTable(.tuple, true);
 const unhashable_tuple_vtable = makeVTable(.tuple, false);
 const set_vtable = makeVTable(.set, false);
@@ -455,11 +542,16 @@ fn decimalFloat(ptr: *const anyopaque) Error!f64 {
     return pythonView(ptr).decimal.toFloat();
 }
 
-fn truthy(ptr: *const anyopaque) bool {
+fn builtinFloat(ptr: *const anyopaque) Error!f64 {
+    return pythonView(ptr).float;
+}
+
+fn truthy(ptr: *const anyopaque) error{ParseValue}!bool {
     return switch (pythonView(ptr)) {
         .bytes, .bytearray => |data| data.len != 0,
         .tuple, .set, .frozen_set => |items| items.len != 0,
         .dictionary => |pairs| pairs.len != 0,
+        .float => |f| f != 0,
         .complex => |c| c.real != 0 or c.imag != 0,
         .decimal => |data| data.truthy(),
         .ellipsis => true,
@@ -646,13 +738,22 @@ fn signedHash(magnitude: u64, negative: bool) u64 {
     return validHash(if (negative) 0 -% magnitude else magnitude);
 }
 
-fn floatHash(f: f64, identity: ?*const anyopaque) u64 {
+/// CPython hashes a NaN by object address. The logical identity stands in for
+/// it, so every owning clone of one NaN keeps the hash stored in cloned tables.
+fn identityHash(v: Value) u64 {
+    if (ownBox(v)) |box| switch (box.identity) {
+        .none => {},
+        .minted => |sequence| return validHash(sequence *% 0x9e3779b97f4a7c15),
+        .static => |token| return pointerHash(token),
+    };
+    return pointerHash(v.custom.ptr);
+}
+
+fn floatHash(f: f64, nan_hash: u64) u64 {
     if (std.math.isInf(f)) return signedHash(314159, f < 0);
-    if (std.math.isNan(f)) {
-        // Embedded floats cannot carry Python's distinct float-object pointers.
-        // A coherent native hash still keeps unequal NaNs as separate entries.
-        return if (identity) |ptr| pointerHash(ptr) else 0;
-    }
+    // Embedded floats cannot carry Python's distinct float-object identity:
+    // their callers pass zero, which still keeps unequal NaNs separate entries.
+    if (std.math.isNan(f)) return nan_hash;
     const bits: u64 = @bitCast(f);
     const exponent: i32 = @intCast((bits >> 52) & 0x7ff);
     const significand = (bits & 0x000f_ffff_ffff_ffff) | if (exponent == 0) @as(u64, 0) else 0x0010_0000_0000_0000;
@@ -744,8 +845,12 @@ fn hashValue(input: Value, seed: u32) error{ParseValue}!u64 {
             acc = acc *% 69069 +% 907133923;
             break :blk if (acc == std.math.maxInt(u64)) 590923713 else acc;
         },
-        .complex => |c| validHash(floatHash(c.real, v.custom.ptr) +% 1000003 *% floatHash(c.imag, v.custom.ptr)),
-        .decimal => |data| @bitCast(try data.hash(@bitCast(pointerHash(v.custom.ptr)))),
+        .float => |f| floatHash(f, identityHash(v)),
+        .complex => |c| blk: {
+            const nan_hash = identityHash(v);
+            break :blk validHash(floatHash(c.real, nan_hash) +% 1000003 *% floatHash(c.imag, nan_hash));
+        },
+        .decimal => |data| @bitCast(try data.hash(@bitCast(identityHash(v)))),
         .ellipsis => pointerHash(&ellipsis_identity),
         .bytearray, .set, .dictionary => error.ParseValue,
     };
@@ -753,11 +858,11 @@ fn hashValue(input: Value, seed: u32) error{ParseValue}!u64 {
         .null => pointerHash(&none_identity),
         .bool => |b| @intFromBool(b),
         .integer => |i| signedHash(@abs(i) % hash_modulus, i < 0),
-        .float => |f| floatHash(f, null),
+        .float => |f| floatHash(f, 0),
         .string => |text| stringHash(text, seed),
         .number_string => |text| blk: {
             if (!std.json.isNumberFormattedLikeAnInteger(text))
-                break :blk floatHash(std.fmt.parseFloat(f64, text) catch return error.ParseValue, null);
+                break :blk floatHash(std.fmt.parseFloat(f64, text) catch return error.ParseValue, 0);
             if (text.len == 0) return error.ParseValue;
             const negative = text[0] == '-';
             const digits = text[@intFromBool(negative)..];
@@ -800,8 +905,9 @@ fn hashValue(input: Value, seed: u32) error{ParseValue}!u64 {
 
 pub fn containerEqual(a: Value, b: Value) Error!bool {
     // PyObject_RichCompareBool performs this identity shortcut for membership
-    // and container elements, even when an object's own equality is false.
-    if (a == .custom and b == .custom and a.custom.ptr == b.custom.ptr) return true;
+    // and container elements, even when an object's own equality is false or
+    // raises (NaN, signaling Decimal NaN). Equal bits alone never qualify.
+    if (sameIdentity(a, b)) return true;
     if (ownBox(a)) |box| return equalValue(box, b);
     if (ownBox(b)) |box| return equalValue(box, a);
     return value_ops.pyEqual(a, b);
@@ -815,7 +921,7 @@ fn equal(left: *const anyopaque, right: *const anyopaque) Error!bool {
 fn equalValue(ptr: *const anyopaque, other: Value) Error!bool {
     const self = runtimeBox(ptr);
     if (other == .custom and other.custom.ptr == ptr and
-        self.payload != .complex and self.payload != .decimal) return true;
+        self.payload != .float and self.payload != .complex and self.payload != .decimal) return true;
     const b = view(other);
     return switch (self.payload) {
         .bytes, .bytearray => |data| if (b) |python| switch (python) {
@@ -859,12 +965,24 @@ fn equalValue(ptr: *const anyopaque, other: Value) Error!bool {
             }
             break :blk true;
         },
+        .float => |f| blk: {
+            // Builtin operands are compared here; only a non-builtin operand
+            // reaches pyEqual, with this box already reduced to a plain number.
+            if (b) |python| break :blk switch (python) {
+                .float => |g| f == g,
+                .complex => |c| c.imag == 0 and f == c.real,
+                .decimal => |data| try decimalEqual(data, .{ .float = f }),
+                else => false,
+            };
+            break :blk value_ops.pyEqual(.{ .float = f }, other);
+        },
         .complex => |c| blk: {
             if (b) |python| {
                 if (python == .decimal) {
                     if (c.imag != 0) break :blk false;
                     break :blk decimalEqual(python.decimal, .{ .float = c.real });
                 }
+                if (python == .float) break :blk c.imag == 0 and c.real == python.float;
                 if (python != .complex) break :blk false;
                 break :blk c.real == python.complex.real and c.imag == python.complex.imag;
             }
@@ -935,6 +1053,7 @@ fn decimalEqual(data: decimals.Decimal, input: Value) Error!bool {
             const python = view(other) orelse return false;
             break :blk switch (python) {
                 .decimal => |number| number,
+                .float => |number| decimalFloatOperand(number, &buffer),
                 .complex => |number| if (number.imag == 0)
                     decimalFloatOperand(number.real, &buffer)
                 else
@@ -951,7 +1070,8 @@ fn rawValue(_: Allocator, ptr: *const anyopaque) Allocator.Error!Value {
     return .{ .custom = .{ .ptr = ptr, .vtable = runtimeBox(ptr).vtable } };
 }
 
-fn cloneItems(a: Allocator, items: []const Value) Allocator.Error![]Value {
+fn cloneItems(context: *runtime.CloneContext, items: []const Value) Allocator.Error![]Value {
+    const a = context.allocator;
     const out = try a.alloc(Value, items.len);
     var initialized: usize = 0;
     errdefer {
@@ -959,17 +1079,25 @@ fn cloneItems(a: Allocator, items: []const Value) Allocator.Error![]Value {
         a.free(out);
     }
     for (items, out) |item, *copy| {
-        copy.* = try ownership.cloneJsonValue(a, item);
+        copy.* = try context.cloneValue(item);
         initialized += 1;
     }
     return out;
 }
 
-fn clone(a: Allocator, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+fn clone(context: *runtime.CloneContext, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+    const a = context.allocator;
     const source = runtimeBox(ptr);
     const copy = try a.create(Box);
     errdefer a.destroy(copy);
-    copy.* = .{ .payload = source.payload, .vtable = source.vtable, .hash_seed = source.hash_seed };
+    // An immutable builtin clone is logically the same Python object. Mutable
+    // and container sources carry no logical identity to copy.
+    copy.* = .{
+        .payload = source.payload,
+        .vtable = source.vtable,
+        .hash_seed = source.hash_seed,
+        .identity = source.identity,
+    };
     switch (source.payload) {
         .bytes => |data| copy.payload = .{ .bytes = try a.dupe(u8, data) },
         .decimal => |data| {
@@ -982,7 +1110,7 @@ fn clone(a: Allocator, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
             copy.owns_storage = true;
         },
         .tuple, .set, .frozen_set => |items| {
-            const children = try cloneItems(a, items);
+            const children = try cloneItems(context, items);
             errdefer {
                 for (children) |item| ownership.freeJsonValue(a, item);
                 a.free(children);
@@ -1010,9 +1138,9 @@ fn clone(a: Allocator, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
                 a.free(entries);
             }
             for (pairs, entries) |entry, *destination| {
-                const key = try ownership.cloneJsonValue(a, entry.key);
+                const key = try context.cloneValue(entry.key);
                 errdefer ownership.freeJsonValue(a, key);
-                destination.* = .{ .key = key, .value = try ownership.cloneJsonValue(a, entry.value) };
+                destination.* = .{ .key = key, .value = try context.cloneValue(entry.value) };
                 initialized += 1;
             }
             copy.payload = .{ .dictionary = entries };
@@ -1022,7 +1150,7 @@ fn clone(a: Allocator, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
                 copy.owns_table = true;
             }
         },
-        .complex, .ellipsis => {},
+        .float, .complex, .ellipsis => {},
     }
     return .{ .ptr = copy, .vtable = copy.vtable, .owns_data = true };
 }
@@ -1049,7 +1177,7 @@ fn deinit(a: Allocator, ptr: *const anyopaque, owns_data: bool) void {
             };
             if (box.owns_storage) a.free(pairs);
         },
-        .complex, .ellipsis => {},
+        .float, .complex, .ellipsis => {},
     }
     if (box.owns_table) a.free(box.table);
     a.destroy(box);
@@ -1109,6 +1237,7 @@ fn writePythonRepr(w: *Writer, python: PythonValue, depth: usize) runtime.Custom
             try writeBytesRepr(w, data, true);
             try w.writeByte(')');
         },
+        .float => |f| try pyjson.writeFloat(w, f, .python),
         .tuple => |items| {
             try w.writeByte('(');
             for (items, 0..) |item, index| {
@@ -1250,6 +1379,8 @@ fn serialized(a: Allocator, ptr: *const anyopaque, depth: u32) runtime.Serializa
                 out.appendAssumeCapacity(try value_ops.serializedValueDepth(a, item, depth + 1));
             break :blk .{ .array = out };
         },
+        // The same projection as an unboxed float: nested nonfinite is null.
+        .float => |f| if (depth > 0 and !std.math.isFinite(f)) .null else .{ .float = f },
         .complex => |c| blk: {
             var out: Writer.Allocating = .init(a);
             defer out.deinit();
@@ -1382,6 +1513,7 @@ const KeyIterator = struct {
                         continue;
                     },
                     .bytes => |data| return if (std.unicode.utf8ValidateSlice(data)) data else error.PythonSerializeFallback,
+                    .float => |f| return self.floatText(f),
                     .complex => |c| {
                         var fixed: Writer = .fixed(&self.buffer);
                         writeComplexJsonText(&fixed, c) catch unreachable;
@@ -1487,6 +1619,7 @@ fn writeRuntimeJson(jws: *std.json.Stringify, ptr: *const anyopaque) Writer.Erro
     // Stringify's callback error set cannot express TypeError, so unsupported
     // values report WriteFailed rather than inventing a successful JSON value.
     switch (runtimeBox(ptr).payload) {
+        .float => |f| try jws.write(f),
         .tuple => |items| try jws.write(items),
         .dictionary => |pairs| {
             try jws.beginObject();
@@ -1509,6 +1642,11 @@ fn writeRuntimeJson(jws: *std.json.Stringify, ptr: *const anyopaque) Writer.Erro
                                 const f = std.fmt.parseFloat(f64, text) catch return error.WriteFailed;
                                 try pyjson.writeFloat(jws.writer, f, .json);
                             }
+                        },
+                        .custom => {
+                            const python = view(pair.key) orelse return error.WriteFailed;
+                            if (python != .float) return error.WriteFailed;
+                            try pyjson.writeFloat(jws.writer, python.float, .json);
                         },
                         else => return error.WriteFailed,
                     }
@@ -1592,6 +1730,7 @@ fn writePythonSerialized(w: *Writer, python: PythonValue, style: runtime.JsonSty
             try pyjson.writeJsonString(w, data);
         },
         .tuple, .set, .frozen_set => |items| try writeSerializedItems(w, items, style, depth),
+        .float => |f| try pyjson.writeJsonProjection(w, .{ .float = f }, style, @intCast(depth)),
         .complex => |c| {
             try w.writeByte('"');
             try writeComplexJsonText(w, c);
@@ -1748,7 +1887,8 @@ const SourceStringKey = struct {
         try w.writeByte('"');
     }
 
-    fn cloneKey(a: Allocator, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+    fn cloneKey(context: *runtime.CloneContext, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+        const a = context.allocator;
         const copy = try a.create(SourceStringKey);
         errdefer a.destroy(copy);
         copy.* = .{ .text = try a.dupe(u8, get(ptr).text), .ordered = get(ptr).ordered };
@@ -1904,7 +2044,7 @@ test "Python bytes retain identity and exact byte repr" {
         try testing.expectEqualStrings(case[0], view(actual).?.bytes);
         try testing.expect(actual.custom.vtable.hashable);
         try testing.expect(!actual.custom.vtable.is_type);
-        try testing.expectEqual(case[0].len != 0, actual.custom.truthy());
+        try testing.expectEqual(case[0].len != 0, try actual.custom.truthy());
         try testing.expect(!try value_ops.pyEqual(actual, .{ .string = case[0] }));
         try testing.expect(!try value_ops.pyEqual(.{ .string = case[0] }, actual));
         try expectRepr(case[1], actual);
@@ -1920,8 +2060,8 @@ test "Python tuple repr identity truth and recursive hash admission" {
     const equal_one = try tuple(a, &.{.{ .bool = true }});
     const list: Value = .{ .array = .init(a) };
     const unhashable = try tuple(a, &.{list});
-    try testing.expect(!empty.custom.truthy());
-    try testing.expect(one.custom.truthy());
+    try testing.expect(!try empty.custom.truthy());
+    try testing.expect(try one.custom.truthy());
     try testing.expect(one.custom.vtable.hashable);
     try testing.expect(!unhashable.custom.vtable.hashable);
     try testing.expect(try value_ops.pyEqual(one, equal_one));
@@ -1971,7 +2111,7 @@ test "CPython seed-zero set layout dedup and frozen cross equality" {
     try expectRepr("set()", try set(a, &.{}));
     const empty_frozen = try frozenSet(a, &.{});
     try expectRepr("frozenset()", empty_frozen);
-    try testing.expect(!empty_frozen.custom.truthy());
+    try testing.expect(!try empty_frozen.custom.truthy());
     try testing.expectEqual(@as(u64, 133146708735736), try hashValue(empty_frozen, 0));
 }
 
@@ -2016,7 +2156,7 @@ test "CPython Unicode storage and explicit seed determine genuine set order" {
         .{ .number = -std.math.inf(f64), .hash = -314159 },
     };
     for (float_hashes) |case|
-        try testing.expectEqual(case.hash, @as(i64, @bitCast(floatHash(case.number, null))));
+        try testing.expectEqual(case.hash, @as(i64, @bitCast(floatHash(case.number, 0))));
 }
 
 test "Python dictionaries retain original equal key and insertion order" {
@@ -2078,7 +2218,7 @@ test "Python complex source repr numeric equality and Pydantic text differ" {
         const actual = try complex(a, case.real, case.imag);
         try expectRepr(case.repr, actual);
         try expectSerialized(case.json, actual);
-        try testing.expectEqual(case.real != 0 or case.imag != 0, actual.custom.truthy());
+        try testing.expectEqual(case.real != 0 or case.imag != 0, try actual.custom.truthy());
     }
     const one = try complex(a, 1, -0.0);
     try testing.expect(try value_ops.pyEqual(one, .{ .bool = true }));
@@ -2113,7 +2253,7 @@ test "Builtin JSON conversion rejects plain unsupported values and preserves top
     const ellipse = try ellipsis(a);
     const same = try value_ops.serializedValue(a, ellipse);
     try testing.expectEqual(ellipse.custom.ptr, same.custom.ptr);
-    try testing.expect(ellipse.custom.truthy());
+    try testing.expect(try ellipse.custom.truthy());
     try testing.expect(ellipse.custom.vtable.hashable);
     try expectRepr("Ellipsis", ellipse);
     writer.end = 0;
@@ -2342,7 +2482,7 @@ test "bytearray growth retains aliases while clones and validated text remain in
         try testing.expectEqualStrings("abc", file.file_id.?);
         try testing.expectEqual(@as(u8, '!'), try bytearrayPop(alias, -1));
         try bytearrayClear(alias);
-        try testing.expect(!mutable.custom.truthy());
+        try testing.expect(!try mutable.custom.truthy());
         try testing.expectError(error.ParseValue, bytearrayPop(mutable, -1));
         try testing.expectError(error.ParseValue, bytearraySet(mutable, 0, 'x'));
         break :blk copy;
@@ -2365,4 +2505,244 @@ test "owned tuple storage borrows members while its clone owns independent field
     borrowed.custom.deinit(testing.allocator);
     source.deinit();
     try testing.expectEqualStrings("citation 雪", view(.{ .custom = copy }).?.tuple[1].string);
+}
+
+/// Clone through a fresh clone context; the list releases the clone at test end.
+fn ownedClone(owned: *std.ArrayList(Value), source: Value) !Value {
+    try owned.ensureUnusedCapacity(testing.allocator, 1);
+    const copy = try ownership.cloneJsonValue(testing.allocator, source);
+    owned.appendAssumeCapacity(copy);
+    return copy;
+}
+
+fn expectContainerMatch(expected: bool, left: Value, right: Value) !void {
+    var left_items: runtime.Array = .init(testing.allocator);
+    defer left_items.deinit();
+    try left_items.append(left);
+    var right_items: runtime.Array = .init(testing.allocator);
+    defer right_items.deinit();
+    try right_items.append(right);
+    try testing.expectEqual(expected, try containerEqual(left, right));
+    try testing.expectEqual(expected, try value_ops.pyEqual(.{ .array = left_items }, .{ .array = right_items }));
+}
+
+test "immutable builtin identity outlives its source arena across independent clones" {
+    // Python deepcopy returns the same immutable object. Clones made by separate
+    // clone contexts must stay that object after the source arena is destroyed,
+    // while separately constructed objects with the same bits must not.
+    const gpa = testing.allocator;
+    var owned: std.ArrayList(Value) = .empty;
+    defer {
+        for (owned.items) |item| ownership.freeJsonValue(gpa, item);
+        owned.deinit(gpa);
+    }
+    const nan = std.math.nan(f64);
+    const count = 7;
+    const signaling_index = 3;
+    var first: [count]Value = undefined;
+    var second: [count]Value = undefined;
+    {
+        var source: std.heap.ArenaAllocator = .init(gpa);
+        defer source.deinit();
+        const a = source.allocator();
+        const originals = [count]Value{
+            try float(a, nan),
+            try complex(a, nan, 0),
+            try decimal(a, "NaN"),
+            try decimal(a, "sNaN"),
+            try bytes(a, try a.dupe(u8, "\xffraw")),
+            try ellipsis(a),
+            staticBytes("static"),
+        };
+        for (originals, &first, &second) |original, *one, *two| {
+            one.* = try ownedClone(&owned, original);
+            two.* = try ownedClone(&owned, original);
+            try testing.expect(sameIdentity(original, one.*));
+        }
+    }
+    for (first, second, 0..) |one, two, index| {
+        const three = try ownedClone(&owned, two);
+        try testing.expect(one.custom.ptr != two.custom.ptr);
+        try testing.expect(two.custom.ptr != three.custom.ptr);
+        try testing.expect(sameIdentity(one, two));
+        try testing.expect(sameIdentity(one, three));
+        try expectContainerMatch(true, one, three);
+        if (index == signaling_index) {
+            try testing.expectError(error.ParseValue, pythonHash(one, 0));
+        } else {
+            try testing.expectEqual(try pythonHash(one, 0), try pythonHash(three, 0));
+        }
+    }
+    // Direct equality keeps each class's own answer for one logical object.
+    for (first[0..3], second[0..3]) |one, two| {
+        try testing.expect(!try value_ops.pyEqual(one, one));
+        try testing.expect(!try value_ops.pyEqual(one, two));
+    }
+    try testing.expectError(error.ParseValue, value_ops.pyEqual(first[signaling_index], second[signaling_index]));
+    for (first[4..], second[4..]) |one, two| try testing.expect(try value_ops.pyEqual(one, two));
+
+    const fresh_float = try float(gpa, nan);
+    defer fresh_float.custom.deinit(gpa);
+    try testing.expectEqual(@as(u64, @bitCast(view(first[0]).?.float)), @as(u64, @bitCast(view(fresh_float).?.float)));
+    try testing.expect(!sameIdentity(first[0], fresh_float));
+    try expectContainerMatch(false, first[0], fresh_float);
+    try testing.expect(try pythonHash(first[0], 0) != try pythonHash(fresh_float, 0));
+    const members = try set(gpa, &.{ first[0], second[0], fresh_float });
+    defer members.custom.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), view(members).?.set.len);
+
+    const fresh_complex = try complex(gpa, nan, 0);
+    defer fresh_complex.custom.deinit(gpa);
+    try expectContainerMatch(false, first[1], fresh_complex);
+    const fresh_decimal = try decimal(gpa, "NaN");
+    defer fresh_decimal.custom.deinit(gpa);
+    try expectContainerMatch(false, first[2], fresh_decimal);
+    // Without shared identity a signaling NaN still raises inside containers.
+    const fresh_signaling = try decimal(gpa, "sNaN");
+    defer fresh_signaling.custom.deinit(gpa);
+    try testing.expect(!sameIdentity(first[signaling_index], fresh_signaling));
+    try testing.expectError(error.ParseValue, containerEqual(first[signaling_index], fresh_signaling));
+    // Equal bytes are equal values, yet a separate construction is another object.
+    const fresh_bytes = try bytes(gpa, "\xffraw");
+    defer fresh_bytes.custom.deinit(gpa);
+    try testing.expect(!sameIdentity(first[4], fresh_bytes));
+    try expectContainerMatch(true, first[4], fresh_bytes);
+
+    // Unboxed floats have no object identity; mutable and container boxes are
+    // one object only as one physical box, so their clones are new objects.
+    try testing.expect(!sameIdentity(.{ .float = nan }, .{ .float = nan }));
+    try testing.expect(!sameIdentity(first[0], .{ .float = nan }));
+    try expectContainerMatch(false, .{ .float = nan }, .{ .float = nan });
+    const mutable = try bytearray(gpa, "raw");
+    defer mutable.custom.deinit(gpa);
+    try testing.expect(sameIdentity(mutable, mutable));
+    try testing.expect(!sameIdentity(mutable, try ownedClone(&owned, mutable)));
+    const sequence = try tuple(gpa, &.{first[0]});
+    defer sequence.custom.deinit(gpa);
+    const sequence_copy = try ownedClone(&owned, sequence);
+    try testing.expect(!sameIdentity(sequence, sequence_copy));
+    try testing.expect(try value_ops.pyEqual(sequence, sequence_copy));
+    const fresh_sequence = try tuple(gpa, &.{fresh_float});
+    defer fresh_sequence.custom.deinit(gpa);
+    try testing.expect(!try value_ops.pyEqual(sequence, fresh_sequence));
+}
+
+test "builtin float keeps Python numeric equality hash truth and text across kinds" {
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const a = scratch.allocator();
+    const one = try float(a, 1);
+    try testing.expect(view(one).? == .float);
+    try expectRepr("1.0", one);
+    try expectRepr("-0.0", try float(a, -0.0));
+    try expectRepr("nan", try float(a, std.math.nan(f64)));
+    try expectRepr("inf", try float(a, std.math.inf(f64)));
+    try expectSerialized("1.5", try float(a, 1.5));
+    try expectSerialized("[null, 2.5]", try tuple(a, &.{ try float(a, std.math.nan(f64)), try float(a, 2.5) }));
+    try testing.expect(try one.custom.truthy());
+    try testing.expect(try (try float(a, std.math.nan(f64))).custom.truthy());
+    try testing.expect(!try (try float(a, -0.0)).custom.truthy());
+
+    const equals = [_]Value{
+        .{ .integer = 1 },
+        .{ .bool = true },
+        .{ .float = 1 },
+        .{ .number_string = "1" },
+        try float(a, 1),
+        try complex(a, 1, 0),
+        try decimal(a, "1.0"),
+    };
+    for (equals) |other| {
+        try testing.expect(try value_ops.pyEqual(one, other));
+        try testing.expect(try value_ops.pyEqual(other, one));
+        try testing.expectEqual(try pythonHash(one, 0), try pythonHash(other, 0));
+    }
+    const unequal = [_]Value{
+        .{ .integer = 2 },
+        .{ .string = "1.0" },
+        .null,
+        try complex(a, 1, 1),
+        try decimal(a, "1.1"),
+        try bytes(a, "1"),
+    };
+    for (unequal) |other| {
+        try testing.expect(!try value_ops.pyEqual(one, other));
+        try testing.expect(!try value_ops.pyEqual(other, one));
+    }
+    // Decimal and wide-integer comparison is exact, never rounded through f64.
+    const tenth = try float(a, 0.1);
+    try testing.expect(!try value_ops.pyEqual(tenth, try decimal(a, "0.1")));
+    try testing.expect(try value_ops.pyEqual(try float(a, 0.5), try decimal(a, "0.5")));
+    const wide = try float(a, 9007199254740992);
+    try testing.expect(!try value_ops.pyEqual(wide, .{ .number_string = "9007199254740993" }));
+    try testing.expect(!try value_ops.pyEqual(.{ .number_string = "9007199254740993" }, wide));
+    try testing.expect(try value_ops.pyEqual(wide, .{ .number_string = "9007199254740992" }));
+    const merged = try dictionary(a, &.{
+        .{ .key = .{ .integer = 1 }, .value = .{ .string = "first" } },
+        .{ .key = one, .value = .{ .string = "last" } },
+    });
+    try testing.expectEqual(@as(usize, 1), view(merged).?.dictionary.len);
+}
+
+fn exerciseImmutableIdentity(a: Allocator) !void {
+    const nan = try float(a, std.math.nan(f64));
+    defer nan.custom.deinit(a);
+    const signaling = try decimal(a, "sNaN");
+    defer signaling.custom.deinit(a);
+    const point = try complex(a, 0, std.math.nan(f64));
+    defer point.custom.deinit(a);
+    const sequence = try tuple(a, &.{ nan, signaling, point, staticBytes("static") });
+    defer sequence.custom.deinit(a);
+    const copied = try ownership.cloneJsonValue(a, sequence);
+    defer ownership.freeJsonValue(a, copied);
+    const again = try ownership.cloneJsonValue(a, copied);
+    defer ownership.freeJsonValue(a, again);
+    // Equal only through member identity: every member is unequal to itself
+    // or raises, except the static bytes.
+    try testing.expect(try value_ops.pyEqual(sequence, again));
+    for (view(sequence).?.tuple, view(again).?.tuple) |source, copy| {
+        try testing.expect(source.custom.ptr != copy.custom.ptr);
+        try testing.expect(sameIdentity(source, copy));
+    }
+}
+
+test "immutable identity clones release every partial allocation" {
+    var stable = testing.FailingAllocator.init(testing.allocator, .{ .resize_fail_index = 0 });
+    try testing.checkAllAllocationFailures(stable.allocator(), exerciseImmutableIdentity, .{});
+}
+
+test "builtin nominal class identity differs from its shared physical box layout" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const a = memory.allocator();
+    const values = [_]Value{
+        try float(a, 1),     try decimal(a, "1"),     try complex(a, 1, 0),
+        try bytes(a, "one"), try bytearray(a, "one"),
+    };
+    for (values, 0..) |left, i| {
+        const copy: Value = .{ .custom = try left.custom.clone(a) };
+        try testing.expect(left.custom.sameType(copy.custom));
+        for (values, 0..) |right, j| {
+            try testing.expectEqual(i == j, left.custom.sameType(right.custom));
+        }
+    }
+    // Hash admissibility does not create a new tuple CLASS.
+    const hashable = try tuple(a, &.{.{ .integer = 1 }});
+    const unhashable = try tuple(a, &.{try bytearray(a, "one")});
+    try testing.expect(hashable.custom.sameType(unhashable.custom));
+    try testing.expectError(error.ParseValue, pythonHash(unhashable, 0));
+    try testing.expect(try value_ops.pyEqual(values[0], values[1]));
+    try testing.expect(try value_ops.pyEqual(values[0], values[2]));
+    try testing.expect(try value_ops.pyEqual(values[3], values[4]));
+}
+
+test "identity minting stops at its limit instead of reusing a sequence" {
+    var counter: std.atomic.Value(u64) = .init(identity_sequence_limit - 2);
+    const earlier = try mintIdentity(&counter);
+    const last = try mintIdentity(&counter);
+    try testing.expectEqual(identity_sequence_limit - 2, earlier.minted);
+    try testing.expectEqual(identity_sequence_limit - 1, last.minted);
+    try testing.expectError(error.OutOfMemory, mintIdentity(&counter));
+    try testing.expectError(error.OutOfMemory, mintIdentity(&counter));
+    try testing.expectEqual(identity_sequence_limit, counter.load(.monotonic));
 }

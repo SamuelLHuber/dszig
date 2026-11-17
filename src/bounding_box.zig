@@ -76,6 +76,11 @@ pub const BoundingBox = struct {
             .number_string => |text| std.fmt.parseFloat(f64, text) catch error.InvalidBoundingBox,
             .string => |text| if (lax) std.fmt.parseFloat(f64, std.mem.trim(u8, text, " \t\n\r")) catch error.InvalidBoundingBox else error.InvalidBoundingBox,
             .bool => |boolean| if (lax) @floatFromInt(@intFromBool(boolean)) else error.InvalidBoundingBox,
+            .custom => blk: {
+                // Only an actual builtin float box is a strict float edge.
+                const builtin = @import("python_value.zig").view(value) orelse break :blk error.InvalidBoundingBox;
+                break :blk if (builtin == .float) builtin.float else error.InvalidBoundingBox;
+            },
             else => error.InvalidBoundingBox,
         };
     }
@@ -193,7 +198,8 @@ pub const BoundingBox = struct {
         try writer.writeByte('}');
     }
 
-    fn cloneRuntime(allocator: Allocator, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+    fn cloneRuntime(context: *runtime.CloneContext, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+        const allocator = context.allocator;
         const copy = try allocator.create(BoundingBox);
         copy.* = runtimeBox(ptr).*;
         return .{ .ptr = copy, .vtable = &runtime_vtable, .owns_data = true };

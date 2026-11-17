@@ -16,6 +16,9 @@ pub const Response = struct {
     status: std.http.Status,
     /// Owned by the underlying HTTP client's allocator.
     body: []u8,
+    /// First nonempty `x-typesafe-request-id` response header, owned by the
+    /// request arena; null when the server sent none.
+    request_id: ?[]const u8 = null,
 };
 
 pub const Request = struct {
@@ -201,6 +204,15 @@ pub const Transport = struct {
         }
         var response = try request.receiveHead(&.{});
         const status = response.head.status;
+        // Head bytes are invalidated once the body is read, so copy now.
+        var request_id: ?[]const u8 = null;
+        var response_headers = response.head.iterateHeaders();
+        while (response_headers.next()) |header| {
+            if (header.value.len == 0) continue;
+            if (!std.ascii.eqlIgnoreCase(header.name, "x-typesafe-request-id")) continue;
+            request_id = try arena.dupe(u8, header.value);
+            break;
+        }
         const location = if (self.max_redirects > 0 and isRedirect(status))
             if (response.head.location) |text| if (text.len > 0) try arena.dupe(u8, text) else null else null
         else
@@ -219,6 +231,7 @@ pub const Transport = struct {
             .response = .{
                 .status = status,
                 .body = try reader.allocRemaining(self.client.allocator, .limited(self.max_response_bytes)),
+                .request_id = request_id,
             },
             .location = location,
         };

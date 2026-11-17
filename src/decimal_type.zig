@@ -60,6 +60,7 @@ pub fn DecimalWithOptions(comptime options: Options) type {
                         if (!options.allow_inf_nan and builtin.decimal.kind != .finite) return error.ParseValue;
                         break :blk input;
                     }
+                    if (builtin == .float) break :blk try fromFloatString(allocator, builtin.float);
                     if (builtin != .tuple) return error.ParseValue;
                     break :blk try fromTuple(allocator, input);
                 },

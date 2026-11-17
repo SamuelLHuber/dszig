@@ -45,6 +45,8 @@ fn needsMask(comptime T: type) bool {
 fn replacement(arena: Allocator, comptime T: type, v: Value, depth: u32, comptime reasoning_as_text: bool) Error!?Value {
     if (depth >= @import("pyjson.zig").max_depth) return error.JsonTooDeep;
     if (v == .null) return null;
+    if (comptime @typeInfo(T) == .optional)
+        return replacement(arena, @typeInfo(T).optional.child, v, depth, reasoning_as_text);
     if (v == .string and !std.unicode.utf8ValidateSlice(v.string))
         return .{ .string = "<non-serializable: str>" };
     if (v == .custom) {
@@ -57,7 +59,8 @@ fn replacement(arena: Allocator, comptime T: type, v: Value, depth: u32, comptim
                 .tuple => |items| {
                     var result: ?[]Value = null;
                     for (items, 0..) |item, index| {
-                        if (try replacement(arena, Value, item, depth + 1, reasoning_as_text)) |changed| {
+                        const Child = if (@typeInfo(T) == .array) @typeInfo(T).array.child else Value;
+                        if (try replacement(arena, Child, item, depth + 1, reasoning_as_text)) |changed| {
                             if (result == null) result = try arena.dupe(Value, items);
                             result.?[index] = changed;
                         }
@@ -80,6 +83,7 @@ fn replacement(arena: Allocator, comptime T: type, v: Value, depth: u32, comptim
                     else
                         null;
                 },
+                .float => return null,
                 else => {},
             }
         }
@@ -135,6 +139,7 @@ fn orjsonAccepts(v: Value, depth: u32) bool {
                         for (items) |item| if (!orjsonAccepts(item, depth + 1)) break :blk false;
                         break :blk true;
                     },
+                    .float => break :blk true,
                     else => {},
                 }
             }

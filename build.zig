@@ -137,6 +137,10 @@ fn addCompileFailTests(b: *std.Build, step: *std.Build.Step) void {
         .{ "reserved_completed", "is reserved by the chat protocol" },
         .{ "unknown_description", "description for unknown field `answr`" },
         .{ "unsupported_type", "has unsupported type" },
+        .{ "intenum_unicode_bytes", "invalid IntEnum integer bytes" },
+        .{ "intenum_over_limit_bytes", "exceeds CPython's default 4300-digit limit" },
+        .{ "annotated_choice_type", "Choice criteria must match the Literal members, including their Python types." },
+        .{ "annotated_float_score", "Use Score[...] directly as the field type, not Annotated[float, Score[...]]." },
     };
     for (cases) |case| {
         const run = b.addSystemCommand(&.{ b.graph.zig_exe, "test", "--dep", "dszig" });

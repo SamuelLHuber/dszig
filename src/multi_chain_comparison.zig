@@ -235,7 +235,7 @@ fn comparisonSignature(comptime Sig: type, comptime M: usize) type {
     };
 }
 
-fn truthy(v: Value) bool {
+fn truthy(v: Value) error{ParseValue}!bool {
     return switch (v) {
         .null => false,
         .bool => |b| b,
@@ -245,7 +245,7 @@ fn truthy(v: Value) bool {
         .string => |s| s.len > 0,
         .array => |a| a.items.len > 0,
         .object => |o| o.count() > 0,
-        .custom => |custom| custom.truthy(),
+        .custom => |custom| try custom.truthy(),
     };
 }
 
@@ -290,7 +290,7 @@ fn formatAttempt(arena: Allocator, completion: *const Record, last_key: []const 
     // `get` uses reasoning only when rationale is absent, not when it is null
     // or otherwise false. The subsequent `or ""` is a separate operation.
     const raw = completion.get("rationale") orelse completion.get("reasoning") orelse .null;
-    const rationale = if (truthy(raw)) try firstLine(arena, raw) else "";
+    const rationale = if (try truthy(raw)) try firstLine(arena, raw) else "";
     const answer = try firstLine(arena, completion.get(last_key) orelse return error.MissingField);
     return if (rationale.len > 0)
         std.fmt.allocPrint(arena, "«I'm trying to {s} I'm not sure but my prediction is {s}»", .{ rationale, answer })
@@ -660,7 +660,7 @@ test "comparison state roundtrip preserves optimizer metadata demos and cheap-co
     try testing.expectEqualStrings(rationale_prefix, saved_fields[2].object.get("prefix").?.string);
 
     var restored: Compare = .{};
-    try state.loadState(arena, &restored, dumped);
+    try state.loadState(arena, &restored, dumped, .{});
     try testing.expectEqualStrings(compare.predict.state.instructions, restored.predict.state.instructions);
     try testing.expectEqualDeep(compare.predict.state.descs, restored.predict.state.descs);
     try testing.expectEqualDeep(compare.predict.state.prefixes, restored.predict.state.prefixes);

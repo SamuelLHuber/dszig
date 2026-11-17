@@ -52,6 +52,7 @@ pub fn SlotFor(comptime Result: type) type {
 pub fn Runner(comptime Result: type) type {
     return struct {
         ptr: *anyopaque,
+        workers: u16,
         tasks: u32,
         attempts: u32,
         forward: *const fn (*anyopaque, []const TaskFor(Result), Options) anyerror![]const SlotFor(Result),
@@ -178,7 +179,7 @@ pub fn Parallel(comptime Result: type, comptime limits: Limits) type {
 
         pub fn runner(self: *Self) Runner(Result) {
             assert(self.address == self);
-            return .{ .ptr = self, .tasks = limits.tasks, .attempts = limits.attempts, .forward = forwardErased };
+            return .{ .ptr = self, .workers = limits.workers, .tasks = limits.tasks, .attempts = limits.attempts, .forward = forwardErased };
         }
 
         fn forwardErased(ptr: *anyopaque, tasks: []const Task, options: Options) anyerror![]const Slot {
@@ -275,7 +276,8 @@ pub fn Parallel(comptime Result: type, comptime limits: Limits) type {
             // Persistent lifecycle loop: only deinit ends a worker. Each callback
             // and each queue are independently bounded by the caller's contract.
             while (self.live) {
-                const id = self.scheduler.start(now(self.io)) orelse {
+                const timed = self.scheduler.options.straggler_timeout_ns != 0;
+                const id = self.scheduler.start(if (timed) now(self.io) else 0) orelse {
                     self.work.waitUncancelable(self.io, &self.mutex);
                     continue;
                 };
@@ -288,7 +290,9 @@ pub fn Parallel(comptime Result: type, comptime limits: Limits) type {
                     .worker_index = worker_index,
                     .cancellation = .{ .flag = &self.cancellation },
                 };
-                self.changed.signal(self.io);
+                // Without speculative deadlines, the owner only needs the
+                // terminal decision, not two wakeups for every short task.
+                if (timed) self.changed.signal(self.io);
                 self.mutex.unlock(self.io);
                 const failure: ?anyerror = if (task.invoke(task.ptr, attempt, &self.outputs[id]))
                     null
@@ -296,8 +300,11 @@ pub fn Parallel(comptime Result: type, comptime limits: Limits) type {
                     err;
                 self.mutex.lockUncancelable(self.io);
                 self.scheduler.complete(id, failure);
-                if (self.scheduler.terminal != .running) self.cancellation.store(true, .release);
-                self.changed.signal(self.io);
+                if (self.scheduler.terminal != .running) {
+                    self.cancellation.store(true, .release);
+                    // Includes late completions needed by the join barrier.
+                    self.changed.signal(self.io);
+                } else if (timed) self.changed.signal(self.io);
             }
             assert(!self.live);
         }
@@ -341,7 +348,8 @@ pub fn Parallel(comptime Result: type, comptime limits: Limits) type {
 }
 
 /// Native `dspy.Evaluate(num_threads=limits.workers)`: concurrent program and
-/// metric calls whose results are summed in devset order, failed slots scoring 0.
+/// metric calls whose results are summed in devset order, using failure_score
+/// for failed slots (zero by default).
 /// Initialize in place; never move a live evaluator. Per-attempt prediction
 /// records, typed outputs and scratch allocators are created at initialization.
 /// Out-of-memory aborts the run, as in serial `optimize.evaluate`.
@@ -361,6 +369,8 @@ pub fn Evaluator(comptime P: type, comptime limits: Limits) type {
         out_of_memory: std.atomic.Value(bool),
         bound_contexts: []const Context,
         bound_options: Options,
+        /// DSPy Evaluate.failure_score; configure between joined evaluations.
+        failure_score: f64,
 
         const Self = @This();
         const Call = struct { evaluator: *Self, example: *const optimize.Example };
@@ -371,6 +381,7 @@ pub fn Evaluator(comptime P: type, comptime limits: Limits) type {
             for (&self.storage) |*storage| try storage.init();
             for (&self.scratch, backing[0..limits.attempts]) |*scratch, bytes| scratch.* = .init(bytes);
             self.out_of_memory = .init(false);
+            self.failure_score = 0;
             try self.pool.init(io, config);
         }
 
@@ -385,7 +396,7 @@ pub fn Evaluator(comptime P: type, comptime limits: Limits) type {
             assert(contexts.len >= limits.attempts);
             self.bound_contexts = contexts;
             self.bound_options = options;
-            return .{ .ptr = self, .program_type = @typeName(P), .run = runBound };
+            return .{ .ptr = self, .program_type = @import("runtime_value.zig").typeIdentity(P), .run = runBound };
         }
 
         fn runBound(
@@ -434,7 +445,10 @@ pub fn Evaluator(comptime P: type, comptime limits: Limits) type {
             var sum: f64 = 0;
             var errors: usize = 0;
             for (report.results) |slot| switch (slot) {
-                .failed => errors += 1,
+                .failed => {
+                    errors += 1;
+                    sum += self.failure_score;
+                },
                 .value => |score| sum += score.*,
             };
             return optimize.summarize(sum, devset.len, errors);

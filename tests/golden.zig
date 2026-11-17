@@ -186,7 +186,7 @@ test "BootstrapFewShot RAG artifact is byte-identical to DSPy" {
     try testing.expectEqualStrings(bootstrap_rag, saved);
 
     var loaded: rag.RAG = .{};
-    try dszig.state.load(out.allocator(), &loaded, bootstrap_rag);
+    try dszig.state.load(out.allocator(), &loaded, bootstrap_rag, .{});
     try testing.expectEqualStrings(bootstrap_rag, try dszig.state.saveAlloc(out.allocator(), &loaded));
 }
 

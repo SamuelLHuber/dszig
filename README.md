@@ -6,7 +6,7 @@ allocators and execution context are explicit.
 
 **This is not a feature-complete or fully identical implementation of DSPy.** The
 cross-runtime gates cover the behaviors below, not every DSPy capability. In
-particular, the Python-executing RLM/Flex stack, fine-tuning, images/audio,
+particular, the Python-executing RLM/Flex stack, images/audio,
 full provider SDK coverage, and streaming are not implemented. Native File and
 bounded Responses document support are implemented, not general multimodal
 parity. See [Compatibility limits](#compatibility-limits).
@@ -107,24 +107,53 @@ retain the actual continuation and raw provider response independently.
 
 | DSPy surface | Native Zig surface and coverage |
 |---|---|
-| Class-style signatures and typed fields | `Signature`, `Dict`, `Code`, `CodeWithLanguage`, `BoundingBox`, `File`, `Citations` and `Citations.Citation`, scalar/string/list/optional/model fields, string literal enums and mixed scalar/Enum/bytes `Literal`, field descriptions/defaults, compile-time rejection of invalid signatures |
+| Class-style signatures and typed fields | `Signature`, `Dict`, `Code`, `CodeWithLanguage`, `BoundingBox`, `File`, `Citations` and `Citations.Citation`, scalar/string/list/fixed-array/optional/model fields, string literal enums and mixed scalar/Enum/bytes `Literal`, field descriptions/defaults, compile-time rejection of invalid signatures |
 | Runtime values and documents | `Value`, `Array`, `ObjectMap`, boxed native Code/File/Reasoning/BoundingBox/Citations/decision/evidence identity, recursive typed-class serialization, text/canonical-document content union and bounded Responses `input_file` translation |
 | Chat, JSON, XML and two-stage adapters | `Adapter.chat`, `.json`, `.xml`, `.two_step`; `TwoStepAdapter` with a separate extraction LM; independent prompt/parse fixtures, strict response-schema construction, JSON fallback, typed XML and Unicode key handling |
-| Prediction and reasoning | `Predict`, `ChainOfThought`, `BestOfN`, `Refine`, `MultiChainComparison`, explicit `Context`, typed outputs, serialized `Trace`, named predictor/parameter discovery |
+| Prediction and reasoning | `Predict`, `ChainOfThought`, `BestOfN`, `Refine`, `MultiChainComparison`, explicit `Context`, per-predictor LM bindings and module LM aggregation, typed outputs, serialized `Trace`, named predictor/parameter discovery |
 | Parallel composition | Startup-created `Parallel(Result, limits)` workers, typed program/Example/tuple bindings, ordered result slots, speculative straggler retries, bounded accumulated failure reports and joined cooperative cancellation |
 | Typed decisions | `Noul`, configured `Score`/`Choice`, generative evidence classes, criteria/state snapshots, native Annotated metadata, owning evidence collectors and TypeSafe SystemOne prediction; finite coverage and unsupported rows below |
 | Retrieval and embeddings | `Retrieve`, lexical `InMemoryRetriever`, HTTP `ColBERTv2` with shared mutable-graph memory caching, custom/OpenAI/Azure `Embedder`, float32 `KNN`, per-query `KNNFewShot`, and brute-force `Embeddings`/`EmbeddingsWithScores` with NumPy persistence |
-| Evaluation and few-shot search | `optimize.evaluate`, concurrent `parallel.Evaluator`, `LabeledFewShot`, `BootstrapFewShot`, `BootstrapFewShotWithRandomSearch`, `BootstrapFewShotWithOptuna`, teacher context, zero thresholds and positional multi-use trace selection |
+| Evaluation and few-shot search | `optimize.evaluate`, concurrent `parallel.Evaluator`, `bootstrapTraceData` with real parse-failure capture and ordered native rollouts, `LabeledFewShot`, `BootstrapFewShot`, `BootstrapFewShotWithRandomSearch`, `BootstrapFewShotWithOptuna`, teacher context, zero thresholds and positional multi-use trace selection |
+| Fine-tuning | Chat/XML `Adapter.formatFinetuneData`; native `BootstrapFinetune` over bounded OpenAI HTTP jobs, startup workers, retained model names and joined failure cleanup |
+| Optimizer composition | Native `BetterTogether`, real default prompt/weight optimization, typed custom registries, retained candidate LM snapshots and joined lifecycle cleanup |
 | Instruction optimization | `InferRules`; `MIPROv2`, its program-aware proposer and an Optuna 4.5.0 TPE port; `COPRO`; `SIMBA`; supported instance-frontier `GEPA` paths against gepa 0.1.4 |
-| Agents and tools | `ReAct`, comptime `Tool`, `History`, `ToolCalls`, tool results, native declarations and text tool calls, typed submit, retained history |
+| Agents and tools | `ReAct`, bounded native `Avatar` and `AvatarOptimizer`, comptime `Tool`, `History`, `ToolCalls`, tool results, native declarations and text tool calls, typed submit, retained history |
+| Generated native execution | `generated_zig.Generator` (`Predict(Code[zig])`) and fixed-storage Linux `Executor`: restricted compiler, kernel-confined guest, exact native capability RPC, pending output and whole-tree join; not Python RLM/Flex |
 | Voting | `Ensemble`, `ensemble.majority`, Unicode text normalization; exact Python numeric equality, NaN object identity and source-order fallback behavior |
 | Answer metrics | `metrics.emScore`, `f1Score`, `hotpotF1Score`, `precisionScore`, multi-reference `em`/`f1`/`hotpotF1`, thresholded and record-based answer matching, DPR-token passage matching |
 | LM boundary | `LM`, native `lm.OpenAI` Chat Completions/Responses and `lm.TypeSafe` SystemOne, shared bounded `http.Transport`, scripted/keyword LMs, recording/replay wrappers and typed native protocol metadata |
 | Cache | `CachedLM`, per-candidate/request identity, LRU eviction, rich-response JSON dump/load; failed calls are not cached |
-| State | `state.save`, `saveAlloc`, `load`, with DSPy 3.5.0 dependency metadata and program JSON artifact comparisons |
+| State | `state.save`, `saveAlloc`, `load`/`loadState` with explicit load options, native OpenAI configuration reconstruction, DSPy 3.5.0 dependency metadata and program JSON artifact comparisons |
 
 A named surface in this table is not a claim that every Python option or provider
 route is implemented. The limits below are part of the compatibility contract.
+
+### Fixed-size native signature fields
+
+A field `[N]T` is a homogeneous fixed-length Python tuple annotation, not a
+variable-length list. For example, `[2]i64` renders as `tuple[int, int]` with
+`prefixItems` and equal `minItems`/`maxItems`; `[0]T` is the empty tuple.
+Arrays compose with optional, list, dictionary, model and other array fields.
+Validation applies the element codec and rejects missing or extra elements.
+Typed decoding writes into the fixed array, including its sentinel when present.
+
+Erased values retain genuine runtime tuple metadata. Chat/JSON/XML formatting
+and typed Predict work through the same field codecs; XML prompts use a JSON
+tuple body, matching DSPy's tuple annotation behavior rather than its nested-list
+prompt syntax. Owning clones copy tuple children; source-backed tuples and their
+children retain the existing arena lifetime requirements. The nested conversion
+still provisions runtime tuple storage: static Zig output arrays alone do **not**
+make the full prediction path allocation-free. This does not add heterogeneous
+tuple annotations or native union annotations.
+
+A native probe matched six actual DSPy 3.5 schemas/annotation names, nine
+validation cases and all 12 Chat/JSON/XML prompt messages, then executed all
+three typed Predict paths. Additional empty-rich-tuple, sentinel, model-feedback
+and clone-lifetime checks passed. A separate native Evaluate probe ran 8,192
+fixed-array-input/scalar-output calls in each of Debug and ReleaseSafe with a
+zero-byte general allocator backing, checksum 262,144 and no LM calls. That
+narrow execution proof does not cover nested runtime output allocation.
 
 ### LM text and non-text results
 
@@ -136,6 +165,71 @@ text. The text-only `complete`, `completeMany` and `OpenAI.parseResponse`
 helpers return `LMFailure` for an absent text result rather than inventing `""`.
 Chat's no-tool empty/null/missing content fallback is separately normalized to
 `""`, as in the source; a Chat tool-only result retains `null`.
+
+### Response metadata and exact token usage
+
+`lm.Completion.metadata` retains canonical `id`, `model`, `finish_reason` and
+`usage` independently of raw `provider_data`. Legacy native engines can leave
+these facts unknown. Chat Completions, Responses and TypeSafe read their real
+response fields; model fallback uses the actual wire request, and TypeSafe's
+response ID comes from `x-typesafe-request-id`, not its body. The five canonical
+finish reasons are `stop`, `length`, `tool_call`, `content_filter` and `error`.
+
+`lm.Usage` contains eight optional exact counters. Unknown is `.null`, not zero.
+Use its checked constructor before passing hand-built counts to an engine:
+
+```zig
+const usage = try dszig.lm.Usage.init(arena, .{
+    .input_tokens = .{ .integer = 13 },
+    .output_tokens = .{ .integer = 7 },
+});
+// usage.total_tokens is the exact integer 20.
+```
+
+Counters retain integers beyond machine-word precision; finite integral builtin
+floats become exact integers. Bool, strings, fractional/nonfinite floats,
+ordinary Enum and Decimal counters refuse. Genuine IntEnum counters retain
+their identity. Construction enforces nonnegative counts, part/whole relations
+and explicit total consistency, inferring a total only when both addends are
+known. Provider ingestion separately follows the SDK's settlement order:
+inconsistent wire wholes may become unknown before constructing canonical
+usage; raw provider counts remain unchanged in `provider_data`.
+
+`Usage.fromValue` reads the eight SDK names and ignores unknown dictionary
+keys. `toValue` produces the sparse SDK dictionary; `dspyValue` produces
+prompt/completion totals and nested detail dictionaries, preserving reported
+zero and unknown details. `init`/`fromValue` borrow input number text and boxes;
+converted wide floats and computed wide totals use the supplied arena.
+`clone`/`free` manage independent owned snapshots, and both projections own
+their keys and values. A native object dictionary is required; arbitrary Python
+dictionary objects and runtime-created numeric subclasses are not modeled.
+
+Completion cloning, scripted responses, recording/replay, cache persistence and
+native live transcripts retain this metadata. Scripted metadata is supplied
+separately from `provider_data`, never inferred from fixture expectations.
+Explicit SDK-style choice selection retains the response-wide usage on each
+choice; the normal LM boundary refuses an unexpected multi-choice response.
+
+Independent actual Source probes cover 276 Usage constructor/serde inputs and
+30 Chat response inputs. Native Debug and ReleaseSafe each matched 1,595
+targeted Usage observations and 165 Chat observations without mismatches.
+The integrated checkpoint passed **551/551 tests and 38/38 build steps in each
+mode**, its actual RAG/bootstrap/8,192-run Parallel examples, and all 687 existing
+native replay requests. An isolated wrong-field metadata encoder produced 27
+mismatches and a nonzero independent comparison exit with unchanged Source bytes.
+One unknown-keyword constructor row remains unobserved at runtime because the
+native constructor is statically typed; Python exception classes/messages and
+the Usage probe's complete Response objects were not compared. The Chat
+comparison exercised actual localhost HTTP; native live Chat/Responses CoT
+smokes returned `4`, and a TypeSafe HTTP smoke retained its header, wire-model
+fallback and exact counts through recording, replay and cache dump/load after
+the original response arena was destroyed. This is finite protocol evidence,
+not authenticated inference.
+
+Reading token usage is not usage accounting: scoped tracking, per-module
+Prediction usage, costs/pricing, Python Response/Prediction object APIs,
+asynchronous execution and streaming remain open. The xAI separate-reasoning
+usage dialect is not configured by this native OpenAI transport.
 
 The Responses parser follows the observed lm15 behavior: root/item statuses
 and message roles do not discard returned text, `output_text` and `text`
@@ -219,11 +313,12 @@ Non-UTF-8 bytes validate, but cannot generate a JSON schema: native schema
 generation rejects them at compile time, whereas Python raises
 `UnicodeDecodeError` when schema generation is requested. Both refusal paths
 were exercised; their failure timing is not identical. Dynamic annotation
-construction and shared NaN identity remain unsupported.
+construction remains unsupported. Unboxed Literal floats do not carry object
+identity; explicit runtime float boxes below preserve it.
 
 The zero-dependency `python_literal` parser implements the supported CPython
 3.11 literal grammar without execution, and `python_value` retains genuine
-bytes, mutable bytearrays, tuples, sets, frozensets, complex values, Ellipsis and arbitrary-key
+bytes, mutable bytearrays, identity-bearing floats, tuples, sets, frozensets, complex values, Ellipsis and arbitrary-key
 dictionaries rather than replacing them with JSON lookalikes. Native comparison
 against **175,826 actual `ast.literal_eval` calls** matched 175,820 and differed
 on six near-recursion-limit cases. Python's cutoff depends on its caller frame
@@ -318,27 +413,47 @@ numeric, while `repr` retains its class and canonical member name.
 Declaration-time builtin floats truncate toward zero without routing large
 integers through binary64 arithmetic. Base-ten strings accept signs, leading
 zeros, digit separators and Unicode decimal digits, subject to CPython's default
-4,300-digit string limit. Conversion precedes singleton alias resolution.
+4,300-digit string limit. Genuine builtin bytes use the same base-ten grammar
+with ASCII digits and whitespace only, not Unicode text coercion. Conversion
+precedes singleton alias resolution.
 
 The following independent frozen-source observations matched in both native
 Debug and ReleaseSafe, with byte-identical output between modes:
 
 | Native consumer | Compared / Source rows | Outcome/value/identity/signal observations | Normalized exception identities unobserved |
 | --- | ---: | ---: | ---: |
-| IntEnum runtime operations | 2,294 / 2,324 | 24,577 | 657 |
+| IntEnum runtime operations | 2,324 / 2,324 | 24,901 | 663 |
 | IntEnum scalar validation | 35 / 35 | 379 | 6 |
 | Builtin IntEnum declarations | 19 / 19 | 134 | 0 |
+| Builtin bytes IntEnum declarations | 7 / 7 | 50 | 0 |
 | Configured Decimal policies | 368 / 368 | 3,950 | 233 |
 
-The runtime consumer deliberately exits nonzero for incomplete coverage:
-sequence repetition is not implemented by the numeric helpers. Unsafe unbounded
-repetitions were separately left unattempted by the Source probe. The declaration
-probe includes fractional and maximum finite floats, signed zero, subnormals,
+The historical runtime consumer exited nonzero with 30 sequence-repetition rows
+unsupported. `value.numericProduct` now repeats immutable text and genuine bytes
+with integer/IntEnum multipliers in either order. After a focused comparison of
+those 30 rows, the complete frozen runtime/scalar/Decimal-policy corpus was
+recompared against the current native implementation in Debug and ReleaseSafe.
+All rows are now consumed with zero mismatches and byte-identical mode output;
+the table reports these current observations, not their sum with old runs.
+No Source oracle was rerun. The restored historical driver was verified against
+its original archive hash before removing its obsolete repetition skip and
+adding genuine bytes-result encoding. One-fold results may borrow their input;
+repeated bytes own their new buffer. Use caller-provided startup storage through a fixed allocator
+when runtime heap allocation is prohibited. Index and output-size overflow are
+refused before allocation, including out-of-range counts on empty sequences.
+Unsafe unbounded repetitions were separately left unattempted by the Source
+probe; normalized refusals do not establish identical Python exception classes.
+The declaration probe includes fractional and maximum finite floats, signed zero, subnormals,
 Unicode/separated strings, exact wide integers and the 4,300-digit boundary.
 Seventeen independently compiled Debug programs also refused the source-observed
 malformed strings, over-limit strings and nonfinite floats; compile-time
-refusals do not establish Python exception identity. Declaration-time bytes,
-Decimal, tuple/base arguments, arbitrary Python `int(value)` protocols, custom
+refusals do not establish Python exception identity. A separate new Source
+probe observed seven builtin-bytes declarations and their complete schema;
+native Debug and ReleaseSafe matched all 50 observations. Sixteen independent
+native compilation probes refused the Source-observed invalid byte inputs,
+including Unicode digits/whitespace, malformed separators and the 4,301-digit
+boundary. Native compile-time refusal is not Python runtime exception parity.
+Declaration-time Decimal, tuple/base arguments, arbitrary Python `int(value)` protocols, custom
 mixins, configurable Python digit limits and dynamic Python class construction
 are not implemented. Normalized native errors are not proof of identical Python
 exception classes.
@@ -416,7 +531,57 @@ Typed conversion boxes the supported native model families; parsing ordinary JSO
 not. A raw lookalike dictionary remains a dictionary until explicit typed
 validation. Native class validation preserves an existing box, subject to the
 model's actual validators. Owning clones retain their class and copy borrowed
-strings; generic container copies do not reproduce Python's memoized alias graph.
+strings. One value/record/model clone memoizes custom boxes across its fields
+and nested containers: repeated references share one independent cloned box.
+Each owning alias retains a counted reference; releasing one does not invalidate
+the others. Ordinary handle assignment is still a borrowed copy, not an implicit
+retain. Use the allocator that created the clone when releasing owned handles.
+Native array/object metadata remains copied by value, so this is not Python
+container-graph or cyclic-deepcopy equivalence.
+
+`runtime.CloneContext` exposes that same scope for multiple related values.
+Custom vtable clone callbacks receive the context and must use
+`context.cloneValue`/`cloneCustom` for children, preserving the common memo.
+Source boxes must remain alive for the complete context lifetime. The memo is
+temporary; returned owners do not retain a pointer to it. Non-singleton custom
+copies provision a shared-control allocation and memo storage through the caller's
+allocator; this is not whole-runtime startup-only memory proof.
+
+An independent new DSPy 3.5 boundary probe observed shared bytearray preservation
+through direct fields, lists, tuples and non-string-key dictionaries. Native
+Debug and ReleaseSafe executables each matched the four distinct scenarios,
+including mutation visibility and original isolation, with a leak-checking
+allocator. Permanent regressions also exercise source-arena destruction,
+independent second copies, early alias release and allocation-failure cleanup.
+The integrated pinned gates passed **527/527 tests and 36/36 steps in each mode**,
+actual RAG/bootstrap/Parallel examples and all 687 replay requests. These are new
+finite clone observations, not a rerun or expansion of the frozen model corpus.
+
+`python_value.float(allocator, number)` boxes an actual builtin float, distinct
+from a model that merely implements `__float__`. `python_value.sameIdentity`
+compares logical immutable identity: independently owned copies of one float,
+Decimal, complex number or bytes object retain that identity after the source
+arena is destroyed, while separately constructed same-bit NaNs stay distinct.
+Direct NaN equality remains false (signaling Decimal NaN can raise); container
+membership/equality applies the identity shortcut first. Hashing remains coherent
+across those copies. Identity minting is bounded and allocation-free; exhaustion
+refuses construction rather than degrading to address identity. Physical boxes
+and their ownership remain independent. Unboxed `Value.float` and native `f64`
+projections do not acquire identity, and mutable container graphs remain outside
+this protocol.
+
+A new independent Source probe observed 27 boolean results across float,
+Decimal and complex NaNs. Native Debug and ReleaseSafe CLIs matched all 27 using
+actual lists, dictionaries and decision models, then retained identity across
+source-arena destruction and another copy. A separate actual-source class probe
+exposed six incorrect cross-class matches among float, Decimal and complex;
+per-kind nominal tokens now distinguish those classes without changing their
+shared physical layout or numeric equality. Both modes matched all 12 class
+observations, including copy preservation. The integrated scalar/mutable-field
+checkpoint passed **538/538 tests and 36/36 steps in each mode**, the actual
+RAG/bootstrap/Parallel examples and all 687 replay requests. The separate model
+corpus re-consumption below remains incomplete; these finite results do not
+establish full DSPy parity.
 
 - `Reasoning{ .content = ... }` borrows its content. `toRuntime(arena)` boxes it;
   `toValue(arena)` returns the raw `{ "content": ... }` fields. Its ordinary
@@ -592,6 +757,12 @@ must not alias program inputs or outputs. Both the typed output slot and its
 borrowed children must remain alive until the prediction is discarded or
 reused. Evaluation and bootstrap reserve their typed slots before their loops.
 
+Prepared output records also borrow runtime boxes retained by scalar wrappers
+(including Decimal) and raw `Value` fields. Releasing those borrowed handles
+cannot destroy the caller's scalar object; cloning still produces an
+independently owned box and data. This does not change nested container
+allocation or aliasing limits.
+
 Direct Code, BoundingBox, Reasoning, File, Citation, Citations and decision
 fields, including optional fields, borrow those typed slots instead of
 allocating model boxes. Nominal class identity, projected specializations and
@@ -717,7 +888,8 @@ A native consumer matched **281 actual DSPy validations, 210 class/rendering/
 serialization/hashability comparisons and 75 symmetric equality cases** from
 `code_identity_oracle.py`.
 Automatic fresh runtime class creation, Python constructor calling conventions
-and generic memoized deepcopy graphs are not provided by these explicit Zig APIs.
+and cyclic or shared container-identity graphs are not provided by these explicit
+Zig APIs; custom boxes within a native tree do share the clone context above.
 A native executable also exercised a typed Code prediction, fenced output,
 language-specialized instance preservation through the base validator,
 raw-string traces and saved-demo restoration.
@@ -901,6 +1073,53 @@ const Judge = dszig.Signature(struct {
 });
 ```
 
+Declare a nominal native subclass with
+`dszig.decision.Subclass(Base, name, Identity)`, for example:
+
+```zig
+const Risk = dszig.decision.Subclass(dszig.Noul, "Risk", struct {});
+```
+
+Use a distinct identity tag for independent declarations, even if their names
+match. Subclasses inherit criteria, values and native-adaptation eligibility.
+A parent accepts its descendants without erasing their concrete boxed class;
+children reject parent and sibling instances. Owning clones preserve the
+concrete class after the source arena is destroyed. Ancestry is compile-time
+metadata, bounded to 64 ancestors, not a runtime allocation or class registry.
+Consumer-declared subclasses also retain their non-DSPy ownership for XML:
+their structured fields use nested XML rather than the literal JSON leaves
+used by DSPy-owned decision models. This is a static native declaration API,
+not Python's mutable runtime class construction.
+
+`Model.modelConstruct(arena, fields)` preserves unvalidated keyword fields in
+a genuine erased instance of that model class. Required fields may be absent,
+and wrong-typed fields retain their actual values, including Decimal and
+bytearray boxes. Optional evidence fields default to null. Raw iteration and
+Python-mode dumps retain those values; JSON-mode serialization applies the
+declared field projections without revalidating the instance.
+Value-level validation preserves accepted instance identity, while typed
+`Model.fromValue` refuses fields that cannot safely inhabit the typed layout.
+`custom.get(Model)` never reinterprets erased raw storage as a typed pointer.
+Owning runtime clones retain the concrete class and deep-copy present fields.
+
+For dynamic attributes, `Model.mutable(arena, fields, mode)` validates constructor
+fields once and returns a genuine erased mutable instance.
+`Model.setField(instance, name, value)` then stores the actual unvalidated value;
+`Model.deleteField(instance, name)` removes an existing field. Unknown assignment
+and absent deletion refuse. Existing aliases of the instance see the mutation.
+Assigned values borrow caller storage, which must outlive their use by the model.
+A mutated owning clone retains displaced owned fields until model destruction,
+so earlier borrowed field aliases remain valid. This retirement ledger has at
+most one slot per declared field and allocates nothing during assignment or
+deletion. Copies include current fields, not retired ownership bookkeeping.
+Use these APIs for dynamic model behavior rather than erasing a boxed scalar
+into a strongly typed `f64` field and expecting Python object identity.
+
+The erased object boolean protocol is fallible:
+`try object.custom.truthy()` propagates a refusal, such as an unvalidated Noul
+whose `value` is not a bool. Strongly typed model `.truthy()` methods remain
+ordinary bool-returning methods.
+
 `Predict(Judge)` selects decision adaptation automatically. Its typed outputs
 retain boolean/score/typed-choice values, confidence and model-specific
 probability/level fields. Generative decisions work through the ordinary
@@ -913,8 +1132,40 @@ Explicit compatible metadata uses the existing description declaration:
 `.flag = .{ .text = "Evaluate flag.", .metadata = &.{ConfiguredNoul} }`.
 A matching configured Choice can similarly annotate a Literal output. These
 native Annotated forms produce the primitive output while retaining the
-configured decision model for evidence and criteria. Float/Score metadata and
-arbitrary runtime annotations are not implemented.
+configured decision model for evidence and criteria. Choice criteria must match
+the Literal's members **including their Python types**, independently of order;
+integer `1` is not boolean `True` for this check. Native string-enum fields use
+the same metadata constraints and configured evidence binding. Float/Score
+metadata is rejected, matching Source's refusal rather than silently accepting
+it. Invalid static signature metadata is a compile-time error, whereas Source
+raises during runtime TypeAdapter construction.
+
+`dszig.types.validateAnnotated(T, metadata, arena, input)` and
+`dszig.types.schemaAnnotated(T, metadata)` expose standalone validation and
+schema generation with that same metadata slice. They return `error.ParseValue`
+for invalid combinations before validating the input. Valid values retain the
+underlying primitive or model; there is no Annotated wrapper box. Noul/Choice
+metadata replaces the schema description without losing the base schema's
+constraints or definitions. Score metadata has no description hook. Arbitrary
+runtime Python annotations and Python's Annotated descriptor-cache identity are
+not implemented.
+
+Explicit Noul/Score/Choice class metadata activates evidence for supported
+boolean and Literal outputs, including bare metadata classes. Routing still
+follows the base field: a boolean uses Noul; a Literal uses a compatible
+configured Choice or its own declared members. The metadata class need not be
+that selected class. Fields without decision metadata remain ordinary outputs.
+An independent nine-case actual Source state probe exposed 18 incorrect
+selection/configuration/criteria observations before repair; native Debug and
+ReleaseSafe CLIs then matched all 36 recorded fields. This is finite state
+routing evidence, not Python descriptor-cache or complete pipeline equivalence.
+The Annotated checkpoint passed **540/540 tests in both Debug and ReleaseSafe**;
+the integrated build now passes **38/38 steps**, including two permanent
+compile-refusal regressions for invalid typed Choice and float/Score signatures.
+Actual RAG/bootstrap/8,192-run Parallel examples and all 687 replay requests
+passed. An isolated schema-comparator mutation produced ten mismatches and
+`ProofMismatch`; incomplete ordinary consumers still fail with
+`UnsupportedSourceRows`, not success.
 
 `Predict.state.decision_fields` is the mutable decision configuration, separate
 from signature-field metadata. `getCriteria(arena, name)` returns an owning
@@ -942,27 +1193,57 @@ structured state, questions and response schema through recording/replay/cache
 wrappers. OpenAI refuses direct native decision requests rather than silently
 dropping them. The TypeSafe box route sends the experimental images header;
 this is **not** an Image/assets implementation or the complete provider SDK.
-Usage/request-id/convenience views, Python exception identity, asynchronous
-execution and streaming remain outside this native decision implementation.
+Canonical response usage and the actual request-ID header are retained as
+described above. Scoped usage accounting, convenience views, Python exception
+identity, asynchronous execution and streaming remain outside this native
+decision implementation.
 
 The frozen independent DSPy 3.5 source receipt contains **15,218 actual rows
-and 17 model definitions**. Two separate consumers report the following finite
-coverage; their entries/observations overlap and must not be added together:
+and 17 model definitions**. The model consumer was re-run natively after the
+immutable-scalar, mutable-field and Annotated metadata changes, without rerunning
+Source. The pipeline row remains its earlier historical run. These separate
+consumers report finite coverage; their entries/observations overlap and must
+not be added together:
 
 | Independent consumer | Fully supported entries | Unsupported entries | Unconsumed entries | Compared observations | Mismatches |
 |---|---:|---:|---:|---:|---:|
-| Decision models and views | 8,216 | 1,152 | 5,867 | 81,843 | 0 |
-| Evidence/state/Predict pipeline | 1,879 | 501 | 12,838 | 15,751 | 0 |
+| Decision models and views | 9,095 | 0 | 6,140 | 94,174 | 0 |
+| Evidence/state/Predict pipeline | 2,045 | 335 | 12,838 | 17,037 | 0 |
 
 Both consumers deliberately **exit nonzero for incomplete coverage**.
 Partially compared unsupported rows contribute observations, not a claim that
 their entire operation is supported. Six candidate-client rollout observations
 are unobserved: the source engine receipt does not capture those client-only
-options. Decimal, dynamic subclasses, arbitrary forged model state (including
-bytearray values in statically typed Noul/Score fields) and other unsupported
-operations remain in the receipt, not replaced with JSON lookalikes. ScriptedLM
-now refuses non-JSON provider data at response construction, before adapter
-decoding or evidence recording; this is not a complete SDK response-object API. Bare Score/Choice evidence refusal also differs in failure timing:
+options. The native catalogue now includes all 17 declarations, including the
+three simple subclasses, and consumers reconstruct genuine Decimal and
+bytearray inputs rather than JSON lookalikes. Unvalidated model construction
+now preserves raw state without unsafe typed casts. The latest model runs in
+Debug and ReleaseSafe each compared 94,174 observations with zero mismatches and
+zero unsupported observations; 9,375 observations remain unconsumed. All 304
+Annotated validation rows were exercised (322 acceptance/result observations),
+as were all 16 schema rows (26 comparisons). Six schema-error exception-identity
+observations remain unconsumed; native errors are not Python exception objects.
+The actual Source descriptor for the reordered Choice case already has the
+original member order because of Python's Annotated cache; the native regression
+separately verifies order-independent typed-set compatibility. The earlier
+unconsumed-row counter did not separately budget 17 newly compared
+acceptance/result observations, so historical observation totals are not a
+conservation ledger. All five frozen assignment/deletion scenarios exercised
+real native mutable operations:
+110 observations matched, with five missing-argument views still unconsumed.
+Python type-object reflection, mutable runtime class construction, broader scalar
+identity/reflection operations and other unconsumed operations remain explicit
+gaps. An independent focused Source probe and native
+Debug/ReleaseSafe consumers additionally matched all 24 XML prompt structures
+and routing decisions across direct, optional, list and optional-list-item
+annotations of the three roots and three subclasses. A separate eight-case
+Source probe matched 40 exact raw str/repr/Python-dump/JSON observations in each
+mode. It exposed and verified the repair for Score's Python-string key fallback
+versus Choice's JSON-key spelling; Python serialization warnings remain
+unobserved. ScriptedLM now refuses non-JSON provider data at response
+construction, before adapter decoding or evidence recording; this is not a
+complete SDK response-object API. Bare Score/Choice evidence refusal also
+differs in failure timing:
 native compile-time rejection versus Python runtime rejection. These results
 do not establish complete decision-model or DSPy equivalence.
 
@@ -977,12 +1258,17 @@ Typed valid output, geometry refusal before evidence recording and boolean
 probability refusal were exercised. This is HTTP/codec/prediction evidence,
 **not authenticated homelab inference**.
 
-Both decision consumers produced the same counts in Debug and ReleaseSafe,
-including the deliberate incomplete-coverage failures. The bytearray change also
-passed pinned **355/355 tests and 28/28 build steps in each mode**, actual
-RAG/bootstrap execution, the complete 687-request native replay and the
-independent Python fixture/artifact/reference gate. Unicode and DPR tables
-regenerated unchanged.
+Both current decision consumers produced the same counts in Debug and
+ReleaseSafe, including the deliberate incomplete-coverage failures. The raw
+model and fallible-boolean changes passed pinned **525/525 tests and 36/36 build
+steps in each mode**, actual RAG/bootstrap and 8,192-run Parallel examples,
+plus the complete 687-request native replay. A separate opaque-layout smoke
+reproduced incorrect equality before repair and safe bidirectional equality
+afterward, without permitting typed extraction. An isolated old-XML-routing control failed on the
+actual `SubNoul` prompt instead of passing the new surface comparison.
+The older bytearray checkpoint additionally ran the independent Python
+fixture/artifact/reference gate and unchanged Unicode/DPR regeneration;
+those Python gates were not rerun for these native class changes.
 
 ### Citations and provider references
 
@@ -1209,6 +1495,523 @@ Regenerate this table with
 | `dspy.track_usage` (–) | missing | – | – | – |
 
 
+## Native LM bindings and program state
+
+`Predict.state.lm` is an optional borrowed LM handle. A predictor selects an
+explicit `Context.lm_override`, then its own binding, then `Context.lm`.
+Set `lm_override_present = true` with a null override to bypass the binding
+and select the context fallback, matching DSPy's explicit `lm=None`.
+A bound predictor does not require a context fallback; an entirely unconfigured
+call returns `error.NoLM`. Capability selection, JSON fallback, native decisions
+and candidate fanout all use the selected handle.
+
+`predict.setLM(arena, &program, model)` binds every discovered predictor;
+passing null clears the bindings. `predict.getLM` returns the unique borrowed
+handle, or null if every predictor is unbound. Mixed bound/unbound predictors,
+distinct LM identities, and modules without predictors return `error.MultipleLMs`.
+Program value copies retain model identity without owning the model.
+`PredictState.reset` and `predict.resetPredictors` clear both demos and bindings.
+
+Program save/dump now stores a bound LM's configuration rather than silently
+writing null. `lm.OpenAI` supports native configuration persistence, including
+its API, model, capability flags, generation token limit, response bound, retries
+and timeouts, plus `finetuning_model`, `train_kwargs` and `launch_kwargs`.
+Nested training/launch options are JSON objects owned by the startup load arena.
+The native class discriminator and transport settings are **not
+Python LM-state interchange**. API keys, HTTP clients, trust stores and header
+providers are never serialized. Custom engines must provide `LM.VTable.dump_state`
+and an application-owned `LM.StateLoader`; inference-only scripted, replay, cache
+and recording handles do not automatically gain persistence.
+
+Loading has an explicit fourth argument:
+
+```zig
+var loader: dszig.lm.OpenAI.StateLoader = .{
+    .client = &http_client,
+    .base_url = trusted_base_url,
+    .api_key = credential,
+};
+try dszig.state.load(startup_arena, &program, saved_json, .{
+    .lm_loader = loader.loader(),
+});
+```
+
+Use `.{}` when loading programs without bound models. A nonempty LM state
+without a loader fails with `error.MissingLMLoader`, never a fake restored model.
+By default, loading removes the top-level `api_base`, `base_url` and `model_list`
+routing keys and uses the explicitly injected endpoint. Preserve saved routing
+only with `.allow_unsafe_lm_state = true` for trusted files. Credentials always
+come from the loader. Native loaders use static class dispatch, not serialized
+function pointers or dynamic Python imports.
+
+The startup arena owns reconstructed models and copied configuration strings;
+the injected client, trust and authentication resources must outlive the loaded
+program and every joined call using it. Restore constructs each predictor's LM
+separately, just as the source does: shared identity before saving need not remain
+shared after loading. A failed LM restore retains the source's earlier signature,
+demo and decision-state commits, while leaving the previous LM binding intact.
+
+An independent native executable matched **24 complete normalized observations**
+from actual DSPy 3.5: binding/override/null precedence, fanout, copy/reset behavior,
+module identity errors, secret redaction, trusted/untrusted routing, reconstruction
+and failure transitions. Native error enums are mapped to corresponding source
+refusals for that comparison, not claimed to be identical Python exceptions.
+Debug and ReleaseSafe also exercised a restored model through actual localhost
+HTTP and typed Predict, returning `42`; the fixture verified model, token limit
+and injected authentication. This is not live-model inference, training-job,
+whole-runtime static-memory, or complete LM/provider save/load parity evidence.
+
+## Native OpenAI training jobs
+
+`LM.finetune(&job, request)` starts genuine OpenAI-compatible HTTP training in a
+caller-owned `training.Job`. Unsupported engines return `error.UnsupportedFinetuning`.
+Initialize the immovable job with `Job.init(io, buffers, limits, thread_config)` at
+startup: it creates one persistent worker. Supply disjoint bounded body/scratch
+buffers and explicit row, poll, whole-job, whole-request, cleanup and poll-interval
+limits. The client, authentication provider, dataset and model configuration are
+borrowed until completion; do not mutate them concurrently.
+
+Requests accept `.chat` or `.completion` data. Like the source provider, this
+checks the format tag, not training-row schema. The worker uploads JSONL with
+purpose `fine-tune`, creates `/fine_tuning/jobs`, polls status and the latest
+event, and obtains the succeeded job's trained model. A configured nonempty
+`finetuning_model` overrides the inference model. Empty/absent per-job
+`train_kwargs` fall back to the LM's defaults. OpenAI's provider prefix is removed
+from the wire training model; the returned trained name is not prefixed again.
+`launch_kwargs` persist as configuration; this OpenAI provider does not launch a
+local training engine.
+
+`Job.wait()` joins the submitted operation and returns its actual model or error.
+The returned OpenAI borrows the job's inline model-name storage until reuse.
+`OpenAI.copyWithModel(&target, model_name)` copies configuration without allocation,
+retaining inference clients/authentication/options and borrowing the supplied name.
+Copy that name into caller-owned stable storage before retaining a result across
+job reuse. `Job.status(arena)` queries fresh remote status with separate caller
+scratch; do not read mutable job fields while work is running.
+
+`cancelAndWait()` requests cancellation, cleans up known remote resources and
+waits for the local completion barrier. Every request races a whole-request timer;
+both sides are canceled and joined before scratch reuse. The supplied Io backend
+and authentication callbacks must cooperate with cancellation; a non-cooperating
+caller callback can delay the barrier. `release()` cancels any
+remaining nonterminal remote job and deletes the training file. It must succeed
+before another `start`: failed cleanup retains IDs and refuses reuse.
+`deinit()` cancels, joins the startup worker, and reports remaining cleanup errors.
+Report those errors rather than silently dropping them. A response lost after a
+remote commit can leave an unknown remote object: no automatic create retry or
+claim of guaranteed remote rollback is made.
+
+This intentionally does not reproduce the source's unbounded polling or its
+cancel-during-poll hang. Native failure results are errors, not Python exception
+objects returned as successful Future values. Polling avoids redundant SDK
+existence/estimate retrieves; event IDs are deduplicated against the immediately
+preceding ID. Native limits include 1,024-byte retained identifiers/model names
+and the supplied response/body capacities. Before submission, an iterative
+fixed-depth traversal bounds JSON input bytes/nodes by body capacity, including
+hyperparameters; huge inputs cannot evade work bounds by producing tiny output.
+Non-JSON custom runtime values and invalid UTF-8 refuse rather than executing a
+user serializer on the worker. HTTP-client and Io internals may allocate:
+bounded job buffers are not whole-runtime static-memory proof.
+
+The actual DSPy provider was exercised with an in-process scripted SDK; the
+OpenAI SDK itself is absent from the pinned reference environment. Native
+localhost HTTP exercised upload/create/poll/events, trained-model typed Predict,
+failure, remote cancellation, poll/request bounds, cancellation and slot reuse.
+These are finite protocol/lifecycle checks, not paid training, authenticated
+model inference, SDK/error identity, all providers, training-job persistence,
+`BetterTogether`, DST/PBT or full DSPy parity.
+
+## Native BootstrapFinetune
+
+`BootstrapFinetune.compile(P, out, io, ctx, &student, trainset, teachers, slots,
+trace_options)` collects actual native traces, formats training rows and starts
+real `LM.finetune` jobs. It mutates the supplied student; it neither resets nor
+copies it, and an already compiled root is accepted. Predictor bindings are
+required even if `ctx.lm` supplies inference: like Source, that validation occurs
+**after** teacher trace collection.
+
+Initialize every `slots[i].job` at startup using the training API above. Supply
+explicit limits for teachers, examples, predictors, emitted training rows and
+visited trace steps. `out` holds discovery, retained traces and training JSON;
+use distinct bounded startup backing for it and attempt scratch. The optimizer
+does not own a heap or create worker threads. Without `trace_options.rollouts`,
+collection is serial; with it, collection uses that startup pool and its private
+attempt contexts. `num_threads` (default eight; zero selects eight) bounds job
+count and refuses a trace pool whose exposed worker count exceeds it.
+`parallel.Runner` exposes that startup `workers` count as well as task/attempt
+capacities.
+
+`teachers = null` uses the actual student. Explicit lists accept heterogeneous
+native programs through `bootstrap_finetune.Teacher.init(T, &teacher)`, including
+different signatures with the same predictor names and count. Explicit shared
+predictor identities are refused, including an explicit student alias.
+A `.student` list element represents Source's `None`; an empty list collects
+nothing and still prepares empty datasets for the bound student models.
+
+Groups use LM identity and, unless `multitask` is true, predictor index. Selection
+uses the **trace position**, not the traced predictor identity; formatting uses
+that step's own signature and demonstrations. With a metric, nonzero numeric
+scores survive, including negative values and NaN. Each group uses a fresh
+Python-compatible `Random(0)` shuffle. `exclude_demos` removes formatter demos
+and, after success, student demos.
+
+`adapters` and `train_kwargs` accept a `.global` value or explicit `.per_lm`
+identity entries. Missing keys in nonempty maps refuse. A null adapter uses
+`ctx.adapter`, not an LM property. As in Source, an empty adapter dictionary
+cannot infer a format; empty training kwargs use the provider's defaults.
+Chat/XML prepare chat data. JSON accepts an empty selection but its formatter
+refuses selected rows; TwoStep cannot infer a training format even when empty.
+A selected failed prediction is not an answer dictionary: Chat/XML refuse its
+missing mapping protocol when outputs are declared, rather than inventing
+answers from its diagnostic attributes.
+
+All starts precede waits. On failure, every started job is canceled and joined,
+including jobs Source abandons on its first failure. All releases are attempted;
+cleanup errors take precedence and retain IDs so those jobs cannot be reused
+unsafely. The student is rebound only after every job and cleanup succeeds.
+Each source LM is killed immediately before its training job starts, as in
+Source. A native lifecycle hook must join its workers before returning and
+support repeated kills, including shared-LM groups and error cleanup.
+OpenAI-compatible remote API LMs need no local lifecycle hook; this does not
+implement a separate local inference engine.
+
+A slot owns its retained trained-model name and copied OpenAI configuration.
+Slots must remain unmoved and alive while compiled bindings use them; reusing a
+slot explicitly invalidates its previous compiled model. Original clients,
+authentication and nested model configuration remain borrowed. Result storage
+is written only after **all** workers and cleanup have stopped reading inputs,
+so a reused slot cannot overwrite another running job's borrowed model name.
+Formatting/tracing scratch can be reclaimed after compile joins.
+
+This is native-program orchestration over the implemented OpenAI provider,
+not arbitrary Python module execution, every provider's training API, paid
+training, every BetterTogether optimizer option, or whole-runtime
+allocation-freedom. The bounded training/HTTP limitations above still apply.
+
+The native HTTP consumer exercised 23 scenarios in both Debug and ReleaseSafe,
+including parallel traces, heterogeneous and mixed student/teacher lists,
+separate/shared LM groups, negative/NaN scores, late missing-LM validation,
+adapter/config errors, thread/slot limits and joined job/start failure cleanup.
+Each mode made 183 localhost requests with 14 uploads/job creations. Complete
+training rows matched actual DSPy compile/trace output for six selected
+comparisons per mode, including all fields and shuffle order; remote group
+arrival order was not compared. Compiled typed predictions returned `42` after
+the 1 MiB compile backing was overwritten. Actual Source had 106 finite oracle
+cases; its training jobs were scripted real futures, not provider/SDK/network
+work, and those 106 cases were not all matched to native execution.
+
+## Few-shot compile options
+
+`LabeledFewShot.compile(P, out, student, trainset, options)` accepts
+`.{ .sample = true }` for CPython-compatible sampling or
+`.{ .sample = false }` for prefix selection. Its signed `i128` count preserves
+Python negative slicing in prefix mode. A negative sampled count fails only
+when a nonempty dataset has a predictor; empty data returns a reset copy first.
+Both modes own deep-copied demos in `out`. DSPy aliases the original Examples,
+so native ownership is an intentional difference, not alias-identity parity.
+
+`BootstrapFewShotWithRandomSearch.compile(..., valset, options)` accepts
+`restrict: ?[]const i64` and `labeled_sample: bool`. Restrictions are a borrowed
+seed set: duplicates and out-of-range entries are ignored, candidates retain
+ascending seed order, and no matching seed returns `RestrictMatchesNoSeed`
+before candidate work. `labeled_sample` changes only the labeled seed `-2`.
+The reset, labeled and fixed bootstrap seeds permit zero bootstrapped demos;
+a consumed random seed instead returns `InvalidBootstrapRange`. Early stopping
+can avoid that failure. Teacher-list refusal is likewise deferred until a
+bootstrap candidate actually consumes the teacher.
+
+BetterTogether's `optimizers.LabeledFewShot` and `optimizers.RandomSearch`
+expose `compile_options`; `Defaults.prompt_compile_options` configures the
+default `"p"` step. These are typed native options, not arbitrary Python kwargs.
+Random-search candidate reports still contain seed and score, not the Source
+candidate programs and per-example subscores.
+
+The Debug and ReleaseSafe public-API consumers each matched 203 value
+observations and 13 refusal
+categories across 32 labeled and 30 search Source cases, separately recording
+13 ownership differences. Its BetterTogether paths passed 67 checks.
+Eight additional actual Source zero-bootstrap cases matched 31 value
+observations and three refusal categories after reproducing and fixing the
+former eager native assertion. These execute real optimizer methods without
+model inference; categories do not reproduce Python exception classes/messages.
+
+## Bounded native Avatar
+
+`Avatar(Sig)` and `AvatarWithOptions(Sig, .{ .actions_max = 8,
+.tools_max = 32 })` build native actors with statically generated signature
+layouts. Initialize with `Program.init(arena, tools)`. Tools use
+`avatar.Tool`/`avatar.Runner`, distinct from ReAct's root-level `Tool`.
+`forward(ctx, input)` runs on a copy; mutable `call(ctx, input, options)`
+preserves actor evolution after failures. Successful calls restore the actor
+and return the task outputs plus ordered `actions`. After an evolved failure,
+another mutable call refuses before LM use until `reset()`.
+
+The action capacity is a real safety bound: the next decision may finish, but
+cannot execute another tool. Exhaustion returns `AvatarActionsExhausted`,
+never a fabricated final answer. Source's `max_iters` loop does not provide
+that bound; native call options preserve its observed behavior within the
+explicit capacity. Native tool callbacks are borrowed, and evolved signature
+class identities are static per layout rather than freshly generated Python
+classes. Typed inputs require all declared fields.
+
+`AvatarOptimizer.compile(P, out, gpa, ctx, rng, student, trainset)` evaluates
+native actors serially, partitions examples by score, samples positives before
+negatives from the explicit CPython-compatible generator, then runs comparator
+and feedback-instruction Predicts. It applies instructions only on a strict
+improvement and returns the newly proposed instruction without evaluating that
+proposal again. Reports use raw mean scores, not Evaluate percentages.
+Failed examples score zero except allocation failure, which propagates.
+Returned metadata/instructions live in `out`; tool callbacks remain borrowed.
+
+DSPy 3.5's original Avatar and AvatarOptimizer constructors fail because they
+refer to removed `dspy.TypedPredictor`. This port follows saved observations
+of unchanged Source methods on explicitly initialized real `dspy.Predict`
+instances, not working original constructors or unmodified end-to-end Source
+execution. Debug and ReleaseSafe native HTTP smokes each completed 22 actual
+requests, including tool execution, two optimizer iterations and execution of
+the optimized actor; both modes closed and joined the fixture. This is
+localhost transport evidence, not authenticated model inference or
+whole-runtime static-memory proof.
+
+Final Debug and ReleaseSafe gates each passed 496 tests and 34 build steps,
+including examples. The saved actor-method receipt covers 39 rows: each mode
+passed 7,674 Source-backed value/metadata/message comparisons and 19
+refusal-category comparisons, separately reporting 226 native invariants, nine
+deliberate differences and 65 unsupported-category reports. Two requests
+belonging to missing typed input remain explicitly unconsumed; three requests
+are unconsumed only in the supplemental capacity-limited replay. These are not
+parity matches. The unchanged expectations first exposed 136 prompt mismatches,
+fixed by propagating DSPy model-module metadata into shared XML annotation
+routing: DSPy-owned BaseModels use JSON leaves while ordinary models retain
+nested XML.
+
+The optimizer-method consumer accounts for all 25 saved rows: 20 matches,
+four refusal categories and one deliberate serial-context difference. All 13
+ordered sampling rows match. Its 2,677 checks include exact feedback inputs and
+prompts, but are checks, not 2,677 independent Source observations. Actor prompt
+bytes absent from that optimizer receipt, Python exception identity, dynamic
+class/object identity and Source thread scheduling are not established by it.
+
+## Native BetterTogether
+
+`BetterTogether.compile(P, out, gpa, io, ctx, &student, trainset, options,
+defaults)` runs real native prompt and weight optimizers. Its default strategy
+is exactly `"p -> w -> p"`: `BootstrapFewShotWithRandomSearch`,
+`BootstrapFinetune`, then prompt search again. `defaults` supplies the weight
+limits and fresh slot sets; optional typed `prompt` and `weight` configurations
+replace the corresponding defaults.
+
+Set every student predictor's LM explicitly before compiling; `ctx.lm` alone
+does not satisfy that requirement. Already compiled students refuse. Explicit
+teachers use `bootstrap_finetune.Teacher.init(T, &teacher)`. Top-level
+`options.teachers` is normalized as a list, including the Source distinction
+between an implicit student and an explicit `.student` (`None`) list element.
+Teacher paths/counts, not native signature equality, determine compatibility.
+
+`compileWith(..., options, .{ .p = &prompt, .w = &weight, ... })` accepts an
+anonymous registry of borrowed native adapters. Exact field names are strategy
+keys, separated by `" -> "`. Builtin adapters cover RandomSearch, LabeledFewShot,
+BootstrapFewShot, MIPROv2, COPRO, GEPA, InferRules, SIMBA, Optuna and
+BootstrapFinetune. Custom entries implement
+`compile(self, comptime P, better_together.optimizers.Request(P)) !P`.
+In-place entries declare `returns_in_place = true` and mutate `student_ref`;
+others return a value that is published only after restoration and launch
+succeed. InferRules borrows its initialized optimizer to retain induction state.
+
+`options.optimizer_compile_args` supplies per-key dataset and teacher
+overrides. `valset = .{ .value = null }` explicitly removes validation for that
+optimizer call; omission preserves the standard value. The singular `teacher`
+override is `.none`, `.program` or `.list`. For example, a single typed teacher
+is `.{ .program = bootstrap_finetune.Teacher.init(P, &teacher).program }`.
+Unlike a top-level singleton list, that value works with prompt optimizers
+expecting one program. Explicit arguments unsupported by a builtin optimizer
+refuse before launch; optimizer-specific settings remain typed on the adapter,
+not a Python keyword dictionary. Prompt adapters currently require a single
+teacher of the same nominal `P`; heterogeneous erased teachers remain supported
+by BootstrapFinetune. Lists are not silently coerced to single programs.
+
+The result contains `program`, `candidate_programs` (program, optional score
+and strategy prefix), and `flag_compilation_error_occurred`. Validation ties
+retain the earliest candidate; absent or empty validation selects the latest
+successful candidate. Evaluation failures score zero. A failed optimizer,
+snapshot or replacement launch stops composition and retains earlier
+candidates. If any predictor loses its LM, all previous bindings are restored
+positionally. Named LMs relaunch when the model-name list changes, not merely
+when handle identities change.
+
+Candidate snapshots clone LMs, preserving shared LM identity within each
+candidate and distinct clones across candidates. A custom LM must implement
+the real `clone` hook or compilation refuses. OpenAI snapshots own model/URL
+strings and nested training/launch configuration, but borrow the initialized
+HTTP client, authentication and callback resources. They have no Python
+engine store to copy. Signature-class instruction mutations propagate through
+the reachable current/original programs, candidates and explicit teachers,
+not arbitrary global objects. Const teachers remain readable, but an operation
+requiring instruction writes refuses rather than casting away their constness.
+
+Supply explicit limits for strategy bytes/steps, examples, predictors and
+teachers. `out` is caller-owned arena or fixed startup backing retaining the
+result graph; release it as a unit only after all candidates are finished.
+Every weight attempt needs distinct, unused slot/name storage while any
+current/original/teacher binding borrows it. Startup jobs may be shared across
+sequential slot sets because training and cleanup join before reuse.
+Lifecycle cleanup attempts every unique handle even after a hook error.
+The composition seed is an optional native `u32`; omitted seeds use secure
+randomness. Attempt/provider allocators and HTTP resources retain their existing
+contracts: bounded metadata backing does **not** prove whole-runtime
+post-initialization allocation freedom or generated-code process isolation.
+
+The HTTP consumer exercised 23 scenarios in both Debug and ReleaseSafe,
+including unmodified default prompt search, repeated weight steps, teacher
+overrides and alias propagation, GEPA's empty sampled holdout, slot refusal,
+failed training and a provider requiring shutdown before training.
+It made 637 localhost requests and created
+13 training jobs per mode. Eighteen matched actual DSPy scenarios passed
+122 comparisons per mode of selection, candidate metadata, failure boundaries
+and complete SDK training rows. Error categories and model-name equality
+relations were compared, not
+identical exception types or fixture-specific generated model strings.
+Candidate clone invariants were checked separately. Eight additional lifecycle
+control cases exercised failure cleanup with synchronous resource tokens; those
+are not inference, actual worker-join or subprocess-isolation evidence.
+
+## Isolated generated native Zig
+
+`dszig.generated_zig` composes a genuine `Predict(CodeWithLanguage("zig"))`
+with compilation and execution of native Zig. `Generator` has ordinary
+discoverable predictor state, demos, LM bindings, adapters and tracing.
+`generateAndRun(&generator, &executor, context, input)` generates code through
+that predictor, then executes it; it adds no execution retry or alternate model.
+`input` contains `task`, `input_json` and `capabilities` (exact native names and
+argument/result descriptions). The returned JSON borrows executor storage until
+its next run.
+
+This is **not** an arbitrary Python interpreter or an implementation of Python
+RLM/Flex. There is no unsafe in-process or Darwin fallback. Execution requires
+64-bit aarch64/x86_64 Linux, working unprivileged user/PID/network/mount namespaces,
+Landlock ABI 7 or newer, seccomp, and an owned delegated cgroup-v2 domain with
+memory and pids controllers. Supply the pinned Zig compiler and its complete
+immutable `/nix/store/...` runtime closure. Nix is used to prepare that closure,
+not invoked for individual executions. Missing prerequisites refuse execution.
+
+At startup, create a private owner-only directory directly under `/tmp/dszig-*`
+and an **empty, owned** delegated child cgroup. Open its directory with CLOEXEC
+and initialize `generated_zig.Lane.configure(fd, limits)`. This verifies the
+cgroup-v2 filesystem, configures and reads back `memory.max`, `memory.swap.max=0`,
+`memory.oom.group=1` and `pids.max`. The executor stays outside that lane.
+Initialize the large `Executor` **in place** with `Options`:
+
+- `lane`: a borrowed initialized lane.
+- `worker`: `workspace`, absolute `compiler`, exact `read_only_roots`, and
+  `artifact_bytes` (default 128 MiB, maximum 256 MiB).
+- `tools`: a startup registry of exact names, native context pointers and bounded
+  callbacks. A callback writes one JSON value into the supplied fixed buffer and
+  returns its byte length; its final argument is an absolute monotonic deadline.
+- `timeout_ms`: one absolute deadline covering preparation, compiler and runtime,
+  not an inactivity timeout (default 60 seconds, maximum 120 seconds).
+- `max_calls`, `max_frame_bytes`, `max_work_bytes`: cumulative RPC limits;
+  hard maxima are 256 calls, 8 MiB framed bytes and 16 MiB validation work.
+
+Options, closure paths, lane and native callback contexts must remain stable for
+the executor's lifetime. Each executor/lane has one exclusive owner; do not run
+the same executor concurrently or share its lane with another active executor.
+An earlier result expires when the next run starts: copy it into caller-owned
+startup-provisioned storage before using it as that next run's input.
+The lane retains the kernel's effective page-rounded memory bound, never a value
+larger than requested. Registered native callbacks are **trusted bounded host
+code**, not sandboxed code: they must honor the supplied deadline. The executor
+checks before/after dispatch but cannot preempt a noncooperative native callback.
+`Tool.call(context, &arguments)` is the shared typed-argument normalization path
+also used by ReAct; the qualification consumer uses it for native capability RPC.
+
+The compiler and guest have different kernel policies. A startup-gated direct
+PID1 child receives its UID/GID mappings and aggregate cgroup membership before
+work begins. It mounts a fresh quota-limited tmpfs and proc, installs resource
+limits, and validates source inside the child using fixed parser scratch.
+Compiler subprocesses can read/execute only the immutable closure and
+read/write the private workspace; sockets, new namespaces and tracing are
+denied. Compiler output goes only to bounded diagnostics. The supervisor kills
+and reaps remaining compiler descendants **before** starting the runtime.
+The statically compiled guest enters a second syscall allowlist before generated
+code: only stdin reads, stdout/stderr writes, basic exit and signal-return/mask
+operations remain. Heap mappings, file access, sockets and process creation
+terminate it.
+
+Generated source has a 64 KiB / 4096-token / 4096-node limit and must contain
+exactly `const guest = @import("guest");` plus the sole public entrypoint
+`pub fn run(ctx: *guest.Context) !void`. Other imports, assembly, extern/export
+and unsupported builtins are rejected. This source guard is **not the sandbox**:
+`guest.std` reaches operating-system APIs, so the kernel policy remains required.
+Guest methods use fixed buffers:
+
+```zig
+const guest = @import("guest");
+pub fn run(ctx: *guest.Context) !void {
+    const reply = try ctx.tool("lookup", try ctx.input());
+    try ctx.finish(reply);
+}
+```
+
+Arguments, replies and final output must be complete bounded UTF-8 JSON values.
+Names are matched exactly; unknown tools never dispatch. JSON depth, total work,
+call count and frame bytes are checked independently by the host. A finish frame
+is pending, not success: publication requires successful process exit, the direct
+namespace PID1 reaped, the lane empty, and both streams drained through EOF with
+no trailing or partial frame. Finish-then-crash, finish-then-hang and extra bytes
+revoke output. An unread/reset protocol stream also prevents publication, even
+when the child exits zero. Ordinary source/compile failures retain diagnostics and
+report `ChildFailed` after joining, rather than hiding them as socket resets.
+Failure attempts both recursive cgroup kill and direct PID1 kill and joins before
+reuse. If cleanup cannot be proved within its bounded attempts, the executor returns
+`ExecutorQuarantined`, retains its child handle and refuses subsequent runs;
+it never reports a clean join or reuses that storage.
+
+The executor/session/guest use startup-provisioned fixed storage; this does not
+claim the ordinary model client, all optimizers or the whole runtime are
+allocation-free. Authenticated model inference remains a separate gate.
+A localhost HTTP provider fixture proves transport, typed `Code[zig]` decoding,
+actual isolated compilation and native execution, **not** real-model inference.
+
+`tools/generated_zig_consumer.zig` is the Linux qualification CLI. Supply a
+`compiler_closure` module containing `pub const paths = [_][:0]const u8{ ... };`
+from the compiler's actual recursive Nix closure. Build with the pinned compiler:
+
+```sh
+zig build-exe -O ReleaseSafe --dep dszig --dep compiler_closure \
+  -Mroot=tools/generated_zig_consumer.zig \
+  -O ReleaseSafe -Mdszig=src/root.zig \
+  -O ReleaseSafe -Mcompiler_closure=/absolute/path/compiler-closure.zig \
+  -femit-bin=/tmp/generated-zig-consumer
+```
+
+Run `/tmp/generated-zig-consumer LANE WORKSPACE COMPILER CASE TIMEOUT_MS [BASE_URL]`.
+`success` and the malformed-frame/tool/OS/finalization cases each verify successful
+reuse of the same executor; `generated` calls an explicit OpenAI-compatible
+endpoint. The CLI's default key is explicitly fixture-only; use an explicit
+endpoint and `OPENAI_API_KEY` for an authorized real provider. Its native tool
+checks that only the supervisor and runtime remain at dispatch: no compiler
+descendant may survive into the runtime phase.
+
+The finite qualification for this slice passed the pinned repository's
+512 tests / 34 build steps plus examples in both Debug and ReleaseSafe.
+On aarch64 Linux, 18 distinct execution/refusal cases per host mode verify
+same-engine recovery, including diagnostic overflow and a successful child exit
+with unread reply bytes. One HTTP fixture request per mode also generated typed
+Zig, compiled it, called the native typed tool and returned `42`; fixture serving
+and non-daemon request threads were closed and joined. Guests are always compiled
+ReleaseSafe, independently of the host mode.
+
+Separate real kernel controls exercised aggregate OOM group termination,
+1 MiB tmpfs exhaustion, an eight-process cap, three/eight live pidfds becoming
+dead after PID1 join, direct-kill fallback after cgroup control failure and
+non-page-aligned memory limits. An immutable compiler wrapper deliberately left
+an acknowledged live descendant; runtime tool dispatch still saw only PID1 and
+the runtime. Planted removal of compiler reaping failed the process invariant,
+and planted acceptance of an unclean reset failed with `UnexpectedPublication`.
+x86_64 Linux received semantic-only checking, not runtime qualification; Darwin
+was actually run and refused with `UnsupportedPlatform`. These results are
+finite native proof, not full DSPy parity or authenticated inference.
+
 ## Native parallel composition
 
 `Parallel(Result, limits)` runs native programs or callbacks on a persistent worker
@@ -1233,8 +2036,11 @@ Its `task()` is a native task descriptor:
 
 Provide at least `limits.attempts` contexts. **Copying Context does not isolate its
 pointees.** Scratch, mutable LM state, traces and mutable retrievers must be private
-to each simultaneously running attempt or explicitly synchronized. Do not mutate
-shared program configuration while calls run. In particular, do not freeze or
+to each simultaneously running attempt or explicitly synchronized. Predictor-bound
+LMs are shared through program value copies and override `Context.lm`: supplying
+a private fallback per attempt does not isolate a bound model. Use an explicit
+per-attempt `lm_override`, private program bindings, or a synchronized model.
+Do not mutate shared program configuration while calls run. In particular, do not freeze or
 globally roll back live InferRules instruction identities to make concurrency
 appear safe. Scratch-backed children must survive until the returned results are
 discarded; resetting a worker arena between tasks would invalidate earlier outputs.
@@ -1281,8 +2087,24 @@ whole-runtime allocation/performance proof. The ordinary test suite also exercis
 actual concurrent typed Predict with separate scripted LMs and scratch, joined
 stragglers/cancellation, and seeded scheduling properties.
 
+With speculative retries disabled (`straggler_timeout_ns = 0`), workers avoid
+per-task clock reads and notify the owner only on a terminal decision or a late
+completion needed by the join barrier. Timed runs retain start/completion
+notifications so retry deadlines are recalculated.
+
+A local ReleaseSafe A/B of `examples/parallel.zig` used 20 interleaved runs per
+binary, each checking 8,192 results against serial execution. Median pool time
+fell from 20.54 ms to 15.19 ms; serial medians were 43.63 ms and 43.49 ms.
+Both versions retained the same checksum, zero scratch bytes and zero LM calls.
+This is a short CPU-workload observation, not a general throughput or tail-latency
+guarantee: the candidate's slowest sample was 54.84 ms versus 24.70 ms for the
+baseline, on a non-isolated workstation.
+
 `parallel.Evaluator(P, limits)` is the native counterpart of
-`dspy.Evaluate(num_threads=...)`. `init(io, spawn_config, backing)` creates the
+`dspy.Evaluate(num_threads=...)`. After initialization, set `failure_score`
+(default zero) to score recoverable program or metric failures; error-budget
+cancellation and out-of-memory still abort. Configure it only between joined
+evaluations. `init(io, spawn_config, backing)` creates the
 workers, one prediction record and typed output slot per attempt, and a
 fixed-buffer scratch allocator over each borrowed `backing[attempt]`.
 `evaluate(contexts, &program, devset, metric, options)` runs program plus metric per
@@ -1290,17 +2112,142 @@ example with the same `Options` as `Parallel` (`return_failed_tasks` must be fal
 Each attempt's context supplies its own LM/retriever pointees; its arena is
 replaced by the reset attempt scratch and its trace by null. The program and metric
 must be thread-safe. Scores are summed after the join in devset order, not
-completion order, with failed slots scoring 0, so the sum matches serial
-`optimize.evaluate` and DSPy. `errors` counts failed examples, not losing
+completion order, with failed slots scoring `failure_score`, as in DSPy.
+At the default zero failure score the sum also matches serial `optimize.evaluate`.
+`errors` counts failed examples, not losing
 duplicate attempts. As with `Parallel`, reaching `max_errors` returns
 `error.ExecutionCanceled` (DSPy's executor raises "Execution cancelled"), while
 serial `optimize.evaluate` returns the triggering error. Out-of-memory, including
 exhausted attempt scratch, cancels the run and returns `error.OutOfMemory`, as
 serially.
 
+### Trace bootstrapping
+
+`bootstrapTraceData(P, out, ctx, &program, dataset, options)` is the native
+counterpart of DSPy 3.5's `bootstrap_trace_data`. It runs the original program
+without patching or mutating it. Rows retain their dataset index, borrowed
+example, successful prediction or `FailedPrediction`, ordered trace and nullable
+score. The score is absent (`null`) when no metric was supplied.
+
+```zig
+const rows = try dszig.bootstrapTraceData(
+    Program, out, ctx, &program, dataset,
+    .{ .metric = metric, .failure_score = 0.5 },
+);
+```
+
+Adapter failures retain the actual completion and partial result from the
+production parser, including JSON fallback's **final** failed response.
+Missing-field payloads include all present fields and defaults, even after an
+earlier missing field. Chat/XML invalid values carry no partial result; JSON
+retains converted predecessors and raw invalid/following values. Empty
+completions fail before output defaults can turn them into a success.
+TwoStep extraction failures retain the original main response and signature,
+not the extraction response. Invalid native decision boxes retain the source's
+ASCII-escaped JSON answer text.
+
+Failed-format rewards are
+`format_failure_score + (failure_score - format_failure_score) * present / expected`,
+or `format_failure_score` with no present fields. Failed predictions bypass the
+metric. Successful predictions call it with a null trace, as under DSPy's
+Evaluate. The appended failed trace selects the **first predictor with the same
+signature class** and records top-level program inputs, not that predictor's
+inputs. A newly derived evidence signature with no matching program predictor
+follows the source's unhandled-failure policy rather than inventing a match.
+
+`capture_crashes` captures non-LM program errors, retaining preceding successful
+trace steps; its completion text is the native error name, not a fabricated
+Python exception class/message. `LMFailure` and `ScriptExhausted` are never
+captured as crashes. Unhandled program/metric rows are skipped with
+`raise_on_error = false`; otherwise all evaluation work finishes before
+`error.UnpackPredictionAndTrace` is returned. `unhandled` can retain the first
+cause, stage and dataset index. Out-of-memory and cancellation abort instead.
+
+For DSPy's `num_threads`, supply `rollouts` with a startup-created
+`Parallel(bootstrap_trace.Run, limits).runner()` and exclusive per-attempt
+contexts. Results are collected in dataset order only after every callback
+joins. Each context supplies its own scratch arena, LM and retriever; the
+program and metric must be thread-safe. `out` is used only by the calling
+thread, never concurrently. It owns retained predictions, completion text and
+successful trace children; rows and failed-step input values borrow the dataset,
+and predictor pointers borrow the program. Neither may expire while rows live.
+An optional `scratch_reset` callback reclaims attempt storage after joined
+results have been retained; do not reset or alias that storage with `out`.
+
+Native `callbacks` expose evaluation start/end events with a correlated
+process-local `u64` call ID and `callback_metadata`. Handler errors are logged
+and ignored. End receives the aggregate evaluation, including configured
+failure scores for unhandled rows; a later unpack failure does not retroactively
+turn a successful evaluation event into an error. An empty dataset, memory
+failure or cancellation reaches end as an error. `log_format_failures` enables
+format-failure warnings. There is no no-op `capture_failed_parses` option:
+upstream leaves that argument unused and always captures actual parse errors.
+
+Low-level callers can opt into `Context.parse_failure` or
+`Adapter.parseWithFailure` without using trace bootstrapping. Captures borrow
+the completion and parse arena; use one per concurrent context. If a program
+handles a predictor error and later raises its own `error.AdapterParse` without
+another predictor call, explicitly `reset()` its capture: Zig error values do
+not preserve Python exception-instance identity.
+
+An independent actual DSPy 3.5 comparison covered 15 direct parser cases,
+24 trace-bootstrap cases and 17 policy cases, including serial/parallel ordered
+results, duplicate signature classes, fallback, metric failure and crash policy.
+A separate comparison covered five evaluation callback lifecycles, TwoStep
+wrapping and two native decision-box failures. Four configured evidence-signature
+lookup-failure policies also matched. These finite checks do not supply
+fine-tuning, BetterTogether or whole-library static-memory parity.
+
+### Fine-tuning training records
+
+`Adapter.formatFinetuneData(arena, io, view, demos, &inputs, &outputs)` formats
+one successful call as OpenAI-shaped `{"messages": [...]}` training data.
+Chat and XML reuse their existing system, demo, history and request rendering,
+then append the assistant answer. Missing declared answer fields become Python
+`None` in Chat and self-closing tags in XML, including incomplete ordinary
+history events. Explicitly filtered native-tool history retains its filtered
+field set. Native-tool history keeps assistant `tool_calls`, paired
+`tool_call_id` values, error-result text and null content for calls without
+assistant text. Formatting does not validate the answer as a prediction or
+submit a training job.
+
+This mirrors the actual DSPy adapter boundary: JSON reports
+`error.FinetuneNotImplemented`, and TwoStep reports
+`error.MissingFinetuneFormatter` because its source class has no such method.
+Both refuse before formatting inputs or accessing media. These are source
+limitations, not fallbacks to another adapter.
+
+Training/display serialization is deliberately separate from canonical lm15
+serialization and the live OpenAI Chat HTTP policy. Native documents become
+OpenAI `file` blocks, with `file_id` or inline `file_data`; generated filenames
+use the pinned CPython MIME-extension ordering, not the caller's filename.
+Raw canonical local-path documents are read through the explicit `std.Io`,
+and file errors propagate; URL documents report `error.UnsupportedFeature`.
+`Content.toOpenAIChatValue(arena, io)` exposes this training/display projection.
+It does **not** enable document requests on the live Chat transport.
+
+Containers, encoded data and generated names use the supplied arena. Other
+string leaves borrow input, demo or history storage; clone before retaining
+the record beyond those lifetimes. A fixed-capacity arena bounds formatter
+memory, not all allocations inside the caller's I/O implementation.
+
+An independent DSPy 3.5 comparison matched 60 cases: 26 complete training
+records and 34 source refusals or file errors. It includes missing/null answers,
+incomplete demos/history, Code, Reasoning, fixed tuples, optional fields and
+in-memory/local-file documents. A separate comparison matched 1,086 actual
+source document blocks across MIME types. Sixteen additional complete tool
+dialogues matched native/text policies, result errors, null assistant text and
+mismatched call IDs. These are finite formatter proofs,
+not provider training, `BootstrapFinetune`, full DSPy parity or whole-library
+static-memory proof.
+
+### Concurrent optimizer evaluation
+
 Optimizers take DSPy's `num_threads` as `concurrent_evaluation`:
 `evaluator.concurrent(&contexts, options)` binds an initialized evaluator to its
-program type, per-attempt contexts and options. `BootstrapFewShotWithRandomSearch`,
+nominal program type, per-attempt contexts and options. A different program type
+is rejected before invocation, even when generic type display names collide.
+`BootstrapFewShotWithRandomSearch`,
 `BootstrapFewShotWithOptuna`, `MIPROv2`, `COPRO` and `InferRules` then evaluate
 candidates through it, each call using the optimizer's own `max_errors`; a
 program-type mismatch returns `error.ProgramTypeMismatch`, and null keeps serial
@@ -1450,6 +2397,8 @@ Refine/SIMBA masking, model truthiness and majority hashability. It rebuilt
 actual native boxes rather than substituting their dictionaries. The checks
 explicitly exclude tuple repr/dispatch, shared deepcopy aliases, NaN
 cross-instance float-object identity and Reasoning's Python string operators.
+The later independent clone-context proof above addresses shared custom-box
+aliases, without relabeling these older excluded observations as passed.
 
 Additional native executable checks exercised hosted OpenAI/Azure embeddings,
 base64/index ordering, cache reuse, vector KNN, repeated KNNFewShot predictions
@@ -1545,6 +2494,16 @@ DSPy 3.5 routes `openai/*` models through the Responses API, so `dz-live` record
 DSZig with `DSZIG_LIVE_API=responses`; a Chat Completions recording returns native
 tool calls where Responses returns text and does not cross-replay.
 
+The committed `dspy_3.5.0.json` and `dszig_3.5.0.json` recordings use the public
+OpenAI endpoint with `gpt-4o-mini`: 679 DSPy calls and 680 native calls.
+`devenv shell -- dz-live` completed both authenticated recordings, both
+cross-runtime replays and the pinned reference gate. The nine pipeline scores
+and serialized artifacts matched on replay; GEPA improved the date task from
+0% to 100%, while COPRO and SIMBA remained at 0% in this run. This is finite
+live-model coverage, not proof of every optimizer option or full DSPy parity.
+The recorder preserves lm15's already-flat JSON-schema metadata and also
+normalizes nested Chat-wire schema dictionaries.
+
 ## Real inference
 
 The live executable reads `OPENAI_API_KEY`, or `CODEX_LB_API_KEY` for the local
@@ -1603,8 +2562,18 @@ The following prevent a claim that DSZig can do everything DSPy can:
   LocalInterpreter, InterpreterPool or complete Python execution environment.
   DSPy's RLM/Flex execute arbitrary Python and can import real DSPy inside the
   guest. A restricted expression evaluator is not an identical implementation.
-- **Other modules and optimizers:** no AvatarOptimizer, BetterTogether,
-  BootstrapFinetune or bootstrap_trace_data. Native Parallel uses explicit typed
+  The separate Linux generated-Zig executor above compiles native programs and
+  capability RPC; it does not claim arbitrary Python execution or full RLM/Flex
+  behavior.
+- **Other modules and optimizers:** bounded native Avatar/AvatarOptimizer follow
+  Source methods, with broken Source constructors and the explicit native
+  capacity, class-identity, callback-ownership and serial-execution boundaries
+  described above. Native BetterTogether
+  composes implemented optimizers, with the typed argument, teacher, ownership
+  and provider limits described above. Trace bootstrapping, Chat/XML fine-tuning
+  data formatting, bounded OpenAI training jobs and BootstrapFinetune are implemented
+  with the provider, capacity and ownership limits described above.
+  Native Parallel uses explicit typed
   tasks and contexts, not Python callback objects or ambient thread-local settings.
   Its startup capacities and cooperative join contract are described above.
 - **Optimizer execution and shared identity:** InferRules' signature-alias propagation does not update arbitrary external
@@ -1616,8 +2585,9 @@ The following prevent a claim that DSZig can do everything DSPy can:
 - **Runtime model identity:** Code, File, Reasoning, BoundingBox, Citations,
   Noul/Score/Choice and generated decision evidence have genuine boxed classes,
   not a complete Python object runtime. Other model
-  families still use their existing representations. Generic arrays/maps do not
-  preserve shared container/class aliases through memoized deepcopy. Complete
+  families still use their existing representations. A clone scope preserves
+  shared custom-box aliases, but generic arrays/maps do not preserve shared
+  container identity or cycles through memoized deepcopy. Complete
   Python builtin identity/dispatch, NaN float-object identity across distinct or
   cloned boxes, Reasoning indexing/string-method delegation, arbitrary attribute
   mutation and Python frozen-assignment exceptions are not reproduced. The
@@ -1627,8 +2597,8 @@ The following prevent a claim that DSZig can do everything DSPy can:
   handling, File tool-result markers and bounded Responses document translation
   are implemented as described above. There is still no complete lm15 provider
   catalog/routing/auth/error taxonomy, full provider SDK, embedding providers
-  beyond OpenAI/Azure, Image/Audio, general rich-media tool results, provider
-  training lifecycle or native streaming. Document support is not general
+  beyond OpenAI/Azure, Image/Audio, general rich-media tool results, non-OpenAI
+  training providers or native streaming. Document support is not general
   multimodal support, and Chat Completions does not accept document parts.
 - **File and DocumentPart boundaries:** the constructor smoke explicitly leaves
   606 successful source Python DocumentPart object/repr/bytes operations
@@ -1666,10 +2636,12 @@ The following prevent a claim that DSZig can do everything DSPy can:
   comptime class definitions, not arbitrary runtime class creation or Enum
   mixins. Python literal lexical nesting is bounded at 200; its separate native
   AST-depth ceiling is 3,000, not Python's caller-stack-dependent recursion
-  budget. Generic runtime values still cannot preserve shared NaN float-object
-  identity or arbitrary mutable alias/cycle graphs. A builtin observation smoke
-  matched 405 checks but differed on two same-NaN container-equality cases;
-  those failures are not counted as parity. Native ownership clones preserve a
+  budget. Explicit builtin float/Decimal/complex boxes now retain immutable NaN
+  identity through owning copies, but unboxed floats and arbitrary mutable
+  alias/cycle graphs do not. A historical builtin observation smoke matched
+  405 checks but differed on two same-NaN cases; that old receipt was not rerun
+  or relabeled as passing. The new scalar/mutable-model evidence is reported
+  separately above. Native ownership clones preserve a
   set's stored iteration snapshot, not CPython deepcopy's reconstruction order.
   JSON repair covers the
   pinned default parser and correlated Chat/Responses tool arguments, not every
@@ -1684,8 +2656,9 @@ The following prevent a claim that DSZig can do everything DSPy can:
 - **Optimizer options:** unsupported GEPA custom code/instruction proposers,
   Flex components, other frontier/selection policies, format-failure feedback,
   logging integrations, and some MIPROv2/SIMBA/COPRO statistics/logging options.
-  Evaluation runs sequentially rather than implementing DSPy's parallel and
-  async execution. SIMBA uses Zig `@exp`, not NumPy's implementation.
+  Concurrent evaluation and SIMBA/GEPA rollouts use explicit startup-created
+  native pools; Python ambient settings and general async execution are not
+  implemented. SIMBA uses Zig `@exp`, not NumPy's implementation.
 - **Integer TPE numerical portability:** the independent sampler uses a native
   extended-precision logarithm before binary64 rounding to reproduce the observed
   source acquisition/selection boundaries. A separate 10,009-value primitive
@@ -1709,7 +2682,10 @@ The following prevent a claim that DSZig can do everything DSPy can:
   Python string representations use the pinned CPython 3.11 Unicode 14 tables;
   classification can differ from other Python/Unicode releases.
 - **Persistence and errors:** cache files/key hashing are not DSPy's diskcache
-  format; LM/provider/training state is not a complete DSPy save/load port.
+  format. Native OpenAI configuration and bound predictors support program
+  save/load with injected runtime resources; Python class reconstruction, all
+  native engine codecs, provider training state and complete DSPy LM save/load
+  remain unsupported.
   Python exception tracebacks are not reconstructed from native Zig errors.
 - **Upstream limits are not repaired silently:** stock DSPy 3.5.0 Retrieve still
   rejects the `json_mode` argument supplied by module state dumping. The RAG

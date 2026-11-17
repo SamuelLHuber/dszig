@@ -39,6 +39,38 @@ pub const Content = union(enum) {
         };
     }
 
+    /// SDK training/display projection, not canonical serialization or LM HTTP policy.
+    /// Leaves borrow Content; containers, data URIs and filenames belong to arena.
+    /// Local documents are read only through the explicitly supplied I/O, so the
+    /// caller's arena capacity bounds all memory. URL documents are refused.
+    pub fn toOpenAIChatValue(self: Content, arena: Allocator, io: std.Io) !Value {
+        const parts = switch (self) {
+            .text => |text| return .{ .string = text },
+            .parts => |parts| parts,
+        };
+        // The source writer ignores text/document continuation state, and a lone
+        // text part is a bare string on the Chat wire even when it carries one.
+        if (parts.len == 1) {
+            if (try openAIChatText(parts[0])) |text| return .{ .string = text };
+        }
+        var array: @import("runtime_value.zig").Array = .init(arena);
+        try array.ensureTotalCapacity(parts.len);
+        for (parts) |part| {
+            var block: @import("runtime_value.zig").ObjectMap = .empty;
+            try block.ensureTotalCapacity(arena, 2);
+            if (try openAIChatText(part)) |text| {
+                block.putAssumeCapacity("type", .{ .string = "text" });
+                block.putAssumeCapacity("text", .{ .string = text });
+            } else {
+                block.putAssumeCapacity("type", .{ .string = "file" });
+                block.putAssumeCapacity("file", try openAIChatFile(arena, io, part));
+            }
+            array.appendAssumeCapacity(.{ .object = block });
+        }
+        std.debug.assert(array.items.len == parts.len);
+        return .{ .array = array };
+    }
+
     pub fn fromValue(arena: Allocator, input: Value) Error!Content {
         if (input == .string) return .{ .text = try arena.dupe(u8, input.string) };
         if (input != .array) return error.InvalidContent;
@@ -114,6 +146,62 @@ pub const Content = union(enum) {
         };
     }
 };
+
+/// Text of a canonical text part, null for a document, error for anything else.
+fn openAIChatText(part: Value) error{InvalidContent}!?[]const u8 {
+    if (part != .object) return error.InvalidContent;
+    const kind = part.object.get("type") orelse return error.InvalidContent;
+    if (kind != .string) return error.InvalidContent;
+    if (std.mem.eql(u8, kind.string, "document")) return null;
+    if (!std.mem.eql(u8, kind.string, "text")) return error.InvalidContent;
+    const text = part.object.get("text") orelse return "";
+    if (text != .string) return error.InvalidContent;
+    return text.string;
+}
+
+/// Source order: URL refusal, then file_id, then media bytes, then the filename.
+fn openAIChatFile(arena: Allocator, io: std.Io, part: Value) !Value {
+    std.debug.assert(part == .object);
+    const media_type = part.object.get("media_type") orelse return error.InvalidContent;
+    if (media_type != .string) return error.InvalidContent;
+    if (part.object.get("url")) |url| {
+        if (url != .null) return error.UnsupportedFeature;
+    }
+    var file: @import("runtime_value.zig").ObjectMap = .empty;
+    if (part.object.get("file_id")) |id| {
+        if (id != .null) {
+            if (id != .string) return error.InvalidContent;
+            try file.put(arena, "file_id", id);
+            return .{ .object = file };
+        }
+    }
+    const data = part.object.get("data") orelse Value.null;
+    const uri = if (data == .null) local_file: {
+        const path = part.object.get("path") orelse return error.InvalidContent;
+        if (path != .string) return error.InvalidContent;
+        // An empty filename avoids copying a basename the provider name ignores.
+        const loaded = try @import("file.zig").File.fromPath(arena, io, path.string, .{
+            .mime_type = media_type.string,
+            .filename = "",
+        });
+        break :local_file loaded.file_data.?;
+    } else inline_data: {
+        if (data != .string) return error.InvalidContent;
+        // Do not decode and re-encode: the SDK keeps the original base64 spelling.
+        break :inline_data try std.fmt.allocPrint(arena, "data:{s};base64,{s}", .{
+            media_type.string, data.string,
+        });
+    };
+    std.debug.assert(std.mem.startsWith(u8, uri, "data:"));
+    // The provider filename comes from the MIME type alone, never the local path.
+    const extension = @import("mime_types.zig").guessExtension(media_type.string, true);
+    try file.ensureTotalCapacity(arena, 2);
+    file.putAssumeCapacity("file_data", .{ .string = uri });
+    file.putAssumeCapacity("filename", .{
+        .string = try std.fmt.allocPrint(arena, "file{s}", .{extension orelse ".bin"}),
+    });
+    return .{ .object = file };
+}
 
 fn payloadValues(arena: Allocator, payload: []const u8) Error!?[]const Value {
     if (try parse(arena, payload)) |v| return if (v == .array) v.array.items else null;
@@ -259,3 +347,156 @@ const Builder = struct {
         return .{ .parts = try self.parts.toOwnedSlice(self.arena) };
     }
 };
+
+fn testDocument(
+    arena: Allocator,
+    media_type: []const u8,
+    key: []const u8,
+    source: []const u8,
+) !Value {
+    var object: @import("runtime_value.zig").ObjectMap = .empty;
+    try object.put(arena, "type", .{ .string = "document" });
+    try object.put(arena, "media_type", .{ .string = media_type });
+    try object.put(arena, key, .{ .string = source });
+    return .{ .object = object };
+}
+
+fn expectOpenAIChat(arena: Allocator, expected_json: []const u8, content: Content) !void {
+    const expected = (try parse(arena, expected_json)).?;
+    const actual = try content.toOpenAIChatValue(arena, std.testing.io);
+    try std.testing.expect(try inference.jsonEqual(expected, actual));
+}
+
+// Goal: the SDK training projection emits provider blocks, not canonical parts.
+// Method: canonical Content goes in, the exact OpenAI Chat JSON shape comes out.
+test "toOpenAIChatValue projects text, inline documents and file ids" {
+    var scratch: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+
+    const text: Content = .{ .text = "plain" };
+    const projected = try text.toOpenAIChatValue(arena, std.testing.io);
+    try std.testing.expectEqual(text.text.ptr, projected.string.ptr);
+
+    // Non-canonical base64 spelling survives untouched; the MIME is lowercased
+    // only for the extension lookup, never inside the data URI.
+    const mixed = try Content.fromValue(arena, (try parse(arena,
+        \\[{"type":"text","text":"read "},
+        \\ {"type":"document","media_type":"Application/PDF","data":"aGVs\nbG8="},
+        \\ {"type":"document","media_type":"text/plain","file_id":"file-1"},
+        \\ {"type":"text","text":"now"}]
+    )).?);
+    try expectOpenAIChat(arena,
+        \\[{"type":"text","text":"read "},
+        \\ {"type":"file","file":{"file_data":"data:Application/PDF;base64,aGVs\nbG8=",
+        \\   "filename":"file.pdf"}},
+        \\ {"type":"file","file":{"file_id":"file-1"}},
+        \\ {"type":"text","text":"now"}]
+    , mixed);
+    const actual = try mixed.toOpenAIChatValue(arena, std.testing.io);
+    const projected_text = actual.array.items[0].object.get("text").?.string;
+    try std.testing.expectEqual(mixed.parts[0].object.get("text").?.string.ptr, projected_text.ptr);
+
+    // Continuation state is dropped, and a lone text part is a bare string.
+    const continued = try Content.fromValue(arena, (try parse(arena,
+        \\[{"type":"text","text":"kept","continuation":[{"provider":"p","kind":"k"}]}]
+    )).?);
+    try std.testing.expect(continued == .parts);
+    try expectOpenAIChat(arena, "\"kept\"", continued);
+    // The canonical view is unchanged by the provider projection.
+    const canonical = continued.toValue(arena).array.items[0].object;
+    try std.testing.expect(canonical.get("continuation") != null);
+}
+
+// Goal: filenames follow pinned CPython mimetypes.guess_extension(strict=True).
+// Method: receipt observations, including aliases, case and absent strict entries.
+test "toOpenAIChatValue filenames use the pinned inverse MIME database" {
+    var scratch: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    const guess = @import("mime_types.zig").guessExtension;
+
+    for ([_][2][]const u8{
+        .{ "application/pdf", "file.pdf" },
+        .{ "TEXT/Plain", "file.txt" },
+        .{ "application/msword", "file.doc" },
+        .{ "application/octet-stream", "file.bin" },
+        .{ "audio/midi", "file.mid" },
+        // Only the non-strict database knows image/jpg.
+        .{ "image/jpg", "file.bin" },
+        // This key keeps uppercase in CPython's inverse map, so lower() misses it.
+        .{ "application/vnd.HandHeld-Entertainment+xml", "file.bin" },
+        .{ "application/x-dszig-unknown", "file.bin" },
+        // U+212A KELVIN SIGN lowercases to ASCII k in str.lower().
+        .{ "application/p\xe2\x84\xaacs10", "file.p10" },
+    }) |case| {
+        const content: Content = .{ .parts = &.{
+            try testDocument(arena, case[0], "data", "QQ=="),
+            try testDocument(arena, case[0], "file_id", "f"),
+        } };
+        const actual = try content.toOpenAIChatValue(arena, std.testing.io);
+        const file = actual.array.items[0].object.get("file").?.object;
+        try std.testing.expectEqualStrings(case[1], file.get("filename").?.string);
+        const reference = actual.array.items[1].object.get("file").?.object;
+        try std.testing.expectEqual(@as(usize, 1), reference.count());
+        try std.testing.expectEqualStrings("f", reference.get("file_id").?.string);
+    }
+    try std.testing.expectEqualStrings(".jpg", guess("image/jpg", false).?);
+    try std.testing.expectEqualStrings(".mid", guess("audio/midi", false).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), guess("image/jpg", true));
+    try std.testing.expectEqual(@as(?[]const u8, null), guess("", true));
+    const oversized: [200]u8 = @splat('x');
+    try std.testing.expectEqual(@as(?[]const u8, null), guess(&oversized, false));
+}
+
+// Goal: local paths are really read through the injected I/O, and every
+// refusal is explicit. Method: a temporary file, then each invalid neighbour.
+test "toOpenAIChatValue reads local paths and refuses explicitly" {
+    var scratch: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    const io = std.testing.io;
+    const expectError = std.testing.expectError;
+    const pdf = "application/pdf";
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+
+    try temporary.dir.writeFile(io, .{ .sub_path = "notes.csv", .data = "hello" });
+    const directory = try temporary.dir.realPathFileAlloc(io, ".", arena);
+    const path = try std.fmt.allocPrint(arena, "{s}/notes.csv", .{directory});
+    const local: Content = .{ .parts = &.{try testDocument(arena, pdf, "path", path)} };
+    // The filename is derived from the MIME type, NOT from the .csv basename.
+    try expectOpenAIChat(arena,
+        \\[{"type":"file","file":{"file_data":"data:application/pdf;base64,aGVsbG8=",
+        \\   "filename":"file.pdf"}}]
+    , local);
+
+    const missing = try std.fmt.allocPrint(arena, "{s}/absent.pdf", .{directory});
+    const absent: Content = .{ .parts = &.{try testDocument(arena, pdf, "path", missing)} };
+    try expectError(error.FileNotFound, absent.toOpenAIChatValue(arena, io));
+    const folder: Content = .{ .parts = &.{try testDocument(arena, pdf, "path", directory)} };
+    try expectError(error.FileNotFound, folder.toOpenAIChatValue(arena, io));
+
+    // A URL is refused before any later part is read or encoded.
+    const remote: Content = .{ .parts = &.{
+        try testDocument(arena, pdf, "url", "https://example.invalid/a.pdf"),
+        try testDocument(arena, pdf, "path", missing),
+    } };
+    try expectError(error.UnsupportedFeature, remote.toOpenAIChatValue(arena, io));
+
+    const sourceless: Content = .{ .parts = &.{(try parse(arena,
+        \\{"type":"document","media_type":"application/pdf"}
+    )).?} };
+    try expectError(error.InvalidContent, sourceless.toOpenAIChatValue(arena, io));
+    const image: Content = .{ .parts = &.{ (try parse(arena, "{\"type\":\"image\"}")).?, .null } };
+    try expectError(error.InvalidContent, image.toOpenAIChatValue(arena, io));
+
+    // The caller's arena capacity is the memory limit: no hidden allocator.
+    var small: [96]u8 = undefined;
+    var bounded: std.heap.FixedBufferAllocator = .init(&small);
+    try expectError(error.OutOfMemory, local.toOpenAIChatValue(bounded.allocator(), io));
+    const larger_than_arena: [4096]u8 = @splat('x');
+    const borrowed: Content = .{ .text = &larger_than_arena };
+    const borrowed_value = try borrowed.toOpenAIChatValue(bounded.allocator(), io);
+    try std.testing.expectEqual(borrowed.text.ptr, borrowed_value.string.ptr);
+}
