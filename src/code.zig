@@ -820,7 +820,7 @@ test "Code runtime boxes keep class identity apart from strings and dictionaries
     try testing.expect(!try value.pyEqual(java, try (CodeWithLanguage("python"){ .code = content }).toRuntime(arena)));
     try testing.expect(!try value.pyEqual(java, try (Java{ .code = "other" }).toRuntime(arena)));
     const empty = try (Code{ .code = "" }).toRuntime(arena);
-    try testing.expect(empty.custom.truthy());
+    try testing.expect(try empty.custom.truthy());
     try testing.expectEqualStrings("\"\"", try std.json.Stringify.valueAlloc(arena, empty, .{}));
     // The typed public dump stays a string even with std.json reflection.
     try testing.expectEqualStrings("\"run();\"", try std.json.Stringify.valueAlloc(arena, Java.init("run();"), .{}));

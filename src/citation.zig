@@ -669,7 +669,7 @@ pub const Citations = struct {
     fn actual(ptr: *const anyopaque) *const Citations {
         return @ptrCast(@alignCast(ptr));
     }
-    fn runtimeTruthy(ptr: *const anyopaque) bool {
+    fn runtimeTruthy(ptr: *const anyopaque) error{ParseValue}!bool {
         return actual(ptr).truthy();
     }
     fn iterateRuntime(arena: Allocator, ptr: *const anyopaque) Error![]Value {
@@ -762,7 +762,7 @@ pub const Citations = struct {
                 .engine_chunk => &engine_chunk_vtable,
             };
         }
-        fn boolValue(ptr: *const anyopaque) bool {
+        fn boolValue(ptr: *const anyopaque) error{ParseValue}!bool {
             return object(ptr).kind == .namespace or object(ptr).attributes.count() != 0;
         }
         fn iterate(arena: Allocator, ptr: *const anyopaque) Error![]Value {
@@ -825,13 +825,13 @@ pub const Citations = struct {
 
     pub fn parseStreamChunk(arena: Allocator, chunk: Value) runtime.CustomError!?Citations {
         const choices = attribute(chunk, "choices") orelse return null;
-        if (!truth(choices)) return null;
+        if (!try truth(choices)) return null;
         const first = try indexZero(choices) orelse return null;
         const delta = attribute(first, "delta") orelse return null;
         const fields = attribute(delta, "provider_specific_fields") orelse return null;
-        if (!truth(fields)) return null;
+        if (!try truth(fields)) return null;
         const data = dictionaryGet(fields, "citation") orelse return null;
-        if (!truth(data) or !isDictionary(data)) return null;
+        if (!try truth(data) or !isDictionary(data)) return null;
         var part: inference.CitationPart = .{};
         inline for (.{ "text", "title", "url" }) |name| {
             if (dictionaryGet(data, name)) |item| {
@@ -970,7 +970,7 @@ fn indexZero(input: Value) runtime.CustomError!?Value {
     };
 }
 
-fn truth(input: Value) bool {
+fn truth(input: Value) error{ParseValue}!bool {
     return switch (input) {
         .null => false,
         .bool => |b| b,
@@ -980,7 +980,7 @@ fn truth(input: Value) bool {
         .string => |s| s.len != 0,
         .array => |a| a.items.len != 0,
         .object => |o| o.count() != 0,
-        .custom => |custom| custom.truthy(),
+        .custom => |custom| try custom.truthy(),
     };
 }
 
@@ -1155,7 +1155,7 @@ test "Citations source validator differs from from_dict_list and preserves neste
     try std.testing.expectEqual(child.custom.ptr, (try collection.getRuntime(0)).custom.ptr);
     try std.testing.expectEqual(child.custom.ptr, (try collection.getRuntime(-1)).custom.ptr);
     try std.testing.expect(try collection.contains(child));
-    try std.testing.expect(parent.custom.truthy());
+    try std.testing.expect(try parent.custom.truthy());
     try std.testing.expectEqual(parent.custom.ptr, (try types.validate(Citations, arena, parent)).custom.ptr);
     const iterator = try parent.custom.vtable.iterate.?(arena, parent.custom.ptr);
     try std.testing.expectEqual(child.custom.ptr, iterator[0].custom.ptr);

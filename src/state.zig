@@ -21,8 +21,8 @@ pub const dependency_versions = [_][2][]const u8{
 const lm = @import("lm.zig");
 const testing = std.testing;
 
-pub const LoadError = error{ MissingState, InvalidState } || lm.StateError;
-pub const SaveError = error{InvalidValue} || lm.StateError;
+pub const LoadError = error{ MissingState, InvalidState, ParseValue } || lm.StateError;
+pub const SaveError = error{ InvalidValue, ParseValue } || lm.StateError;
 
 pub const LoadOptions = struct {
     lm_loader: ?lm.LM.StateLoader = null,
@@ -78,7 +78,7 @@ fn dumpPredict(arena: Allocator, s: *const predict.PredictState) SaveError!Value
     try sig.put(arena, "fields", .{ .array = fields });
     try obj.put(arena, "signature", .{ .object = sig });
     try obj.put(arena, "lm", if (s.lm) |model| try model.dumpState(arena) else .null);
-    if (s.hasDecisionFields()) {
+    if (try s.hasDecisionFields()) {
         _ = @import("decision_state.zig").State.init(arena, try s.view(arena), s.decision_fields, false, null) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.InvalidValue,
@@ -225,7 +225,7 @@ fn restoreLM(arena: Allocator, model: Value, options: LoadOptions) LoadError!?lm
         .string => |text| text.len != 0,
         .array => |items| items.items.len != 0,
         .object => |items| items.count() != 0,
-        .custom => |custom| custom.truthy(),
+        .custom => |custom| try custom.truthy(),
     };
     if (!truthy) return null;
     if (model != .object) return error.InvalidLMState;

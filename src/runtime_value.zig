@@ -60,8 +60,11 @@ pub fn typeIdentity(comptime T: type) *const anyopaque {
 
 pub const CustomVTable = struct {
     type_name: []const u8,
-    /// Null is an opaque callback object, never admissible to typed get().
+    /// Exact native storage layout. Null never permits typed get().
     type_identity: ?*const anyopaque = null,
+    /// An erased representation may retain a class without claiming its layout.
+    /// Null uses type_identity; typed get() never consults this override.
+    class_identity: ?*const anyopaque = null,
     model_name: []const u8,
     /// DSPy Type objects can supply bare text for a native tool result;
     /// ordinary models whose JSON serializer returns a string stay JSON-quoted.
@@ -71,7 +74,7 @@ pub const CustomVTable = struct {
     hashable: bool = false,
     /// Classes with cross-value equality must supply a compatible Python hash.
     python_hash: ?*const fn (*const anyopaque, u32) error{ParseValue}!i64 = null,
-    bool_value: ?*const fn (*const anyopaque) bool = null,
+    bool_value: ?*const fn (*const anyopaque) error{ParseValue}!bool = null,
     /// Python __float__, without numeric identity or numeric equality.
     float_value: ?*const fn (*const anyopaque) CustomError!f64 = null,
     /// Actual Python int-subclass payload, not an arbitrary __int__ conversion.
@@ -125,12 +128,16 @@ pub const Custom = struct {
         return @ptrCast(@alignCast(self.ptr));
     }
 
+    pub fn classIdentity(self: Custom) ?*const anyopaque {
+        return self.vtable.class_identity orelse self.vtable.type_identity;
+    }
+
     pub fn sameType(self: Custom, other: Custom) bool {
-        if (self.vtable.type_identity) |identity| return other.vtable.type_identity == identity;
+        if (self.classIdentity()) |identity| return other.classIdentity() == identity;
         return self.vtable == other.vtable;
     }
 
-    pub fn truthy(self: Custom) bool {
+    pub fn truthy(self: Custom) error{ParseValue}!bool {
         if (self.vtable.bool_value) |value| return value(self.ptr);
         if (self.integerValue()) |integer| return switch (integer) {
             .integer => |number| number != 0,
@@ -189,6 +196,17 @@ pub const Custom = struct {
 
     pub fn eql(self: Custom, other: Custom) CustomError!bool {
         if (!self.sameType(other)) return false;
+        // Two opaque layouts do not become compatible because both tokens are
+        // null. Without a token, only the same vtable witnesses a shared layout.
+        const same_layout = if (self.vtable.type_identity) |identity|
+            other.vtable.type_identity == identity
+        else
+            self.vtable == other.vtable;
+        if (!same_layout) {
+            if (self.vtable.eql_value) |compare| return compare(self.ptr, .{ .custom = other });
+            if (other.vtable.eql_value) |compare| return compare(other.ptr, .{ .custom = self });
+            return false;
+        }
         return self.vtable.eql(self.ptr, other.ptr);
     }
 };

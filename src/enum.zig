@@ -145,7 +145,7 @@ test "IntEnum exact numeric equality does not erase nominal validation or alias 
     try std.testing.expect(try value.pyEqual(left, right));
     try std.testing.expect(!left.custom.sameType(right.custom));
     try std.testing.expect((try Left.member("alias")).custom.ptr == left.custom.ptr);
-    try std.testing.expect(!((try Left.member("zero")).custom.truthy()));
+    try std.testing.expect(!try (try Left.member("zero")).custom.truthy());
     try std.testing.expectError(error.ParseValue, Left.validateStrict(std.testing.allocator, right));
     try std.testing.expect((try Left.validate(std.testing.allocator, right)).custom.ptr == left.custom.ptr);
     try std.testing.expect(!try value.pyEqual(wide, .{ .float = 9007199254740992.0 }));

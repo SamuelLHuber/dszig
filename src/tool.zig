@@ -26,10 +26,10 @@ pub const ToolCall = struct {
         var name = record.get("name");
         var args: Value = .null;
         if (function) |f| {
-            if (truthy(f) and f != .object) return error.ParseValue;
+            if (try truthy(f) and f != .object) return error.ParseValue;
             if (f == .object) {
                 if (f.object.get("name")) |n| {
-                    if (truthy(n)) name = n;
+                    if (try truthy(n)) name = n;
                 }
                 args = f.object.get("arguments") orelse .null;
             }
@@ -47,7 +47,7 @@ pub const ToolCall = struct {
         } else if (args != .object) args = .{ .object = .empty };
 
         var id = record.get("id");
-        if (id == null or !truthy(id.?)) id = record.get("call_id");
+        if (id == null or !try truthy(id.?)) id = record.get("call_id");
         const call_id: ?[]const u8 = if (id) |i| switch (i) {
             .null => null,
             .string => |s| s,
@@ -438,7 +438,7 @@ fn renderError(err: pyjson.Error) adapter.Error {
     };
 }
 
-fn truthy(input: Value) bool {
+fn truthy(input: Value) error{ParseValue}!bool {
     return switch (input) {
         .null => false,
         .bool => |b| b,
@@ -448,7 +448,7 @@ fn truthy(input: Value) bool {
         .string => |s| s.len > 0,
         .array => |a| a.items.len > 0,
         .object => |o| o.count() > 0,
-        .custom => |custom| custom.truthy(),
+        .custom => |custom| try custom.truthy(),
     };
 }
 

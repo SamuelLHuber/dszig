@@ -974,6 +974,22 @@ their structured fields use nested XML rather than the literal JSON leaves
 used by DSPy-owned decision models. This is a static native declaration API,
 not Python's mutable runtime class construction.
 
+`Model.modelConstruct(arena, fields)` preserves unvalidated keyword fields in
+a genuine erased instance of that model class. Required fields may be absent,
+and wrong-typed fields retain their actual values, including Decimal and
+bytearray boxes. Optional evidence fields default to null. Raw iteration and
+Python-mode dumps retain those values; JSON-mode serialization applies the
+declared field projections without revalidating the instance.
+Value-level validation preserves accepted instance identity, while typed
+`Model.fromValue` refuses fields that cannot safely inhabit the typed layout.
+`custom.get(Model)` never reinterprets erased raw storage as a typed pointer.
+Owning runtime clones retain the concrete class and deep-copy present fields.
+
+The erased object boolean protocol is fallible:
+`try object.custom.truthy()` propagates a refusal, such as an unvalidated Noul
+whose `value` is not a bool. Strongly typed model `.truthy()` methods remain
+ordinary bool-returning methods.
+
 `Predict(Judge)` selects decision adaptation automatically. Its typed outputs
 retain boolean/score/typed-choice values, confidence and model-specific
 probability/level fields. Generative decisions work through the ordinary
@@ -1024,7 +1040,7 @@ coverage; their entries/observations overlap and must not be added together:
 
 | Independent consumer | Fully supported entries | Unsupported entries | Unconsumed entries | Compared observations | Mismatches |
 |---|---:|---:|---:|---:|---:|
-| Decision models and views | 8,817 | 233 | 6,185 | 89,441 | 0 |
+| Decision models and views | 8,821 | 52 | 6,362 | 93,766 | 0 |
 | Evidence/state/Predict pipeline | 2,045 | 335 | 12,838 | 17,037 | 0 |
 
 Both consumers deliberately **exit nonzero for incomplete coverage**.
@@ -1033,15 +1049,21 @@ their entire operation is supported. Six candidate-client rollout observations
 are unobserved: the source engine receipt does not capture those client-only
 options. The native catalogue now includes all 17 declarations, including the
 three simple subclasses, and consumers reconstruct genuine Decimal and
-bytearray inputs rather than JSON lookalikes. Python type-object reflection,
-mutable runtime class construction, arbitrary forged model state (including
-bytearray values in statically typed Noul/Score fields) and other unsupported
-operations remain explicit gaps. An independent focused Source probe and native
+bytearray inputs rather than JSON lookalikes. Unvalidated model construction
+now preserves raw state without unsafe typed casts. Shared NaN/scalar object
+identity, Python type-object reflection, mutable runtime class construction,
+runtime field mutation/deletion and other unsupported operations remain explicit
+gaps. An independent focused Source probe and native
 Debug/ReleaseSafe consumers additionally matched all 24 XML prompt structures
 and routing decisions across direct, optional, list and optional-list-item
-annotations of the three roots and three subclasses. ScriptedLM
-now refuses non-JSON provider data at response construction, before adapter
-decoding or evidence recording; this is not a complete SDK response-object API. Bare Score/Choice evidence refusal also differs in failure timing:
+annotations of the three roots and three subclasses. A separate eight-case
+Source probe matched 40 exact raw str/repr/Python-dump/JSON observations in each
+mode. It exposed and verified the repair for Score's Python-string key fallback
+versus Choice's JSON-key spelling; Python serialization warnings remain
+unobserved. ScriptedLM now refuses non-JSON provider data at response
+construction, before adapter decoding or evidence recording; this is not a
+complete SDK response-object API. Bare Score/Choice evidence refusal also
+differs in failure timing:
 native compile-time rejection versus Python runtime rejection. These results
 do not establish complete decision-model or DSPy equivalence.
 
@@ -1057,14 +1079,16 @@ probability refusal were exercised. This is HTTP/codec/prediction evidence,
 **not authenticated homelab inference**.
 
 Both current decision consumers produced the same counts in Debug and
-ReleaseSafe, including the deliberate incomplete-coverage failures. The nominal
-subclass change passed pinned **518/518 tests and 36/36 build steps in each
-mode**, actual RAG/bootstrap and 8,192-run Parallel examples, plus the complete
-687-request native replay. An isolated old-XML-routing control failed on the
+ReleaseSafe, including the deliberate incomplete-coverage failures. The raw
+model and fallible-boolean changes passed pinned **525/525 tests and 36/36 build
+steps in each mode**, actual RAG/bootstrap and 8,192-run Parallel examples,
+plus the complete 687-request native replay. A separate opaque-layout smoke
+reproduced incorrect equality before repair and safe bidirectional equality
+afterward, without permitting typed extraction. An isolated old-XML-routing control failed on the
 actual `SubNoul` prompt instead of passing the new surface comparison.
 The older bytearray checkpoint additionally ran the independent Python
 fixture/artifact/reference gate and unchanged Unicode/DPR regeneration;
-those Python gates were not rerun for this native-only subclass change.
+those Python gates were not rerun for these native class changes.
 
 ### Citations and provider references
 

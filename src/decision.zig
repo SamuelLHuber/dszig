@@ -1,6 +1,9 @@
 //! DSPy 3.5 decision classes. Runtime boxes retain the concrete class; plain
 //! dictionaries never acquire model identity. Constructors/decoders borrow
 //! storage from their arena; clone() and owning runtime clones own every field.
+//! modelConstruct retains unvalidated fields in a separate erased layout with
+//! the original nominal class. Validation preserves that instance; typed views
+//! require representable fields and never cast raw storage to a typed model.
 //!
 //! Factories and nominal Subclass declarations are finite compile-time types.
 //! Python's mutable runtime classes and its 256-entry LRU eviction/recreation
@@ -290,7 +293,35 @@ fn DecisionType(comptime config: Configuration) type {
             return validateMode(arena, input, .lax);
         }
         pub fn validateMode(arena: Allocator, input: Value, mode: ValidationMode) runtime.CustomError!Value {
+            if (input == .custom and acceptsInstance(input.custom)) return input;
             return (try decode(arena, input, mode, false)).toRuntime(arena);
+        }
+
+        fn acceptsInstance(instance: runtime.Custom) bool {
+            if (instance.classIdentity() == runtime.typeIdentity(Self)) return true;
+            const metadata = instance.vtable.decision orelse return false;
+            if (metadata.kind != kind) return false;
+            if (comptime config.parent == null) return true;
+            for (metadata.ancestors) |ancestor| {
+                if (ancestor == runtime.typeIdentity(Self)) return true;
+            }
+            return false;
+        }
+
+        /// Like Python model_construct, fields are borrowed and unvalidated.
+        /// RawData has its own layout identity: get(Self) must never expose it.
+        pub fn modelConstruct(arena: Allocator, fields: Value) runtime.CustomError!Value {
+            if (fields != .object) {
+                const view = python.view(fields) orelse return error.ParseValue;
+                if (view != .dictionary) return error.ParseValue;
+                for (view.dictionary) |entry| if (entry.key != .string) return error.ParseValue;
+            }
+            const box = try arena.create(RawData);
+            box.* = .{};
+            inline for (field_names, 0..) |name, index| {
+                box.fields[index] = if (getInput(fields, name)) |field| field else if (index >= 2) @as(Value, .null) else null;
+            }
+            return .{ .custom = .{ .ptr = box, .vtable = &raw_vtable } };
         }
         pub fn validateJson(arena: Allocator, text: []const u8, mode: ValidationMode) runtime.CustomError!Value {
             const input = @import("json_repair.zig").parseJson(arena, text) catch |err| return switch (err) {
@@ -308,17 +339,7 @@ fn DecisionType(comptime config: Configuration) type {
                     return result;
                 }
                 if (input.custom.vtable.decision) |metadata| {
-                    if (metadata.kind != kind) return error.ParseValue;
-                    // Only genuine bare roots accept every same-kind class.
-                    // Other classes accept descendants through nominal ancestry,
-                    // never by reinterpreting their boxes as a parent pointer.
-                    const accepts = if (comptime config.parent == null) true else blk: {
-                        for (metadata.ancestors) |ancestor| {
-                            if (ancestor == runtime.typeIdentity(Self)) break :blk true;
-                        }
-                        break :blk false;
-                    };
-                    if (!accepts) return error.ParseValue;
+                    if (!acceptsInstance(input.custom)) return error.ParseValue;
                     var result = try projectInstance(metadata, input.custom.ptr);
                     result.runtime_origin = input.custom;
                     return result;
@@ -384,7 +405,7 @@ fn DecisionType(comptime config: Configuration) type {
                     const probabilities = metadata.field(ptr, "probabilities") orelse .null;
                     result.probabilities = if (probabilities == .null) null else probabilities;
                     const level = metadata.field(ptr, "level") orelse .null;
-                    result.level = if (level == .null) null else .{ .value = level };
+                    result.level = if (level == .null) null else .{ .value = try strictInteger(level) };
                 },
                 .choice => {
                     result.value = value;
@@ -445,7 +466,7 @@ fn DecisionType(comptime config: Configuration) type {
 
         /// Decisions override serialization, NOT Type.format(). Calling this
         /// inherited operation has no implementation in the actual Source.
-        pub fn format(_: Self) error{NotImplemented}!Value {
+        pub fn format(_: anytype) error{NotImplemented}!Value {
             return error.NotImplemented;
         }
         pub fn truthy(self: Self) bool {
@@ -457,9 +478,9 @@ fn DecisionType(comptime config: Configuration) type {
         pub fn eql(self: Self, other: Self) runtime.CustomError!bool {
             if (self.runtime_origin) |left| {
                 if (other.runtime_origin) |right| return left.eql(right);
-                if (left.vtable.type_identity != runtime.typeIdentity(Self)) return false;
+                return left.eql(other.borrowedRuntime().custom);
             } else if (other.runtime_origin) |right| {
-                if (right.vtable.type_identity != runtime.typeIdentity(Self)) return false;
+                return self.borrowedRuntime().custom.eql(right);
             }
             inline for (field_names) |name| if (!try values.pyEqual(self.fieldValue(name), other.fieldValue(name))) return false;
             return true;
@@ -510,7 +531,7 @@ fn DecisionType(comptime config: Configuration) type {
                 if (field != .null or comptime std.mem.eql(u8, name, "value")) {
                     try writer.objectField(name);
                     if (comptime kind != .noul and std.mem.eql(u8, name, "probabilities")) {
-                        try writeProbabilityJson(writer, field);
+                        try writeProbabilityJson(writer, field, kind);
                     } else {
                         try writer.write(field);
                     }
@@ -577,11 +598,12 @@ fn DecisionType(comptime config: Configuration) type {
             .clone = cloneRuntime,
             .deinit = deinitRuntime,
             .eql = equalRuntime,
+            .eql_value = equalRuntimeValue,
         };
         fn actual(ptr: *const anyopaque) *const Self {
             return @ptrCast(@alignCast(ptr));
         }
-        fn runtimeBool(ptr: *const anyopaque) bool {
+        fn runtimeBool(ptr: *const anyopaque) error{ParseValue}!bool {
             return actual(ptr).truthy();
         }
         fn runtimeFloat(ptr: *const anyopaque) runtime.CustomError!f64 {
@@ -617,7 +639,7 @@ fn DecisionType(comptime config: Configuration) type {
                 const raw = actual(ptr).fieldValue(name);
                 if (raw != .null or comptime std.mem.eql(u8, name, "value")) {
                     const field = if (comptime kind != .noul and std.mem.eql(u8, name, "probabilities"))
-                        try serializedProbabilities(arena, raw, depth + 1)
+                        try serializedProbabilities(arena, raw, depth + 1, kind)
                     else
                         try values.serializedValueDepth(arena, raw, depth + 1);
                     object.putAssumeCapacity(name, field);
@@ -646,7 +668,7 @@ fn DecisionType(comptime config: Configuration) type {
                     try writer.writeAll("\"" ++ name);
                     try writer.writeAll(if (style == .minified) "\":" else "\": ");
                     if (comptime kind != .noul and std.mem.eql(u8, name, "probabilities")) {
-                        try writeProbabilities(writer, field, style, depth + 1);
+                        try writeProbabilities(writer, field, style, depth + 1, kind);
                     } else {
                         try pyjson.writeJsonProjection(writer, field, style, @intCast(depth + 1));
                     }
@@ -670,6 +692,219 @@ fn DecisionType(comptime config: Configuration) type {
         }
         fn equalRuntime(left: *const anyopaque, right: *const anyopaque) runtime.CustomError!bool {
             return left == right or try actual(left).eql(actual(right).*);
+        }
+        fn equalRuntimeValue(ptr: *const anyopaque, other: Value) runtime.CustomError!bool {
+            return equalFields(.{ .ptr = ptr, .vtable = &runtime_vtable, .owns_box = false }, other);
+        }
+
+        fn equalFields(left: runtime.Custom, other: Value) runtime.CustomError!bool {
+            if (other != .custom or !left.sameType(other.custom)) return false;
+            const left_metadata = left.vtable.decision orelse return false;
+            const right_metadata = other.custom.vtable.decision orelse return false;
+            inline for (field_names) |name| {
+                const lhs = left_metadata.field(left.ptr, name);
+                const rhs = right_metadata.field(other.custom.ptr, name);
+                if (lhs) |field| {
+                    if (rhs == null or !try values.pyEqual(field, rhs.?)) return false;
+                } else if (rhs != null) return false;
+            }
+            return true;
+        }
+
+        const RawData = struct {
+            fields: [field_names.len]?Value = @splat(null),
+        };
+        const raw_vtable: runtime.CustomVTable = .{
+            .type_name = @typeName(Self),
+            .type_identity = runtime.typeIdentity(RawData),
+            .class_identity = runtime.typeIdentity(Self),
+            .model_name = model_name,
+            .is_type = true,
+            .hashable = false,
+            .bool_value = rawBool,
+            .float_value = if (kind == .score) rawFloat else null,
+            .decision = .{ .kind = kind, .field = rawField, .ancestors = &ancestor_identities },
+            .iterate = rawIterate,
+            .raw_value = rawDump,
+            .serialized = rawSerialized,
+            .write_str = rawStr,
+            .write_repr = rawRepr,
+            .write_json = rawJson,
+            .write_serialized_json = rawSerializedJson,
+            .clone = rawClone,
+            .deinit = rawDeinit,
+            .eql = rawEqual,
+            .eql_value = rawEqualValue,
+        };
+        fn rawData(ptr: *const anyopaque) *const RawData {
+            return @ptrCast(@alignCast(ptr));
+        }
+        fn rawField(ptr: *const anyopaque, name: []const u8) ?Value {
+            inline for (field_names, 0..) |field, index| {
+                if (std.mem.eql(u8, field, name)) return rawData(ptr).fields[index];
+            }
+            return null;
+        }
+        fn rawBool(ptr: *const anyopaque) error{ParseValue}!bool {
+            if (comptime kind != .noul) return true;
+            const value = rawField(ptr, "value") orelse return error.ParseValue;
+            return if (value == .bool) value.bool else error.ParseValue;
+        }
+        fn rawFloat(ptr: *const anyopaque) runtime.CustomError!f64 {
+            const value = rawField(ptr, "value") orelse return error.ParseValue;
+            return if (value == .float) value.float else error.ParseValue;
+        }
+        fn rawDump(arena: Allocator, ptr: *const anyopaque) Allocator.Error!Value {
+            var object: runtime.ObjectMap = .empty;
+            errdefer object.deinit(arena);
+            try object.ensureTotalCapacity(arena, field_names.len);
+            inline for (field_names, 0..) |name, index| {
+                if (rawData(ptr).fields[index]) |field| {
+                    if (field != .null or comptime std.mem.eql(u8, name, "value"))
+                        object.putAssumeCapacity(name, field);
+                }
+            }
+            return .{ .object = object };
+        }
+        /// JSON mode still uses declared field serializers, without changing
+        /// the unvalidated Python fields retained by model_construct.
+        fn rawJsonScalar(comptime name: []const u8, field: Value) Value {
+            if (comptime std.mem.eql(u8, name, "confidence")) return probabilityJsonScalar(field);
+            if (comptime kind == .noul and std.mem.eql(u8, name, "probability"))
+                return probabilityJsonScalar(field);
+            if (comptime kind == .score) {
+                if (comptime std.mem.eql(u8, name, "value")) return probabilityJsonScalar(field);
+                if (comptime std.mem.eql(u8, name, "level")) {
+                    if (field == .bool) return .{ .integer = @intFromBool(field.bool) };
+                }
+            }
+            return field;
+        }
+        fn rawSerialized(arena: Allocator, ptr: *const anyopaque, depth: u32) runtime.SerializationError!Value {
+            if (depth >= pyjson.max_depth) return error.ParseValue;
+            var object: runtime.ObjectMap = .empty;
+            try object.ensureTotalCapacity(arena, field_names.len);
+            inline for (field_names, 0..) |name, index| {
+                if (rawData(ptr).fields[index]) |field| {
+                    if (field != .null or comptime std.mem.eql(u8, name, "value")) {
+                        const projected = if (comptime kind != .noul and std.mem.eql(u8, name, "probabilities"))
+                            try serializedProbabilities(arena, field, depth + 1, kind)
+                        else
+                            try values.serializedValueDepth(arena, rawJsonScalar(name, field), depth + 1);
+                        object.putAssumeCapacity(name, projected);
+                    }
+                }
+            }
+            return .{ .object = object };
+        }
+        fn rawIterate(arena: Allocator, ptr: *const anyopaque) runtime.CustomError![]Value {
+            var count: usize = 0;
+            for (rawData(ptr).fields) |field| if (field != null) {
+                count += 1;
+            };
+            const result = try arena.alloc(Value, count);
+            var initialized: usize = 0;
+            errdefer {
+                for (result[0..initialized]) |item| item.custom.deinit(arena);
+                arena.free(result);
+            }
+            inline for (field_names, 0..) |name, index| {
+                if (rawData(ptr).fields[index]) |field| {
+                    const pair = try arena.dupe(Value, &.{ .{ .string = name }, field });
+                    errdefer arena.free(pair);
+                    result[initialized] = try python.tupleFromOwnedSlice(arena, pair);
+                    initialized += 1;
+                }
+            }
+            return result;
+        }
+        fn rawDisplay(writer: *Writer, ptr: *const anyopaque, repr: bool, depth: u32) runtime.CustomWriteError!void {
+            if (depth >= pyjson.max_depth) return error.JsonTooDeep;
+            if (repr) try writer.writeAll(model_name ++ "(");
+            var first = true;
+            inline for (field_names, 0..) |name, index| {
+                if (rawData(ptr).fields[index]) |field| {
+                    if (!first) try writer.writeAll(if (repr) ", " else " ");
+                    first = false;
+                    try writer.writeAll(name ++ "=");
+                    try pyjson.writeRepr(writer, field, depth + 1);
+                }
+            }
+            if (repr) try writer.writeByte(')');
+        }
+        fn rawStr(writer: *Writer, ptr: *const anyopaque) runtime.CustomWriteError!void {
+            return rawDisplay(writer, ptr, false, 0);
+        }
+        fn rawRepr(writer: *Writer, ptr: *const anyopaque, depth: u32) runtime.CustomWriteError!void {
+            return rawDisplay(writer, ptr, true, depth);
+        }
+        fn rawJson(writer: *std.json.Stringify, ptr: *const anyopaque) Writer.Error!void {
+            try writer.beginObject();
+            inline for (field_names, 0..) |name, index| {
+                if (rawData(ptr).fields[index]) |field| {
+                    if (field != .null or comptime std.mem.eql(u8, name, "value")) {
+                        try writer.objectField(name);
+                        // A model's JSON mode projects genuine Python boxes.
+                        // Their plain json.dumps callback is not this protocol.
+                        try writer.beginWriteRaw();
+                        if (comptime kind != .noul and std.mem.eql(u8, name, "probabilities")) {
+                            writeProbabilities(writer.writer, field, .minified, 1, kind) catch return error.WriteFailed;
+                        } else {
+                            pyjson.writeJsonProjection(writer.writer, rawJsonScalar(name, field), .minified, 1) catch return error.WriteFailed;
+                        }
+                        writer.endWriteRaw();
+                    }
+                }
+            }
+            try writer.endObject();
+        }
+        fn rawSerializedJson(writer: *Writer, ptr: *const anyopaque, style: runtime.JsonStyle, depth: usize) runtime.CustomWriteError!void {
+            if (depth >= pyjson.max_depth) return error.JsonTooDeep;
+            try writer.writeByte('{');
+            var first = true;
+            inline for (field_names, 0..) |name, index| {
+                if (rawData(ptr).fields[index]) |field| {
+                    if (field != .null or comptime std.mem.eql(u8, name, "value")) {
+                        try separator(writer, style, depth + 1, first);
+                        first = false;
+                        try writer.writeAll("\"" ++ name);
+                        try writer.writeAll(if (style == .minified) "\":" else "\": ");
+                        if (comptime kind != .noul and std.mem.eql(u8, name, "probabilities")) {
+                            try writeProbabilities(writer, field, style, depth + 1, kind);
+                        } else {
+                            try pyjson.writeJsonProjection(writer, rawJsonScalar(name, field), style, @intCast(depth + 1));
+                        }
+                    }
+                }
+            }
+            if (!first and (style == .indent2 or style == .orjson_indent2)) {
+                try writer.writeByte('\n');
+                try writer.splatByteAll(' ', depth * 2);
+            }
+            try writer.writeByte('}');
+        }
+        fn rawClone(allocator: Allocator, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+            const copy = try allocator.create(RawData);
+            copy.* = .{};
+            errdefer rawDeinit(allocator, copy, true);
+            for (rawData(ptr).fields, &copy.fields) |field, *out| {
+                if (field) |value| out.* = try inference.cloneJsonValue(allocator, value);
+            }
+            return .{ .ptr = copy, .vtable = &raw_vtable, .owns_data = true };
+        }
+        fn rawDeinit(allocator: Allocator, ptr: *const anyopaque, owns_data: bool) void {
+            if (owns_data) {
+                for (rawData(ptr).fields) |field| {
+                    if (field) |value| inference.freeJsonValue(allocator, value);
+                }
+            }
+            allocator.destroy(rawData(ptr));
+        }
+        fn rawEqual(left: *const anyopaque, right: *const anyopaque) runtime.CustomError!bool {
+            return left == right or try rawEqualValue(left, .{ .custom = .{ .ptr = right, .vtable = &raw_vtable, .owns_box = false } });
+        }
+        fn rawEqualValue(ptr: *const anyopaque, other: Value) runtime.CustomError!bool {
+            return equalFields(.{ .ptr = ptr, .vtable = &raw_vtable, .owns_box = false }, other);
         }
     };
 }
@@ -794,7 +1029,7 @@ fn probabilityJsonScalar(input: Value) Value {
         else => input,
     };
 }
-fn serializedProbabilities(arena: Allocator, input: Value, depth: u32) runtime.SerializationError!Value {
+fn serializedProbabilities(arena: Allocator, input: Value, depth: u32, comptime kind: Kind) runtime.SerializationError!Value {
     if (depth >= pyjson.max_depth) return error.ParseValue;
     if (input == .object) {
         var result: runtime.ObjectMap = .empty;
@@ -805,6 +1040,22 @@ fn serializedProbabilities(arena: Allocator, input: Value, depth: u32) runtime.S
     }
     if (python.view(input)) |view| {
         if (view == .dictionary) {
+            if (comptime kind == .score) {
+                var result: runtime.ObjectMap = .empty;
+                try result.ensureTotalCapacity(arena, view.dictionary.len);
+                for (view.dictionary) |entry| {
+                    const key = if (entry.key == .string) entry.key.string else text: {
+                        var output: Writer.Allocating = .init(arena);
+                        pyjson.writeStr(&output.writer, entry.key) catch |err| return switch (err) {
+                            error.WriteFailed => error.OutOfMemory,
+                            else => error.ParseValue,
+                        };
+                        break :text output.written();
+                    };
+                    result.putAssumeCapacity(key, try values.serializedValueDepth(arena, probabilityJsonScalar(entry.value), depth + 1));
+                }
+                return .{ .object = result };
+            }
             const pairs = try arena.dupe(runtime.PythonEntry, view.dictionary);
             defer arena.free(pairs);
             for (pairs) |*entry| entry.value = probabilityJsonScalar(entry.value);
@@ -820,7 +1071,7 @@ fn serializedProbabilities(arena: Allocator, input: Value, depth: u32) runtime.S
     }
     return values.serializedValueDepth(arena, input, depth);
 }
-fn writeProbabilityJson(writer: *std.json.Stringify, input: Value) Writer.Error!void {
+fn writeProbabilityJson(writer: *std.json.Stringify, input: Value, comptime kind: Kind) Writer.Error!void {
     if (input == .object) {
         try writer.beginObject();
         for (input.object.keys(), input.object.values()) |key, item| {
@@ -834,7 +1085,7 @@ fn writeProbabilityJson(writer: *std.json.Stringify, input: Value) Writer.Error!
             try writer.beginObject();
             for (view.dictionary) |entry| {
                 try writer.beginObjectFieldRaw();
-                python.writeQuotedKey(writer.writer, entry.key) catch return error.WriteFailed;
+                writeProbabilityKey(writer.writer, entry.key, kind) catch return error.WriteFailed;
                 writer.endObjectFieldRaw();
                 try writer.write(probabilityJsonScalar(entry.value));
             }
@@ -843,7 +1094,7 @@ fn writeProbabilityJson(writer: *std.json.Stringify, input: Value) Writer.Error!
     }
     try writer.write(input);
 }
-fn writeProbabilities(writer: *Writer, input: Value, style: runtime.JsonStyle, depth: usize) runtime.CustomWriteError!void {
+fn writeProbabilities(writer: *Writer, input: Value, style: runtime.JsonStyle, depth: usize, comptime kind: Kind) runtime.CustomWriteError!void {
     if (depth >= pyjson.max_depth) return error.JsonTooDeep;
     if (input != .object) {
         if (python.view(input)) |view| {
@@ -851,10 +1102,7 @@ fn writeProbabilities(writer: *Writer, input: Value, style: runtime.JsonStyle, d
                 try writer.writeByte('{');
                 for (view.dictionary, 0..) |entry, index| {
                     try separator(writer, style, depth + 1, index == 0);
-                    python.writeQuotedKey(writer, entry.key) catch |err| return switch (err) {
-                        error.PythonSerializeFallback => error.ParseValue,
-                        else => |other| other,
-                    };
+                    try writeProbabilityKey(writer, entry.key, kind);
                     try writer.writeAll(if (style == .minified) ":" else ": ");
                     try pyjson.writeJsonProjection(writer, probabilityJsonScalar(entry.value), style, @intCast(depth + 1));
                 }
@@ -871,6 +1119,18 @@ fn writeProbabilities(writer: *Writer, input: Value, style: runtime.JsonStyle, d
         try pyjson.writeJsonProjection(writer, probabilityJsonScalar(item), style, @intCast(depth + 1));
     }
     return closeObject(writer, style, depth, input.object.count() == 0);
+}
+fn writeProbabilityKey(writer: *Writer, key: Value, comptime kind: Kind) runtime.CustomWriteError!void {
+    if (comptime kind != .score) return python.writeQuotedKey(writer, key) catch |err| switch (err) {
+        error.PythonSerializeFallback => error.ParseValue,
+        else => |other| other,
+    };
+    // Pydantic's int-key serializer falls back to Python str, not JSON key
+    // spellings. Choice uses its ordinary JSON-key protocol instead.
+    try writer.writeByte('"');
+    var escaped: pyjson.StringContentsWriter = .{ .destination = writer };
+    try pyjson.writeStr(&escaped.writer, key);
+    try writer.writeByte('"');
 }
 fn closeObject(writer: *Writer, style: runtime.JsonStyle, depth: usize, empty: bool) Writer.Error!void {
     if (!empty and (style == .indent2 or style == .orjson_indent2)) {
@@ -1240,6 +1500,199 @@ test "decision boxes preserve class identity and direct routing eligibility" {
     try std.testing.expectError(error.ParseValue, python.set(a, &.{configured}));
 }
 
+test "raw decision construction preserves invalid state and nominal identity" {
+    const First = Subclass(Noul, "Same", struct {});
+    const Second = Subclass(Noul, "Same", struct {});
+    const Child = Subclass(First, "Child", struct {});
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const a = memory.allocator();
+    const raw = try First.modelConstruct(a, try testInput(a, "{\"confidence\":0.5,\"value\":7,\"ignored\":true}"));
+    try std.testing.expect(raw.custom.get(First) == null);
+    try std.testing.expect(raw.custom.classIdentity() == runtime.typeIdentity(First));
+    try std.testing.expectEqual(@as(i64, 7), raw.custom.vtable.decision.?.field(raw.custom.ptr, "value").?.integer);
+    const none = std.testing.failing_allocator;
+    try std.testing.expectEqual(raw.custom.ptr, (try First.validate(none, raw)).custom.ptr);
+    try std.testing.expectEqual(raw.custom.ptr, (try Noul.validateStrict(none, raw)).custom.ptr);
+    try std.testing.expectError(error.ParseValue, First.fromValue(a, raw));
+    try std.testing.expectError(error.ParseValue, raw.custom.truthy());
+    try std.testing.expectError(error.ParseValue, Second.validate(a, raw));
+    const invalid_confidence = try First.modelConstruct(a, try testInput(a, "{\"confidence\":\"unchecked\",\"value\":true}"));
+    try std.testing.expectEqual(invalid_confidence.custom.ptr, (try First.validate(none, invalid_confidence)).custom.ptr);
+    try std.testing.expectError(error.ParseValue, First.fromValue(a, invalid_confidence));
+    const child = try Child.modelConstruct(a, try testInput(a, "{\"value\":7}"));
+    try std.testing.expectEqual(child.custom.ptr, (try First.validate(none, child)).custom.ptr);
+    try std.testing.expectError(error.ParseValue, Child.validate(a, raw));
+    try std.testing.expectError(error.NotImplemented, First.format(raw));
+
+    const valid = try First.modelConstruct(a, try testInput(a, "{\"confidence\":0.75,\"value\":true}"));
+    const typed = try (First{ .confidence = 0.75, .value = true }).toRuntime(a);
+    try std.testing.expect(try valid.custom.eql(typed.custom));
+    try std.testing.expect(try typed.custom.eql(valid.custom));
+    const projected = try First.fromValue(a, valid);
+    try std.testing.expect(try projected.eql(typed.custom.get(First).?.*));
+    const sibling = try Second.modelConstruct(a, try testInput(a, "{\"confidence\":0.75,\"value\":true}"));
+    try std.testing.expect(!try valid.custom.eql(sibling.custom));
+    try std.testing.expect(try valid.custom.truthy());
+}
+
+test "raw decision protocols distinguish missing fields and preserve scalar tags" {
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const a = memory.allocator();
+    const missing = try Score.modelConstruct(a, try testInput(a, "{}"));
+    const metadata = missing.custom.vtable.decision.?;
+    try std.testing.expect(metadata.field(missing.custom.ptr, "confidence") == null);
+    try std.testing.expect(metadata.field(missing.custom.ptr, "value") == null);
+    try std.testing.expect(metadata.field(missing.custom.ptr, "probabilities").? == .null);
+    try std.testing.expect(metadata.field(missing.custom.ptr, "level").? == .null);
+    const missing_noul = try Noul.modelConstruct(a, try testInput(a, "{}"));
+    try std.testing.expectError(error.ParseValue, missing_noul.custom.truthy());
+    try std.testing.expect(try missing.custom.truthy());
+    try std.testing.expectError(error.ParseValue, missing.custom.vtable.float_value.?(missing.custom.ptr));
+    const fields = try missing.custom.vtable.iterate.?(a, missing.custom.ptr);
+    try std.testing.expectEqual(@as(usize, 2), fields.len);
+    try std.testing.expectEqualStrings("probabilities", python.view(fields[0]).?.tuple[0].string);
+    const dump = try missing.custom.rawValue(a);
+    try std.testing.expectEqual(@as(usize, 0), dump.object.count());
+    var display: Writer.Allocating = .init(a);
+    try missing.custom.writeRepr(&display.writer);
+    try std.testing.expectEqualStrings("Score(probabilities=None, level=None)", display.written());
+    const missing_copy = try missing.custom.clone(std.testing.allocator);
+    defer missing_copy.deinit(std.testing.allocator);
+    const copy_metadata = missing_copy.vtable.decision.?;
+    try std.testing.expect(copy_metadata.field(missing_copy.ptr, "confidence") == null);
+    try std.testing.expect(copy_metadata.field(missing_copy.ptr, "value") == null);
+    try std.testing.expect(copy_metadata.field(missing_copy.ptr, "probabilities").? == .null);
+    try std.testing.expect(copy_metadata.field(missing_copy.ptr, "level").? == .null);
+    try std.testing.expect(try missing.custom.eql(missing_copy));
+    const explicit = try Score.modelConstruct(a, try testInput(a, "{\"value\":null}"));
+    try std.testing.expect(!try explicit.custom.eql(missing.custom));
+    const explicit_dump = try explicit.custom.rawValue(a);
+    try std.testing.expect(explicit_dump.object.get("value").? == .null);
+    const raw = try Score.modelConstruct(a, try testInput(a, "{\"confidence\":2,\"value\":3,\"probabilities\":{\"x\":4}}"));
+    const json = try values.serializedValue(a, raw);
+    try std.testing.expect(json.object.get("confidence").? == .float);
+    try std.testing.expect(json.object.get("value").? == .float);
+    try std.testing.expect(json.object.get("probabilities").?.object.get("x").? == .float);
+    const python_dump = try raw.custom.rawValue(a);
+    try std.testing.expect(python_dump.object.get("confidence").? == .integer);
+    try std.testing.expect(python_dump.object.get("value").? == .integer);
+    try std.testing.expect(python_dump.object.get("probabilities").?.object.get("x").? == .integer);
+    try std.testing.expectError(error.ParseValue, raw.custom.vtable.float_value.?(raw.custom.ptr));
+    try std.testing.expectError(error.ParseValue, Score.fromValue(a, raw));
+    try std.testing.expectEqualStrings(
+        "{\"confidence\":2.0,\"value\":3.0,\"probabilities\":{\"x\":4.0}}",
+        try std.json.Stringify.valueAlloc(a, raw, .{}),
+    );
+    var streamed: Writer.Allocating = .init(a);
+    try raw.custom.writeSerializedJson(&streamed.writer, .minified, 0);
+    try std.testing.expectEqualStrings(
+        "{\"confidence\":2.0,\"value\":3.0,\"probabilities\":{\"x\":4.0}}",
+        streamed.written(),
+    );
+    var text: Writer.Allocating = .init(a);
+    try raw.custom.writeStr(&text.writer);
+    try std.testing.expectEqualStrings("confidence=2 value=3 probabilities={'x': 4} level=None", text.written());
+    const float_value = try Score.modelConstruct(a, try testInput(a, "{\"value\":3.5}"));
+    try std.testing.expectEqual(@as(f64, 3.5), try float_value.custom.vtable.float_value.?(float_value.custom.ptr));
+    const invalid_keys = try python.dictionary(a, &.{.{ .key = .{ .integer = 1 }, .value = .null }});
+    try std.testing.expectError(error.ParseValue, Score.modelConstruct(a, invalid_keys));
+    const dictionary = try python.dictionary(a, &.{
+        .{ .key = .{ .string = "value" }, .value = .{ .integer = 7 } },
+        .{ .key = .{ .string = "unknown" }, .value = .{ .bool = true } },
+    });
+    const from_dictionary = try Noul.modelConstruct(a, dictionary);
+    const dictionary_fields = from_dictionary.custom.vtable.decision.?;
+    try std.testing.expectEqual(@as(i64, 7), dictionary_fields.field(from_dictionary.custom.ptr, "value").?.integer);
+    try std.testing.expect(dictionary_fields.field(from_dictionary.custom.ptr, "unknown") == null);
+}
+
+test "raw decision JSON uses observed field serializers without validating stored fields" {
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const a = memory.allocator();
+    const noul = try Noul.modelConstruct(a, try testInput(a, "{\"confidence\":0.75,\"value\":true,\"probability\":2}"));
+    var score_fields = try testInput(a, "{\"confidence\":0.75,\"value\":1,\"level\":true}");
+    const integer_keys = try python.dictionary(a, &.{.{
+        .key = .{ .integer = 0 },
+        .value = .{ .integer = 2 },
+    }});
+    try score_fields.object.put(a, "probabilities", integer_keys);
+    const score = try Score.modelConstruct(a, score_fields);
+    const choice = try Choice.modelConstruct(a, try testInput(a, "{\"confidence\":0.75,\"value\":\"billing\",\"probabilities\":{\"unknown\":2}}"));
+    const cases = .{
+        .{ noul, "{\"confidence\":0.75,\"value\":true,\"probability\":2.0}" },
+        .{ score, "{\"confidence\":0.75,\"value\":1.0,\"probabilities\":{\"0\":2.0},\"level\":1}" },
+        .{ choice, "{\"confidence\":0.75,\"value\":\"billing\",\"probabilities\":{\"unknown\":2.0}}" },
+    };
+    inline for (cases) |case| {
+        try std.testing.expectEqualStrings(case[1], try std.json.Stringify.valueAlloc(a, case[0], .{}));
+        var streamed: Writer.Allocating = .init(a);
+        try case[0].custom.writeSerializedJson(&streamed.writer, .minified, 0);
+        try std.testing.expectEqualStrings(case[1], streamed.written());
+    }
+    const noul_dump = try noul.custom.rawValue(a);
+    try std.testing.expect(noul_dump.object.get("probability").? == .integer);
+    const score_dump = try score.custom.rawValue(a);
+    try std.testing.expect(score_dump.object.get("value").? == .integer);
+    try std.testing.expect(score_dump.object.get("level").? == .bool);
+    const raw_probabilities = python.view(score_dump.object.get("probabilities").?).?.dictionary;
+    try std.testing.expectEqual(@as(i64, 0), raw_probabilities[0].key.integer);
+    try std.testing.expectEqual(@as(i64, 2), raw_probabilities[0].value.integer);
+    const projected = try values.serializedValue(a, score);
+    try std.testing.expect(projected.object.get("value").? == .float);
+    try std.testing.expectEqual(@as(i64, 1), projected.object.get("level").?.integer);
+    var fields: runtime.ObjectMap = .empty;
+    try fields.put(a, "confidence", .{ .float = std.math.nan(f64) });
+    try fields.put(a, "value", .{ .bool = true });
+    const nonfinite = try Noul.modelConstruct(a, .{ .object = fields });
+    try std.testing.expect(try nonfinite.custom.eql(nonfinite.custom));
+    try std.testing.expectEqualStrings("{\"confidence\":null,\"value\":true}", try std.json.Stringify.valueAlloc(a, nonfinite, .{}));
+}
+
+test "owning raw decision clones retain nested genuine boxes and unwind allocations" {
+    var owned: runtime.Custom = undefined;
+    {
+        var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer memory.deinit();
+        const a = memory.allocator();
+        const mutable = try python.bytearray(a, "original");
+        const decimal = try python.decimal(a, "1.2500");
+        const nested = try python.dictionary(a, &.{.{ .key = .{ .integer = 7 }, .value = mutable }});
+        var object: runtime.ObjectMap = .empty;
+        try object.put(a, "confidence", decimal);
+        try object.put(a, "value", nested);
+        const raw = try Choice.modelConstruct(a, .{ .object = object });
+        try std.testing.expectEqualStrings(
+            "{\"confidence\":\"1.2500\",\"value\":{\"7\":\"original\"}}",
+            try std.json.Stringify.valueAlloc(a, raw, .{}),
+        );
+        var streamed: Writer.Allocating = .init(a);
+        try raw.custom.writeSerializedJson(&streamed.writer, .minified, 0);
+        try std.testing.expectEqualStrings(
+            "{\"confidence\":\"1.2500\",\"value\":{\"7\":\"original\"}}",
+            streamed.written(),
+        );
+        owned = try raw.custom.clone(std.testing.allocator);
+        errdefer owned.deinit(std.testing.allocator);
+        try python.bytearraySet(mutable, 0, 'X');
+        const copy_value = owned.vtable.decision.?.field(owned.ptr, "value").?;
+        try std.testing.expectEqualStrings("original", python.view(python.view(copy_value).?.dictionary[0].value).?.bytearray);
+        var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+        try std.testing.checkAllAllocationFailures(stable.allocator(), exerciseDecisionOwnership, .{raw});
+    }
+    defer owned.deinit(std.testing.allocator);
+    try std.testing.expect(owned.get(Choice) == null);
+    const confidence = owned.vtable.decision.?.field(owned.ptr, "confidence").?;
+    try std.testing.expect(python.view(confidence).? == .decimal);
+    const nested = owned.vtable.decision.?.field(owned.ptr, "value").?;
+    try std.testing.expectEqualStrings("original", python.view(python.view(nested).?.dictionary[0].value).?.bytearray);
+    const second = try owned.clone(std.testing.allocator);
+    defer second.deinit(std.testing.allocator);
+    try std.testing.expect(try owned.eql(second));
+}
+
 test "decision raw iteration retains defaults while structured dumps filter nulls" {
     var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer memory.deinit();
@@ -1438,6 +1891,33 @@ test "decision subclass owning clones keep their class after the input arena die
     try std.testing.expect(try actual.custom.eql(again));
 }
 
+test "typed projections of raw subclasses clone the original class and raw fields" {
+    const Leaf = Subclass(Choice, "RawLeaf", struct {});
+    const owned = blk: {
+        var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer memory.deinit();
+        const a = memory.allocator();
+        const raw = try Leaf.modelConstruct(a, try testInput(a, "{\"confidence\":0.75,\"value\":\"borrowed 日本\",\"probabilities\":[1,\"unchecked\",null]}"));
+        const projected = try Choice.fromValue(a, raw);
+        try std.testing.expectEqual(raw.custom.ptr, (try projected.toRuntime(std.testing.failing_allocator)).custom.ptr);
+        break :blk try projected.clone(std.testing.allocator);
+    };
+    defer owned.deinit(std.testing.allocator);
+    const actual = try owned.toRuntime(std.testing.failing_allocator);
+    try std.testing.expect(actual.custom.get(Choice) == null);
+    try std.testing.expect(actual.custom.get(Leaf) == null);
+    try std.testing.expect(actual.custom.classIdentity() == runtime.typeIdentity(Leaf));
+    try std.testing.expectEqualStrings("borrowed 日本", owned.value.string);
+    const probabilities = actual.custom.vtable.decision.?.field(actual.custom.ptr, "probabilities").?.array.items;
+    try std.testing.expectEqual(@as(i64, 1), probabilities[0].integer);
+    try std.testing.expectEqualStrings("unchecked", probabilities[1].string);
+    try std.testing.expect(probabilities[2] == .null);
+    const second = try Choice.fromValue(std.testing.failing_allocator, actual);
+    try std.testing.expect(try owned.eql(second));
+    const typed = Choice{ .confidence = 0.75, .value = owned.value, .probabilities = owned.probabilities };
+    try std.testing.expect(!try owned.eql(typed));
+}
+
 fn exerciseDecisionOwnership(allocator: Allocator, original: Value) !void {
     const copy = try original.custom.clone(allocator);
     defer copy.deinit(allocator);
@@ -1482,6 +1962,54 @@ test "nested decision conversion and feedback retain actual model identity" {
     try std.testing.expect(rubric_schema.get("properties").?.object.get("probabilities") == null);
     try std.testing.expect(rubric_schema.get("properties").?.object.get("level") == null);
 }
+test "opaque same-class representations never share an unwitnessed layout" {
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const a = memory.allocator();
+    const raw = try Noul.modelConstruct(a, try testInput(a, "{\"confidence\":0.5,\"value\":true}"));
+    const typed = try (Noul{ .confidence = 0.5, .value = true }).toRuntime(a);
+    var raw_vtable = raw.custom.vtable.*;
+    var typed_vtable = typed.custom.vtable.*;
+    raw_vtable.type_identity = null;
+    typed_vtable.type_identity = null;
+    typed_vtable.class_identity = runtime.typeIdentity(Noul);
+    var left = raw.custom;
+    var right = typed.custom;
+    left.vtable = &raw_vtable;
+    right.vtable = &typed_vtable;
+    try std.testing.expect(left.get(Noul) == null);
+    try std.testing.expect(right.get(Noul) == null);
+    try std.testing.expect(try left.eql(right));
+    try std.testing.expect(try right.eql(left));
+}
+
+test "raw Score int-key fallback differs from Choice JSON-key spelling" {
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const a = memory.allocator();
+    const probabilities = try python.dictionary(a, &.{.{
+        .key = .{ .bool = true },
+        .value = .{ .bool = false },
+    }});
+    var fields: runtime.ObjectMap = .empty;
+    try fields.put(a, "confidence", .{ .float = 0.75 });
+    try fields.put(a, "value", .{ .bool = true });
+    try fields.put(a, "probabilities", probabilities);
+    inline for (.{
+        .{ Score, "True", "{\"confidence\":0.75,\"value\":1.0,\"probabilities\":{\"True\":0.0}}" },
+        .{ Choice, "true", "{\"confidence\":0.75,\"value\":true,\"probabilities\":{\"true\":0.0}}" },
+    }) |entry| {
+        const model = try entry[0].modelConstruct(a, .{ .object = fields });
+        const projected = try model.custom.serialize(a);
+        const distribution = projected.object.get("probabilities").?.object;
+        try std.testing.expectEqual(@as(usize, 1), distribution.count());
+        try std.testing.expectEqual(@as(f64, 0), distribution.get(entry[1]).?.float);
+        var output: Writer.Allocating = .init(a);
+        try model.custom.writeSerializedJson(&output.writer, .minified, 0);
+        try std.testing.expectEqualStrings(entry[2], output.written());
+    }
+}
+
 const score_schema_description = "Experimental: This class may change or be removed in a future release without warning.\n\n" ++
     "A continuous score with a declared rubric and confidence.\n\n" ++
     "    Declare ``Score[\"poor\", \"fair\", \"excellent\"]`` in increasing order.\n" ++

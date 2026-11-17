@@ -90,7 +90,7 @@ pub const Reasoning = struct {
         return @ptrCast(@alignCast(ptr));
     }
 
-    fn runtimeTruthy(ptr: *const anyopaque) bool {
+    fn runtimeTruthy(ptr: *const anyopaque) error{ParseValue}!bool {
         return runtimeReasoning(ptr).content.len != 0;
     }
 

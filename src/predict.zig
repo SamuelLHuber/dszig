@@ -243,7 +243,7 @@ pub const PredictState = struct {
     /// Persisted Predict.fields overrides, distinct from signature metadata.
     decision_fields: @import("runtime_value.zig").Value = .{ .object = .empty },
 
-    pub fn hasDecisionFields(state: *const PredictState) bool {
+    pub fn hasDecisionFields(state: *const PredictState) error{ParseValue}!bool {
         return switch (state.decision_fields) {
             .null => false,
             .bool => |b| b,
@@ -253,7 +253,7 @@ pub const PredictState = struct {
             .string => |text| text.len != 0,
             .array => |items| items.items.len != 0,
             .object => |items| items.count() != 0,
-            .custom => |custom| custom.truthy(),
+            .custom => |custom| try custom.truthy(),
         };
     }
 

@@ -455,7 +455,7 @@ fn decimalFloat(ptr: *const anyopaque) Error!f64 {
     return pythonView(ptr).decimal.toFloat();
 }
 
-fn truthy(ptr: *const anyopaque) bool {
+fn truthy(ptr: *const anyopaque) error{ParseValue}!bool {
     return switch (pythonView(ptr)) {
         .bytes, .bytearray => |data| data.len != 0,
         .tuple, .set, .frozen_set => |items| items.len != 0,
@@ -1904,7 +1904,7 @@ test "Python bytes retain identity and exact byte repr" {
         try testing.expectEqualStrings(case[0], view(actual).?.bytes);
         try testing.expect(actual.custom.vtable.hashable);
         try testing.expect(!actual.custom.vtable.is_type);
-        try testing.expectEqual(case[0].len != 0, actual.custom.truthy());
+        try testing.expectEqual(case[0].len != 0, try actual.custom.truthy());
         try testing.expect(!try value_ops.pyEqual(actual, .{ .string = case[0] }));
         try testing.expect(!try value_ops.pyEqual(.{ .string = case[0] }, actual));
         try expectRepr(case[1], actual);
@@ -1920,8 +1920,8 @@ test "Python tuple repr identity truth and recursive hash admission" {
     const equal_one = try tuple(a, &.{.{ .bool = true }});
     const list: Value = .{ .array = .init(a) };
     const unhashable = try tuple(a, &.{list});
-    try testing.expect(!empty.custom.truthy());
-    try testing.expect(one.custom.truthy());
+    try testing.expect(!try empty.custom.truthy());
+    try testing.expect(try one.custom.truthy());
     try testing.expect(one.custom.vtable.hashable);
     try testing.expect(!unhashable.custom.vtable.hashable);
     try testing.expect(try value_ops.pyEqual(one, equal_one));
@@ -1971,7 +1971,7 @@ test "CPython seed-zero set layout dedup and frozen cross equality" {
     try expectRepr("set()", try set(a, &.{}));
     const empty_frozen = try frozenSet(a, &.{});
     try expectRepr("frozenset()", empty_frozen);
-    try testing.expect(!empty_frozen.custom.truthy());
+    try testing.expect(!try empty_frozen.custom.truthy());
     try testing.expectEqual(@as(u64, 133146708735736), try hashValue(empty_frozen, 0));
 }
 
@@ -2078,7 +2078,7 @@ test "Python complex source repr numeric equality and Pydantic text differ" {
         const actual = try complex(a, case.real, case.imag);
         try expectRepr(case.repr, actual);
         try expectSerialized(case.json, actual);
-        try testing.expectEqual(case.real != 0 or case.imag != 0, actual.custom.truthy());
+        try testing.expectEqual(case.real != 0 or case.imag != 0, try actual.custom.truthy());
     }
     const one = try complex(a, 1, -0.0);
     try testing.expect(try value_ops.pyEqual(one, .{ .bool = true }));
@@ -2113,7 +2113,7 @@ test "Builtin JSON conversion rejects plain unsupported values and preserves top
     const ellipse = try ellipsis(a);
     const same = try value_ops.serializedValue(a, ellipse);
     try testing.expectEqual(ellipse.custom.ptr, same.custom.ptr);
-    try testing.expect(ellipse.custom.truthy());
+    try testing.expect(try ellipse.custom.truthy());
     try testing.expect(ellipse.custom.vtable.hashable);
     try expectRepr("Ellipsis", ellipse);
     writer.end = 0;
@@ -2342,7 +2342,7 @@ test "bytearray growth retains aliases while clones and validated text remain in
         try testing.expectEqualStrings("abc", file.file_id.?);
         try testing.expectEqual(@as(u8, '!'), try bytearrayPop(alias, -1));
         try bytearrayClear(alias);
-        try testing.expect(!mutable.custom.truthy());
+        try testing.expect(!try mutable.custom.truthy());
         try testing.expectError(error.ParseValue, bytearrayPop(mutable, -1));
         try testing.expectError(error.ParseValue, bytearraySet(mutable, 0, 'x'));
         break :blk copy;

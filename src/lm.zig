@@ -1413,8 +1413,8 @@ pub const OpenAI = struct {
             if (message != .object) return error.LMFailure;
             completion.* = .{ .text = null, .provider_data = parsed };
             var part_index: usize = 0;
-            const reasoning = annotationAlternative(message, &.{ "reasoning_content", "reasoning" });
-            if (responseTruthy(reasoning)) {
+            const reasoning = try annotationAlternative(message, &.{ "reasoning_content", "reasoning" });
+            if (try responseTruthy(reasoning)) {
                 completion.reasoning = try responseStringValue(arena, reasoning);
                 part_index += 1;
             }
@@ -1433,7 +1433,7 @@ pub const OpenAI = struct {
                 }
             }
             if (message.object.get("refusal")) |refusal| {
-                if (responseTruthy(refusal)) part_index += 1;
+                if (try responseTruthy(refusal)) part_index += 1;
             }
             if (message.object.get("tool_calls")) |calls| {
                 if (calls == .array) {
@@ -1441,7 +1441,7 @@ pub const OpenAI = struct {
                     for (calls.array.items) |call| {
                         if (call != .object) continue;
                         const kind = call.object.get("type") orelse .null;
-                        if (responseTruthy(kind) and !stringEquals(kind, "function")) continue;
+                        if (try responseTruthy(kind) and !stringEquals(kind, "function")) continue;
                         const function = call.object.get("function") orelse return error.LMFailure;
                         if (function != .object) return error.LMFailure;
                         const name = try responseText(arena, function.object.get("name"));
@@ -1456,7 +1456,7 @@ pub const OpenAI = struct {
                         part_index += 1;
                     }
                     completion.tool_calls = native.items;
-                } else if (calls != .object and calls != .string and responseTruthy(calls)) return error.LMFailure;
+                } else if (calls != .object and calls != .string and try responseTruthy(calls)) return error.LMFailure;
             }
             if (part_index == 0) try text.add("", "");
             completion.text = text.value();
@@ -1548,7 +1548,7 @@ pub const OpenAI = struct {
                                         part_count += 1;
                                     }
                                 }
-                            } else if (annotations != .object and annotations != .string and responseTruthy(annotations)) {
+                            } else if (annotations != .object and annotations != .string and try responseTruthy(annotations)) {
                                 return error.LMFailure;
                             }
                         }
@@ -1568,7 +1568,7 @@ pub const OpenAI = struct {
         };
     }
 
-    fn responseTruthy(value: @import("runtime_value.zig").Value) bool {
+    fn responseTruthy(value: @import("runtime_value.zig").Value) error{ParseValue}!bool {
         return switch (value) {
             .null => false,
             .bool => |b| b,
@@ -1578,7 +1578,7 @@ pub const OpenAI = struct {
             .array => |a| a.items.len != 0,
             .object => |o| o.count() != 0,
             .number_string => true,
-            .custom => |c| c.truthy(),
+            .custom => |c| try c.truthy(),
         };
     }
 
@@ -1588,10 +1588,10 @@ pub const OpenAI = struct {
     }
 
     /// Python `a or b or c` keeps the last operand even when it is false.
-    fn annotationAlternative(annotation: @import("runtime_value.zig").Value, comptime names: []const []const u8) @import("runtime_value.zig").Value {
+    fn annotationAlternative(annotation: @import("runtime_value.zig").Value, comptime names: []const []const u8) error{ParseValue}!@import("runtime_value.zig").Value {
         inline for (names, 0..) |name, i| {
             const value = annotation.object.get(name) orelse .null;
-            if (i + 1 == names.len or responseTruthy(value)) return value;
+            if (i + 1 == names.len or try responseTruthy(value)) return value;
         }
         unreachable;
     }
@@ -1660,8 +1660,8 @@ pub const OpenAI = struct {
     }
 
     fn responseCitation(arena: Allocator, annotation: @import("runtime_value.zig").Value, text: []const u8) Error!?CitationPart {
-        const url = try annotationString(arena, annotationAlternative(annotation, &.{ "url", "uri" }));
-        const title = try annotationString(arena, annotationAlternative(annotation, &.{ "title", "filename", "file_id" }));
+        const url = try annotationString(arena, try annotationAlternative(annotation, &.{ "url", "uri" }));
+        const title = try annotationString(arena, try annotationAlternative(annotation, &.{ "title", "filename", "file_id" }));
         var cited: ?[]const u8 = null;
         for ([_][]const u8{ "text", "snippet", "cited_text", "quote" }) |name| {
             if (try annotationString(arena, annotation.object.get(name) orelse .null)) |s| {
@@ -1685,7 +1685,7 @@ pub const OpenAI = struct {
     /// lm15's str(value or ""), retaining strings without allocation.
     fn responseText(arena: Allocator, input: ?@import("runtime_value.zig").Value) Error![]const u8 {
         const value = input orelse return "";
-        if (!responseTruthy(value)) return "";
+        if (!try responseTruthy(value)) return "";
         return responseStringValue(arena, value);
     }
 
