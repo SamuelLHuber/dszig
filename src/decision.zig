@@ -93,6 +93,53 @@ pub fn modelInfo(comptime T: type) ?ModelInfo {
     };
 }
 
+/// Static metadata validity is shared by standalone validation and signatures.
+/// Python integers keep one type even when native storage uses numeric text.
+pub fn annotationError(comptime T: type, comptime metadata: []const type) ?[]const u8 {
+    comptime {
+        for (metadata) |M| {
+            if (!isDecision(M)) continue;
+            if (M.kind == .score and @typeInfo(T) == .float)
+                return "Use Score[...] directly as the field type, not Annotated[float, Score[...]].";
+            if (M.kind != .choice or !M.configured) continue;
+            const members: []const Value = if (@import("literal.zig").isLiteral(T))
+                &T.dszig_literal_values
+            else if (@typeInfo(T) == .@"enum") values: {
+                const names = std.meta.fieldNames(T);
+                var native: [names.len]Value = undefined;
+                for (names, &native) |name, *member| member.* = .{ .string = name };
+                const final = native;
+                break :values &final;
+            } else continue;
+            if (members.len != M.members.len)
+                return "Choice criteria must match the Literal members, including their Python types.";
+            for (members) |member| {
+                for (M.members) |declared| {
+                    const member_int = member == .integer or member == .number_string;
+                    const declared_int = declared == .integer or declared == .number_string;
+                    const same_type = if (member_int or declared_int)
+                        member_int and declared_int
+                    else
+                        std.meta.activeTag(member) == std.meta.activeTag(declared);
+                    if (same_type and (@import("value.zig").pyEqual(member, declared) catch false)) break;
+                } else return "Choice criteria must match the Literal members, including their Python types.";
+            }
+        }
+        return null;
+    }
+}
+
+/// Score metadata has no JSON-schema hook; Noul and Choice replace description.
+pub fn annotationDescription(comptime metadata: []const type) ?[]const u8 {
+    comptime {
+        var result: ?[]const u8 = null;
+        for (metadata) |M| {
+            if (isDecision(M) and (M.kind == .noul or M.kind == .choice)) result = M.description;
+        }
+        return result;
+    }
+}
+
 /// Custom-type discovery recurses through annotation arguments, not fields.
 pub fn annotationType(comptime T: type) ?type {
     if (isDecision(T)) return T;

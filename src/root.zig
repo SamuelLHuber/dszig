@@ -13,6 +13,7 @@ pub const Decimal = @import("decimal_type.zig").Decimal;
 pub const DecimalWithOptions = @import("decimal_type.zig").DecimalWithOptions;
 pub const decimal = @import("decimal_environment.zig");
 pub const Literal = @import("literal.zig").Literal;
+pub const types = @import("types.zig");
 pub const Value = runtime_value.Value;
 pub const Array = runtime_value.Array;
 pub const ObjectMap = runtime_value.ObjectMap;

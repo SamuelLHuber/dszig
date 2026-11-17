@@ -424,15 +424,22 @@ fn collectDefs(comptime T: type, comptime seen: []const type) []const type {
 
 /// `json.dumps(_get_json_schema(T))`.
 pub fn schema(comptime T: type) []const u8 {
-    return comptime schemaImpl(T, false);
+    return comptime schemaImpl(T, false, &.{});
 }
 
 /// XML and native schemas preserve the model's field declaration order.
 pub fn schemaXml(comptime T: type) []const u8 {
-    return comptime schemaImpl(T, true);
+    return comptime schemaImpl(T, true, &.{});
 }
 
-fn schemaImpl(comptime T: type, comptime ordered_properties: bool) []const u8 {
+/// Standalone Annotated schema, using Signature.Description's metadata convention.
+/// Invalid combinations refuse here, before schema generation or value validation.
+pub fn schemaAnnotated(comptime T: type, comptime metadata: []const type) Error![]const u8 {
+    if (comptime decision.annotationError(T, metadata) != null) return error.ParseValue;
+    return comptime schemaImpl(T, false, metadata);
+}
+
+fn schemaImpl(comptime T: type, comptime ordered_properties: bool, comptime metadata: []const type) []const u8 {
     comptime {
         @setEvalBranchQuota(1_000_000);
         const is_model = isModel(T);
@@ -448,8 +455,45 @@ fn schemaImpl(comptime T: type, comptime ordered_properties: bool) []const u8 {
             const final = d;
             top = top ++ &[_]Entry{.{ .key = "$defs", .val = render(&final) }};
         }
+        if (decision.annotationDescription(metadata)) |description| {
+            var described: []const Entry = &.{};
+            for (top) |entry| {
+                if (!std.mem.eql(u8, entry.key, "description")) described = described ++ &[_]Entry{entry};
+            }
+            top = described ++ &[_]Entry{.{ .key = "description", .val = quote(description) }};
+        }
         return render(top);
     }
+}
+
+/// Validate Annotated values without boxing or wrapping the underlying native type.
+/// Metadata errors precede input validation, as in TypeAdapter construction.
+pub fn validateAnnotated(comptime T: type, comptime metadata: []const type, arena: Allocator, v: Value) Error!Value {
+    if (comptime decision.annotationError(T, metadata) != null) return error.ParseValue;
+    return validate(T, arena, v);
+}
+
+test "Annotated decisions enforce typed member sets before validating values" {
+    const Literal = @import("literal.zig").Literal;
+    const One = decision.ChoiceWithOptions(&.{.{ .value = .{ .integer = 1 }, .description_json = "\"one\"" }});
+    const Truth = Literal(&.{.{ .bool = true }});
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.ParseValue, validateAnnotated(Truth, &.{One}, a, .{ .bool = true }));
+    try std.testing.expectError(error.ParseValue, schemaAnnotated(Truth, &.{One}));
+    try std.testing.expectError(error.ParseValue, validateAnnotated(f64, &.{decision.Score}, a, .{ .float = 0.5 }));
+    try std.testing.expectError(error.ParseValue, schemaAnnotated(f64, &.{decision.Score}));
+
+    const Choice = decision.ChoiceWithOptions(&.{
+        .{ .value = .{ .string = "first" }, .description_json = "\"one\"" },
+        .{ .value = .{ .string = "second" }, .description_json = "\"two\"" },
+    });
+    const Reordered = Literal(&.{ .{ .string = "second" }, .{ .string = "first" } });
+    const result = try validateAnnotated(Reordered, &.{Choice}, a, .{ .string = "first" });
+    try std.testing.expectEqualStrings("first", result.string);
+    try std.testing.expectError(error.ParseValue, validateAnnotated(Reordered, &.{Choice}, a, .{ .string = "other" }));
+    try std.testing.expect((try validateAnnotated(bool, &.{decision.Noul}, a, .{ .integer = 1 })).bool);
+    const Wrong = enum { first, other };
+    try std.testing.expectError(error.ParseValue, validateAnnotated(Wrong, &.{Choice}, a, .{ .string = "first" }));
 }
 
 /// `TypeAdapter(T).validate_python(v)`, including configured model strictness.

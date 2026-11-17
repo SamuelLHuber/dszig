@@ -1067,8 +1067,40 @@ Explicit compatible metadata uses the existing description declaration:
 `.flag = .{ .text = "Evaluate flag.", .metadata = &.{ConfiguredNoul} }`.
 A matching configured Choice can similarly annotate a Literal output. These
 native Annotated forms produce the primitive output while retaining the
-configured decision model for evidence and criteria. Float/Score metadata and
-arbitrary runtime annotations are not implemented.
+configured decision model for evidence and criteria. Choice criteria must match
+the Literal's members **including their Python types**, independently of order;
+integer `1` is not boolean `True` for this check. Native string-enum fields use
+the same metadata constraints and configured evidence binding. Float/Score
+metadata is rejected, matching Source's refusal rather than silently accepting
+it. Invalid static signature metadata is a compile-time error, whereas Source
+raises during runtime TypeAdapter construction.
+
+`dszig.types.validateAnnotated(T, metadata, arena, input)` and
+`dszig.types.schemaAnnotated(T, metadata)` expose standalone validation and
+schema generation with that same metadata slice. They return `error.ParseValue`
+for invalid combinations before validating the input. Valid values retain the
+underlying primitive or model; there is no Annotated wrapper box. Noul/Choice
+metadata replaces the schema description without losing the base schema's
+constraints or definitions. Score metadata has no description hook. Arbitrary
+runtime Python annotations and Python's Annotated descriptor-cache identity are
+not implemented.
+
+Explicit Noul/Score/Choice class metadata activates evidence for supported
+boolean and Literal outputs, including bare metadata classes. Routing still
+follows the base field: a boolean uses Noul; a Literal uses a compatible
+configured Choice or its own declared members. The metadata class need not be
+that selected class. Fields without decision metadata remain ordinary outputs.
+An independent nine-case actual Source state probe exposed 18 incorrect
+selection/configuration/criteria observations before repair; native Debug and
+ReleaseSafe CLIs then matched all 36 recorded fields. This is finite state
+routing evidence, not Python descriptor-cache or complete pipeline equivalence.
+The Annotated checkpoint passed **540/540 tests in both Debug and ReleaseSafe**;
+the integrated build now passes **38/38 steps**, including two permanent
+compile-refusal regressions for invalid typed Choice and float/Score signatures.
+Actual RAG/bootstrap/8,192-run Parallel examples and all 687 replay requests
+passed. An isolated schema-comparator mutation produced ten mismatches and
+`ProofMismatch`; incomplete ordinary consumers still fail with
+`UnsupportedSourceRows`, not success.
 
 `Predict.state.decision_fields` is the mutable decision configuration, separate
 from signature-field metadata. `getCriteria(arena, name)` returns an owning
@@ -1101,13 +1133,14 @@ execution and streaming remain outside this native decision implementation.
 
 The frozen independent DSPy 3.5 source receipt contains **15,218 actual rows
 and 17 model definitions**. The model consumer was re-run natively after the
-immutable-scalar and mutable-field changes, without rerunning Source. The pipeline
-row remains its earlier historical run. These separate consumers report finite
-coverage; their entries/observations overlap and must not be added together:
+immutable-scalar, mutable-field and Annotated metadata changes, without rerunning
+Source. The pipeline row remains its earlier historical run. These separate
+consumers report finite coverage; their entries/observations overlap and must
+not be added together:
 
 | Independent consumer | Fully supported entries | Unsupported entries | Unconsumed entries | Compared observations | Mismatches |
 |---|---:|---:|---:|---:|---:|
-| Decision models and views | 8,821 | 0 | 6,414 | 93,869 | 0 |
+| Decision models and views | 9,095 | 0 | 6,140 | 94,174 | 0 |
 | Evidence/state/Predict pipeline | 2,045 | 335 | 12,838 | 17,037 | 0 |
 
 Both consumers deliberately **exit nonzero for incomplete coverage**.
@@ -1118,9 +1151,18 @@ options. The native catalogue now includes all 17 declarations, including the
 three simple subclasses, and consumers reconstruct genuine Decimal and
 bytearray inputs rather than JSON lookalikes. Unvalidated model construction
 now preserves raw state without unsafe typed casts. The latest model runs in
-Debug and ReleaseSafe each compared 93,869 observations with zero mismatches and
-zero unsupported observations; 9,663 observations remain unconsumed. All five
-frozen assignment/deletion scenarios exercised real native mutable operations:
+Debug and ReleaseSafe each compared 94,174 observations with zero mismatches and
+zero unsupported observations; 9,375 observations remain unconsumed. All 304
+Annotated validation rows were exercised (322 acceptance/result observations),
+as were all 16 schema rows (26 comparisons). Six schema-error exception-identity
+observations remain unconsumed; native errors are not Python exception objects.
+The actual Source descriptor for the reordered Choice case already has the
+original member order because of Python's Annotated cache; the native regression
+separately verifies order-independent typed-set compatibility. The earlier
+unconsumed-row counter did not separately budget 17 newly compared
+acceptance/result observations, so historical observation totals are not a
+conservation ledger. All five frozen assignment/deletion scenarios exercised
+real native mutable operations:
 110 observations matched, with five missing-argument views still unconsumed.
 Python type-object reflection, mutable runtime class construction, broader scalar
 identity/reflection operations and other unconsumed operations remain explicit

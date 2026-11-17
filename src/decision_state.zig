@@ -502,6 +502,35 @@ fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
+test "explicit bare metadata activates primitive evidence without activating ordinary fields" {
+    const decisions = @import("decision.zig");
+    const Text = @import("literal.zig").Literal(&.{ .{ .string = "first" }, .{ .string = "second" } });
+    const Sig = signature.Signature(struct {
+        pub const Input = struct {};
+        pub const Output = struct { flag: bool, category: Text, ordinary: bool };
+        pub const descriptions = .{
+            .flag = .{ .text = "Flag.", .metadata = &.{decisions.Score} },
+            .category = .{ .text = "Category.", .metadata = &.{decisions.Choice} },
+        };
+    });
+    const view: adapter.View = .{ .instructions = Sig.instructions, .inputs = Sig.input_fields_list, .outputs = Sig.output_fields_list };
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const a = memory.allocator();
+    const state = try State.init(a, view, .{ .object = .empty }, false, null);
+    const evidence = try json_repair.parseJson(a,
+        \\{"flag":{"noul":0.75},"category":{"probabilities":{"first":0.25,"second":0.75},"confidence":0.8},"ordinary":true}
+    );
+    const outputs = try state.decode(a, &evidence.object);
+    try std.testing.expect(outputs.get("flag").?.bool);
+    try std.testing.expectEqualStrings("second", outputs.get("category").?.string);
+    try std.testing.expect(!outputs.contains("ordinary"));
+    const criteria = try state.getCriteria(a, "category");
+    try std.testing.expect(criteria.object.get("first").? == .null);
+    try std.testing.expect(criteria.object.get("second").? == .null);
+    try std.testing.expectError(error.InvalidDecision, state.getCriteria(a, "ordinary"));
+}
+
 test "Choice weights retain exact integers and distinguish integer zero from float zero" {
     const Choice = @import("decision.zig").ChoiceWithOptions(&.{
         .{ .value = .{ .string = "billing" }, .description_json = "\"Payment issue\"" },
