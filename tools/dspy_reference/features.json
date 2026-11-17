@@ -41,9 +41,12 @@
   },
   {
    "name": "AvatarOptimizer",
-   "status": "missing",
-   "dszig": [],
-   "checks": "",
+   "status": "partial",
+   "dszig": [
+    "avatar_optimizer.zig",
+    "avatar.zig"
+   ],
+   "checks": "native unit tests in avatar.zig/avatar_optimizer.zig; no committed DSPy oracle (DSPy 3.5 constructor calls removed TypedPredictor)",
    "bench": [],
    "upstream": "teleprompt/avatar_optimizer.py",
    "sha256": "f13a8b305f48bf5424d019aae403c2e2cabc752089dd2f356e137673f4bf95b6"
@@ -83,9 +86,12 @@
   },
   {
    "name": "BetterTogether",
-   "status": "missing",
-   "dszig": [],
-   "checks": "",
+   "status": "partial",
+   "dszig": [
+    "better_together.zig",
+    "better_together_optimizers.zig"
+   ],
+   "checks": "native unit tests in better_together.zig, tests/behavior.zig; no committed DSPy oracle",
    "bench": [],
    "upstream": "teleprompt/bettertogether.py",
    "sha256": "984fd3c19e4f7a5a984fba7cb12a176104b4a5792b80f974f56b02eb48d5fb3a"
@@ -132,9 +138,13 @@
   },
   {
    "name": "BootstrapFinetune",
-   "status": "missing",
-   "dszig": [],
-   "checks": "",
+   "status": "partial",
+   "dszig": [
+    "bootstrap_finetune.zig",
+    "bootstrap_finetune_data.zig",
+    "training.zig"
+   ],
+   "checks": "finetune-data tests in tests/behavior.zig and bootstrap_finetune_data.zig; no committed DSPy oracle",
    "bench": [],
    "upstream": "teleprompt/bootstrap_finetune.py",
    "sha256": "c9820d8ff154bfeabdf330f938a942fcc1caef9b56709f63d223841f596b5b12"
@@ -780,7 +790,10 @@
   {
    "name": "Parallel",
    "status": "partial",
-   "dszig": ["parallel.zig", "parallel_state.zig"],
+   "dszig": [
+    "parallel.zig",
+    "parallel_state.zig"
+   ],
    "checks": "parallel.json (DSPy ParallelExecutor order, failures, max_errors cancel) on the native pool; tests/parallel.zig (typed program/Example bindings, straggler duplicates, cancellation joins, seeded scheduling); no progress bar, SIGINT or thread-local settings; attempts bounded (`AttemptCapacity`)",
    "bench": [],
    "upstream": "predict/parallel.py",
@@ -975,9 +988,11 @@
   },
   {
    "name": "TrainingJob",
-   "status": "missing",
-   "dszig": [],
-   "checks": "",
+   "status": "partial",
+   "dszig": [
+    "training.zig"
+   ],
+   "checks": "native unit tests in training.zig; OpenAI jobs only; no committed DSPy oracle",
    "bench": [],
    "upstream": "clients/provider.py",
    "sha256": "6a1de5a92edf453f8b7b5a0b54a3fb35ec9b0c8a978adbebf3799f95b727a768"
@@ -1029,9 +1044,11 @@
   },
   {
    "name": "bootstrap_trace_data",
-   "status": "missing",
-   "dszig": [],
-   "checks": "",
+   "status": "partial",
+   "dszig": [
+    "bootstrap_trace.zig"
+   ],
+   "checks": "trace-bootstrap tests in tests/behavior.zig; no committed DSPy oracle",
    "bench": [],
    "upstream": "teleprompt/bootstrap_trace.py",
    "sha256": "2c5bf2aeeef2c0b8516bb80474f9105ea5d48d1b0b1c9e1665f96b60ce9cc39a"

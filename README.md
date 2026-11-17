@@ -1381,15 +1381,15 @@ Regenerate this table with
 | `dspy.Adapter` (`adapters/base.py`) | partial | `adapter.zig` | format_cases.json, xml.json, dspy_3_5_0_mock_suite.json | cases: 23 ms → 0.16 ms |
 | `dspy.AdapterParseError` (`utils/exceptions.py`) | partial | `adapter.zig` | error.AdapterParse outcome compared in suite cases | – |
 | `dspy.Audio` (`adapters/types/audio.py`) | missing | – | – | – |
-| `dspy.AvatarOptimizer` (`teleprompt/avatar_optimizer.py`) | missing | – | – | – |
+| `dspy.AvatarOptimizer` (`teleprompt/avatar_optimizer.py`) | partial | `avatar_optimizer.zig`, `avatar.zig` | native unit tests in avatar.zig/avatar_optimizer.zig; no committed DSPy oracle (DSPy 3.5 constructor calls removed TypedPredictor) | – |
 | `dspy.BaseLM` (`clients/base_lm.py`) | partial | `lm.zig` | lm_response_oracle.py, request_schema_oracle.py | – |
 | `dspy.BaseModule` (`primitives/base_module.py`) | partial | `predict.zig` | named predictor discovery tests | – |
 | `dspy.BestOfN` (`predict/best_of_n.py`) | native | `best_of_n.zig` | behavior tests vs DSPy source | – |
-| `dspy.BetterTogether` (`teleprompt/bettertogether.py`) | missing | – | – | – |
+| `dspy.BetterTogether` (`teleprompt/bettertogether.py`) | partial | `better_together.zig`, `better_together_optimizers.zig` | native unit tests in better_together.zig, tests/behavior.zig; no committed DSPy oracle | – |
 | `dspy.BootstrapFewShot` (`teleprompt/bootstrap.py`) | native | `optimize.zig` | bootstrap_rag.json, bootstrap_multihop.json, trace_selection.json, live replay | rag: 52 ms → 0.24 ms; dates: 116 ms → 0.43 ms; rag_react: 161 ms → 1.48 ms |
 | `dspy.BootstrapFewShotWithOptuna` (`teleprompt/teleprompt_optuna.py`) | partial | `bootstrap_optuna.zig`, `tpe.zig` | bootstrap_optuna_oracle.py, optuna_tpe.json | – |
 | `dspy.BootstrapFewShotWithRandomSearch` (`teleprompt/random_search.py`) | native | `optimize.zig` | suite replay candidates | dates_search: 346 ms → 1.37 ms |
-| `dspy.BootstrapFinetune` (`teleprompt/bootstrap_finetune.py`) | missing | – | – | – |
+| `dspy.BootstrapFinetune` (`teleprompt/bootstrap_finetune.py`) | partial | `bootstrap_finetune.zig`, `bootstrap_finetune_data.zig`, `training.zig` | finetune-data tests in tests/behavior.zig and bootstrap_finetune_data.zig; no committed DSPy oracle | – |
 | `dspy.BootstrapRS` (`teleprompt/random_search.py`) | native | `optimize.zig` | alias of BootstrapFewShotWithRandomSearch | dates_search: 346 ms → 1.37 ms |
 | `dspy.BoundingBox` (`adapters/types/bounding_box.py`) | native | `bounding_box.zig` | bounding_box_oracle.py, bounding_box_identity_oracle.py | – |
 | `dspy.COPRO` (`teleprompt/copro_optimizer.py`) | native | `copro.zig` | suite replay candidates and scores | dates_copro: 368 ms → 1.14 ms |
@@ -1466,12 +1466,12 @@ Regenerate this table with
 | `dspy.Tool` (`adapters/types/tool.py`) | native | `tool.zig` | react.json, tool_argument_repair_oracle.py | – |
 | `dspy.ToolCallResults` (`adapters/types/tool.py`) | native | `tool.zig` | react.json | – |
 | `dspy.ToolCalls` (`adapters/types/tool.py`) | native | `tool.zig` | react.json | – |
-| `dspy.TrainingJob` (`clients/provider.py`) | missing | – | – | – |
+| `dspy.TrainingJob` (`clients/provider.py`) | partial | `training.zig` | native unit tests in training.zig; OpenAI jobs only; no committed DSPy oracle | – |
 | `dspy.TwoStepAdapter` (`adapters/two_step_adapter.py`) | native | `adapter.zig` | two_step_oracle.py | – |
 | `dspy.Type` (`adapters/types/base_type.py`) | partial | `types.zig` | nested.json | – |
 | `dspy.XMLAdapter` (`adapters/xml_adapter.py`) | native | `xml.zig`, `xml_schema.zig` | xml.json | cases: 23 ms → 0.16 ms |
 | `dspy.asyncify` (`utils/asyncify.py`) | missing | – | – | – |
-| `dspy.bootstrap_trace_data` (`teleprompt/bootstrap_trace.py`) | missing | – | – | – |
+| `dspy.bootstrap_trace_data` (`teleprompt/bootstrap_trace.py`) | partial | `bootstrap_trace.zig` | trace-bootstrap tests in tests/behavior.zig; no committed DSPy oracle | – |
 | `dspy.configure` (`dsp/utils/settings.py`) | partial | `predict.zig` | explicit Context instead of global settings | – |
 | `dspy.configure_cache` (`clients/__init__.py`) | partial | `cache.zig`, `request_cache.zig` | cache tests | – |
 | `dspy.configure_dspy_loggers` (`utils/logging_utils.py`) | missing | – | – | – |
