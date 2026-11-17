@@ -359,10 +359,18 @@ Debug and ReleaseSafe, with byte-identical output between modes:
 | Builtin IntEnum declarations | 19 / 19 | 134 | 0 |
 | Configured Decimal policies | 368 / 368 | 3,950 | 233 |
 
-The runtime consumer deliberately exits nonzero for incomplete coverage:
-sequence repetition is not implemented by the numeric helpers. Unsafe unbounded
-repetitions were separately left unattempted by the Source probe. The declaration
-probe includes fractional and maximum finite floats, signed zero, subnormals,
+The historical runtime consumer exited nonzero with 30 sequence-repetition rows
+unsupported. `value.numericProduct` now repeats immutable text and genuine bytes
+with integer/IntEnum multipliers in either order. A focused native consumer
+compares all 30 previously unsupported frozen Source rows: 24 results and six
+ordinary-Enum refusals. This does not rerun or expand the historical 24,577
+observations above. One-fold results may borrow their input; repeated bytes own
+their new buffer. Use caller-provided startup storage through a fixed allocator
+when runtime heap allocation is prohibited. Index and output-size overflow are
+refused before allocation, including out-of-range counts on empty sequences.
+Unsafe unbounded repetitions were separately left unattempted by the Source
+probe; normalized refusals do not establish identical Python exception classes.
+The declaration probe includes fractional and maximum finite floats, signed zero, subnormals,
 Unicode/separated strings, exact wide integers and the 4,300-digit boundary.
 Seventeen independently compiled Debug programs also refused the source-observed
 malformed strings, over-limit strings and nonfinite floats; compile-time

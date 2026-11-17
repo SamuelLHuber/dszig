@@ -860,12 +860,15 @@ pub fn numericOrder(a_input: Value, b_input: Value) error{InvalidNumber}!?std.ma
     return std.math.order(f, g);
 }
 
-/// Python numeric multiplication. Integer-only products remain exact; float
-/// products first convert BOTH operands, even when the other operand is zero.
-/// Zero/one integer products borrow unchanged numeric text without allocation.
+/// Python numeric multiplication, including integer repetition of text/bytes.
+/// Integer-only products remain exact; float products first convert BOTH
+/// operands, even when the other operand is zero. Zero/one numeric products
+/// and one-fold immutable sequences may borrow their unchanged input.
 pub fn numericProduct(arena: Allocator, a_input: Value, b_input: Value) (Allocator.Error || error{InvalidNumber})!Value {
     const a = numericBase(a_input);
     const b = numericBase(b_input);
+    if (sequenceData(a)) |data| return repeatSequence(arena, a, data, b);
+    if (sequenceData(b)) |data| return repeatSequence(arena, b, data, a);
     if (decimalView(a) != null or decimalView(b) != null)
         return decimalBinary(arena, a, b, .multiply);
     if (complexView(a) != null or complexView(b) != null)
@@ -910,6 +913,88 @@ pub fn numericProduct(arena: Allocator, a_input: Value, b_input: Value) (Allocat
     const left = try numericFloat(a);
     const right = try numericFloat(b);
     return .{ .float = left * right };
+}
+
+test "IntEnum repetition preserves sequence kind, order and exact index bounds" {
+    const Counts = @import("enum.zig").IntEnum("Counts", &.{
+        .{ .name = "two", .value = .{ .integer = 2 } },
+    });
+    const a = std.testing.allocator;
+    const two = try Counts.member("two");
+    const text: Value = .{ .string = "é🙂" };
+    const repeated = try numericProduct(a, text, two);
+    defer a.free(repeated.string);
+    try std.testing.expectEqualStrings("é🙂é🙂", repeated.string);
+    const reversed = try numericProduct(a, two, text);
+    defer a.free(reversed.string);
+    try std.testing.expectEqualStrings(repeated.string, reversed.string);
+    const binary = python.staticBytes("\x00\xff");
+    const repeated_bytes = try numericProduct(a, binary, two);
+    defer repeated_bytes.custom.deinit(a);
+    try std.testing.expectEqualSlices(u8, "\x00\xff\x00\xff", python.view(repeated_bytes).?.bytes);
+    try std.testing.expectError(error.InvalidNumber, numericProduct(a, text, .{ .float = 2 }));
+    for ([_][]const u8{ "9223372036854775808", "-9223372036854775809" }) |wide| {
+        try std.testing.expectError(error.InvalidNumber, numericProduct(a, .{ .string = "" }, .{ .number_string = wide }));
+    }
+    const minimum = try numericProduct(a, text, .{ .number_string = "-9223372036854775808" });
+    try std.testing.expectEqualStrings("", minimum.string);
+    try std.testing.expectError(error.InvalidNumber, numericProduct(a, text, .{ .integer = std.math.maxInt(i64) }));
+}
+
+test "repeated bytes release storage on success and every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, repeatBytesAllocation, .{});
+}
+
+fn repeatBytesAllocation(a: Allocator) !void {
+    const repeated = try numericProduct(a, python.staticBytes("\x00\xff"), .{ .integer = 3 });
+    defer repeated.custom.deinit(a);
+    try std.testing.expectEqualSlices(u8, "\x00\xff\x00\xff\x00\xff", python.view(repeated).?.bytes);
+}
+
+fn sequenceData(input: Value) ?[]const u8 {
+    if (input == .string) return input.string;
+    const builtin = python.view(input) orelse return null;
+    return if (builtin == .bytes) builtin.bytes else null;
+}
+
+fn repeatSequence(
+    arena: Allocator,
+    sequence: Value,
+    data: []const u8,
+    multiplier: Value,
+) (Allocator.Error || error{InvalidNumber})!Value {
+    var buffer: [20]u8 = undefined;
+    const integer = IntegerText.fromValue(multiplier, &buffer) orelse return error.InvalidNumber;
+    const magnitude = std.fmt.parseUnsigned(usize, integer.digits, 10) catch
+        return error.InvalidNumber;
+    // Python checks __index__ against Py_ssize_t even for empty sequences and
+    // negative multipliers. Do not silently clamp an out-of-range integer.
+    const maximum: usize = std.math.maxInt(isize);
+    if (magnitude > maximum + @intFromBool(integer.negative)) return error.InvalidNumber;
+    const count = if (integer.negative) 0 else magnitude;
+    if (count == 0 or data.len == 0)
+        return if (sequence == .string) .{ .string = "" } else python.staticBytes("");
+    if (count == 1) return sequence;
+    const length, const overflow = @mulWithOverflow(data.len, count);
+    if (overflow != 0 or length > maximum) return error.InvalidNumber;
+    const storage = try arena.alloc(u8, length);
+    errdefer arena.free(storage);
+    @memcpy(storage[0..data.len], data);
+    var filled = data.len;
+    while (filled < storage.len) {
+        std.debug.assert(filled > 0);
+        const amount = @min(filled, storage.len - filled);
+        @memcpy(storage[filled..][0..amount], storage[0..amount]);
+        filled += amount;
+    }
+    std.debug.assert(filled == length);
+    if (sequence == .string) return .{ .string = storage };
+    var result = python.bytes(arena, storage) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidNumber,
+    };
+    result.custom.owns_data = true;
+    return result;
 }
 
 const NumericError = Allocator.Error || error{InvalidNumber};
