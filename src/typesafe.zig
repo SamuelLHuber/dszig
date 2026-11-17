@@ -149,6 +149,9 @@ pub const TypeSafe = struct {
         defer self.client.allocator.free(response.body);
         const out = try arena.alloc(Completion, 1);
         out[0] = try parseResponse(arena, request.decision.?.response_schema, response.body);
+        // lm15 reads the response id only from this header, never the body.
+        out[0].metadata.id = response.request_id;
+        if (out[0].metadata.model == null) out[0].metadata.model = try arena.dupe(u8, wireModel(self.model));
         return out;
     }
 };
@@ -317,22 +320,37 @@ pub fn parseResponse(arena: Allocator, response_schema: Value, body: []const u8)
         const answer = answers.object.get(judgment.name) orelse return error.LMFailure;
         try validateAnswer(judgment, answer);
     }
-    if (data.object.get("usage")) |usage| {
-        if (usage != .null) {
-            if (usage != .object) return error.LMFailure;
-            for ([_][]const u8{ "input_tokens", "output_tokens" }) |field| {
-                if (!tokenCount(usage.object.get(field) orelse .null)) return error.LMFailure;
-            }
+    // lm15 builds Usage from these two counters only; a refused count fails
+    // the response, and an absent or null usage leaves every counter unknown.
+    var counts: lm_mod.Usage = .{};
+    if (data.object.get("usage")) |reported| {
+        if (reported != .null) {
+            if (reported != .object) return error.LMFailure;
+            counts.input_tokens = reported.object.get("input_tokens") orelse .null;
+            counts.output_tokens = reported.object.get("output_tokens") orelse .null;
         }
     }
+    const usage = lm_mod.Usage.init(arena, counts) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidUsage => error.LMFailure,
+    };
+    // The engine applies the SDK's wire-request-model fallback when absent.
+    var model_reported: ?[]const u8 = null;
     if (data.object.get("model")) |model| {
-        if (model != .null and (model != .string or model.string.len == 0)) return error.LMFailure;
+        if (model != .null) {
+            if (model != .string or model.string.len == 0) return error.LMFailure;
+            model_reported = model.string;
+        }
     }
     var typesafe: ObjectMap = .empty;
     try typesafe.put(arena, "answers", answers);
     var provider_data: ObjectMap = .empty;
     try provider_data.put(arena, "typesafe", .{ .object = typesafe });
-    return .{ .text = null, .provider_data = .{ .object = provider_data } };
+    return .{
+        .text = null,
+        .provider_data = .{ .object = provider_data },
+        .metadata = .{ .model = model_reported, .finish_reason = .stop, .usage = usage },
+    };
 }
 
 fn validateAnswer(judgment: Judgment, answer: Value) Error!void {
@@ -374,15 +392,4 @@ fn probability(raw: Value) Error!void {
         else => false,
     };
     if (!ok) return error.LMFailure;
-}
-
-/// lm15 Usage counters: null, a nonnegative integer, or a same-valued float.
-fn tokenCount(raw: Value) bool {
-    return switch (raw) {
-        .null => true,
-        .integer => |value| value >= 0,
-        .float => |value| std.math.isFinite(value) and @floor(value) == value and value >= 0,
-        .number_string => |text| std.json.isNumberFormattedLikeAnInteger(text) and text[0] != '-',
-        else => false,
-    };
 }

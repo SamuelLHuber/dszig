@@ -151,6 +151,11 @@ fn smokeTranscript(
     var provider_data: dszig.Array = .init(arena);
     for (call.provider_data) |data| try provider_data.append(data orelse .null);
     try row.put(arena, "provider_data", .{ .array = provider_data });
+    if (call.metadata.len != 0) {
+        var metadata: dszig.Array = .init(arena);
+        for (call.metadata) |entry| try metadata.append(try dszig.lm.responseMetadataValue(arena, entry));
+        try row.put(arena, "metadata", .{ .array = metadata });
+    }
     var calls: dszig.Array = .init(arena);
     try calls.append(.{ .object = row });
 

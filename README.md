@@ -166,6 +166,71 @@ helpers return `LMFailure` for an absent text result rather than inventing `""`.
 Chat's no-tool empty/null/missing content fallback is separately normalized to
 `""`, as in the source; a Chat tool-only result retains `null`.
 
+### Response metadata and exact token usage
+
+`lm.Completion.metadata` retains canonical `id`, `model`, `finish_reason` and
+`usage` independently of raw `provider_data`. Legacy native engines can leave
+these facts unknown. Chat Completions, Responses and TypeSafe read their real
+response fields; model fallback uses the actual wire request, and TypeSafe's
+response ID comes from `x-typesafe-request-id`, not its body. The five canonical
+finish reasons are `stop`, `length`, `tool_call`, `content_filter` and `error`.
+
+`lm.Usage` contains eight optional exact counters. Unknown is `.null`, not zero.
+Use its checked constructor before passing hand-built counts to an engine:
+
+```zig
+const usage = try dszig.lm.Usage.init(arena, .{
+    .input_tokens = .{ .integer = 13 },
+    .output_tokens = .{ .integer = 7 },
+});
+// usage.total_tokens is the exact integer 20.
+```
+
+Counters retain integers beyond machine-word precision; finite integral builtin
+floats become exact integers. Bool, strings, fractional/nonfinite floats,
+ordinary Enum and Decimal counters refuse. Genuine IntEnum counters retain
+their identity. Construction enforces nonnegative counts, part/whole relations
+and explicit total consistency, inferring a total only when both addends are
+known. Provider ingestion separately follows the SDK's settlement order:
+inconsistent wire wholes may become unknown before constructing canonical
+usage; raw provider counts remain unchanged in `provider_data`.
+
+`Usage.fromValue` reads the eight SDK names and ignores unknown dictionary
+keys. `toValue` produces the sparse SDK dictionary; `dspyValue` produces
+prompt/completion totals and nested detail dictionaries, preserving reported
+zero and unknown details. `init`/`fromValue` borrow input number text and boxes;
+converted wide floats and computed wide totals use the supplied arena.
+`clone`/`free` manage independent owned snapshots, and both projections own
+their keys and values. A native object dictionary is required; arbitrary Python
+dictionary objects and runtime-created numeric subclasses are not modeled.
+
+Completion cloning, scripted responses, recording/replay, cache persistence and
+native live transcripts retain this metadata. Scripted metadata is supplied
+separately from `provider_data`, never inferred from fixture expectations.
+Explicit SDK-style choice selection retains the response-wide usage on each
+choice; the normal LM boundary refuses an unexpected multi-choice response.
+
+Independent actual Source probes cover 276 Usage constructor/serde inputs and
+30 Chat response inputs. Native Debug and ReleaseSafe each matched 1,595
+targeted Usage observations and 165 Chat observations without mismatches.
+The integrated checkpoint passed **551/551 tests and 38/38 build steps in each
+mode**, its actual RAG/bootstrap/8,192-run Parallel examples, and all 687 existing
+native replay requests. An isolated wrong-field metadata encoder produced 27
+mismatches and a nonzero independent comparison exit with unchanged Source bytes.
+One unknown-keyword constructor row remains unobserved at runtime because the
+native constructor is statically typed; Python exception classes/messages and
+the Usage probe's complete Response objects were not compared. The Chat
+comparison exercised actual localhost HTTP; native live Chat/Responses CoT
+smokes returned `4`, and a TypeSafe HTTP smoke retained its header, wire-model
+fallback and exact counts through recording, replay and cache dump/load after
+the original response arena was destroyed. This is finite protocol evidence,
+not authenticated inference.
+
+Reading token usage is not usage accounting: scoped tracking, per-module
+Prediction usage, costs/pricing, Python Response/Prediction object APIs,
+asynchronous execution and streaming remain open. The xAI separate-reasoning
+usage dialect is not configured by this native OpenAI transport.
+
 The Responses parser follows the observed lm15 behavior: root/item statuses
 and message roles do not discard returned text, `output_text` and `text`
 blocks concatenate, and an empty output can use the top-level text fallback.
@@ -1128,8 +1193,10 @@ structured state, questions and response schema through recording/replay/cache
 wrappers. OpenAI refuses direct native decision requests rather than silently
 dropping them. The TypeSafe box route sends the experimental images header;
 this is **not** an Image/assets implementation or the complete provider SDK.
-Usage/request-id/convenience views, Python exception identity, asynchronous
-execution and streaming remain outside this native decision implementation.
+Canonical response usage and the actual request-ID header are retained as
+described above. Scoped usage accounting, convenience views, Python exception
+identity, asynchronous execution and streaming remain outside this native
+decision implementation.
 
 The frozen independent DSPy 3.5 source receipt contains **15,218 actual rows
 and 17 model definitions**. The model consumer was re-run natively after the

@@ -822,7 +822,9 @@ fn integerStringEqualsValue(text: []const u8, v: Value) bool {
     return a.eql(IntegerText.parse(other) orelse return false);
 }
 
-fn integralFloatText(f: f64, buffer: *[310]u8) ?[]const u8 {
+/// Exact decimal integer spelling for a finite integral binary64 value.
+/// The returned slice borrows buffer; fractional and nonfinite inputs refuse.
+pub fn integralFloatText(f: f64, buffer: *[310]u8) ?[]const u8 {
     if (!std.math.isFinite(f) or f != @trunc(f)) return null;
     // Reconstruct binary64's exact integer without unsupported wide casts.
     const bits: u64 = @bitCast(@abs(f));

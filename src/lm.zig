@@ -11,6 +11,8 @@ const adapter = @import("adapter.zig");
 const pyjson = @import("pyjson.zig");
 const http = @import("http.zig");
 pub const inference = @import("inference.zig");
+/// Canonical SDK token usage; every unknown counter stays null, never zero.
+pub const Usage = @import("lm_usage.zig").Usage;
 const Message = adapter.Message;
 pub const FunctionTool = inference.FunctionTool;
 pub const ToolCall = inference.ToolCall;
@@ -104,7 +106,137 @@ pub const Completion = struct {
     continuation: []const Continuation = &.{},
     /// Actual provider JSON, retained separately from canonical continuation.
     provider_data: ?@import("runtime_value.zig").Value = null,
+    /// Canonical response facts; raw provider numbers stay in `provider_data`.
+    metadata: ResponseMetadata = .{},
 };
+
+/// The five lm15 finish reasons.
+pub const FinishReason = enum { stop, length, tool_call, content_filter, @"error" };
+
+/// Canonical facts a provider actually reported about one response. Every
+/// field defaults to unknown: engines without the information leave it absent
+/// rather than inventing an identity, a finish reason or token counts.
+pub const ResponseMetadata = struct {
+    id: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+    finish_reason: ?FinishReason = null,
+    usage: Usage = .{},
+
+    /// False for legacy completions, whose serialized shape has no metadata.
+    pub fn known(metadata: ResponseMetadata) bool {
+        if (metadata.id != null) return true;
+        if (metadata.model != null) return true;
+        if (metadata.finish_reason != null) return true;
+        return usageKnown(metadata.usage);
+    }
+};
+
+const usage_counters = [_][]const u8{
+    "input_tokens",       "output_tokens",    "total_tokens",       "cache_read_tokens",
+    "cache_write_tokens", "reasoning_tokens", "input_audio_tokens", "output_audio_tokens",
+};
+
+comptime {
+    // Every counter must be inspected, or a reported count could be dropped.
+    assert(@typeInfo(Usage).@"struct".field_names.len == usage_counters.len);
+}
+
+fn usageKnown(usage: Usage) bool {
+    inline for (usage_counters) |name| {
+        if (@field(usage, name) != .null) return true;
+    }
+    return false;
+}
+
+/// Owning copy which borrows nothing from `metadata`; unwinds on failure.
+pub fn cloneResponseMetadata(allocator: Allocator, metadata: ResponseMetadata) Allocator.Error!ResponseMetadata {
+    const id = if (metadata.id) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (id) |value| allocator.free(value);
+    const model = if (metadata.model) |value| try allocator.dupe(u8, value) else null;
+    errdefer if (model) |value| allocator.free(value);
+    return .{
+        .id = id,
+        .model = model,
+        .finish_reason = metadata.finish_reason,
+        .usage = try metadata.usage.clone(allocator),
+    };
+}
+
+pub fn freeResponseMetadata(allocator: Allocator, metadata: ResponseMetadata) void {
+    metadata.usage.free(allocator);
+    if (metadata.model) |model| allocator.free(model);
+    if (metadata.id) |id| allocator.free(id);
+}
+
+/// Sparse borrowed view: only known fields appear, so unknown never reads as
+/// zero. Callers own `metadata` for the view's lifetime.
+pub fn responseMetadataValue(arena: Allocator, metadata: ResponseMetadata) Allocator.Error!@import("runtime_value.zig").Value {
+    var object: @import("runtime_value.zig").ObjectMap = .empty;
+    if (metadata.id) |id| try object.put(arena, "id", .{ .string = id });
+    if (metadata.model) |model| try object.put(arena, "model", .{ .string = model });
+    if (metadata.finish_reason) |reason| try object.put(arena, "finish_reason", .{ .string = @tagName(reason) });
+    if (usageKnown(metadata.usage)) try object.put(arena, "usage", try metadata.usage.toValue(arena));
+    return .{ .object = object };
+}
+
+/// Owning reader for `responseMetadataValue`. Absent fields stay unknown;
+/// unrecognized fields refuse rather than being silently dropped.
+pub fn responseMetadataFromValue(arena: Allocator, input: @import("runtime_value.zig").Value) inference.MetadataError!ResponseMetadata {
+    if (input != .object) return error.BadMetadata;
+    var out: ResponseMetadata = .{};
+    var recognized: usize = 0;
+    if (input.object.get("id")) |id| {
+        if (id != .null) out.id = try arena.dupe(u8, try metadataIdentity(id));
+        recognized += 1;
+    }
+    if (input.object.get("model")) |model| {
+        if (model != .null) out.model = try arena.dupe(u8, try metadataIdentity(model));
+        recognized += 1;
+    }
+    if (input.object.get("finish_reason")) |reason| {
+        if (reason != .null) out.finish_reason = std.meta.stringToEnum(FinishReason, try metadataString(reason)) orelse return error.BadMetadata;
+        recognized += 1;
+    }
+    if (input.object.get("usage")) |usage| {
+        const borrowed = Usage.fromValue(arena, usage) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.InvalidUsage => error.BadMetadata,
+        };
+        out.usage = try borrowed.clone(arena);
+        recognized += 1;
+    }
+    if (recognized != input.object.count()) return error.BadMetadata;
+    return out;
+}
+
+/// An unknown identity is an absent field, so a present one is never empty.
+fn metadataIdentity(input: @import("runtime_value.zig").Value) inference.MetadataError![]const u8 {
+    const text = try metadataString(input);
+    if (text.len == 0) return error.BadMetadata;
+    return text;
+}
+
+/// Engine-boundary validation of caller-supplied metadata. The result may
+/// borrow from `raw`; engines clone it before returning a completion.
+fn checkedMetadata(arena: Allocator, raw: ResponseMetadata) Error!ResponseMetadata {
+    if (raw.id) |id| {
+        if (id.len == 0) return error.LMFailure;
+    }
+    if (raw.model) |model| {
+        if (model.len == 0) return error.LMFailure;
+    }
+    var out = raw;
+    out.usage = try checkedUsage(arena, raw.usage);
+    return out;
+}
+
+/// SDK Usage construction; a refused count is a failed response.
+fn checkedUsage(arena: Allocator, raw: Usage) Error!Usage {
+    return Usage.init(arena, raw) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidUsage => error.LMFailure,
+    };
+}
 
 /// lm15 Response.provider_data permits only an optional JSON object, without
 /// coercing builtin classes into JSON. Like the other runtime traversals this
@@ -147,6 +279,7 @@ pub fn cloneCompletion(allocator: Allocator, completion: Completion) Allocator.E
     const continuation = try inference.cloneContinuations(allocator, completion.continuation);
     errdefer inference.freeContinuations(allocator, continuation);
     const provider_data = if (completion.provider_data) |data| try inference.cloneJsonValue(allocator, data) else null;
+    errdefer if (provider_data) |data| inference.freeJsonValue(allocator, data);
     return .{
         .text = text,
         .reasoning = reasoning,
@@ -154,10 +287,12 @@ pub fn cloneCompletion(allocator: Allocator, completion: Completion) Allocator.E
         .citations = citations,
         .continuation = continuation,
         .provider_data = provider_data,
+        .metadata = try cloneResponseMetadata(allocator, completion.metadata),
     };
 }
 
 pub fn freeCompletion(allocator: Allocator, completion: Completion) void {
+    freeResponseMetadata(allocator, completion.metadata);
     if (completion.provider_data) |data| inference.freeJsonValue(allocator, data);
     if (completion.text) |text| allocator.free(text);
     if (completion.reasoning) |reasoning| allocator.free(reasoning);
@@ -233,6 +368,8 @@ pub fn completionValue(arena: Allocator, completion: Completion) Allocator.Error
     try object.put(arena, "citations", try inference.citationsValue(arena, completion.citations));
     try object.put(arena, "continuation", try inference.continuationsValue(arena, completion.continuation));
     try object.put(arena, "provider_data", completion.provider_data orelse .null);
+    // Legacy completions carry no metadata and keep their original shape.
+    if (completion.metadata.known()) try object.put(arena, "metadata", try responseMetadataValue(arena, completion.metadata));
     return .{ .object = object };
 }
 
@@ -333,6 +470,9 @@ pub fn completionFromValue(arena: Allocator, input: @import("runtime_value.zig")
             if (data != .object) return error.BadMetadata;
             out.provider_data = try inference.cloneJsonValue(arena, data);
         }
+    }
+    if (input.object.get("metadata")) |metadata| {
+        if (metadata != .null) out.metadata = try responseMetadataFromValue(arena, metadata);
     }
     return out;
 }
@@ -487,6 +627,9 @@ pub const ScriptedLM = struct {
     citations: []const []const CitationPart = &.{},
     continuation: []const []const Continuation = &.{},
     provider_data: []const ?@import("runtime_value.zig").Value = &.{},
+    /// Optional canonical metadata, parallel to `responses` and independent
+    /// of `provider_data`; nothing is derived from the raw provider JSON.
+    metadata: []const ResponseMetadata = &.{},
     supports_reasoning: bool = false,
     supports_response_format: bool = false,
     supports_response_schema: bool = false,
@@ -519,6 +662,7 @@ pub const ScriptedLM = struct {
         if (self.citations.len != 0 and self.citations.len != self.responses.len) return error.LMFailure;
         if (self.continuation.len != 0 and self.continuation.len != self.responses.len) return error.LMFailure;
         if (self.provider_data.len != 0 and self.provider_data.len != self.responses.len) return error.LMFailure;
+        if (self.metadata.len != 0 and self.metadata.len != self.responses.len) return error.LMFailure;
         const out = try arena.alloc(Completion, n);
         for (out, self.responses[self.index..][0..n], self.index..) |*o, r, i| {
             const reasoning = if (self.reasonings.len != 0) self.reasonings[i] else null;
@@ -533,6 +677,7 @@ pub const ScriptedLM = struct {
                 .citations = if (self.citations.len != 0) self.citations[i] else &.{},
                 .continuation = if (self.continuation.len != 0) self.continuation[i] else &.{},
                 .provider_data = provider_data,
+                .metadata = if (self.metadata.len != 0) try checkedMetadata(arena, self.metadata[i]) else .{},
             });
         }
         self.index += n;
@@ -622,6 +767,9 @@ pub const ReplayLM = struct {
         citations: []const []const CitationPart = &.{},
         continuation: []const []const Continuation = &.{},
         provider_data: []const ?@import("runtime_value.zig").Value = &.{},
+        /// Canonical metadata, parallel to `all()`; empty for transcripts
+        /// which recorded none, whose completions then stay unknown.
+        metadata: []const ResponseMetadata = &.{},
 
         pub fn all(call: *const Call) []const ?[]const u8 {
             if (call.completions.len > 0) return call.completions;
@@ -674,6 +822,7 @@ pub const ReplayLM = struct {
             if (call.citations.len != 0 and call.citations.len != recorded.len) return error.LMFailure;
             if (call.continuation.len != 0 and call.continuation.len != recorded.len) return error.LMFailure;
             if (call.provider_data.len != 0 and call.provider_data.len != recorded.len) return error.LMFailure;
+            if (call.metadata.len != 0 and call.metadata.len != recorded.len) return error.LMFailure;
             for (recorded, 0..) |text, i| {
                 if (self.used[first + i]) continue;
                 out[written] = try cloneCompletion(arena, .{
@@ -683,6 +832,7 @@ pub const ReplayLM = struct {
                     .citations = if (call.citations.len != 0) call.citations[i] else &.{},
                     .continuation = if (call.continuation.len != 0) call.continuation[i] else &.{},
                     .provider_data = if (call.provider_data.len != 0) call.provider_data[i] else null,
+                    .metadata = if (call.metadata.len != 0) try checkedMetadata(arena, call.metadata[i]) else .{},
                 });
                 self.used[first + i] = true;
                 written += 1;
@@ -783,6 +933,12 @@ pub const RecordingLM = struct {
         for (provider_data, completions[0..provider_data.len]) |*kept_data, completion| {
             kept_data.* = if (completion.provider_data) |data| try inference.cloneJsonValue(self.arena, data) else null;
         }
+        var has_metadata = false;
+        for (completions) |completion| has_metadata = has_metadata or completion.metadata.known();
+        const metadata: []ResponseMetadata = if (has_metadata) try self.arena.alloc(ResponseMetadata, completions.len) else &.{};
+        for (metadata, completions[0..metadata.len]) |*kept_metadata, completion| {
+            kept_metadata.* = try cloneResponseMetadata(self.arena, completion.metadata);
+        }
         try self.calls.append(self.arena, .{
             .messages = messages,
             .options = try cloneOptions(self.arena, request.options),
@@ -795,6 +951,7 @@ pub const RecordingLM = struct {
             .citations = citations,
             .continuation = continuation,
             .provider_data = provider_data,
+            .metadata = metadata,
         });
         return completions;
     }
@@ -1356,7 +1513,13 @@ pub const OpenAI = struct {
                 else => error.LMFailure,
             };
             defer self.client.allocator.free(response.body);
-            return parseCompletions(arena, response.body);
+            const completions = try parseCompletions(arena, response.body);
+            // The parser allocated these completions in this call's arena;
+            // its public const view does not make that owned storage immutable.
+            for (@constCast(completions)) |*completion| {
+                if (completion.metadata.model == null) completion.metadata.model = try arena.dupe(u8, self.model);
+            }
+            return completions;
         }
         const out = try arena.alloc(Completion, request.options.n);
         for (out) |*completion| {
@@ -1366,6 +1529,7 @@ pub const OpenAI = struct {
             };
             defer self.client.allocator.free(response.body);
             completion.* = try parseResponsesResponse(arena, response.body);
+            if (completion.metadata.model == null) completion.metadata.model = try arena.dupe(u8, self.model);
         }
         return out;
     }
@@ -1410,6 +1574,9 @@ pub const OpenAI = struct {
         const choices = parsed.object.get("choices") orelse return error.LMFailure;
         if (choices != .array or choices.array.items.len == 0) return error.LMFailure;
         const out = try arena.alloc(Completion, choices.array.items.len);
+        const id = try responseIdentity(arena, parsed.object.get("id"));
+        const model = try responseIdentity(arena, parsed.object.get("model"));
+        const usage = try chatUsage(arena, parsed);
         for (choices.array.items, out) |choice, *completion| {
             if (choice != .object) return error.LMFailure;
             const message = choice.object.get("message") orelse return error.LMFailure;
@@ -1463,6 +1630,15 @@ pub const OpenAI = struct {
             }
             if (part_index == 0) try text.add("", "");
             completion.text = text.value();
+            completion.metadata = .{
+                .id = id,
+                .model = model,
+                .finish_reason = chatFinishReason(choice.object.get("finish_reason") orelse .null, completion.tool_calls.len != 0),
+                // SDK choice=i ingestion retains the response-wide usage for
+                // each selected choice. The LM boundary rejects an unexpected
+                // multi-choice body rather than billing these as separate calls.
+                .usage = usage,
+            };
         }
         return out;
     }
@@ -1568,6 +1744,196 @@ pub const OpenAI = struct {
             .citations = citations.items,
             .continuation = continuation.items,
             .provider_data = parsed,
+            .metadata = .{
+                .id = try responseIdentity(arena, parsed.object.get("id")),
+                .model = try responseIdentity(arena, parsed.object.get("model")),
+                .finish_reason = try responsesFinishReason(arena, parsed, calls.items.len != 0),
+                .usage = try responsesUsage(arena, parsed),
+            },
+        };
+    }
+
+    /// lm15 reads `str(x) if x else None`. Model fallback is applied at the
+    /// engine boundary, where the actual request model is available.
+    fn responseIdentity(arena: Allocator, raw: ?@import("runtime_value.zig").Value) Error!?[]const u8 {
+        const value = raw orelse return null;
+        if (!(try responseTruthy(value))) return null;
+        return try responseStringValue(arena, value);
+    }
+
+    /// lm15 `_FINISH_REASON_MAP`: a tool call wins, and an absent, empty or
+    /// unmapped reason reads as stop.
+    fn chatFinishReason(raw: @import("runtime_value.zig").Value, has_tool_call: bool) FinishReason {
+        if (has_tool_call) return .tool_call;
+        if (raw != .string) return .stop;
+        const mapped = [_]struct { []const u8, FinishReason }{
+            .{ "stop", .stop },
+            .{ "length", .length },
+            .{ "tool_calls", .tool_call },
+            .{ "function_call", .tool_call },
+            .{ "content_filter", .content_filter },
+        };
+        for (mapped) |entry| {
+            if (std.mem.eql(u8, raw.string, entry[0])) return entry[1];
+        }
+        return .stop;
+    }
+
+    /// lm15 `_finish_from_status`. Case folding is ASCII, not Python's Unicode
+    /// `str.lower`; the provider vocabulary compared against is ASCII.
+    fn responsesFinishReason(arena: Allocator, data: @import("runtime_value.zig").Value, has_tool_call: bool) Error!FinishReason {
+        assert(data == .object);
+        if (has_tool_call) return .tool_call;
+        const status = try loweredText(arena, data.object.get("status") orelse .null);
+        const details = data.object.get("incomplete_details") orelse .null;
+        const reason = if (details == .object)
+            try loweredText(arena, details.object.get("reason") orelse .null)
+        else
+            "";
+        if (std.mem.eql(u8, status, "incomplete")) {
+            if (std.mem.indexOf(u8, reason, "token") != null) return .length;
+        }
+        if (std.mem.indexOf(u8, reason, "content_filter") != null) return .content_filter;
+        if (std.mem.indexOf(u8, reason, "safety") != null) return .content_filter;
+        return .stop;
+    }
+
+    /// Python `str(value or "").lower()`.
+    fn loweredText(arena: Allocator, value: @import("runtime_value.zig").Value) Error![]const u8 {
+        if (!(try responseTruthy(value))) return "";
+        return std.ascii.allocLowerString(arena, try responseStringValue(arena, value));
+    }
+
+    /// MAP-19 for Chat Completions under the default `in_completion` dialect:
+    /// prompt and completion counts already include their detail counters.
+    /// The xAI `separate` reasoning dialect has no native configuration.
+    fn chatUsage(arena: Allocator, data: @import("runtime_value.zig").Value) Error!Usage {
+        assert(data == .object);
+        const raw = data.object.get("usage") orelse .null;
+        if (!(try responseTruthy(raw))) return .{};
+        if (raw != .object) return error.LMFailure;
+        const prompt_details = try usageDetails(raw, &.{"prompt_tokens_details"});
+        const completion_details = try usageDetails(raw, &.{"completion_tokens_details"});
+        // Some servers report the cached count flat on usage instead.
+        var cached = detail(prompt_details, "cached_tokens");
+        if (cached == .null) cached = raw.object.get("cached_tokens") orelse .null;
+        return settleUsage(arena, .{
+            .input_tokens = try wireCount(arena, raw.object.get("prompt_tokens") orelse .null),
+            .output_tokens = try wireCount(arena, raw.object.get("completion_tokens") orelse .null),
+            .total_tokens = try wireCount(arena, raw.object.get("total_tokens") orelse .null),
+            .cache_read_tokens = try wireCount(arena, cached),
+            .cache_write_tokens = try wireCount(arena, detail(prompt_details, "cache_write_tokens")),
+            .reasoning_tokens = try wireCount(arena, detail(completion_details, "reasoning_tokens")),
+            .input_audio_tokens = try wireCount(arena, detail(prompt_details, "audio_tokens")),
+            .output_audio_tokens = try wireCount(arena, detail(completion_details, "audio_tokens")),
+        });
+    }
+
+    /// MAP-19 for Responses: every counter keeps its reported value.
+    fn responsesUsage(arena: Allocator, data: @import("runtime_value.zig").Value) Error!Usage {
+        assert(data == .object);
+        const raw = data.object.get("usage") orelse .null;
+        if (raw != .object) return .{};
+        const input_details = try usageDetails(raw, &.{ "input_tokens_details", "input_token_details" });
+        const output_details = try usageDetails(raw, &.{ "output_tokens_details", "output_token_details" });
+        return settleUsage(arena, .{
+            .input_tokens = try wireCount(arena, raw.object.get("input_tokens") orelse .null),
+            .output_tokens = try wireCount(arena, raw.object.get("output_tokens") orelse .null),
+            .total_tokens = try wireCount(arena, raw.object.get("total_tokens") orelse .null),
+            .cache_read_tokens = try wireCount(arena, detail(input_details, "cached_tokens")),
+            .cache_write_tokens = try wireCount(arena, detail(input_details, "cache_write_tokens")),
+            .reasoning_tokens = try wireCount(arena, detail(output_details, "reasoning_tokens")),
+            .input_audio_tokens = try wireCount(arena, detail(input_details, "audio_tokens")),
+            .output_audio_tokens = try wireCount(arena, detail(output_details, "audio_tokens")),
+        });
+    }
+
+    /// Python `usage.get(a) or usage.get(b) or {}`, where a non-dict is `{}`.
+    fn usageDetails(usage: @import("runtime_value.zig").Value, comptime names: []const []const u8) error{ParseValue}!?@import("runtime_value.zig").Value {
+        const chosen = try annotationAlternative(usage, names);
+        return if (chosen == .object) chosen else null;
+    }
+
+    fn detail(details: ?@import("runtime_value.zig").Value, name: []const u8) @import("runtime_value.zig").Value {
+        const object = details orelse return .null;
+        return object.object.get(name) orelse .null;
+    }
+
+    /// Wire counts may be negative: settle_usage first withholds an inconsistent
+    /// whole, then SDK Usage validates the counters which remain. Refusing here
+    /// changes that observable order. Bool and nonintegral values still refuse.
+    fn wireCount(arena: Allocator, raw: @import("runtime_value.zig").Value) Error!@import("runtime_value.zig").Value {
+        switch (raw) {
+            .null, .integer => return raw,
+            .number_string => |digits| {
+                if (!std.json.isNumberFormattedLikeAnInteger(digits)) return error.LMFailure;
+                return raw;
+            },
+            .float => |number| {
+                if (!std.math.isFinite(number) or number != @trunc(number)) return error.LMFailure;
+                if (number >= -9223372036854775808.0 and number < 9223372036854775808.0)
+                    return .{ .integer = @intFromFloat(number) };
+                var buffer: [310]u8 = undefined;
+                const digits = @import("value.zig").integralFloatText(number, &buffer).?;
+                return .{ .number_string = try arena.dupe(u8, digits) };
+            },
+            .bool, .string, .array, .object, .custom => return error.LMFailure,
+        }
+    }
+
+    /// lm15 `settle_usage` (MAP-19 rule 3): withhold what the provider's
+    /// numbers do not determine instead of failing or estimating. A part
+    /// larger than its whole withholds the whole; a total which is not
+    /// input + output withholds both and keeps the provider's total.
+    fn settleUsage(arena: Allocator, counts: Usage) Error!Usage {
+        var usage = counts;
+        if (usage.input_tokens != .null) {
+            const cached = if (usage.cache_read_tokens == .null and usage.cache_write_tokens == .null)
+                @import("runtime_value.zig").Value{ .integer = 0 }
+            else if (usage.cache_read_tokens == .null)
+                usage.cache_write_tokens
+            else if (usage.cache_write_tokens == .null)
+                usage.cache_read_tokens
+            else
+                try countSum(arena, usage.cache_read_tokens, usage.cache_write_tokens);
+            if (try countExceeds(cached, usage.input_tokens)) {
+                usage.input_tokens = .null;
+            } else if (try countExceeds(usage.input_audio_tokens, usage.input_tokens)) {
+                usage.input_tokens = .null;
+            }
+        }
+        if (usage.output_tokens != .null) {
+            if (try countExceeds(usage.reasoning_tokens, usage.output_tokens)) {
+                usage.output_tokens = .null;
+            } else if (try countExceeds(usage.output_audio_tokens, usage.output_tokens)) {
+                usage.output_tokens = .null;
+            }
+        }
+        if (usage.total_tokens != .null and usage.input_tokens != .null and usage.output_tokens != .null) {
+            const sum = try countSum(arena, usage.input_tokens, usage.output_tokens);
+            if (!(try countExceeds(sum, usage.total_tokens)) and !(try countExceeds(usage.total_tokens, sum))) {
+                // The provider's total is exactly input + output.
+            } else {
+                usage.input_tokens = .null;
+                usage.output_tokens = .null;
+            }
+        }
+        return checkedUsage(arena, usage);
+    }
+
+    /// Exact integer comparison; an unknown part exceeds nothing.
+    fn countExceeds(part: @import("runtime_value.zig").Value, whole: @import("runtime_value.zig").Value) Error!bool {
+        assert(whole != .null);
+        if (part == .null) return false;
+        const order = @import("value.zig").numericOrder(part, whole) catch return error.LMFailure;
+        return (order orelse return error.LMFailure) == .gt;
+    }
+
+    /// Exact integer sum; counters never round through binary64.
+    fn countSum(arena: Allocator, a: @import("runtime_value.zig").Value, b: @import("runtime_value.zig").Value) Error!@import("runtime_value.zig").Value {
+        return @import("value.zig").numericSum(arena, a, b) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.LMFailure,
         };
     }
 
@@ -2074,4 +2440,310 @@ test "replay LM matches recorded requests exactly and reports misses" {
     try testing.expect(inner.exhausted());
     try testing.expectEqual(@as(usize, 1), recorder.calls.items.len);
     try testing.expectEqualStrings("b", recorder.calls.items[0].messages[0].content.text);
+}
+
+/// Counters are opaque canonical integers, so compare by exact numeric order.
+fn expectCount(expected: []const u8, actual: @import("runtime_value.zig").Value) !void {
+    try testing.expect(actual != .null);
+    const order = try @import("value.zig").numericOrder(.{ .number_string = expected }, actual);
+    try testing.expectEqual(std.math.Order.eq, order.?);
+}
+
+test "Chat body metadata keeps reported counts and withholds undetermined ones" {
+    // Decodes real Chat bodies through the public parser. The raw provider
+    // JSON must stay byte-equivalent to the body while the canonical usage
+    // follows lm15 MAP-19: detail counters are parts, never added on top.
+    var state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+    const body =
+        \\{"id":"chatcmpl-1","model":"served-model","choices":[
+        \\{"message":{"content":"one"},"finish_reason":"length"},
+        \\{"message":{"content":"two"},"finish_reason":"provider_specific"}],
+        \\"usage":{"prompt_tokens":11,"completion_tokens":7.0,"total_tokens":18,
+        \\"prompt_tokens_details":{"cached_tokens":4},
+        \\"completion_tokens_details":{"reasoning_tokens":3}}}
+    ;
+    const completions = try OpenAI.parseCompletions(arena, body);
+    try testing.expectEqual(@as(usize, 2), completions.len);
+    const first = completions[0].metadata;
+    try testing.expectEqualStrings("chatcmpl-1", first.id.?);
+    try testing.expectEqualStrings("served-model", first.model.?);
+    try testing.expectEqual(FinishReason.length, first.finish_reason.?);
+    try expectCount("11", first.usage.input_tokens);
+    try expectCount("7", first.usage.output_tokens);
+    try expectCount("18", first.usage.total_tokens);
+    try expectCount("4", first.usage.cache_read_tokens);
+    try expectCount("3", first.usage.reasoning_tokens);
+    try testing.expect(first.usage.cache_write_tokens == .null);
+    try testing.expect(first.usage.input_audio_tokens == .null);
+    // Explicit choice ingestion retains the same reported response-wide usage.
+    try testing.expectEqual(FinishReason.stop, completions[1].metadata.finish_reason.?);
+    try testing.expectEqualStrings("chatcmpl-1", completions[1].metadata.id.?);
+    try expectCount("11", completions[1].metadata.usage.input_tokens);
+    try expectCount("7", completions[1].metadata.usage.output_tokens);
+    const raw = try OpenAI.parseJson(arena, body);
+    try testing.expect(try inference.jsonEqual(raw, completions[0].provider_data.?));
+
+    // A cached count above the prompt count withholds input only.
+    const part_over_whole = (try OpenAI.parseCompletions(arena,
+        \\{"choices":[{"message":{"content":"x"}}],"usage":{"prompt_tokens":5,
+        \\"completion_tokens":7,"total_tokens":12,"prompt_tokens_details":{"cached_tokens":9}}}
+    ))[0].metadata;
+    try testing.expect(part_over_whole.id == null);
+    try testing.expect(part_over_whole.model == null);
+    try testing.expectEqual(FinishReason.stop, part_over_whole.finish_reason.?);
+    try testing.expect(part_over_whole.usage.input_tokens == .null);
+    try expectCount("7", part_over_whole.usage.output_tokens);
+    try expectCount("12", part_over_whole.usage.total_tokens);
+    try expectCount("9", part_over_whole.usage.cache_read_tokens);
+
+    // A total which is not input + output keeps only the provider's total.
+    const total_mismatch = (try OpenAI.parseCompletions(arena,
+        \\{"choices":[{"message":{"content":"x"}}],
+        \\"usage":{"prompt_tokens":5,"completion_tokens":7,"total_tokens":99}}
+    ))[0].metadata;
+    try testing.expect(total_mismatch.usage.input_tokens == .null);
+    try testing.expect(total_mismatch.usage.output_tokens == .null);
+    try expectCount("99", total_mismatch.usage.total_tokens);
+
+    // A count beyond 64 bits stays exact, and unknown is not zero.
+    const wide = (try OpenAI.parseCompletions(arena,
+        \\{"choices":[{"message":{"content":"x"}}],"usage":{"total_tokens":18446744073709551617}}
+    ))[0].metadata;
+    try expectCount("18446744073709551617", wide.usage.total_tokens);
+    try testing.expect(wide.usage.input_tokens == .null);
+
+    const absent = (try OpenAI.parseCompletions(arena,
+        \\{"choices":[{"message":{"content":"x"}}],"usage":null}
+    ))[0].metadata;
+    try testing.expect(!usageKnown(absent.usage));
+
+    // wire_count accepts the negative wire integer; settle_usage withholds an
+    // input smaller than its known cache sum (zero even with no cache details).
+    const negative_input = (try OpenAI.parseCompletions(arena,
+        \\{"choices":[{"message":{"content":"x"}}],"usage":{"prompt_tokens":-1}}
+    ))[0].metadata;
+    try testing.expect(negative_input.usage.input_tokens == .null);
+    try testing.expect(!usageKnown(negative_input.usage));
+
+    const refused = [_][]const u8{
+        \\{"choices":[{"message":{"content":"x"}}],"usage":{"completion_tokens":true}}
+        ,
+        \\{"choices":[{"message":{"content":"x"}}],"usage":{"completion_tokens":1.5}}
+        ,
+        \\{"choices":[{"message":{"content":"x"}}],"usage":{"completion_tokens":-1}}
+        ,
+        \\{"choices":[{"message":{"content":"x"}}],"usage":{"total_tokens":"7"}}
+        ,
+        \\{"choices":[{"message":{"content":"x"}}],"usage":{"prompt_tokens_details":{"cached_tokens":[1]}}}
+        ,
+        \\{"choices":[{"message":{"content":"x"}}],"usage":"12 tokens"}
+    };
+    for (refused) |malformed| {
+        try testing.expectError(error.LMFailure, OpenAI.parseCompletions(arena, malformed));
+    }
+}
+
+test "Responses body metadata maps status, tool calls and detail counters" {
+    var state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+    const body =
+        \\{"id":"resp_1","model":"served-model","status":"incomplete",
+        \\"incomplete_details":{"reason":"max_output_tokens"},
+        \\"output":[{"type":"message","content":[{"type":"output_text","text":"cut"}]}],
+        \\"usage":{"input_tokens":10,"output_tokens":4,"total_tokens":14,
+        \\"input_tokens_details":{"cached_tokens":2},
+        \\"output_tokens_details":{"reasoning_tokens":1}}}
+    ;
+    const truncated = try OpenAI.parseResponsesResponse(arena, body);
+    try testing.expectEqualStrings("resp_1", truncated.metadata.id.?);
+    try testing.expectEqualStrings("served-model", truncated.metadata.model.?);
+    try testing.expectEqual(FinishReason.length, truncated.metadata.finish_reason.?);
+    try expectCount("10", truncated.metadata.usage.input_tokens);
+    try expectCount("4", truncated.metadata.usage.output_tokens);
+    try expectCount("14", truncated.metadata.usage.total_tokens);
+    try expectCount("2", truncated.metadata.usage.cache_read_tokens);
+    try expectCount("1", truncated.metadata.usage.reasoning_tokens);
+    try testing.expect(try inference.jsonEqual(try OpenAI.parseJson(arena, body), truncated.provider_data.?));
+
+    const filtered = try OpenAI.parseResponsesResponse(arena,
+        \\{"status":"incomplete","incomplete_details":{"reason":"content_filter"},"output":[]}
+    );
+    try testing.expectEqual(FinishReason.content_filter, filtered.metadata.finish_reason.?);
+    try testing.expect(filtered.metadata.id == null);
+    try testing.expect(filtered.metadata.model == null);
+    try testing.expect(!usageKnown(filtered.metadata.usage));
+
+    // A tool call wins over the status, as in the SDK.
+    const called = try OpenAI.parseResponsesResponse(arena,
+        \\{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},
+        \\"output":[{"type":"function_call","call_id":"c1","name":"lookup","arguments":"{}"}]}
+    );
+    try testing.expectEqual(FinishReason.tool_call, called.metadata.finish_reason.?);
+
+    try testing.expectError(error.LMFailure, OpenAI.parseResponsesResponse(arena,
+        \\{"output":[],"usage":{"output_tokens_details":{"reasoning_tokens":0.5}}}
+    ));
+}
+
+test "scripted metadata survives recording, replay and serialization without the source arena" {
+    // Scripted -> Recording -> Replay -> value round trip. The scripted
+    // source strings are overwritten and freed after recording, so any alias
+    // into them would be observed as corrupted metadata.
+    const Value = @import("runtime_value.zig").Value;
+    var kept_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer kept_state.deinit();
+    const kept = kept_state.allocator();
+    const messages = [_]Message{.{ .role = .user, .content = .{ .text = "question" } }};
+
+    var recorder: RecordingLM = undefined;
+    {
+        var source_state: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer source_state.deinit();
+        const source = source_state.allocator();
+        const id = try source.dupe(u8, "resp-source");
+        const model = try source.dupe(u8, "served-model");
+        const wide = try source.dupe(u8, "18446744073709551617");
+        var raw_usage: @import("runtime_value.zig").ObjectMap = .empty;
+        try raw_usage.put(source, "prompt_tokens", .{ .integer = 999 });
+        var raw: @import("runtime_value.zig").ObjectMap = .empty;
+        try raw.put(source, "usage", .{ .object = raw_usage });
+        const provider_data = [_]?Value{ .{ .object = raw }, null };
+        const metadata = [_]ResponseMetadata{
+            .{
+                .id = id,
+                .model = model,
+                .finish_reason = .content_filter,
+                .usage = .{ .input_tokens = .{ .integer = 3 }, .cache_read_tokens = .{ .integer = 0 }, .total_tokens = .{ .number_string = wide } },
+            },
+            .{},
+        };
+        var scripted: ScriptedLM = .{
+            .responses = &.{ "first", "legacy" },
+            .provider_data = &provider_data,
+            .metadata = &metadata,
+        };
+        recorder = .{ .inner = scripted.lm(), .arena = kept };
+        _ = try recorder.lm().completeResponses(source, .{ .messages = &messages, .options = .{ .n = 2 } });
+        @memset(id, '!');
+        @memset(model, '!');
+        @memset(wide, '9');
+    }
+
+    var used = [_]bool{ false, false };
+    var replay: ReplayLM = .{ .calls = recorder.calls.items, .used = &used };
+    const replayed = try replay.lm().completeResponses(kept, .{ .messages = &messages, .options = .{ .n = 2 } });
+    try testing.expect(replay.exhausted());
+    for ([_]Completion{ replayed[0], try completionFromValue(kept, try completionValue(kept, replayed[0])) }) |completion| {
+        try testing.expectEqualStrings("resp-source", completion.metadata.id.?);
+        try testing.expectEqualStrings("served-model", completion.metadata.model.?);
+        try testing.expectEqual(FinishReason.content_filter, completion.metadata.finish_reason.?);
+        try expectCount("3", completion.metadata.usage.input_tokens);
+        // A reported zero is a count; an unreported counter stays unknown.
+        try expectCount("0", completion.metadata.usage.cache_read_tokens);
+        try expectCount("18446744073709551617", completion.metadata.usage.total_tokens);
+        try testing.expect(completion.metadata.usage.output_tokens == .null);
+        // Metadata is never derived from, or written into, raw provider JSON.
+        try testing.expectEqual(@as(i64, 999), completion.provider_data.?.object.get("usage").?.object.get("prompt_tokens").?.integer);
+        try testing.expectEqual(@as(usize, 1), completion.provider_data.?.object.count());
+    }
+    // The second completion had none: it stays unknown and keeps the legacy shape.
+    try testing.expect(!replayed[1].metadata.known());
+}
+
+test "metadata boundaries refuse malformed counts, identities and lengths" {
+    var state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+    const messages = [_]Message{.{ .role = .user, .content = .{ .text = "question" } }};
+
+    const refused = [_]ResponseMetadata{
+        .{ .id = "" },
+        .{ .model = "" },
+        .{ .usage = .{ .input_tokens = .{ .bool = true } } },
+        .{ .usage = .{ .output_tokens = .{ .integer = -1 } } },
+        .{ .usage = .{ .total_tokens = .{ .float = 1.5 } } },
+        // An explicit total must be input + output.
+        .{ .usage = .{ .input_tokens = .{ .integer = 3 }, .output_tokens = .{ .integer = 1 }, .total_tokens = .{ .integer = 9 } } },
+        // A part never exceeds its whole.
+        .{ .usage = .{ .output_tokens = .{ .integer = 1 }, .reasoning_tokens = .{ .integer = 2 } } },
+    };
+    for (refused) |metadata| {
+        var scripted: ScriptedLM = .{ .responses = &.{"answer"}, .metadata = &.{metadata} };
+        try testing.expectError(error.LMFailure, scripted.lm().completeResponses(arena, .{ .messages = &messages }));
+        var used = [_]bool{false};
+        var replay: ReplayLM = .{
+            .calls = &.{.{ .messages = &messages, .completion = "answer", .metadata = &.{metadata} }},
+            .used = &used,
+        };
+        try testing.expectError(error.LMFailure, replay.lm().completeResponses(arena, .{ .messages = &messages }));
+    }
+
+    var mismatched: ScriptedLM = .{ .responses = &.{"answer"}, .metadata = &.{ .{}, .{} } };
+    try testing.expectError(error.LMFailure, mismatched.lm().completeResponses(arena, .{ .messages = &messages }));
+    var used = [_]bool{false};
+    var replay: ReplayLM = .{
+        .calls = &.{.{ .messages = &messages, .completion = "answer", .metadata = &.{ .{}, .{} } }},
+        .used = &used,
+    };
+    try testing.expectError(error.LMFailure, replay.lm().completeResponses(arena, .{ .messages = &messages }));
+
+    const malformed = [_][]const u8{
+        \\{"text":"x","metadata":"stop"}
+        ,
+        \\{"text":"x","metadata":{"finish_reason":"done"}}
+        ,
+        \\{"text":"x","metadata":{"id":""}}
+        ,
+        \\{"text":"x","metadata":{"model":7}}
+        ,
+        \\{"text":"x","metadata":{"usage":{"input_tokens":true}}}
+        ,
+        \\{"text":"x","metadata":{"usage":{"input_tokens":2,"cache_read_tokens":3}}}
+        ,
+        \\{"text":"x","metadata":{"cost":1}}
+    };
+    for (malformed) |text| {
+        try testing.expectError(error.BadMetadata, completionFromValue(arena, try OpenAI.parseJson(arena, text)));
+    }
+    // Absent, null and empty metadata all mean unknown.
+    for ([_][]const u8{
+        \\{"text":"x"}
+        ,
+        \\{"text":"x","metadata":null}
+        ,
+        \\{"text":"x","metadata":{}}
+    }) |text| {
+        const completion = try completionFromValue(arena, try OpenAI.parseJson(arena, text));
+        try testing.expect(!completion.metadata.known());
+    }
+}
+
+fn cloneThenFreeCompletion(allocator: Allocator, completion: Completion) !void {
+    const copy = try cloneCompletion(allocator, completion);
+    defer freeCompletion(allocator, copy);
+    try testing.expect(copy.metadata.id.?.ptr != completion.metadata.id.?.ptr);
+    try testing.expectEqualStrings(completion.metadata.id.?, copy.metadata.id.?);
+    try expectCount("18446744073709551617", copy.metadata.usage.total_tokens);
+}
+
+test "completion clone with metadata unwinds every allocation failure" {
+    var state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer state.deinit();
+    const arena = state.allocator();
+    var raw: @import("runtime_value.zig").ObjectMap = .empty;
+    try raw.put(arena, "kept", .{ .string = "raw" });
+    const completion: Completion = .{
+        .text = "answer",
+        .provider_data = .{ .object = raw },
+        .metadata = try checkedMetadata(arena, .{
+            .id = "resp-1",
+            .model = "served-model",
+            .finish_reason = .stop,
+            .usage = .{ .total_tokens = .{ .number_string = "18446744073709551617" } },
+        }),
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, cloneThenFreeCompletion, .{completion});
 }
