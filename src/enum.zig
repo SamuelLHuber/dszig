@@ -181,7 +181,7 @@ pub fn EnumWithIdentity(comptime name: []const u8, comptime entries: []const Ent
 }
 
 /// Genuine immutable integer subclasses with class-owned singleton members.
-/// Declaration-time builtin floats truncate toward zero; decimal strings,
+/// Declaration-time builtin floats truncate toward zero; decimal text/bytes,
 /// bools and integer subclasses normalize before canonical alias resolution.
 pub fn IntEnum(comptime name: []const u8, comptime entries: []const Entry) type {
     return IntEnumWithIdentity(name, entries, void);
@@ -193,7 +193,7 @@ pub fn IntEnumWithIdentity(comptime name: []const u8, comptime entries: []const 
         var result: [entries.len]Entry = undefined;
         for (entries, 0..) |entry, index| {
             const input = if (entry.value == .custom)
-                entry.value.custom.integerValue() orelse @compileError("dszig: IntEnum values must be exact integers")
+                declarationCustom(entry.value)
             else
                 entry.value;
             const integer: Value = switch (input) {
@@ -213,6 +213,36 @@ pub fn IntEnumWithIdentity(comptime name: []const u8, comptime entries: []const 
         break :blk result;
     };
     return EnumClass(name, &normalized, Identity, true);
+}
+
+fn declarationCustom(comptime input: Value) Value {
+    if (input.custom.integerValue()) |integer| return integer;
+    const builtin = @import("python_value.zig").view(input) orelse
+        @compileError("dszig: IntEnum values must support builtin integer conversion");
+    if (builtin != .bytes)
+        @compileError("dszig: IntEnum declaration does not support this integer conversion");
+    // int(bytes) accepts ASCII digits/whitespace, not str's Unicode digits or
+    // Unicode whitespace. Reject non-ASCII before sharing the decimal parser.
+    for (builtin.bytes) |byte| {
+        if (byte >= 0x80) @compileError("dszig: invalid IntEnum integer bytes");
+    }
+    return declarationString(builtin.bytes);
+}
+
+test "IntEnum byte declarations canonicalize ASCII values without losing wide integers" {
+    const binary = @import("python_value.zig").staticBytes;
+    const Converted = IntEnum("ByteConverted", &.{
+        .{ .name = "two", .value = binary(" \t+0_2\r\n") },
+        .{ .name = "alias", .value = .{ .integer = 2 } },
+        .{ .name = "negative", .value = binary("-3") },
+        .{ .name = "wide", .value = binary("18446744073709551616") },
+    });
+    const two = try Converted.member("two");
+    const alias = try Converted.member("alias");
+    try std.testing.expect(two.custom.ptr == alias.custom.ptr);
+    try std.testing.expectEqual(@as(i64, 2), two.custom.integerValue().?.integer);
+    try std.testing.expectEqual(@as(i64, -3), (try Converted.member("negative")).custom.integerValue().?.integer);
+    try std.testing.expectEqualStrings("18446744073709551616", (try Converted.member("wide")).custom.integerValue().?.number_string);
 }
 
 fn declarationFloat(comptime number: f64) Value {

@@ -347,7 +347,9 @@ numeric, while `repr` retains its class and canonical member name.
 Declaration-time builtin floats truncate toward zero without routing large
 integers through binary64 arithmetic. Base-ten strings accept signs, leading
 zeros, digit separators and Unicode decimal digits, subject to CPython's default
-4,300-digit string limit. Conversion precedes singleton alias resolution.
+4,300-digit string limit. Genuine builtin bytes use the same base-ten grammar
+with ASCII digits and whitespace only, not Unicode text coercion. Conversion
+precedes singleton alias resolution.
 
 The following independent frozen-source observations matched in both native
 Debug and ReleaseSafe, with byte-identical output between modes:
@@ -357,6 +359,7 @@ Debug and ReleaseSafe, with byte-identical output between modes:
 | IntEnum runtime operations | 2,294 / 2,324 | 24,577 | 657 |
 | IntEnum scalar validation | 35 / 35 | 379 | 6 |
 | Builtin IntEnum declarations | 19 / 19 | 134 | 0 |
+| Builtin bytes IntEnum declarations | 7 / 7 | 50 | 0 |
 | Configured Decimal policies | 368 / 368 | 3,950 | 233 |
 
 The historical runtime consumer exited nonzero with 30 sequence-repetition rows
@@ -374,8 +377,13 @@ The declaration probe includes fractional and maximum finite floats, signed zero
 Unicode/separated strings, exact wide integers and the 4,300-digit boundary.
 Seventeen independently compiled Debug programs also refused the source-observed
 malformed strings, over-limit strings and nonfinite floats; compile-time
-refusals do not establish Python exception identity. Declaration-time bytes,
-Decimal, tuple/base arguments, arbitrary Python `int(value)` protocols, custom
+refusals do not establish Python exception identity. A separate new Source
+probe observed seven builtin-bytes declarations and their complete schema;
+native Debug and ReleaseSafe matched all 50 observations. Sixteen independent
+native compilation probes refused the Source-observed invalid byte inputs,
+including Unicode digits/whitespace, malformed separators and the 4,301-digit
+boundary. Native compile-time refusal is not Python runtime exception parity.
+Declaration-time Decimal, tuple/base arguments, arbitrary Python `int(value)` protocols, custom
 mixins, configurable Python digit limits and dynamic Python class construction
 are not implemented. Normalized native errors are not proof of identical Python
 exception classes.

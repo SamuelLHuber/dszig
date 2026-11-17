@@ -125,6 +125,8 @@ fn addCompileFailTests(b: *std.Build, step: *std.Build.Step) void {
         .{ "reserved_completed", "is reserved by the chat protocol" },
         .{ "unknown_description", "description for unknown field `answr`" },
         .{ "unsupported_type", "has unsupported type" },
+        .{ "intenum_unicode_bytes", "invalid IntEnum integer bytes" },
+        .{ "intenum_over_limit_bytes", "exceeds CPython's default 4300-digit limit" },
     };
     for (cases) |case| {
         const run = b.addSystemCommand(&.{ b.graph.zig_exe, "test", "--dep", "dszig" });
