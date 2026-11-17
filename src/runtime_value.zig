@@ -44,6 +44,8 @@ pub const DecisionKind = enum { noul, score, choice };
 pub const DecisionMetadata = struct {
     kind: DecisionKind,
     field: *const fn (*const anyopaque, []const u8) ?Value,
+    /// Static nominal ancestors, nearest parent first. Typed get() remains exact.
+    ancestors: []const *const anyopaque = &.{},
 };
 
 /// Nominal identity cannot use @typeName: Zig elides struct-valued generic

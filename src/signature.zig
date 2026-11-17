@@ -243,7 +243,7 @@ fn customXmlLiteral(comptime T: type) bool {
 /// Source keeps BaseModels owned by a `dspy.*` module as literal JSON leaves.
 /// Module metadata also covers native models that are not rich DSPy Types.
 fn dspyXmlModel(comptime T: type) bool {
-    if (code.isCode(T) or T == BoundingBox or T == File or citation.isCitation(T) or decision.isDecision(T)) return true;
+    if (code.isCode(T) or T == BoundingBox or T == File or citation.isCitation(T)) return true;
     return switch (@typeInfo(T)) {
         .@"struct" => @hasDecl(T, "model_module") and
             @hasDecl(T, "model_name") and std.mem.startsWith(u8, T.model_module, "dspy."),

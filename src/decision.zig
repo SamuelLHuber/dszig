@@ -2,8 +2,9 @@
 //! dictionaries never acquire model identity. Constructors/decoders borrow
 //! storage from their arena; clone() and owning runtime clones own every field.
 //!
-//! Factories are finite compile-time declarations. Python's mutable runtime
-//! subclasses and its 256-entry LRU eviction/recreation identity are not modeled.
+//! Factories and nominal Subclass declarations are finite compile-time types.
+//! Python's mutable runtime classes and its 256-entry LRU eviction/recreation
+//! identity are not modeled.
 const std = @import("std");
 const runtime = @import("runtime_value.zig");
 const values = @import("value.zig");
@@ -35,6 +36,10 @@ const Configuration = struct {
     description: []const u8,
     labels: []const []const u8 = &.{},
     members: []const Value = &.{},
+    parent: ?type = null,
+    declaration_identity: type = void,
+    /// Empty for consumer-declared subclasses, which no dspy module owns.
+    model_module: []const u8 = "dspy.adapters.types.decision",
 };
 
 pub const Noul = DecisionType(.{
@@ -54,6 +59,18 @@ pub const Choice = DecisionType(.{
     .model_name = "Choice",
     .description = "Select exactly one of the declared Literal values.",
 });
+
+/// Declare a static nominal child. Independent declarations must supply distinct
+/// Identity types even when their display names and inherited options coincide.
+pub fn Subclass(comptime Base: type, comptime name: []const u8, comptime Identity: type) type {
+    if (!isDecision(Base)) @compileError("dszig: decision.Subclass requires a decision base");
+    var config = Base.configuration;
+    config.parent = Base;
+    config.declaration_identity = Identity;
+    config.model_name = name;
+    config.model_module = "";
+    return DecisionType(config);
+}
 
 pub fn isDecision(comptime T: type) bool {
     return @typeInfo(T) == .@"struct" and @hasDecl(T, "dszig_decision_type");
@@ -108,6 +125,7 @@ pub fn NoulWithCriteria(comptime options: []const Option) type {
         break :blk DecisionType(.{
             .kind = .noul,
             .configured = true,
+            .parent = Noul,
             .criteria_json = criteria_json,
             .model_name = name ++ "]",
             .description = "A Boolean decision. Criteria: " ++ criteria_json ++ ".",
@@ -140,6 +158,7 @@ pub fn ScoreWithLevels(comptime descriptions_json: []const u8) type {
         break :blk DecisionType(.{
             .kind = .score,
             .configured = true,
+            .parent = Score,
             .criteria_json = levels.json,
             .model_name = name ++ "]",
             .labels = &final_labels,
@@ -175,6 +194,7 @@ pub fn ChoiceWithOptions(comptime options: []const Option) type {
         break :blk DecisionType(.{
             .kind = .choice,
             .configured = true,
+            .parent = Choice,
             .criteria_json = criteria_json ++ "}",
             .model_name = name ++ "]",
             .labels = &final_labels,
@@ -200,11 +220,23 @@ fn optionValue(comptime input: Value) Value {
 fn DecisionType(comptime config: Configuration) type {
     return struct {
         const Self = @This();
+        const configuration = config;
+        const ancestor_identities = if (config.parent) |Base| blk: {
+            if (Base.ancestor_identities.len >= 64)
+                @compileError("dszig: decision ancestry exceeds 64 classes");
+            var ancestors: [Base.ancestor_identities.len + 1]*const anyopaque = undefined;
+            ancestors[0] = runtime.typeIdentity(Base);
+            @memcpy(ancestors[1..], &Base.ancestor_identities);
+            break :blk ancestors;
+        } else [0]*const anyopaque{};
         pub const dszig_decision_type = true;
         pub const kind = config.kind;
         pub const configured = config.configured;
         pub const criteria_json = config.criteria_json;
         pub const model_name = config.model_name;
+        /// Ownership, not identity: adapters treat only dspy-owned models as
+        /// literal leaves, so consumer subclasses must not claim a dspy module.
+        pub const model_module = config.model_module;
         pub const schema_name = definitionName(model_name);
         pub const description = config.description;
         pub const labels = config.labels;
@@ -216,7 +248,7 @@ fn DecisionType(comptime config: Configuration) type {
         };
         pub const LiteralType = if (kind == .choice and configured) @import("literal.zig").Literal(members) else void;
         pub const schema_description_json = if (kind == .score)
-            (if (configured) "" else scalarText(.{ .string = score_schema_description }, .json))
+            (if (config.parent != null) "" else scalarText(.{ .string = score_schema_description }, .json))
         else
             scalarText(.{ .string = description }, .json);
         pub const field_names: []const []const u8 = switch (kind) {
@@ -275,13 +307,21 @@ fn DecisionType(comptime config: Configuration) type {
                     result.runtime_origin = input.custom;
                     return result;
                 }
-                if (comptime !configured) {
-                    if (input.custom.vtable.decision) |metadata| {
-                        if (metadata.kind != kind) return error.ParseValue;
-                        var result = try projectInstance(metadata, input.custom.ptr);
-                        result.runtime_origin = input.custom;
-                        return result;
-                    }
+                if (input.custom.vtable.decision) |metadata| {
+                    if (metadata.kind != kind) return error.ParseValue;
+                    // Only genuine bare roots accept every same-kind class.
+                    // Other classes accept descendants through nominal ancestry,
+                    // never by reinterpreting their boxes as a parent pointer.
+                    const accepts = if (comptime config.parent == null) true else blk: {
+                        for (metadata.ancestors) |ancestor| {
+                            if (ancestor == runtime.typeIdentity(Self)) break :blk true;
+                        }
+                        break :blk false;
+                    };
+                    if (!accepts) return error.ParseValue;
+                    var result = try projectInstance(metadata, input.custom.ptr);
+                    result.runtime_origin = input.custom;
+                    return result;
                 }
             }
             try checkFields(input, field_names);
@@ -417,9 +457,9 @@ fn DecisionType(comptime config: Configuration) type {
         pub fn eql(self: Self, other: Self) runtime.CustomError!bool {
             if (self.runtime_origin) |left| {
                 if (other.runtime_origin) |right| return left.eql(right);
-                if (!std.mem.eql(u8, left.vtable.type_name, @typeName(Self))) return false;
+                if (left.vtable.type_identity != runtime.typeIdentity(Self)) return false;
             } else if (other.runtime_origin) |right| {
-                if (!std.mem.eql(u8, right.vtable.type_name, @typeName(Self))) return false;
+                if (right.vtable.type_identity != runtime.typeIdentity(Self)) return false;
             }
             inline for (field_names) |name| if (!try values.pyEqual(self.fieldValue(name), other.fieldValue(name))) return false;
             return true;
@@ -526,7 +566,7 @@ fn DecisionType(comptime config: Configuration) type {
             .hashable = false,
             .bool_value = runtimeBool,
             .float_value = if (kind == .score) runtimeFloat else null,
-            .decision = .{ .kind = kind, .field = runtimeField },
+            .decision = .{ .kind = kind, .field = runtimeField, .ancestors = &ancestor_identities },
             .iterate = iterateRuntime,
             .raw_value = rawRuntimeValue,
             .serialized = serializedRuntimeValue,
@@ -1250,6 +1290,151 @@ test "decision owning clones outlive input arenas and preserve base projections"
     try std.testing.expectEqual(@as(f64, 0.8), actual.custom.get(Selected).?.probabilities.?.object.get("borrowed 日本").?.float);
     const again = try actual.custom.clone(std.testing.allocator);
     defer again.deinit(std.testing.allocator);
+    try std.testing.expect(try actual.custom.eql(again));
+}
+
+test "decision subclasses accept descendants and refuse bases and equal-name siblings" {
+    const SubNoul = Subclass(Noul, "SubNoul", struct {});
+    const Twin = Subclass(Noul, "SubNoul", struct {});
+    const Grand = Subclass(SubNoul, "GrandNoul", struct {});
+    const Criteria = NoulWithCriteria(&.{.{ .value = .{ .bool = true }, .description_json = "\"blocked\"" }});
+    comptime std.debug.assert(SubNoul != Twin);
+    comptime std.debug.assert(SubNoul != Noul);
+    try std.testing.expectEqualStrings(SubNoul.model_name, Twin.model_name);
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const a = memory.allocator();
+    const source = try testInput(a, "{\"value\":true,\"confidence\":0.5}");
+    const base = try Noul.validate(a, source);
+    const child = try SubNoul.validate(a, source);
+    const twin = try Twin.validate(a, source);
+    const grand = try Grand.validate(a, source);
+    const configured = try Criteria.validate(a, source);
+
+    // Typed access stays exact: a child box is never viewed as its parent type.
+    try std.testing.expect(child.custom.get(SubNoul) != null);
+    try std.testing.expect(child.custom.get(Noul) == null);
+    try std.testing.expect(child.custom.get(Twin) == null);
+    try std.testing.expect(grand.custom.get(SubNoul) == null);
+    try std.testing.expect(!try values.pyEqual(child, twin));
+    try std.testing.expect(!try values.pyEqual(child, base));
+
+    // Upward validation retains the actual box, without allocating.
+    const none = std.testing.failing_allocator;
+    try std.testing.expectEqual(child.custom.ptr, (try Noul.validate(none, child)).custom.ptr);
+    try std.testing.expectEqual(grand.custom.ptr, (try SubNoul.validate(none, grand)).custom.ptr);
+    try std.testing.expectEqual(grand.custom.ptr, (try Noul.validate(none, grand)).custom.ptr);
+    try std.testing.expectEqual(configured.custom.ptr, (try Noul.validate(none, configured)).custom.ptr);
+    const projected = try SubNoul.fromValue(none, grand);
+    try std.testing.expect(projected.value);
+    try std.testing.expect(projected.runtime_origin.?.get(Grand) != null);
+
+    // Downward and sideways validation refuse; a simple subclass is no bare root.
+    try std.testing.expectError(error.ParseValue, SubNoul.validate(a, base));
+    try std.testing.expectError(error.ParseValue, SubNoul.validate(a, twin));
+    try std.testing.expectError(error.ParseValue, Twin.validate(a, child));
+    try std.testing.expectError(error.ParseValue, Twin.validate(a, grand));
+    try std.testing.expectError(error.ParseValue, Grand.validate(a, child));
+    try std.testing.expectError(error.ParseValue, SubNoul.validate(a, configured));
+    try std.testing.expectError(error.ParseValue, Criteria.validate(a, child));
+
+    const ancestors = grand.custom.vtable.decision.?.ancestors;
+    try std.testing.expectEqual(@as(usize, 2), ancestors.len);
+    try std.testing.expectEqual(runtime.typeIdentity(SubNoul), ancestors[0]);
+    try std.testing.expectEqual(runtime.typeIdentity(Noul), ancestors[1]);
+    try std.testing.expectEqual(@as(usize, 0), base.custom.vtable.decision.?.ancestors.len);
+
+    var writer: Writer.Allocating = .init(a);
+    try grand.custom.writeRepr(&writer.writer);
+    try std.testing.expect(std.mem.startsWith(u8, writer.written(), "GrandNoul("));
+}
+
+test "configured decision parents accept subclasses that inherit their answer space" {
+    const Rubric = ScoreWithLevels("[\"low\",\"high\"]");
+    const Other = ScoreWithLevels("[\"low\",\"middle\",\"high\"]");
+    const SubRubric = Subclass(Rubric, "SubRubric", struct {});
+    const SubScore = Subclass(Score, "SubScore", struct {});
+    const SubChoice = Subclass(Choice, "SubChoice", struct {});
+    const SubNoul = Subclass(Noul, "SubNoul", struct {});
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const a = memory.allocator();
+    const source = try testInput(a, "{\"value\":0.5,\"confidence\":1}");
+    const parent = try Rubric.validate(a, source);
+    const child = try SubRubric.validate(a, source);
+    try std.testing.expectEqual(child.custom.ptr, (try Rubric.validate(a, child)).custom.ptr);
+    try std.testing.expectEqual(child.custom.ptr, (try Score.validate(a, child)).custom.ptr);
+    try std.testing.expectError(error.ParseValue, SubRubric.validate(a, parent));
+    try std.testing.expectError(error.ParseValue, Other.validate(a, child));
+    try std.testing.expectError(error.ParseValue, SubScore.validate(a, child));
+    try std.testing.expectError(error.ParseValue, SubRubric.validate(a, try testInput(a, "{\"value\":1.5,\"confidence\":1}")));
+    try std.testing.expectEqual(@as(f64, 0.5), (try types.validate(f64, a, child)).float);
+
+    try std.testing.expectEqualStrings(Rubric.criteria_json, SubRubric.criteria_json);
+    try std.testing.expectEqual(Rubric.labels.len, SubRubric.labels.len);
+    try std.testing.expect(SubRubric.configured);
+    try std.testing.expect(modelInfo(SubRubric) != null);
+    try std.testing.expect(modelInfo(SubNoul) != null);
+    try std.testing.expect(modelInfo(SubScore) == null);
+    try std.testing.expect(modelInfo(SubChoice) == null);
+    try std.testing.expectEqualStrings("null", SubScore.criteria_json);
+    try std.testing.expect(std.mem.startsWith(u8, Score.model_module, "dspy."));
+    try std.testing.expectEqualStrings(Score.model_module, Rubric.model_module);
+    try std.testing.expectEqualStrings("", SubScore.model_module);
+    try std.testing.expectEqualStrings("", SubRubric.model_module);
+
+    // Simple Score subclasses keep the inherited metadata description while
+    // their schema omits it; Noul and Choice subclasses keep the base text.
+    try std.testing.expectEqualStrings(Score.description, SubScore.description);
+    try std.testing.expectEqual(@as(usize, 0), SubScore.schema_description_json.len);
+    try std.testing.expectEqual(@as(usize, 0), SubRubric.schema_description_json.len);
+    try std.testing.expect(Score.schema_description_json.len != 0);
+    try std.testing.expectEqualStrings(Noul.schema_description_json, SubNoul.schema_description_json);
+    try std.testing.expectEqualStrings(Choice.schema_description_json, SubChoice.schema_description_json);
+    const Bundle = struct { score: SubScore, flag: SubNoul, pick: SubChoice };
+    const schema = try testInput(a, types.schema(Bundle));
+    const definitions = schema.object.get("$defs").?.object;
+    const score_schema = definitions.get(SubScore.schema_name).?.object;
+    try std.testing.expectEqualStrings("SubScore", score_schema.get("title").?.string);
+    try std.testing.expect(score_schema.get("description") == null);
+    const flag_schema = definitions.get(SubNoul.schema_name).?.object;
+    try std.testing.expectEqualStrings("SubNoul", flag_schema.get("title").?.string);
+    try std.testing.expectEqualStrings(Noul.description, flag_schema.get("description").?.string);
+    const pick_schema = definitions.get(SubChoice.schema_name).?.object;
+    try std.testing.expectEqualStrings("SubChoice", pick_schema.get("title").?.string);
+    try std.testing.expectEqualStrings(Choice.description, pick_schema.get("description").?.string);
+}
+
+test "decision subclass owning clones keep their class after the input arena dies" {
+    const Selected = ChoiceWithOptions(&.{
+        .{ .value = .{ .string = "borrowed 日本" }, .description_json = "\"text\"" },
+        .{ .value = .null, .description_json = "null" },
+    });
+    const SubSelected = Subclass(Selected, "SubSelected", struct {});
+    const Leaf = Subclass(SubSelected, "LeafSelected", struct {});
+    const Sibling = Subclass(Selected, "SubSelected", struct {});
+    const owned = blk: {
+        var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer memory.deinit();
+        const a = memory.allocator();
+        const original = try Leaf.validate(a, try testInput(a, "{\"value\":\"borrowed 日本\",\"confidence\":0.75,\"probabilities\":{\"borrowed 日本\":0.8}}"));
+        const parent = try Selected.fromValue(a, try SubSelected.validate(a, original));
+        break :blk try parent.clone(std.testing.allocator);
+    };
+    defer owned.deinit(std.testing.allocator);
+    const none = std.testing.failing_allocator;
+    const actual = try owned.toRuntime(none);
+    const leaf = actual.custom.get(Leaf).?;
+    try std.testing.expect(actual.custom.get(SubSelected) == null);
+    try std.testing.expect(actual.custom.get(Selected) == null);
+    try std.testing.expectEqualStrings("borrowed 日本", leaf.value.string);
+    try std.testing.expectEqual(@as(f64, 0.8), leaf.probabilities.?.object.get("borrowed 日本").?.float);
+    try std.testing.expectEqual(actual.custom.ptr, (try SubSelected.validate(none, actual)).custom.ptr);
+    try std.testing.expectEqual(actual.custom.ptr, (try Choice.validate(none, actual)).custom.ptr);
+    try std.testing.expectError(error.ParseValue, Sibling.validate(none, actual));
+    const again = try actual.custom.clone(std.testing.allocator);
+    defer again.deinit(std.testing.allocator);
+    try std.testing.expect(again.get(Leaf) != null);
     try std.testing.expect(try actual.custom.eql(again));
 }
 

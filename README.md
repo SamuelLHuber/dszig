@@ -956,6 +956,24 @@ const Judge = dszig.Signature(struct {
 });
 ```
 
+Declare a nominal native subclass with
+`dszig.decision.Subclass(Base, name, Identity)`, for example:
+
+```zig
+const Risk = dszig.decision.Subclass(dszig.Noul, "Risk", struct {});
+```
+
+Use a distinct identity tag for independent declarations, even if their names
+match. Subclasses inherit criteria, values and native-adaptation eligibility.
+A parent accepts its descendants without erasing their concrete boxed class;
+children reject parent and sibling instances. Owning clones preserve the
+concrete class after the source arena is destroyed. Ancestry is compile-time
+metadata, bounded to 64 ancestors, not a runtime allocation or class registry.
+Consumer-declared subclasses also retain their non-DSPy ownership for XML:
+their structured fields use nested XML rather than the literal JSON leaves
+used by DSPy-owned decision models. This is a static native declaration API,
+not Python's mutable runtime class construction.
+
 `Predict(Judge)` selects decision adaptation automatically. Its typed outputs
 retain boolean/score/typed-choice values, confidence and model-specific
 probability/level fields. Generative decisions work through the ordinary
@@ -1006,16 +1024,22 @@ coverage; their entries/observations overlap and must not be added together:
 
 | Independent consumer | Fully supported entries | Unsupported entries | Unconsumed entries | Compared observations | Mismatches |
 |---|---:|---:|---:|---:|---:|
-| Decision models and views | 8,216 | 1,152 | 5,867 | 81,843 | 0 |
-| Evidence/state/Predict pipeline | 1,879 | 501 | 12,838 | 15,751 | 0 |
+| Decision models and views | 8,817 | 233 | 6,185 | 89,441 | 0 |
+| Evidence/state/Predict pipeline | 2,045 | 335 | 12,838 | 17,037 | 0 |
 
 Both consumers deliberately **exit nonzero for incomplete coverage**.
 Partially compared unsupported rows contribute observations, not a claim that
 their entire operation is supported. Six candidate-client rollout observations
 are unobserved: the source engine receipt does not capture those client-only
-options. Decimal, dynamic subclasses, arbitrary forged model state (including
+options. The native catalogue now includes all 17 declarations, including the
+three simple subclasses, and consumers reconstruct genuine Decimal and
+bytearray inputs rather than JSON lookalikes. Python type-object reflection,
+mutable runtime class construction, arbitrary forged model state (including
 bytearray values in statically typed Noul/Score fields) and other unsupported
-operations remain in the receipt, not replaced with JSON lookalikes. ScriptedLM
+operations remain explicit gaps. An independent focused Source probe and native
+Debug/ReleaseSafe consumers additionally matched all 24 XML prompt structures
+and routing decisions across direct, optional, list and optional-list-item
+annotations of the three roots and three subclasses. ScriptedLM
 now refuses non-JSON provider data at response construction, before adapter
 decoding or evidence recording; this is not a complete SDK response-object API. Bare Score/Choice evidence refusal also differs in failure timing:
 native compile-time rejection versus Python runtime rejection. These results
@@ -1032,12 +1056,15 @@ Typed valid output, geometry refusal before evidence recording and boolean
 probability refusal were exercised. This is HTTP/codec/prediction evidence,
 **not authenticated homelab inference**.
 
-Both decision consumers produced the same counts in Debug and ReleaseSafe,
-including the deliberate incomplete-coverage failures. The bytearray change also
-passed pinned **355/355 tests and 28/28 build steps in each mode**, actual
-RAG/bootstrap execution, the complete 687-request native replay and the
-independent Python fixture/artifact/reference gate. Unicode and DPR tables
-regenerated unchanged.
+Both current decision consumers produced the same counts in Debug and
+ReleaseSafe, including the deliberate incomplete-coverage failures. The nominal
+subclass change passed pinned **518/518 tests and 36/36 build steps in each
+mode**, actual RAG/bootstrap and 8,192-run Parallel examples, plus the complete
+687-request native replay. An isolated old-XML-routing control failed on the
+actual `SubNoul` prompt instead of passing the new surface comparison.
+The older bytearray checkpoint additionally ran the independent Python
+fixture/artifact/reference gate and unchanged Unicode/DPR regeneration;
+those Python gates were not rerun for this native-only subclass change.
 
 ### Citations and provider references
 
