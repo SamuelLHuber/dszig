@@ -163,8 +163,8 @@ pub fn staticBytes(comptime data: []const u8) Value {
     return .{ .custom = .{ .ptr = &Storage.box, .vtable = &Storage.vtable } };
 }
 
-fn cloneStaticBytes(a: Allocator, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
-    var result = try clone(a, ptr);
+fn cloneStaticBytes(context: *runtime.CloneContext, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+    var result = try clone(context, ptr);
     result.vtable = &bytes_vtable;
     runtimeBox(result.ptr).vtable = &bytes_vtable;
     return result;
@@ -951,7 +951,8 @@ fn rawValue(_: Allocator, ptr: *const anyopaque) Allocator.Error!Value {
     return .{ .custom = .{ .ptr = ptr, .vtable = runtimeBox(ptr).vtable } };
 }
 
-fn cloneItems(a: Allocator, items: []const Value) Allocator.Error![]Value {
+fn cloneItems(context: *runtime.CloneContext, items: []const Value) Allocator.Error![]Value {
+    const a = context.allocator;
     const out = try a.alloc(Value, items.len);
     var initialized: usize = 0;
     errdefer {
@@ -959,13 +960,14 @@ fn cloneItems(a: Allocator, items: []const Value) Allocator.Error![]Value {
         a.free(out);
     }
     for (items, out) |item, *copy| {
-        copy.* = try ownership.cloneJsonValue(a, item);
+        copy.* = try context.cloneValue(item);
         initialized += 1;
     }
     return out;
 }
 
-fn clone(a: Allocator, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+fn clone(context: *runtime.CloneContext, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+    const a = context.allocator;
     const source = runtimeBox(ptr);
     const copy = try a.create(Box);
     errdefer a.destroy(copy);
@@ -982,7 +984,7 @@ fn clone(a: Allocator, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
             copy.owns_storage = true;
         },
         .tuple, .set, .frozen_set => |items| {
-            const children = try cloneItems(a, items);
+            const children = try cloneItems(context, items);
             errdefer {
                 for (children) |item| ownership.freeJsonValue(a, item);
                 a.free(children);
@@ -1010,9 +1012,9 @@ fn clone(a: Allocator, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
                 a.free(entries);
             }
             for (pairs, entries) |entry, *destination| {
-                const key = try ownership.cloneJsonValue(a, entry.key);
+                const key = try context.cloneValue(entry.key);
                 errdefer ownership.freeJsonValue(a, key);
-                destination.* = .{ .key = key, .value = try ownership.cloneJsonValue(a, entry.value) };
+                destination.* = .{ .key = key, .value = try context.cloneValue(entry.value) };
                 initialized += 1;
             }
             copy.payload = .{ .dictionary = entries };
@@ -1748,7 +1750,8 @@ const SourceStringKey = struct {
         try w.writeByte('"');
     }
 
-    fn cloneKey(a: Allocator, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+    fn cloneKey(context: *runtime.CloneContext, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+        const a = context.allocator;
         const copy = try a.create(SourceStringKey);
         errdefer a.destroy(copy);
         copy.* = .{ .text = try a.dupe(u8, get(ptr).text), .ordered = get(ptr).ordered };

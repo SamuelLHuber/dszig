@@ -209,7 +209,8 @@ fn CodeType(comptime language_name: []const u8, comptime is_default: bool, compt
             try pyjson.writeJsonString(writer, runtimeCode(ptr).code);
         }
 
-        fn cloneRuntime(allocator: Allocator, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+        fn cloneRuntime(context: *runtime.CloneContext, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+            const allocator = context.allocator;
             const copy = try allocator.create(Self);
             errdefer allocator.destroy(copy);
             // Runtime projections are never boxed as a different class. Clone

@@ -293,6 +293,15 @@ pub const Citations = struct {
 
         /// This result owns all fields and can be released with deinit().
         pub fn clone(self: Citation, allocator: Allocator) Allocator.Error!Citation {
+            var context: runtime.CloneContext = .init(allocator);
+            defer context.deinit();
+            return self.cloneWithContext(&context);
+        }
+
+        /// Integer fields can retain arbitrary runtime values, so one erased
+        /// clone must keep sharing the caller's box memo across all fields.
+        fn cloneWithContext(self: Citation, context: *runtime.CloneContext) Allocator.Error!Citation {
+            const allocator = context.allocator;
             var copy: Citation = .{ .type = "", .cited_text = "" };
             errdefer copy.deinit(allocator);
             inline for (field_names) |name| {
@@ -302,7 +311,7 @@ pub const Citations = struct {
                 } else if (T == ?[]const u8) {
                     @field(copy, name) = if (@field(self, name)) |text| try allocator.dupe(u8, text) else null;
                 } else {
-                    @field(copy, name) = if (@field(self, name)) |integer| .{ .value = try cloneField(allocator, integer.value) } else null;
+                    @field(copy, name) = if (@field(self, name)) |integer| .{ .value = try cloneField(context, integer.value) } else null;
                 }
             }
             return copy;
@@ -378,10 +387,11 @@ pub const Citations = struct {
             if (depth >= pyjson.max_depth) return error.JsonTooDeep;
             try Citation.actual(ptr).writeFields(writer, style, @intCast(depth), true, true);
         }
-        fn cloneRuntime(allocator: Allocator, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+        fn cloneRuntime(context: *runtime.CloneContext, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+            const allocator = context.allocator;
             const copy = try allocator.create(Citation);
             errdefer allocator.destroy(copy);
-            copy.* = try Citation.actual(ptr).clone(allocator);
+            copy.* = try Citation.actual(ptr).cloneWithContext(context);
             return .{ .ptr = copy, .vtable = &Citation.runtime_vtable, .owns_data = true };
         }
         fn deinitRuntime(allocator: Allocator, ptr: *const anyopaque, owns_data: bool) void {
@@ -630,6 +640,13 @@ pub const Citations = struct {
     }
 
     pub fn clone(self: Citations, allocator: Allocator) Allocator.Error!Citations {
+        var context: runtime.CloneContext = .init(allocator);
+        defer context.deinit();
+        return self.cloneWithContext(&context);
+    }
+
+    fn cloneWithContext(self: Citations, context: *runtime.CloneContext) Allocator.Error!Citations {
+        const allocator = context.allocator;
         const result = try allocator.alloc(Citation, self.len());
         var initialized: usize = 0;
         errdefer {
@@ -637,7 +654,7 @@ pub const Citations = struct {
             allocator.free(result);
         }
         for (self.citations, result) |item, *slot| {
-            slot.* = try item.clone(allocator);
+            slot.* = try item.cloneWithContext(context);
             initialized += 1;
         }
         return .{ .citations = result };
@@ -700,10 +717,11 @@ pub const Citations = struct {
         try actual(ptr).writeFormat(&escaped.writer, @intCast(depth));
         try writer.writeByte('"');
     }
-    fn cloneRuntime(allocator: Allocator, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+    fn cloneRuntime(context: *runtime.CloneContext, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+        const allocator = context.allocator;
         const copy = try allocator.create(Citations);
         errdefer allocator.destroy(copy);
-        copy.* = try actual(ptr).clone(allocator);
+        copy.* = try actual(ptr).cloneWithContext(context);
         return .{ .ptr = copy, .vtable = &runtime_vtable, .owns_data = true };
     }
     fn deinitRuntime(allocator: Allocator, ptr: *const anyopaque, owns_data: bool) void {
@@ -804,10 +822,11 @@ pub const Citations = struct {
             if (depth >= pyjson.max_depth) return error.JsonTooDeep;
             try pyjson.writeJsonProjection(writer, .{ .object = object(ptr).attributes }, style, @intCast(depth));
         }
-        fn cloneObject(allocator: Allocator, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+        fn cloneObject(context: *runtime.CloneContext, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+            const allocator = context.allocator;
             const copy = try allocator.create(StreamObject);
             errdefer allocator.destroy(copy);
-            copy.* = .{ .attributes = (try cloneField(allocator, .{ .object = object(ptr).attributes })).object, .kind = object(ptr).kind };
+            copy.* = .{ .attributes = (try cloneField(context, .{ .object = object(ptr).attributes })).object, .kind = object(ptr).kind };
             return .{ .ptr = copy, .vtable = table(copy.kind), .owns_data = true };
         }
         fn deinitObject(allocator: Allocator, ptr: *const anyopaque, owns_data: bool) void {
@@ -1067,7 +1086,8 @@ fn writePlainJson(writer: *Writer, input: Value, style: runtime.JsonStyle, depth
 
 /// The generic arena clone is intentionally leaky on allocation failure.
 /// Owning model clones instead unwind every initialized nested allocation.
-fn cloneField(allocator: Allocator, input: Value) Allocator.Error!Value {
+fn cloneField(context: *runtime.CloneContext, input: Value) Allocator.Error!Value {
+    const allocator = context.allocator;
     switch (input) {
         .array => |array| {
             var copy: runtime.Array = .init(allocator);
@@ -1076,7 +1096,7 @@ fn cloneField(allocator: Allocator, input: Value) Allocator.Error!Value {
                 copy.deinit();
             }
             try copy.ensureTotalCapacity(array.items.len);
-            for (array.items) |item| copy.appendAssumeCapacity(try cloneField(allocator, item));
+            for (array.items) |item| copy.appendAssumeCapacity(try cloneField(context, item));
             return .{ .array = copy };
         },
         .object => |object| {
@@ -1086,11 +1106,11 @@ fn cloneField(allocator: Allocator, input: Value) Allocator.Error!Value {
             for (object.keys(), object.values()) |key, item| {
                 const owned_key = try allocator.dupe(u8, key);
                 errdefer allocator.free(owned_key);
-                copy.putAssumeCapacity(owned_key, try cloneField(allocator, item));
+                copy.putAssumeCapacity(owned_key, try cloneField(context, item));
             }
             return .{ .object = copy };
         },
-        else => return values.cloneValue(allocator, input),
+        else => return context.cloneValue(input),
     }
 }
 

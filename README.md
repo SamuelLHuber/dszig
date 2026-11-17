@@ -465,7 +465,31 @@ Typed conversion boxes the supported native model families; parsing ordinary JSO
 not. A raw lookalike dictionary remains a dictionary until explicit typed
 validation. Native class validation preserves an existing box, subject to the
 model's actual validators. Owning clones retain their class and copy borrowed
-strings; generic container copies do not reproduce Python's memoized alias graph.
+strings. One value/record/model clone memoizes custom boxes across its fields
+and nested containers: repeated references share one independent cloned box.
+Each owning alias retains a counted reference; releasing one does not invalidate
+the others. Ordinary handle assignment is still a borrowed copy, not an implicit
+retain. Use the allocator that created the clone when releasing owned handles.
+Native array/object metadata remains copied by value, so this is not Python
+container-graph or cyclic-deepcopy equivalence.
+
+`runtime.CloneContext` exposes that same scope for multiple related values.
+Custom vtable clone callbacks receive the context and must use
+`context.cloneValue`/`cloneCustom` for children, preserving the common memo.
+Source boxes must remain alive for the complete context lifetime. The memo is
+temporary; returned owners do not retain a pointer to it. Non-singleton custom
+copies provision a shared-control allocation and memo storage through the caller's
+allocator; this is not whole-runtime startup-only memory proof.
+
+An independent new DSPy 3.5 boundary probe observed shared bytearray preservation
+through direct fields, lists, tuples and non-string-key dictionaries. Native
+Debug and ReleaseSafe executables each matched the four distinct scenarios,
+including mutation visibility and original isolation, with a leak-checking
+allocator. Permanent regressions also exercise source-arena destruction,
+independent second copies, early alias release and allocation-failure cleanup.
+The integrated pinned gates passed **527/527 tests and 36/36 steps in each mode**,
+actual RAG/bootstrap/Parallel examples and all 687 replay requests. These are new
+finite clone observations, not a rerun or expansion of the frozen model corpus.
 
 - `Reasoning{ .content = ... }` borrows its content. `toRuntime(arena)` boxes it;
   `toValue(arena)` returns the raw `{ "content": ... }` fields. Its ordinary
@@ -772,7 +796,8 @@ A native consumer matched **281 actual DSPy validations, 210 class/rendering/
 serialization/hashability comparisons and 75 symmetric equality cases** from
 `code_identity_oracle.py`.
 Automatic fresh runtime class creation, Python constructor calling conventions
-and generic memoized deepcopy graphs are not provided by these explicit Zig APIs.
+and cyclic or shared container-identity graphs are not provided by these explicit
+Zig APIs; custom boxes within a native tree do share the clone context above.
 A native executable also exercised a typed Code prediction, fenced output,
 language-specialized instance preservation through the base validator,
 raw-string traces and saved-demo restoration.
@@ -2043,6 +2068,8 @@ Refine/SIMBA masking, model truthiness and majority hashability. It rebuilt
 actual native boxes rather than substituting their dictionaries. The checks
 explicitly exclude tuple repr/dispatch, shared deepcopy aliases, NaN
 cross-instance float-object identity and Reasoning's Python string operators.
+The later independent clone-context proof above addresses shared custom-box
+aliases, without relabeling these older excluded observations as passed.
 
 Additional native executable checks exercised hosted OpenAI/Azure embeddings,
 base64/index ordering, cache reuse, vector KNN, repeated KNNFewShot predictions
@@ -2198,8 +2225,9 @@ The following prevent a claim that DSZig can do everything DSPy can:
 - **Runtime model identity:** Code, File, Reasoning, BoundingBox, Citations,
   Noul/Score/Choice and generated decision evidence have genuine boxed classes,
   not a complete Python object runtime. Other model
-  families still use their existing representations. Generic arrays/maps do not
-  preserve shared container/class aliases through memoized deepcopy. Complete
+  families still use their existing representations. A clone scope preserves
+  shared custom-box aliases, but generic arrays/maps do not preserve shared
+  container identity or cycles through memoized deepcopy. Complete
   Python builtin identity/dispatch, NaN float-object identity across distinct or
   cloned boxes, Reasoning indexing/string-method delegation, arbitrary attribute
   mutation and Python frozen-assignment exceptions are not reproduced. The

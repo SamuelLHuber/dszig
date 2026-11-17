@@ -330,10 +330,11 @@ fn Generated(comptime T: type, comptime probabilities: bool) type {
             try pyjson.writeJsonProjection(writer, actual(ptr).toValue(), style, @intCast(depth));
         }
 
-        fn clone(arena: Allocator, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+        fn clone(context: *runtime.CloneContext, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+            const arena = context.allocator;
             const result = try arena.create(Self);
             errdefer arena.destroy(result);
-            const data = try @import("inference.zig").cloneJsonValue(arena, actual(ptr).toValue());
+            const data = try context.cloneValue(actual(ptr).toValue());
             result.* = .{ .fields = data.object };
             return .{ .ptr = result, .vtable = &vtable, .owns_data = true };
         }

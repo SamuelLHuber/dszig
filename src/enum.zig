@@ -551,7 +551,7 @@ fn EnumClass(comptime name: []const u8, comptime entries: []const Entry, comptim
             if (depth >= pyjson.max_depth) return error.JsonTooDeep;
             try pyjson.writeJsonProjection(writer, entries[instance(ptr).index].value, style, @intCast(depth + 1));
         }
-        fn clone(_: Allocator, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+        fn clone(_: *runtime.CloneContext, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
             // Python Enum members are immutable class-owned singletons;
             // deepcopy preserves the member, including its value's identity.
             var result = boxed(instance(ptr).index).custom;

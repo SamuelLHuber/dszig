@@ -8,8 +8,9 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
-const Value = @import("runtime_value.zig").Value;
-const ObjectMap = @import("runtime_value.zig").ObjectMap;
+const runtime = @import("runtime_value.zig");
+const Value = runtime.Value;
+const ObjectMap = runtime.ObjectMap;
 const Writer = std.Io.Writer;
 
 const pyjson = @import("pyjson.zig");
@@ -1351,31 +1352,18 @@ fn serializeDepth(arena: Allocator, input: Value, depth: u32) @import("runtime_v
     };
 }
 
-/// Deep copy of a value into `arena` (strings included).
+/// Deep copy of a value into `arena` (strings included). One context spans the
+/// tree, so a custom box repeated in it is cloned once and stays shared.
 pub fn cloneValue(arena: Allocator, v: Value) Allocator.Error!Value {
-    return switch (v) {
-        .custom => |custom| .{ .custom = try custom.clone(arena) },
-        .string => |s| .{ .string = try arena.dupe(u8, s) },
-        .number_string => |s| .{ .number_string = try arena.dupe(u8, s) },
-        .array => |a| blk: {
-            var out: @import("runtime_value.zig").Array = .init(arena);
-            try out.ensureTotalCapacity(a.items.len);
-            for (a.items) |item| out.appendAssumeCapacity(try cloneValue(arena, item));
-            break :blk .{ .array = out };
-        },
-        .object => |o| .{ .object = try cloneRecord(arena, &o) },
-        else => v,
-    };
+    var context: runtime.CloneContext = .init(arena);
+    defer context.deinit();
+    return context.cloneValue(v);
 }
 
 pub fn cloneRecord(arena: Allocator, r: *const Record) Allocator.Error!Record {
-    var out: Record = .empty;
-    try out.ensureTotalCapacity(arena, r.count());
-    var it = r.iterator();
-    while (it.next()) |entry| {
-        out.putAssumeCapacity(try arena.dupe(u8, entry.key_ptr.*), try cloneValue(arena, entry.value_ptr.*));
-    }
-    return out;
+    var context: runtime.CloneContext = .init(arena);
+    defer context.deinit();
+    return (try context.cloneValue(.{ .object = r.* })).object;
 }
 
 const testing = std.testing;
@@ -1609,4 +1597,58 @@ test "typed record round trip" {
     try testing.expectEqualStrings("y", back.ctx[1]);
     try testing.expectEqual(in.e, back.e);
     try testing.expect(try recordEqual(&r, &(try cloneRecord(arena, &r))));
+}
+
+// One mutable box reachable from a field, a nested mapping and a list must
+// stay one box after a record clone. Every allocation in the clone is failed in
+// turn; the leak-checking allocator proves each alias holds its own reference
+// and that the cloned box is destroyed exactly once by the last release.
+test "record clone shares one mutable box across fields and survives its source arena" {
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn run(gpa: Allocator) !void {
+            const copy: Record = blk: {
+                var source: std.heap.ArenaAllocator = .init(testing.allocator);
+                defer source.deinit();
+                const arena = source.allocator();
+                const box = try python.bytearray(arena, "ab");
+                var nested: Record = .empty;
+                try nested.put(arena, "alias", box);
+                var items: runtime.Array = .init(arena);
+                try items.append(box);
+                var record: Record = .empty;
+                try record.put(arena, "value", box);
+                try record.put(arena, "probabilities", .{ .object = nested });
+                try record.put(arena, "items", .{ .array = items });
+                break :blk try cloneRecord(gpa, &record);
+            };
+            defer runtime.freeValue(gpa, .{ .object = copy });
+
+            // The source arena and the clone context are both gone here.
+            const field = copy.get("value").?;
+            const nested = copy.get("probabilities").?.object.get("alias").?;
+            try testing.expect(field.custom.owns_box);
+            try testing.expect(field.custom.ptr == nested.custom.ptr);
+            try testing.expect(field.custom.vtable == nested.custom.vtable);
+
+            // A borrowed view holds no reference: releasing it frees nothing.
+            const view = field.custom.borrowed();
+            try testing.expect(!view.owns_box);
+            view.deinit(testing.failing_allocator);
+
+            // Releasing one alias must leave the box alive for the others.
+            const released = copy.getPtr("items").?.array.pop().?;
+            try testing.expect(released.custom.ptr == field.custom.ptr);
+            released.custom.deinit(gpa);
+            try python.bytearraySet(field, 0, 'z');
+            try testing.expectEqualStrings("zb", python.view(nested).?.bytearray);
+
+            // A later clone is a new context, hence a new independent box.
+            const second = try cloneValue(gpa, nested);
+            defer runtime.freeValue(gpa, second);
+            try testing.expect(second.custom.ptr != nested.custom.ptr);
+            try python.bytearraySet(second, 1, 'y');
+            try testing.expectEqualStrings("zb", python.view(field).?.bytearray);
+            try testing.expectEqualStrings("zy", python.view(second).?.bytearray);
+        }
+    }.run, .{});
 }

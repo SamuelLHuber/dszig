@@ -267,66 +267,15 @@ pub fn freeToolCalls(allocator: Allocator, calls: []const ToolCall) void {
 
 /// General-allocator JSON ownership, including cleanup on any failed child
 /// clone. Completion caches cannot rely on a surrounding arena to recover it.
+/// One context spans the tree, so a custom box repeated in it is cloned once.
 pub fn cloneJsonValue(allocator: Allocator, input: Value) Allocator.Error!Value {
-    return switch (input) {
-        .custom => |custom| .{ .custom = try custom.clone(allocator) },
-        .string => |text| .{ .string = try allocator.dupe(u8, text) },
-        .number_string => |text| .{ .number_string = try allocator.dupe(u8, text) },
-        .array => |array| blk: {
-            var out: @import("runtime_value.zig").Array = .init(allocator);
-            errdefer {
-                for (out.items) |item| freeJsonValue(allocator, item);
-                out.deinit();
-            }
-            try out.ensureTotalCapacity(array.items.len);
-            for (array.items) |item| out.appendAssumeCapacity(try cloneJsonValue(allocator, item));
-            break :blk .{ .array = out };
-        },
-        .object => |object| blk: {
-            var out: @import("runtime_value.zig").ObjectMap = .empty;
-            errdefer {
-                var iterator = out.iterator();
-                while (iterator.next()) |entry| {
-                    allocator.free(entry.key_ptr.*);
-                    freeJsonValue(allocator, entry.value_ptr.*);
-                }
-                out.deinit(allocator);
-            }
-            try out.ensureTotalCapacity(allocator, object.count());
-            var iterator = object.iterator();
-            while (iterator.next()) |entry| {
-                const key = try allocator.dupe(u8, entry.key_ptr.*);
-                errdefer allocator.free(key);
-                const child = try cloneJsonValue(allocator, entry.value_ptr.*);
-                out.putAssumeCapacity(key, child);
-            }
-            break :blk .{ .object = out };
-        },
-        else => input,
-    };
+    var context: runtime.CloneContext = .init(allocator);
+    defer context.deinit();
+    return context.cloneValue(input);
 }
 
 pub fn freeJsonValue(allocator: Allocator, input: Value) void {
-    switch (input) {
-        .custom => |custom| custom.deinit(allocator),
-        .string => |text| allocator.free(text),
-        .number_string => |text| allocator.free(text),
-        .array => |array| {
-            var owned = array;
-            for (owned.items) |item| freeJsonValue(allocator, item);
-            owned.deinit();
-        },
-        .object => |object| {
-            var owned = object;
-            var iterator = owned.iterator();
-            while (iterator.next()) |entry| {
-                allocator.free(entry.key_ptr.*);
-                freeJsonValue(allocator, entry.value_ptr.*);
-            }
-            owned.deinit(allocator);
-        },
-        else => {},
-    }
+    runtime.freeValue(allocator, input);
 }
 
 pub fn cloneContinuations(allocator: Allocator, input: []const Continuation) Allocator.Error![]const Continuation {

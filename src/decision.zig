@@ -543,8 +543,14 @@ fn DecisionType(comptime config: Configuration) type {
         /// Owning clones are independent of both the original arena and any
         /// borrowed base projection. deinit() is ONLY for such owning clones.
         pub fn clone(self: Self, allocator: Allocator) Allocator.Error!Self {
+            var context: runtime.CloneContext = .init(allocator);
+            defer context.deinit();
+            return self.cloneWithContext(&context);
+        }
+        fn cloneWithContext(self: Self, context: *runtime.CloneContext) Allocator.Error!Self {
+            const allocator = context.allocator;
             if (self.runtime_origin) |origin| {
-                const owned = try origin.clone(allocator);
+                const owned = try context.cloneCustom(origin);
                 // The same valid class was already projected by fromValue.
                 var result = projectInstance(owned.vtable.decision.?, owned.ptr) catch unreachable;
                 result.runtime_origin = owned;
@@ -556,12 +562,12 @@ fn DecisionType(comptime config: Configuration) type {
             if (comptime kind != .noul) result.probabilities = null;
             if (comptime kind == .score) result.level = null;
             errdefer result.deinit(allocator);
-            if (comptime kind == .choice) result.value = try inference.cloneJsonValue(allocator, self.value);
+            if (comptime kind == .choice) result.value = try context.cloneValue(self.value);
             if (comptime kind != .noul) {
-                if (self.probabilities) |map| result.probabilities = try inference.cloneJsonValue(allocator, map);
+                if (self.probabilities) |map| result.probabilities = try context.cloneValue(map);
             }
             if (comptime kind == .score) {
-                if (self.level) |level| result.level = .{ .value = try inference.cloneJsonValue(allocator, level.value) };
+                if (self.level) |level| result.level = .{ .value = try context.cloneValue(level.value) };
             }
             return result;
         }
@@ -680,10 +686,11 @@ fn DecisionType(comptime config: Configuration) type {
             }
             try writer.writeByte('}');
         }
-        fn cloneRuntime(allocator: Allocator, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+        fn cloneRuntime(context: *runtime.CloneContext, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+            const allocator = context.allocator;
             const copy = try allocator.create(Self);
             errdefer allocator.destroy(copy);
-            copy.* = try actual(ptr).clone(allocator);
+            copy.* = try actual(ptr).cloneWithContext(context);
             return .{ .ptr = copy, .vtable = &runtime_vtable, .owns_data = true };
         }
         fn deinitRuntime(allocator: Allocator, ptr: *const anyopaque, owns_data: bool) void {
@@ -883,12 +890,13 @@ fn DecisionType(comptime config: Configuration) type {
             }
             try writer.writeByte('}');
         }
-        fn rawClone(allocator: Allocator, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+        fn rawClone(context: *runtime.CloneContext, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+            const allocator = context.allocator;
             const copy = try allocator.create(RawData);
             copy.* = .{};
             errdefer rawDeinit(allocator, copy, true);
             for (rawData(ptr).fields, &copy.fields) |field, *out| {
-                if (field) |value| out.* = try inference.cloneJsonValue(allocator, value);
+                if (field) |value| out.* = try context.cloneValue(value);
             }
             return .{ .ptr = copy, .vtable = &raw_vtable, .owns_data = true };
         }
@@ -1691,6 +1699,54 @@ test "owning raw decision clones retain nested genuine boxes and unwind allocati
     const second = try owned.clone(std.testing.allocator);
     defer second.deinit(std.testing.allocator);
     try std.testing.expect(try owned.eql(second));
+}
+
+test "deepcopy preserves shared mutable boxes across model fields and nested builtin containers" {
+    const allocator = std.testing.allocator;
+    inline for (.{ false, true }) |raw| {
+        var owned: Choice = undefined;
+        {
+            var memory: std.heap.ArenaAllocator = .init(allocator);
+            defer memory.deinit();
+            const a = memory.allocator();
+            const mutable = try python.bytearray(a, "ab");
+            const nested = try python.tuple(a, &.{mutable});
+            const probabilities = try python.dictionary(a, &.{
+                .{ .key = .{ .integer = 1 }, .value = mutable },
+                .{ .key = .{ .integer = 2 }, .value = nested },
+            });
+            const original: Choice = if (raw) blk: {
+                var fields: runtime.ObjectMap = .empty;
+                try fields.put(a, "value", mutable);
+                try fields.put(a, "confidence", .{ .float = 0.5 });
+                try fields.put(a, "probabilities", probabilities);
+                break :blk try Choice.fromValue(a, try Choice.modelConstruct(a, .{ .object = fields }));
+            } else .{ .value = mutable, .confidence = 0.5, .probabilities = probabilities };
+            const runtime_original = try original.toRuntime(a);
+            var stable = std.testing.FailingAllocator.init(allocator, .{ .resize_fail_index = 0 });
+            try std.testing.checkAllAllocationFailures(stable.allocator(), exerciseDecisionOwnership, .{runtime_original});
+            owned = try original.clone(allocator);
+            errdefer owned.deinit(allocator);
+            try std.testing.expect(owned.value.custom.ptr != mutable.custom.ptr);
+            try python.bytearraySet(mutable, 0, 'X');
+        }
+        defer owned.deinit(allocator);
+        const pairs = python.view(owned.probabilities.?).?.dictionary;
+        const direct = pairs[0].value;
+        const nested = python.view(pairs[1].value).?.tuple[0];
+        try std.testing.expectEqual(owned.value.custom.ptr, direct.custom.ptr);
+        try std.testing.expectEqual(owned.value.custom.ptr, nested.custom.ptr);
+        try python.bytearrayAppend(allocator, owned.value, 'c');
+        try std.testing.expectEqualStrings("abc", python.view(direct).?.bytearray);
+        try std.testing.expectEqualStrings("abc", python.view(nested).?.bytearray);
+        const second = try owned.clone(allocator);
+        defer second.deinit(allocator);
+        try std.testing.expect(second.value.custom.ptr != owned.value.custom.ptr);
+        const second_pairs = python.view(second.probabilities.?).?.dictionary;
+        try std.testing.expectEqual(second.value.custom.ptr, second_pairs[0].value.custom.ptr);
+        try python.bytearraySet(owned.value, 0, 'Y');
+        try std.testing.expectEqualStrings("abc", python.view(second.value).?.bytearray);
+    }
 }
 
 test "decision raw iteration retains defaults while structured dumps filter nulls" {

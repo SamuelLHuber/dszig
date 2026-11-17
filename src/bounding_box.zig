@@ -191,7 +191,8 @@ pub const BoundingBox = struct {
         try writer.writeByte('}');
     }
 
-    fn cloneRuntime(allocator: Allocator, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+    fn cloneRuntime(context: *runtime.CloneContext, ptr: *const anyopaque) Allocator.Error!runtime.Custom {
+        const allocator = context.allocator;
         const copy = try allocator.create(BoundingBox);
         copy.* = runtimeBox(ptr).*;
         return .{ .ptr = copy, .vtable = &runtime_vtable, .owns_data = true };

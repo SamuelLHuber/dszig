@@ -96,7 +96,7 @@ pub const CustomVTable = struct {
     write_repr: *const fn (*Writer, *const anyopaque, u32) CustomWriteError!void,
     write_json: *const fn (*std.json.Stringify, *const anyopaque) Writer.Error!void,
     write_serialized_json: *const fn (*Writer, *const anyopaque, JsonStyle, usize) CustomWriteError!void,
-    clone: *const fn (Allocator, *const anyopaque) Allocator.Error!Custom,
+    clone: *const fn (*CloneContext, *const anyopaque) Allocator.Error!Custom,
     deinit: *const fn (Allocator, *const anyopaque, bool) void,
     eql: *const fn (*const anyopaque, *const anyopaque) CustomError!bool,
     /// Optional Python equality against a different value tag (e.g. Reasoning
@@ -108,11 +108,15 @@ pub const CustomVTable = struct {
 /// immutable class-owned singletons may retain their static box across clones.
 /// owns_data describes whether ordinary model fields need deep destruction.
 /// A borrowed handle owns neither its box nor the fields behind that box.
+/// Memoized clones share one box: each owning handle holds one counted
+/// reference, and the class destructor runs when the last one is released.
 pub const Custom = struct {
     ptr: *const anyopaque,
     vtable: *const CustomVTable,
     owns_data: bool = false,
     owns_box: bool = true,
+    /// Only owning handles hold a reference. Borrowing never increments it.
+    shared: ?*SharedCustom = null,
 
     /// The source box and its fields must outlive every use of this handle.
     /// Clone still invokes the original class protocol and returns owned storage.
@@ -120,6 +124,7 @@ pub const Custom = struct {
         var result = self;
         result.owns_data = false;
         result.owns_box = false;
+        result.shared = null;
         return result;
     }
 
@@ -179,11 +184,21 @@ pub const Custom = struct {
     }
 
     pub fn clone(self: Custom, allocator: Allocator) Allocator.Error!Custom {
-        const result = try self.vtable.clone(allocator, self.ptr);
-        std.debug.assert(result.owns_data);
-        std.debug.assert(result.owns_box);
-        std.debug.assert(self.sameType(result));
-        return result;
+        var context = CloneContext.init(allocator);
+        defer context.deinit();
+        return context.cloneCustom(self);
+    }
+
+    fn retain(self: Custom) Custom {
+        std.debug.assert(self.owns_box);
+        if (self.shared) |shared| {
+            // The caller already holds a reference, so the count cannot reach
+            // zero concurrently and the increment needs no ordering.
+            const before = shared.references.fetchAdd(1, .monotonic);
+            std.debug.assert(before > 0);
+            std.debug.assert(before < std.math.maxInt(usize));
+        }
+        return self;
     }
 
     pub fn deinit(self: Custom, allocator: Allocator) void {
@@ -191,7 +206,12 @@ pub const Custom = struct {
             std.debug.assert(!self.owns_data);
             return;
         }
-        self.vtable.deinit(allocator, self.ptr, self.owns_data);
+        if (self.shared) |shared| {
+            std.debug.assert(shared.original.ptr == self.ptr);
+            shared.release(allocator);
+        } else {
+            self.vtable.deinit(allocator, self.ptr, self.owns_data);
+        }
     }
 
     pub fn eql(self: Custom, other: Custom) CustomError!bool {
@@ -210,6 +230,137 @@ pub const Custom = struct {
         return self.vtable.eql(self.ptr, other.ptr);
     }
 };
+
+/// Heap-owned state retains the callback-produced handle, whose class destructor
+/// runs once. It holds no allocator and no pointer into a temporary clone
+/// context: as for every Custom, the releasing caller supplies the allocator
+/// that cloned the box. Physical ptr/vtable/class identity is unchanged.
+/// Aliases may be released from different threads, so the count is atomic. The
+/// box behind it gains no synchronization of its own.
+const SharedCustom = struct {
+    original: Custom,
+    references: std.atomic.Value(usize),
+
+    fn release(self: *SharedCustom, allocator: Allocator) void {
+        std.debug.assert(self.original.shared == null);
+        std.debug.assert(self.original.owns_box);
+        // The last releaser must observe every write made under other handles.
+        const before = self.references.fetchSub(1, .acq_rel);
+        std.debug.assert(before > 0);
+        if (before == 1) {
+            self.original.deinit(allocator);
+            allocator.destroy(self);
+        }
+    }
+};
+
+/// Memoizes custom boxes across one tree clone. Native arrays and objects remain
+/// independently owned trees; recursive container graph/cycle cloning is not implied.
+/// Every source box must stay alive until deinit: the memo is keyed by source
+/// address, so a box freed and reallocated mid-clone would alias a stranger.
+pub const CloneContext = struct {
+    allocator: Allocator,
+    memo: std.AutoHashMapUnmanaged(Key, Custom) = .empty,
+
+    const Key = struct {
+        ptr: *const anyopaque,
+        vtable: *const CustomVTable,
+    };
+
+    pub fn init(allocator: Allocator) CloneContext {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *CloneContext) void {
+        var values = self.memo.valueIterator();
+        while (values.next()) |custom| custom.deinit(self.allocator);
+        self.memo.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    pub fn cloneCustom(self: *CloneContext, source: Custom) Allocator.Error!Custom {
+        const key: Key = .{ .ptr = source.ptr, .vtable = source.vtable };
+        if (self.memo.get(key)) |existing| return existing.retain();
+
+        var result = try source.vtable.clone(self, source.ptr);
+        errdefer result.deinit(self.allocator);
+        std.debug.assert(result.owns_data);
+        std.debug.assert(result.owns_box);
+        std.debug.assert(source.sameType(result));
+        // Class-owned immutable singletons already have stable lifetime and a
+        // no-op destructor. Do not wrap their exact-source clone in heap state.
+        const singleton = result.ptr == source.ptr and result.vtable == source.vtable;
+        if (singleton) {
+            // Every clone yields this same box, so it needs no memo entry either.
+            std.debug.assert(result.shared == null);
+            return result;
+        }
+        // A callback that delegated to this context already returned a counted
+        // reference. A fresh box gets its one control block here.
+        if (result.shared == null) {
+            const shared = try self.allocator.create(SharedCustom);
+            shared.* = .{ .original = result, .references = .init(1) };
+            result.shared = shared;
+        }
+        // Insertion can allocate after child callbacks have grown the memo.
+        // The callback result remains owned locally until insertion succeeds.
+        try self.memo.putNoClobber(self.allocator, key, result);
+        return result.retain();
+    }
+
+    pub fn cloneValue(self: *CloneContext, source: Value) Allocator.Error!Value {
+        return switch (source) {
+            .custom => |custom| .{ .custom = try self.cloneCustom(custom) },
+            .string => |text| .{ .string = try self.allocator.dupe(u8, text) },
+            .number_string => |text| .{ .number_string = try self.allocator.dupe(u8, text) },
+            .array => |array| blk: {
+                var out = Array.init(self.allocator);
+                errdefer freeValue(self.allocator, .{ .array = out });
+                try out.ensureTotalCapacity(array.items.len);
+                for (array.items) |item|
+                    out.appendAssumeCapacity(try self.cloneValue(item));
+                break :blk .{ .array = out };
+            },
+            .object => |object| blk: {
+                var out: ObjectMap = .empty;
+                errdefer freeValue(self.allocator, .{ .object = out });
+                try out.ensureTotalCapacity(self.allocator, object.count());
+                var iterator = object.iterator();
+                while (iterator.next()) |entry| {
+                    const key = try self.allocator.dupe(u8, entry.key_ptr.*);
+                    errdefer self.allocator.free(key);
+                    const child = try self.cloneValue(entry.value_ptr.*);
+                    out.putAssumeCapacity(key, child);
+                }
+                break :blk .{ .object = out };
+            },
+            else => source,
+        };
+    }
+};
+
+/// Releases a cloned native tree without depending on its former clone context.
+pub fn freeValue(allocator: Allocator, input: Value) void {
+    switch (input) {
+        .custom => |custom| custom.deinit(allocator),
+        .string, .number_string => |text| allocator.free(text),
+        .array => |array| {
+            var owned = array;
+            for (owned.items) |item| freeValue(allocator, item);
+            owned.deinit();
+        },
+        .object => |object| {
+            var owned = object;
+            var iterator = owned.iterator();
+            while (iterator.next()) |entry| {
+                allocator.free(entry.key_ptr.*);
+                freeValue(allocator, entry.value_ptr.*);
+            }
+            owned.deinit(allocator);
+        },
+        else => {},
+    }
+}
 
 /// JSON values retain their usual representation; custom models retain class identity.
 /// Parsed strings, keys, and number_string data are allocated like std.json.Value,
