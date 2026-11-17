@@ -376,7 +376,10 @@ fn finiteJson(entry: Value, depth: usize) bool {
         .object => |object| for (object.values()) |item| {
             if (!finiteJson(item, depth + 1)) break false;
         } else true,
-        .custom => false,
+        .custom => if (@import("python_value.zig").view(entry)) |builtin|
+            builtin == .float and std.math.isFinite(builtin.float)
+        else
+            false,
     };
 }
 
@@ -440,6 +443,9 @@ fn parseCriteria(arena: Allocator, text: []const u8) Error!Value {
 const Number = struct { f: f64, integer: bool };
 
 fn exactNumber(v: Value) ?Number {
+    if (@import("python_value.zig").view(v)) |builtin| {
+        if (builtin == .float) return .{ .f = builtin.float, .integer = false };
+    }
     return switch (v) {
         .integer => |i| .{ .f = @floatFromInt(i), .integer = true },
         .float => |f| .{ .f = f, .integer = false },

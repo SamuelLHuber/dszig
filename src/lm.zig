@@ -126,7 +126,10 @@ fn providerJsonValue(input: @import("runtime_value.zig").Value, depth: usize) bo
             for (object.values()) |item| if (!providerJsonValue(item, depth + 1)) break :blk false;
             break :blk true;
         },
-        .custom => false,
+        .custom => if (@import("python_value.zig").view(input)) |builtin|
+            builtin == .float and std.math.isFinite(builtin.float)
+        else
+            false,
     };
 }
 
@@ -1746,6 +1749,11 @@ pub const OpenAI = struct {
     fn finiteJson(value: @import("runtime_value.zig").Value) bool {
         switch (value) {
             .float => |number| return std.math.isFinite(number),
+            .custom => {
+                if (@import("python_value.zig").view(value)) |builtin| {
+                    if (builtin == .float) return std.math.isFinite(builtin.float);
+                }
+            },
             .array => |items| for (items.items) |item| {
                 if (!finiteJson(item)) return false;
             },

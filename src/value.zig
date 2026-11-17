@@ -226,7 +226,8 @@ pub fn parseInteger(v: Value) error{ParseValue}!Value {
             break :blk Value.parseFromNumberSlice(s);
         },
         .float => |f| floatToInt(f),
-        .custom => |custom| custom.integerValue() orelse error.ParseValue,
+        .custom => |custom| custom.integerValue() orelse
+            if (builtinFloat(v)) |f| floatToInt(f) else error.ParseValue,
         else => error.ParseValue,
     };
 }
@@ -244,6 +245,7 @@ pub fn coerceInteger(arena: Allocator, input: Value) ParseError!Value {
         v = switch (view) {
             .bytes => |data| .{ .string = data },
             .decimal => |data| return coerceDecimalInteger(arena, data),
+            .float => |number| .{ .float = number },
             else => return error.ParseValue,
         };
     }
@@ -711,7 +713,59 @@ test "Decimal identity shortcuts belong to container elements, not direct equali
 /// Arithmetic and builtin numeric protocols operate on an integer subclass's
 /// exact base, while records and typed enum decoding retain the original box.
 fn numericBase(input: Value) Value {
-    return if (input == .custom) input.custom.integerValue() orelse input else input;
+    if (input != .custom) return input;
+    if (input.custom.integerValue()) |integer| return integer;
+    if (builtinFloat(input)) |number| return .{ .float = number };
+    return input;
+}
+
+/// Borrowed payload of an actual builtin float box. Custom.float_value is
+/// Python __float__ and deliberately does not qualify: a Score is convertible
+/// to float without being one. The projection drops the box's identity, so
+/// container and model comparisons must run before it.
+fn builtinFloat(input: Value) ?f64 {
+    const builtin = python.view(input) orelse return null;
+    return if (builtin == .float) builtin.float else null;
+}
+
+test "builtin float boxes are numeric operands while NaN stays unequal to itself" {
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const a = memory.allocator();
+    const half = try python.float(a, 2.5);
+    const three = try python.float(a, 3);
+    try std.testing.expect(half == .custom);
+    try std.testing.expect(try pyEqual(half, .{ .float = 2.5 }));
+    try std.testing.expect(try pyEqual(.{ .float = 2.5 }, half));
+    try std.testing.expect(try pyEqual(three, .{ .integer = 3 }));
+    try std.testing.expect(try pyEqual(.{ .number_string = "3" }, three));
+    try std.testing.expect(!try pyEqual(three, .{ .string = "3.0" }));
+    try std.testing.expectEqual(@as(f64, 2.5), try numericFloat(half));
+    try std.testing.expectEqual(@as(f64, 2.5), try fromValue(a, f64, half));
+    try std.testing.expectError(error.TypeMismatch, fromValue(a, i64, three));
+    try std.testing.expectEqual(@as(i64, 3), (try coerceInteger(a, three)).integer);
+    try std.testing.expectEqual(@as(i64, 3), (try parseInteger(three)).integer);
+    try std.testing.expectError(error.ParseValue, coerceInteger(a, half));
+    try std.testing.expectEqual(std.math.Order.lt, (try numericOrder(half, three)).?);
+    try std.testing.expectEqual(std.math.Order.gt, (try numericOrder(half, .{ .number_string = "-18446744073709551616" })).?);
+    try std.testing.expect(try floatAtLeast(2.5, half));
+    try std.testing.expectEqual(@as(f64, 7.5), (try numericProduct(a, half, three)).float);
+    try std.testing.expectEqual(@as(f64, 5.5), (try numericSum(a, half, .{ .integer = 3 })).float);
+    // Decimal comparison sees the exact binary64 value, as for a primitive.
+    const decimal = try python.decimal(a, "2.5");
+    try std.testing.expectEqual(std.math.Order.eq, (try numericOrder(half, decimal)).?);
+    try std.testing.expectError(error.InvalidNumber, numericSum(a, half, decimal));
+    // A __float__ protocol alone (Decimal here, Score likewise) is not a float.
+    try std.testing.expectError(error.TypeMismatch, fromValue(a, f64, decimal));
+
+    const nan = try python.float(a, std.math.nan(f64));
+    try std.testing.expect(!try pyEqual(nan, nan));
+    try std.testing.expect(!try pyEqual(nan, .{ .float = std.math.nan(f64) }));
+    try std.testing.expect((try numericOrder(nan, three)) == null);
+    try std.testing.expectError(error.ParseValue, coerceInteger(a, nan));
+    // Validation of an untyped Value keeps the original box, not a projection.
+    const kept = try types.validate(Value, a, nan);
+    try std.testing.expectEqual(nan.custom.ptr, kept.custom.ptr);
 }
 
 const IntegerText = struct {
@@ -1303,6 +1357,15 @@ fn serializeDepth(arena: Allocator, input: Value, depth: u32) @import("runtime_v
         else
             .{ .value = input, .changed = false },
         .custom => |custom| blk: {
+            // A builtin float box serializes exactly like a primitive float,
+            // except that the projection is a new JSON value, not the box.
+            if (builtinFloat(input)) |number| {
+                const nested_nonfinite = depth > 0 and !std.math.isFinite(number);
+                break :blk .{
+                    .value = if (nested_nonfinite) .null else .{ .float = number },
+                    .changed = true,
+                };
+            }
             if (custom.vtable.python) |inspect| {
                 if (inspect(custom.ptr) == .ellipsis)
                     break :blk if (depth == 0)

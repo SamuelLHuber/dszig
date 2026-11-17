@@ -80,7 +80,12 @@ const VoteKey = struct {
     identity: *const Value,
 
     fn equal(a: VoteKey, b: VoteKey) value.ParseError!bool {
-        return a.identity == b.identity or try value.pyEqual(a.value, b.value);
+        if (a.identity == b.identity) return true;
+        // Boxed immutable scalars carry their Python identity across copies.
+        if (a.value == .custom and b.value == .custom) {
+            if (@import("python_value.zig").sameIdentity(a.value, b.value)) return true;
+        }
+        return value.pyEqual(a.value, b.value);
     }
 };
 
@@ -203,6 +208,44 @@ test "majority matches DSPy NaN result fallback and ordinary first ties" {
         try std.testing.expectEqual(case.winner, winner);
         try std.testing.expectEqual(@as(i64, @intCast(case.winner)), records[winner].get("marker").?.integer);
     }
+}
+
+test "majority groups one boxed NaN across records but not separately minted NaNs" {
+    const python = @import("python_value.zig");
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const shared = try python.float(arena, std.math.nan(f64));
+    const seven: Value = .{ .integer = 7 };
+    const eight: Value = .{ .integer = 8 };
+    // Three votes for one NaN object beat two sevens; the equality-only
+    // result search then misses the NaN and returns the last completion.
+    const same = [_]Value{ seven, seven, shared, shared, shared, eight };
+    // Distinct NaN objects with identical bits each vote once: seven wins.
+    const distinct = [_]Value{
+        seven,                                      seven,
+        try python.float(arena, std.math.nan(f64)), try python.float(arena, std.math.nan(f64)),
+        try python.float(arena, std.math.nan(f64)), eight,
+    };
+    const cases = [_]struct { votes: []const Value, winner: usize }{
+        .{ .votes = &same, .winner = 5 },
+        .{ .votes = &distinct, .winner = 0 },
+    };
+    for (cases) |case| {
+        const records = try arena.alloc(Record, case.votes.len);
+        for (records, case.votes) |*record, vote| {
+            record.* = .empty;
+            try record.put(arena, "answer", vote);
+        }
+        try std.testing.expectEqual(case.winner, try majority(arena, records, "answer"));
+    }
+    // A boxed finite float still votes with its numeric equals.
+    const records = try arena.alloc(Record, 3);
+    for (records, [_]Value{ eight, try python.float(arena, 7), seven }) |*record, vote| {
+        record.* = .empty;
+        try record.put(arena, "answer", vote);
+    }
+    try std.testing.expectEqual(@as(usize, 1), try majority(arena, records, "answer"));
 }
 
 test "majority counts aliased NaN identity but not separate equal NaN bits" {

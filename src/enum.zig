@@ -23,7 +23,11 @@ fn jsonType(v: Value) ?[]const u8 {
         .custom => |c| if (c.vtable.enumeration) |inspect|
             jsonType(inspect(c.ptr).value)
         else if (@import("python_value.zig").view(v)) |builtin|
-            if (builtin == .bytes) "string" else null
+            switch (builtin) {
+                .bytes => "string",
+                .float => "number",
+                else => null,
+            }
         else
             null,
         else => null,

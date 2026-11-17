@@ -512,6 +512,9 @@ fn validateMode(comptime T: type, arena: Allocator, input: Value, comptime xml_l
             // Pydantic's lax bool validator uses Decimal's binary64 conversion,
             // including rounding to one and underflow to signed zero.
             .decimal => |data| if (T == bool) .{ .float = try data.toFloat() } else return error.ParseValue,
+            // An actual builtin float validates like a primitive float. The
+            // primitive result cannot carry the box's identity.
+            .float => |number| if (T == []const u8) return error.ParseValue else .{ .float = number },
             else => return error.ParseValue,
         };
     }

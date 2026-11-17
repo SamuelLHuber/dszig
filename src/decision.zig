@@ -323,6 +323,64 @@ fn DecisionType(comptime config: Configuration) type {
             }
             return .{ .custom = .{ .ptr = box, .vtable = &raw_vtable } };
         }
+        /// Validate constructor fields, then retain an erased mutable instance.
+        /// Its attributes may later hold values outside their annotations.
+        pub fn mutable(arena: Allocator, fields: Value, mode: ValidationMode) runtime.CustomError!Value {
+            if (fields == .custom and fields.custom.vtable.decision != null) return error.ParseValue;
+            const validated = try decode(arena, fields, mode, false);
+            var canonical = try validated.toValue(arena);
+            defer canonical.object.deinit(arena);
+            return modelConstruct(arena, canonical);
+        }
+
+        /// Assigned values borrow their caller's storage, as in modelConstruct.
+        /// Displaced owned fields stay alive until this instance is destroyed.
+        pub fn setField(instance: Value, name: []const u8, value: Value) error{ParseValue}!void {
+            const data = try mutableData(instance);
+            inline for (field_names, 0..) |field, index| {
+                if (std.mem.eql(u8, field, name)) {
+                    retireField(data, index);
+                    data.fields[index] = value;
+                    return;
+                }
+            }
+            return error.ParseValue;
+        }
+
+        pub fn deleteField(instance: Value, name: []const u8) error{ParseValue}!void {
+            const data = try mutableData(instance);
+            inline for (field_names, 0..) |field, index| {
+                if (std.mem.eql(u8, field, name)) {
+                    if (data.fields[index] == null) return error.ParseValue;
+                    retireField(data, index);
+                    data.fields[index] = null;
+                    return;
+                }
+            }
+            return error.ParseValue;
+        }
+
+        fn mutableData(instance: Value) error{ParseValue}!*RawData {
+            if (instance != .custom or instance.custom.vtable != &raw_vtable) return error.ParseValue;
+            return @ptrCast(@alignCast(@constCast(instance.custom.ptr)));
+        }
+
+        fn retireField(data: *RawData, index: usize) void {
+            std.debug.assert(index < field_names.len);
+            if (!data.owned[index]) return;
+            const previous = data.fields[index].?;
+            // Each original owning field can be displaced at most once:
+            // assignments are borrowed, and cloning starts a fresh ledger.
+            for (&data.retired) |*slot| {
+                if (slot.* == null) {
+                    slot.* = previous;
+                    data.owned[index] = false;
+                    return;
+                }
+            }
+            unreachable;
+        }
+
         pub fn validateJson(arena: Allocator, text: []const u8, mode: ValidationMode) runtime.CustomError!Value {
             const input = @import("json_repair.zig").parseJson(arena, text) catch |err| return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
@@ -390,18 +448,16 @@ fn DecisionType(comptime config: Configuration) type {
         fn projectInstance(metadata: runtime.DecisionMetadata, ptr: *const anyopaque) runtime.CustomError!Self {
             const confidence = metadata.field(ptr, "confidence") orelse return error.ParseValue;
             const value = metadata.field(ptr, "value") orelse return error.ParseValue;
-            if (confidence != .float) return error.ParseValue;
-            var result: Self = .{ .confidence = confidence.float, .value = undefined };
+            var result: Self = .{ .confidence = try storedFloat(confidence), .value = undefined };
             switch (kind) {
                 .noul => {
                     if (value != .bool) return error.ParseValue;
                     result.value = value.bool;
                     const probability = metadata.field(ptr, "probability") orelse .null;
-                    result.probability = if (probability == .null) null else if (probability == .float) probability.float else return error.ParseValue;
+                    result.probability = if (probability == .null) null else try storedFloat(probability);
                 },
                 .score => {
-                    if (value != .float) return error.ParseValue;
-                    result.value = value.float;
+                    result.value = try storedFloat(value);
                     const probabilities = metadata.field(ptr, "probabilities") orelse .null;
                     result.probabilities = if (probabilities == .null) null else probabilities;
                     const level = metadata.field(ptr, "level") orelse .null;
@@ -417,6 +473,11 @@ fn DecisionType(comptime config: Configuration) type {
         }
 
         pub fn fieldValue(self: Self, comptime name: []const u8) Value {
+            // A typed projection exposes the original fields, not reconstructed
+            // f64 values that would erase immutable object identity.
+            if (self.runtime_origin) |origin| {
+                return origin.vtable.decision.?.field(origin.ptr, name) orelse .null;
+            }
             if (comptime std.mem.eql(u8, name, "confidence")) return .{ .float = self.confidence };
             if (comptime std.mem.eql(u8, name, "value")) return switch (kind) {
                 .noul => .{ .bool = self.value },
@@ -482,7 +543,7 @@ fn DecisionType(comptime config: Configuration) type {
             } else if (other.runtime_origin) |right| {
                 return self.borrowedRuntime().custom.eql(right);
             }
-            inline for (field_names) |name| if (!try values.pyEqual(self.fieldValue(name), other.fieldValue(name))) return false;
+            inline for (field_names) |name| if (!try python.containerEqual(self.fieldValue(name), other.fieldValue(name))) return false;
             return true;
         }
 
@@ -712,7 +773,7 @@ fn DecisionType(comptime config: Configuration) type {
                 const lhs = left_metadata.field(left.ptr, name);
                 const rhs = right_metadata.field(other.custom.ptr, name);
                 if (lhs) |field| {
-                    if (rhs == null or !try values.pyEqual(field, rhs.?)) return false;
+                    if (rhs == null or !try python.containerEqual(field, rhs.?)) return false;
                 } else if (rhs != null) return false;
             }
             return true;
@@ -720,6 +781,9 @@ fn DecisionType(comptime config: Configuration) type {
 
         const RawData = struct {
             fields: [field_names.len]?Value = @splat(null),
+            owned: [field_names.len]bool = @splat(false),
+            /// Bounded retention for aliases obtained before assignment/delete.
+            retired: [field_names.len]?Value = @splat(null),
         };
         const raw_vtable: runtime.CustomVTable = .{
             .type_name = @typeName(Self),
@@ -759,7 +823,7 @@ fn DecisionType(comptime config: Configuration) type {
         }
         fn rawFloat(ptr: *const anyopaque) runtime.CustomError!f64 {
             const value = rawField(ptr, "value") orelse return error.ParseValue;
-            return if (value == .float) value.float else error.ParseValue;
+            return storedFloat(value);
         }
         fn rawDump(arena: Allocator, ptr: *const anyopaque) Allocator.Error!Value {
             var object: runtime.ObjectMap = .empty;
@@ -895,18 +959,23 @@ fn DecisionType(comptime config: Configuration) type {
             const copy = try allocator.create(RawData);
             copy.* = .{};
             errdefer rawDeinit(allocator, copy, true);
-            for (rawData(ptr).fields, &copy.fields) |field, *out| {
-                if (field) |value| out.* = try context.cloneValue(value);
+            for (rawData(ptr).fields, 0..) |field, index| {
+                if (field) |value| {
+                    copy.fields[index] = try context.cloneValue(value);
+                    copy.owned[index] = true;
+                }
             }
             return .{ .ptr = copy, .vtable = &raw_vtable, .owns_data = true };
         }
-        fn rawDeinit(allocator: Allocator, ptr: *const anyopaque, owns_data: bool) void {
-            if (owns_data) {
-                for (rawData(ptr).fields) |field| {
-                    if (field) |value| inference.freeJsonValue(allocator, value);
-                }
+        fn rawDeinit(allocator: Allocator, ptr: *const anyopaque, _: bool) void {
+            const data = rawData(ptr);
+            for (data.fields, data.owned) |field, owned| {
+                if (owned) inference.freeJsonValue(allocator, field.?);
             }
-            allocator.destroy(rawData(ptr));
+            for (data.retired) |field| {
+                if (field) |value| inference.freeJsonValue(allocator, value);
+            }
+            allocator.destroy(data);
         }
         fn rawEqual(left: *const anyopaque, right: *const anyopaque) runtime.CustomError!bool {
             return left == right or try rawEqualValue(left, .{ .custom = .{ .ptr = right, .vtable = &raw_vtable, .owns_box = false } });
@@ -943,6 +1012,14 @@ fn checkFields(input: Value, allowed: []const []const u8) error{ParseValue}!void
             if (std.mem.eql(u8, name, entry.key.string)) break;
         } else return error.ParseValue;
     }
+}
+/// Project actual stored floats without invoking an unrelated __float__ method.
+fn storedFloat(input: Value) error{ParseValue}!f64 {
+    if (input == .float) return input.float;
+    if (python.view(input)) |builtin| {
+        if (builtin == .float) return builtin.float;
+    }
+    return error.ParseValue;
 }
 fn number(arena: Allocator, input: Value, mode: ValidationMode) runtime.CustomError!f64 {
     if (input == .custom) {
@@ -2064,6 +2141,115 @@ test "raw Score int-key fallback differs from Choice JSON-key spelling" {
         try model.custom.writeSerializedJson(&output.writer, .minified, 0);
         try std.testing.expectEqualStrings(entry[2], output.written());
     }
+}
+
+test "raw Score projection retains immutable NaN identity across source destruction" {
+    const allocator = std.testing.allocator;
+    var source_arena: std.heap.ArenaAllocator = .init(allocator);
+    var source_live = true;
+    defer if (source_live) source_arena.deinit();
+    const source_allocator = source_arena.allocator();
+    const nan = try python.float(source_allocator, std.math.nan(f64));
+    var fields: runtime.ObjectMap = .empty;
+    try fields.put(source_allocator, "confidence", nan);
+    try fields.put(source_allocator, "value", nan);
+    const raw = try Score.modelConstruct(source_allocator, .{ .object = fields });
+    const projected = try Score.fromValue(source_allocator, raw);
+    try std.testing.expect(std.math.isNan(projected.confidence));
+    try std.testing.expect(std.math.isNan(projected.value));
+    try std.testing.expect(python.sameIdentity(nan, projected.fieldValue("confidence")));
+    const first = try projected.clone(allocator);
+    defer first.deinit(allocator);
+    const second = try projected.clone(allocator);
+    defer second.deinit(allocator);
+    source_arena.deinit();
+    source_live = false;
+    try std.testing.expect(try first.eql(second));
+    try std.testing.expect(python.sameIdentity(first.fieldValue("value"), second.fieldValue("value")));
+    try std.testing.expect(!try values.pyEqual(first.fieldValue("value"), second.fieldValue("value")));
+    const distinct_nan = try python.float(allocator, std.math.nan(f64));
+    defer inference.freeJsonValue(allocator, distinct_nan);
+    try std.testing.expect(!try python.containerEqual(first.fieldValue("value"), distinct_nan));
+    const third = try first.clone(allocator);
+    defer third.deinit(allocator);
+    try std.testing.expect(try second.eql(third));
+}
+
+fn exerciseMutableDecision(allocator: Allocator) !void {
+    var replacement: Value = .null;
+    defer inference.freeJsonValue(allocator, replacement);
+    var source_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    var source_live = true;
+    defer if (source_live) source_arena.deinit();
+    const source = source_arena.allocator();
+    const original_bytes = try python.bytearray(source, "old");
+    var fields: runtime.ObjectMap = .empty;
+    try fields.put(source, "confidence", .{ .float = 0.5 });
+    try fields.put(source, "value", original_bytes);
+    try fields.put(source, "probabilities", original_bytes);
+    const original = try Choice.modelConstruct(source, .{ .object = fields });
+    const copy: Value = .{ .custom = try original.custom.clone(allocator) };
+    defer inference.freeJsonValue(allocator, copy);
+    source_arena.deinit();
+    source_live = false;
+    const metadata = copy.custom.vtable.decision.?;
+    const old_alias = metadata.field(copy.custom.ptr, "value").?;
+    replacement = try python.bytearray(allocator, "new");
+    try Choice.setField(copy, "value", replacement);
+    try Choice.deleteField(copy, "probabilities");
+    // Both owning aliases were displaced. Their retained ownership must keep
+    // a previously obtained field alive until the model itself is destroyed.
+    try python.bytearrayAppend(allocator, old_alias, '!');
+    try std.testing.expectEqualStrings("old!", python.view(old_alias).?.bytearray);
+    try std.testing.expectEqualStrings("new", python.view(metadata.field(copy.custom.ptr, "value").?).?.bytearray);
+    try std.testing.expect(metadata.field(copy.custom.ptr, "probabilities") == null);
+    try std.testing.expectError(error.ParseValue, Choice.deleteField(copy, "probabilities"));
+    try std.testing.expectError(error.ParseValue, Choice.setField(copy, "unknown", .null));
+    try Choice.setField(copy, "probabilities", replacement);
+    const again: Value = .{ .custom = try copy.custom.clone(allocator) };
+    defer inference.freeJsonValue(allocator, again);
+    const again_metadata = again.custom.vtable.decision.?;
+    const again_value = again_metadata.field(again.custom.ptr, "value").?;
+    const again_alias = again_metadata.field(again.custom.ptr, "probabilities").?;
+    try std.testing.expect(again_value.custom.ptr == again_alias.custom.ptr);
+    try std.testing.expect(again_value.custom.ptr != replacement.custom.ptr);
+    try Choice.deleteField(copy, "value");
+    try Choice.setField(copy, "value", .{ .string = "changed" });
+    try python.bytearrayAppend(allocator, again_value, '!');
+    try std.testing.expectEqualStrings("new!", python.view(again_alias).?.bytearray);
+    try std.testing.expectEqualStrings("new", python.view(replacement).?.bytearray);
+}
+
+test "mutable decision replacements retain displaced aliases and unwind failures" {
+    try exerciseMutableDecision(std.testing.allocator);
+    var stable = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), exerciseMutableDecision, .{});
+}
+
+test "mutable construction validates once while assignment preserves unvalidated fields" {
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const allocator = memory.allocator();
+    const Three = ScoreWithLevels("[\"poor\",\"fair\",\"good\"]");
+    try std.testing.expectError(error.ParseValue, Three.mutable(
+        allocator,
+        try testInput(allocator, "{\"confidence\":0.5,\"value\":99}"),
+        .declared,
+    ));
+    const model = try Three.mutable(
+        allocator,
+        try testInput(allocator, "{\"confidence\":0.5,\"value\":1}"),
+        .declared,
+    );
+    const alias = model;
+    try Three.setField(model, "value", .{ .integer = 99 });
+    try std.testing.expectEqual(@as(i64, 99), alias.custom.vtable.decision.?.field(alias.custom.ptr, "value").?.integer);
+    try Three.deleteField(model, "value");
+    try std.testing.expect(alias.custom.vtable.decision.?.field(alias.custom.ptr, "value") == null);
+    try std.testing.expectError(error.ParseValue, Three.fromValue(allocator, alias));
+    const clone: Value = .{ .custom = try model.custom.clone(allocator) };
+    defer inference.freeJsonValue(allocator, clone);
+    try std.testing.expect(try values.pyEqual(model, clone));
 }
 
 const score_schema_description = "Experimental: This class may change or be removed in a future release without warning.\n\n" ++

@@ -248,11 +248,12 @@ Non-UTF-8 bytes validate, but cannot generate a JSON schema: native schema
 generation rejects them at compile time, whereas Python raises
 `UnicodeDecodeError` when schema generation is requested. Both refusal paths
 were exercised; their failure timing is not identical. Dynamic annotation
-construction and shared NaN identity remain unsupported.
+construction remains unsupported. Unboxed Literal floats do not carry object
+identity; explicit runtime float boxes below preserve it.
 
 The zero-dependency `python_literal` parser implements the supported CPython
 3.11 literal grammar without execution, and `python_value` retains genuine
-bytes, mutable bytearrays, tuples, sets, frozensets, complex values, Ellipsis and arbitrary-key
+bytes, mutable bytearrays, identity-bearing floats, tuples, sets, frozensets, complex values, Ellipsis and arbitrary-key
 dictionaries rather than replacing them with JSON lookalikes. Native comparison
 against **175,826 actual `ast.literal_eval` calls** matched 175,820 and differed
 on six near-recursion-limit cases. Python's cutoff depends on its caller frame
@@ -490,6 +491,32 @@ independent second copies, early alias release and allocation-failure cleanup.
 The integrated pinned gates passed **527/527 tests and 36/36 steps in each mode**,
 actual RAG/bootstrap/Parallel examples and all 687 replay requests. These are new
 finite clone observations, not a rerun or expansion of the frozen model corpus.
+
+`python_value.float(allocator, number)` boxes an actual builtin float, distinct
+from a model that merely implements `__float__`. `python_value.sameIdentity`
+compares logical immutable identity: independently owned copies of one float,
+Decimal, complex number or bytes object retain that identity after the source
+arena is destroyed, while separately constructed same-bit NaNs stay distinct.
+Direct NaN equality remains false (signaling Decimal NaN can raise); container
+membership/equality applies the identity shortcut first. Hashing remains coherent
+across those copies. Identity minting is bounded and allocation-free; exhaustion
+refuses construction rather than degrading to address identity. Physical boxes
+and their ownership remain independent. Unboxed `Value.float` and native `f64`
+projections do not acquire identity, and mutable container graphs remain outside
+this protocol.
+
+A new independent Source probe observed 27 boolean results across float,
+Decimal and complex NaNs. Native Debug and ReleaseSafe CLIs matched all 27 using
+actual lists, dictionaries and decision models, then retained identity across
+source-arena destruction and another copy. A separate actual-source class probe
+exposed six incorrect cross-class matches among float, Decimal and complex;
+per-kind nominal tokens now distinguish those classes without changing their
+shared physical layout or numeric equality. Both modes matched all 12 class
+observations, including copy preservation. The integrated scalar/mutable-field
+checkpoint passed **538/538 tests and 36/36 steps in each mode**, the actual
+RAG/bootstrap/Parallel examples and all 687 replay requests. The separate model
+corpus re-consumption below remains incomplete; these finite results do not
+establish full DSPy parity.
 
 - `Reasoning{ .content = ... }` borrows its content. `toRuntime(arena)` boxes it;
   `toValue(arena)` returns the raw `{ "content": ... }` fields. Its ordinary
@@ -1010,6 +1037,19 @@ Value-level validation preserves accepted instance identity, while typed
 `custom.get(Model)` never reinterprets erased raw storage as a typed pointer.
 Owning runtime clones retain the concrete class and deep-copy present fields.
 
+For dynamic attributes, `Model.mutable(arena, fields, mode)` validates constructor
+fields once and returns a genuine erased mutable instance.
+`Model.setField(instance, name, value)` then stores the actual unvalidated value;
+`Model.deleteField(instance, name)` removes an existing field. Unknown assignment
+and absent deletion refuse. Existing aliases of the instance see the mutation.
+Assigned values borrow caller storage, which must outlive their use by the model.
+A mutated owning clone retains displaced owned fields until model destruction,
+so earlier borrowed field aliases remain valid. This retirement ledger has at
+most one slot per declared field and allocates nothing during assignment or
+deletion. Copies include current fields, not retired ownership bookkeeping.
+Use these APIs for dynamic model behavior rather than erasing a boxed scalar
+into a strongly typed `f64` field and expecting Python object identity.
+
 The erased object boolean protocol is fallible:
 `try object.custom.truthy()` propagates a refusal, such as an unvalidated Noul
 whose `value` is not a bool. Strongly typed model `.truthy()` methods remain
@@ -1060,12 +1100,14 @@ Usage/request-id/convenience views, Python exception identity, asynchronous
 execution and streaming remain outside this native decision implementation.
 
 The frozen independent DSPy 3.5 source receipt contains **15,218 actual rows
-and 17 model definitions**. Two separate consumers report the following finite
+and 17 model definitions**. The model consumer was re-run natively after the
+immutable-scalar and mutable-field changes, without rerunning Source. The pipeline
+row remains its earlier historical run. These separate consumers report finite
 coverage; their entries/observations overlap and must not be added together:
 
 | Independent consumer | Fully supported entries | Unsupported entries | Unconsumed entries | Compared observations | Mismatches |
 |---|---:|---:|---:|---:|---:|
-| Decision models and views | 8,821 | 52 | 6,362 | 93,766 | 0 |
+| Decision models and views | 8,821 | 0 | 6,414 | 93,869 | 0 |
 | Evidence/state/Predict pipeline | 2,045 | 335 | 12,838 | 17,037 | 0 |
 
 Both consumers deliberately **exit nonzero for incomplete coverage**.
@@ -1075,9 +1117,13 @@ are unobserved: the source engine receipt does not capture those client-only
 options. The native catalogue now includes all 17 declarations, including the
 three simple subclasses, and consumers reconstruct genuine Decimal and
 bytearray inputs rather than JSON lookalikes. Unvalidated model construction
-now preserves raw state without unsafe typed casts. Shared NaN/scalar object
-identity, Python type-object reflection, mutable runtime class construction,
-runtime field mutation/deletion and other unsupported operations remain explicit
+now preserves raw state without unsafe typed casts. The latest model runs in
+Debug and ReleaseSafe each compared 93,869 observations with zero mismatches and
+zero unsupported observations; 9,663 observations remain unconsumed. All five
+frozen assignment/deletion scenarios exercised real native mutable operations:
+110 observations matched, with five missing-argument views still unconsumed.
+Python type-object reflection, mutable runtime class construction, broader scalar
+identity/reflection operations and other unconsumed operations remain explicit
 gaps. An independent focused Source probe and native
 Debug/ReleaseSafe consumers additionally matched all 24 XML prompt structures
 and routing decisions across direct, optional, list and optional-list-item
@@ -2276,10 +2322,12 @@ The following prevent a claim that DSZig can do everything DSPy can:
   comptime class definitions, not arbitrary runtime class creation or Enum
   mixins. Python literal lexical nesting is bounded at 200; its separate native
   AST-depth ceiling is 3,000, not Python's caller-stack-dependent recursion
-  budget. Generic runtime values still cannot preserve shared NaN float-object
-  identity or arbitrary mutable alias/cycle graphs. A builtin observation smoke
-  matched 405 checks but differed on two same-NaN container-equality cases;
-  those failures are not counted as parity. Native ownership clones preserve a
+  budget. Explicit builtin float/Decimal/complex boxes now retain immutable NaN
+  identity through owning copies, but unboxed floats and arbitrary mutable
+  alias/cycle graphs do not. A historical builtin observation smoke matched
+  405 checks but differed on two same-NaN cases; that old receipt was not rerun
+  or relabeled as passing. The new scalar/mutable-model evidence is reported
+  separately above. Native ownership clones preserve a
   set's stored iteration snapshot, not CPython deepcopy's reconstruction order.
   JSON repair covers the
   pinned default parser and correlated Chat/Responses tool arguments, not every

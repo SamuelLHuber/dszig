@@ -1077,6 +1077,7 @@ fn writePlainJson(writer: *Writer, input: Value, style: runtime.JsonStyle, depth
                     }
                     try closeContainer(writer, style, depth, entries.len == 0, '}');
                 },
+                .float => try pyjson.writeJsonDepth(writer, input, style, depth, false),
                 else => return error.ParseValue,
             }
         },

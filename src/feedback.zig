@@ -83,6 +83,7 @@ fn replacement(arena: Allocator, comptime T: type, v: Value, depth: u32, comptim
                     else
                         null;
                 },
+                .float => return null,
                 else => {},
             }
         }
@@ -138,6 +139,7 @@ fn orjsonAccepts(v: Value, depth: u32) bool {
                         for (items) |item| if (!orjsonAccepts(item, depth + 1)) break :blk false;
                         break :blk true;
                     },
+                    .float => break :blk true,
                     else => {},
                 }
             }

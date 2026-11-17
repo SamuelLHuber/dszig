@@ -29,6 +29,9 @@ pub const EnumValue = struct {
 pub const PythonEntry = struct { key: Value, value: Value };
 pub const PythonValue = union(enum) {
     bytes: []const u8,
+    /// An actual builtin float object. Value.float stays an unboxed number
+    /// without object identity; arbitrary __float__ classes never use this.
+    float: f64,
     bytearray: []const u8,
     tuple: []const Value,
     set: []const Value,

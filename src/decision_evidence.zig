@@ -380,7 +380,11 @@ fn Generated(comptime T: type, comptime probabilities: bool) type {
 
 fn probabilityMode(arena: Allocator, input: Value, strict: bool) types.Error!Value {
     if (strict and input != .integer and input != .float and input != .number_string) {
-        if (input != .custom or input.custom.vtable.float_value == null) return error.ParseValue;
+        if (input != .custom) return error.ParseValue;
+        if (input.custom.vtable.float_value == null) {
+            const builtin = @import("python_value.zig").view(input) orelse return error.ParseValue;
+            if (builtin != .float) return error.ParseValue;
+        }
     }
     return probability(arena, input);
 }
