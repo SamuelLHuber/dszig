@@ -4004,6 +4004,8 @@ The following prevent a claim that DSZig can do everything DSPy can:
   counter parity; opaque program state can still be borrowed.
   `view_data_batch_size = 0` summarizes an empty initial view without
   refinement, matching DSPy rather than disabling the data-aware proposer.
+  MIPROv2 compile options can override both demo limits without changing the
+  optimizer defaults. A zero seed is explicit; only null inherits the default.
   SIMBA `Result.candidate_programs` retains the final native program values
   alongside their full-trainset scores, descending and stable across ties.
   It reuses the final evaluations and does not deep-copy opaque program state.

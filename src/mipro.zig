@@ -391,11 +391,12 @@ pub const MIPROv2 = struct {
         }
     };
 
-    /// `compile(...)` keyword arguments. `seed` 0 means "use `self.seed`",
-    /// as DSPy's `seed or self.seed` does.
+    /// `compile(...)` keyword arguments. Null overrides inherit optimizer defaults.
     pub const Options = struct {
         valset: ?[]const Example = null,
         num_trials: ?usize = null,
+        max_bootstrapped_demos: ?usize = null,
+        max_labeled_demos: ?usize = null,
         seed: ?u32 = null,
         minibatch: bool = true,
         minibatch_size: usize = 35,
@@ -456,7 +457,7 @@ pub const MIPROv2 = struct {
     /// Everything the result references lives in `out`. `prompt` is the
     /// `prompt_model` context (defaults to `ctx`, the task model).
     pub fn compile(
-        self: MIPROv2,
+        defaults: MIPROv2,
         comptime P: type,
         out: Allocator,
         gpa: Allocator,
@@ -467,12 +468,13 @@ pub const MIPROv2 = struct {
         trainset_in: []const Example,
         options: Options,
     ) !Result(P) {
+        var self = defaults;
+        self.max_bootstrapped_demos = options.max_bootstrapped_demos orelse defaults.max_bootstrapped_demos;
+        self.max_labeled_demos = options.max_labeled_demos orelse defaults.max_labeled_demos;
         const zeroshot = self.max_bootstrapped_demos == 0 and self.max_labeled_demos == 0;
         if (self.auto == null and (self.num_candidates == null or options.num_trials == null)) return error.InvalidOptions;
         if (self.auto != null and (self.num_candidates != null or options.num_trials != null)) return error.InvalidOptions;
-        assert(options.minibatch_full_eval_steps > 0);
-
-        const seed = if (options.seed) |s| (if (s == 0) self.seed else s) else self.seed;
+        const seed = options.seed orelse self.seed;
         var rng: pyrandom.Random = .init(seed);
 
         if (trainset_in.len == 0) return error.EmptyTrainset;
@@ -507,8 +509,20 @@ pub const MIPROv2 = struct {
             num_trials = options.num_trials.?;
         }
         if (minibatch and options.minibatch_size > valset.len) return error.MinibatchTooLarge;
+        if (options.minibatch_full_eval_steps == 0) return error.InvalidOptions;
 
-        const demo_sets = try self.demoCandidates(P, out, gpa, ctx, program, teacher, trainset, n_fewshot, zeroshot, &rng);
+        const demo_sets = try self.demoCandidates(
+            P,
+            out,
+            gpa,
+            ctx,
+            program,
+            teacher,
+            trainset,
+            n_fewshot,
+            zeroshot,
+            &rng,
+        );
         const instructions = try self.proposeInstructions(P, out, prompt orelse ctx, &program, trainset, demo_sets, n_instruct, options, &rng);
         const demos: []const []const []const Record = if (zeroshot) &.{} else demo_sets;
 
@@ -981,6 +995,68 @@ test "MIPRO zero-size dataset summary skips refinement but uses the initial obse
     const final = requests[1].messages;
     try testing.expect(std.mem.indexOf(u8, initial[initial.len - 1].content.text, "[]") != null);
     try testing.expect(std.mem.indexOf(u8, final[final.len - 1].content.text, "Initial.") != null);
+}
+
+test "MIPRO compile demo overrides select zero-shot and seed zero samples independently" {
+    const P = predict.Predict(@import("signature.zig").Signature(struct {
+        pub const instructions = "base";
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: i64 };
+    }));
+    const metric = struct {
+        fn score(_: Allocator, _: *const Example, _: ?*const optimize.RecordPrediction, _: ?*const predict.Trace) value.ParseError!f64 {
+            return 1;
+        }
+    }.score;
+    var backing: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer backing.deinit();
+    const arena = backing.allocator();
+    const lm_mod = @import("lm.zig");
+    const answers: [32][]const u8 = @splat("<answer>\n1\n</answer>");
+    const proposals = [_][]const u8{
+        "<proposed_instruction>\nalpha\n</proposed_instruction>",
+        "<proposed_instruction>\nbeta\n</proposed_instruction>",
+    };
+    var rows: [5]Example = undefined;
+    for (&rows, 0..) |*row, i| {
+        const json = try std.fmt.allocPrint(arena, "{{\"question\":\"{d}\",\"answer\":1}}", .{i});
+        row.* = try Example.fromJson(arena, json, &.{"question"});
+    }
+    const student: P = .{};
+    const optimizer: MIPROv2 = .{ .metric = metric, .auto = null, .num_candidates = 2 };
+    for ([_]?u32{ 0, null }, [_][]const u8{ "4", "1" }) |seed, first_sample| {
+        var history: lm_mod.History = .{ .arena = arena };
+        var task: lm_mod.ScriptedLM = .{ .responses = &answers, .history = &history };
+        var prompt: lm_mod.ScriptedLM = .{ .responses = &proposals };
+        const result = try optimizer.compile(
+            P,
+            arena,
+            arena,
+            .{ .arena = arena, .lm = task.lm() },
+            .{ .arena = arena, .lm = prompt.lm() },
+            student,
+            student,
+            rows[0..2],
+            .{
+                .valset = &rows,
+                .num_trials = 3,
+                .seed = seed,
+                .max_bootstrapped_demos = 0,
+                .max_labeled_demos = 0,
+                .minibatch_size = 2,
+                .minibatch_full_eval_steps = 2,
+                .program_aware_proposer = false,
+                .data_aware_proposer = false,
+                .fewshot_aware_proposer = false,
+                .tip_aware_proposer = false,
+            },
+        );
+        try testing.expectEqualSlices(usize, &.{1}, result.trials[1].params.?);
+        const request = history.requests.items[7];
+        const actual = request.messages[request.messages.len - 1].content.text;
+        const expected = try std.fmt.allocPrint(arena, "<question>\n{s}\n</question>", .{first_sample});
+        try testing.expect(std.mem.indexOf(u8, actual, expected) != null);
+    }
 }
 
 test "MIPRO ranks full-set minibatch trials as full candidates and preserves ties" {
