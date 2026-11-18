@@ -3814,6 +3814,9 @@ The following prevent a claim that DSZig can do everything DSPy can:
   returning predictor names in reflection order. An empty selection skips
   reflection; unknown or repeated names raise `InvalidComponentSelection`.
   The selector is not called when a perfect minibatch is skipped.
+  GEPA warns at most once per compile if the predictor feedback score differs
+  from the program score. `warn_on_score_mismatch = false` suppresses that
+  diagnostic without changing feedback or selection. The result records the seed.
   `add_format_failure_as_feedback = true` includes captured predictor response
   parse failures in the reflection dataset, with the completion text and the
   active adapter's output structure. Such rollouts keep the configured failure

@@ -80,6 +80,8 @@ pub const GEPA = struct {
     seed: u32 = 0,
     /// Retain the predictions attaining the best score for each validation row.
     track_best_outputs: bool = false,
+    /// Warn once per compile if predictor and program scores disagree.
+    warn_on_score_mismatch: bool = true,
     /// DSPy `num_threads`: a `parallel.Parallel(GEPA.Run, limits).runner()`
     /// plus per-attempt contexts. Program and metric must be thread-safe, and
     /// `out`, which retains predictions and traces, must then be thread-safe
@@ -183,6 +185,7 @@ pub const GEPA = struct {
             total_metric_calls: usize,
             num_full_val_evals: usize,
             max_metric_calls: usize,
+            seed: u32,
         };
     }
 
@@ -231,6 +234,7 @@ pub const GEPA = struct {
             total_evals: usize = 0,
             full_evals: usize = 0,
             i: usize = 0,
+            score_mismatch_warned: bool = false,
             // EpochShuffledBatchSampler
             shuffled: std.ArrayList(usize) = .empty,
             epoch: ?usize = null,
@@ -685,6 +689,16 @@ pub const GEPA = struct {
                         if (matching.items.len == 0) continue;
                         const step = matching.items[e.adapter_rng.randbelow(matching.items.len)];
                         const fb = try e.gepa.metric(e.out, &e.trainset[id], &prediction, run.trace, e.names[k], step);
+                        if (e.gepa.warn_on_score_mismatch and !e.score_mismatch_warned and
+                            fb.score != run.score)
+                        {
+                            std.log.scoped(.gepa).warn(
+                                "Predictor feedback score differs from program score; " ++
+                                    "GEPA uses the program score for selection.",
+                                .{},
+                            );
+                            e.score_mismatch_warned = true;
+                        }
                         var item: Record = .empty;
                         const custom = e.gepa.instruction_proposer != null;
                         const inputs = if (custom) try customInputs(e.out, step) else step.inputs;
@@ -1130,6 +1144,7 @@ pub const GEPA = struct {
             .total_metric_calls = e.total_evals,
             .num_full_val_evals = e.full_evals,
             .max_metric_calls = max_calls,
+            .seed = self.seed,
         };
     }
 };
