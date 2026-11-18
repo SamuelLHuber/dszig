@@ -3852,7 +3852,12 @@ The following prevent a claim that DSZig can do everything DSPy can:
   `sampling_strategy` defaults to `.single`; use `.{ .same_parent = n }` for
   several minibatches from one parent, `.{ .independent = n }` to select a
   parent for each task, or `.{ .pxn = .{ .parents = p, .mutations = n } }`
-  to sample `n` minibatches per parent. Batches must contain 1–32 tasks.
+  to sample `n` minibatches per parent. Built-in batches contain 1–32 tasks.
+  A `.custom` proposal sampler can fill up to 32 ordered `(parent_idx,
+  minibatch_ids)` tasks or return zero to skip the iteration. It can use the
+  configured candidate selector and minibatch sampler or supply its own
+  training row IDs, including repeats. Each task must use an existing parent
+  and a nonempty minibatch of at most `max_minibatch_size` rows (default 4096).
   `selection_strategy` defaults to `.all`; `.best` and `.{ .top_k = k }`
   rank accepted proposals by their minibatch improvement, preserving task
   order on ties. Identical selected children are validated once per iteration.
@@ -3864,8 +3869,7 @@ The following prevent a claim that DSZig can do everything DSPy can:
   selection strategy receives the evaluated proposals and can return their
   indices in any order, even if they fail acceptance. `shouldAccept` lazily
   memoizes the criterion for each proposal in that batch. Unknown indices and
-  repeated candidates are ignored. Custom sampling strategies and batched
-  reflection backends are not supported.
+  repeated candidates are ignored. Batched reflection backends are not supported.
   Set `cache_evaluation = true` to reuse a candidate's scored rows during
   validation and merge. As in DSPy, training and validation share numeric
   row IDs for these lookups even if the datasets differ. Traced reflection

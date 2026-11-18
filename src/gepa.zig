@@ -505,6 +505,7 @@ pub const GEPA = struct {
         same_parent: usize,
         independent: usize,
         pxn: struct { parents: usize, mutations: usize },
+        custom: CustomProposalSampler,
 
         fn shape(sampling: ProposalSampling) struct { parents: usize, mutations: usize } {
             return switch (sampling) {
@@ -512,8 +513,44 @@ pub const GEPA = struct {
                 .same_parent => |n| .{ .parents = 1, .mutations = n },
                 .independent => |n| .{ .parents = n, .mutations = 1 },
                 .pxn => |pn| .{ .parents = pn.parents, .mutations = pn.mutations },
+                .custom => unreachable,
             };
         }
+    };
+
+    pub const ProposalTask = struct {
+        parent_idx: usize,
+        minibatch_ids: []const usize,
+    };
+
+    /// The helpers advance the same selector and sampler as the built-ins.
+    /// This view and helper results are only valid during the current iteration.
+    pub const ProposalSample = struct {
+        arena: Allocator,
+        names: []const []const u8,
+        trainset: []const Example,
+        state: ValidationState,
+        context: *anyopaque,
+        select_parent: *const fn (*anyopaque) anyerror!usize,
+        next_minibatch: *const fn (*anyopaque, usize) anyerror![]const usize,
+
+        pub fn selectParent(self: *const ProposalSample) !usize {
+            return self.select_parent(self.context);
+        }
+
+        pub fn nextMinibatch(self: *const ProposalSample, parent_idx: usize) ![]const usize {
+            if (parent_idx >= self.state.candidates.len) return error.InvalidProposalTask;
+            return self.next_minibatch(self.context, parent_idx);
+        }
+    };
+
+    pub const CustomProposalSampler = struct {
+        ptr: *anyopaque,
+        max_minibatch_size: usize = 4096,
+        /// Fill a prefix of `tasks` in evaluation order. Return zero to skip
+        /// the iteration. IDs index trainset and may repeat. Use input.arena
+        /// for temporary ID lists, or borrow lists that outlive the iteration.
+        sample: *const fn (*anyopaque, *const ProposalSample, []ProposalTask) anyerror!usize,
     };
 
     pub const ProposalSelection = union(enum) {
@@ -1582,12 +1619,63 @@ pub const GEPA = struct {
                 return true;
             }
 
-            fn reflectBatch(e: *Self) !void {
-                var scratch = std.heap.ArenaAllocator.init(e.out);
-                defer scratch.deinit();
-                const tmp = scratch.allocator();
+            const ProposalSamplingContext = struct {
+                engine: *Self,
+                arena: Allocator,
+
+                fn select(raw: *anyopaque) !usize {
+                    const ctx: *@This() = @ptrCast(@alignCast(raw));
+                    return ctx.engine.selectParent();
+                }
+
+                fn next(raw: *anyopaque, parent: usize) ![]const usize {
+                    const ctx: *@This() = @ptrCast(@alignCast(raw));
+                    const ids = try ctx.engine.nextMinibatch(parent);
+                    // A custom batch sampler can overwrite the same storage
+                    // on the next call within this proposal-sampling callback.
+                    return if (ctx.engine.gepa.batch_sampler != null)
+                        try ctx.arena.dupe(usize, ids)
+                    else
+                        ids;
+                }
+            };
+
+            fn sampleProposals(
+                e: *Self,
+                tmp: Allocator,
+                storage: *[max_proposal_tasks]ReflectionTask,
+            ) ![]ReflectionTask {
+                if (e.gepa.sampling_strategy == .custom) {
+                    const sampler = e.gepa.sampling_strategy.custom;
+                    var context: ProposalSamplingContext = .{ .engine = e, .arena = tmp };
+                    var sampled: [max_proposal_tasks]ProposalTask = @splat(.{
+                        .parent_idx = 0,
+                        .minibatch_ids = &.{},
+                    });
+                    const count = try sampler.sample(sampler.ptr, &.{
+                        .arena = tmp,
+                        .names = e.names,
+                        .trainset = e.trainset,
+                        .state = e.validationState(e.i),
+                        .context = &context,
+                        .select_parent = ProposalSamplingContext.select,
+                        .next_minibatch = ProposalSamplingContext.next,
+                    }, &sampled);
+                    if (count > sampled.len) return error.ProposalTaskLimitExceeded;
+                    for (sampled[0..count], storage[0..count]) |task, *entry| {
+                        if (task.parent_idx >= e.candidates.items.len or
+                            task.minibatch_ids.len == 0 or
+                            task.minibatch_ids.len > sampler.max_minibatch_size)
+                            return error.InvalidProposalTask;
+                        for (task.minibatch_ids) |id| {
+                            if (id >= e.trainset.len) return error.InvalidProposalTask;
+                        }
+                        entry.* = .{ .parent = task.parent_idx, .ids = task.minibatch_ids };
+                    }
+                    return storage[0..count];
+                }
+
                 const shape = e.gepa.sampling_strategy.shape();
-                var storage: [max_proposal_tasks]ReflectionTask = undefined;
                 const tasks = storage[0 .. shape.parents * shape.mutations];
                 for (0..shape.parents) |p| {
                     const parent = try e.selectParent();
@@ -1599,6 +1687,16 @@ pub const GEPA = struct {
                         };
                     }
                 }
+                return tasks;
+            }
+
+            fn reflectBatch(e: *Self) !void {
+                var scratch = std.heap.ArenaAllocator.init(e.out);
+                defer scratch.deinit();
+                const tmp = scratch.allocator();
+                var storage: [max_proposal_tasks]ReflectionTask = undefined;
+                const tasks = try e.sampleProposals(tmp, &storage);
+                if (tasks.len == 0) return;
 
                 for (tasks, 0..) |*task, i| {
                     const candidate = e.candidates.items[task.parent];
@@ -2193,11 +2291,16 @@ pub const GEPA = struct {
             @as(u2, @intFromBool(self.max_metric_calls != null));
         if (budget_count == 0) return error.NoBudget;
         if (budget_count != 1) return error.ConflictingBudgets;
-        const shape = self.sampling_strategy.shape();
-        if (shape.parents == 0 or shape.mutations == 0) return error.EmptyProposalBatch;
-        if (shape.parents > max_proposal_tasks or shape.mutations > max_proposal_tasks or
-            shape.parents * shape.mutations > max_proposal_tasks)
-            return error.ProposalTaskLimitExceeded;
+        if (self.sampling_strategy == .custom) {
+            if (self.sampling_strategy.custom.max_minibatch_size == 0)
+                return error.InvalidProposalTask;
+        } else {
+            const shape = self.sampling_strategy.shape();
+            if (shape.parents == 0 or shape.mutations == 0) return error.EmptyProposalBatch;
+            if (shape.parents > max_proposal_tasks or shape.mutations > max_proposal_tasks or
+                shape.parents * shape.mutations > max_proposal_tasks)
+                return error.ProposalTaskLimitExceeded;
+        }
         assert(trainset.len > 0);
         if (self.val_evaluation_policy) |policy| {
             if (policy.max_batch_size == 0) return error.InvalidValidationBatch;
@@ -2702,6 +2805,16 @@ test "GEPA ranks before deduplicating and snapshots all validation batches befor
             }});
         }
 
+        fn invalidProposalTask(
+            _: *anyopaque,
+            _: *const GEPA.ProposalSample,
+            tasks: []GEPA.ProposalTask,
+        ) !usize {
+            tasks[0] = .{ .parent_idx = 0, .minibatch_ids = &.{0} };
+            tasks[1] = .{ .parent_idx = 0, .minibatch_ids = &.{2} };
+            return 2;
+        }
+
         fn batch(ptr: *anyopaque, state: *const GEPA.ValidationState) ![]const usize {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqual(1, state.candidates.len);
@@ -2740,6 +2853,11 @@ test "GEPA ranks before deduplicating and snapshots all validation batches befor
     try std.testing.expectError(error.EmptyProposalBatch, invalid.compile(P, arena, ctx, .{}, &examples, .{}));
     invalid.sampling_strategy = .{ .pxn = .{ .parents = 2, .mutations = 17 } };
     try std.testing.expectError(error.ProposalTaskLimitExceeded, invalid.compile(P, arena, ctx, .{}, &examples, .{}));
+    invalid.sampling_strategy = .{ .custom = .{ .ptr = &script, .sample = Script.invalidProposalTask } };
+    try std.testing.expectError(error.InvalidProposalTask, invalid.compile(P, arena, ctx, .{}, &examples, .{}));
+    // Validate the whole batch before running even the valid first task.
+    try std.testing.expectEqual(2, model.index);
+    model.index = 0;
     const fit = try optimizer.compile(P, arena, ctx, .{}, &examples, .{});
     try std.testing.expectEqualStrings("B", fit.candidates[1][0]);
     try std.testing.expectEqualStrings("A", fit.candidates[2][0]);
