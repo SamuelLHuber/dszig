@@ -3848,6 +3848,12 @@ The following prevent a claim that DSZig can do everything DSPy can:
   Tasks run in order within each phase; the optional rollout runner can
   parallelize examples within a task, not across tasks. Custom proposal
   sampling/selection strategies and batched reflection backends are not supported.
+  Set `cache_evaluation = true` to reuse a candidate's scored rows during
+  validation and merge. As in DSPy, training and validation share numeric
+  row IDs for these lookups even if the datasets differ. Traced reflection
+  still runs fresh and updates the cache; only misses in validation and merge
+  consume the metric budget. The cache is per compile, independent of the LM
+  cache, and not persisted. Read `Result.val_ids` for score order when enabled.
   Candidate selection supports `pareto`, `current_best`,
   `epsilon_greedy` (epsilon 0.1), and `top_k_pareto` (top five). Top-five
   selection restricts the validation frontiers before removing dominated

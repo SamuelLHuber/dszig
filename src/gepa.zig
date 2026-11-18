@@ -294,6 +294,8 @@ pub const GEPA = struct {
     acceptance_criterion: Acceptance = .strict_improvement,
     sampling_strategy: ProposalSampling = .single,
     selection_strategy: ProposalSelection = .all,
+    /// Reuse scored rows during validation and merge, not traced reflection rollouts.
+    cache_evaluation: bool = false,
     skip_perfect_score: bool = true,
     /// Use genuine predictor parse failures as reflection examples.
     add_format_failure_as_feedback: bool = false,
@@ -711,6 +713,7 @@ pub const GEPA = struct {
             fronts: []std.ArrayList(usize),
             objectives: Objectives = .{},
             best_outputs: ?[]std.ArrayList(BestOutput) = null,
+            evaluation_cache: std.HashMapUnmanaged(CacheKey, Run, CacheContext, 80) = .empty,
             total_evals: usize = 0,
             full_evals: usize = 0,
             i: usize = 0,
@@ -847,8 +850,21 @@ pub const GEPA = struct {
             }
 
             fn rolloutIds(e: *const Self, candidate: []const []const u8, set: []const Example, ids: []const usize, capture: bool) ![]Run {
-                const built = try e.build(candidate);
                 const runs = try e.out.alloc(Run, ids.len);
+                try e.rolloutIdsInto(candidate, set, ids, capture, runs);
+                return runs;
+            }
+
+            fn rolloutIdsInto(
+                e: *const Self,
+                candidate: []const []const u8,
+                set: []const Example,
+                ids: []const usize,
+                capture: bool,
+                runs: []Run,
+            ) !void {
+                assert(runs.len == ids.len);
+                const built = try e.build(candidate);
                 if (e.gepa.rollouts) |rollouts| {
                     const Call = struct {
                         engine: *const Self,
@@ -874,11 +890,120 @@ pub const GEPA = struct {
                 } else {
                     for (runs, ids) |*r, id| r.* = try e.runOne(e.ctx, &built, &set[id], capture);
                 }
-                return runs;
+            }
+
+            const CacheKey = struct {
+                candidate: []const []const u8,
+                digest: u64,
+                id: usize,
+            };
+
+            const CacheContext = struct {
+                pub fn hash(_: CacheContext, key: CacheKey) u64 {
+                    return std.hash.Wyhash.hash(key.digest, std.mem.asBytes(&key.id));
+                }
+
+                pub fn eql(_: CacheContext, a: CacheKey, b: CacheKey) bool {
+                    return a.id == b.id and a.digest == b.digest and
+                        sameCandidate(a.candidate, b.candidate);
+                }
+            };
+
+            fn candidateDigest(candidate: []const []const u8) u64 {
+                var hash = std.hash.Wyhash.init(0);
+                for (candidate) |text| {
+                    hash.update(std.mem.asBytes(&text.len));
+                    hash.update(text);
+                }
+                return hash.final();
+            }
+
+            fn cacheReflection(
+                e: *Self,
+                candidate: []const []const u8,
+                ids: []const usize,
+                runs: []const Run,
+            ) Allocator.Error!void {
+                if (!e.gepa.cache_evaluation) return;
+                try e.cacheRows(candidate, candidateDigest(candidate), ids, runs);
+            }
+
+            fn cacheRows(
+                e: *Self,
+                candidate: []const []const u8,
+                digest: u64,
+                ids: []const usize,
+                runs: []const Run,
+            ) Allocator.Error!void {
+                assert(e.gepa.cache_evaluation);
+                for (ids, runs) |id, run| {
+                    const key: CacheKey = .{ .candidate = candidate, .digest = digest, .id = id };
+                    if (e.evaluation_cache.getPtr(key)) |entry| {
+                        entry.* = run;
+                    } else try e.evaluation_cache.put(e.out, key, run);
+                }
+            }
+
+            const ScoredRows = struct {
+                ids: []const usize,
+                runs: []Run,
+                calls: usize,
+            };
+
+            fn scoreRows(
+                e: *Self,
+                candidate: []const []const u8,
+                ids: []const usize,
+                order: enum { cached_first, requested },
+            ) !ScoredRows {
+                if (!e.gepa.cache_evaluation or e.candidates.items.len == 0) return .{
+                    .ids = ids,
+                    .runs = try e.rolloutIds(candidate, e.valset, ids, false),
+                    .calls = ids.len,
+                };
+                const digest = candidateDigest(candidate);
+                const runs = try e.out.alloc(Run, ids.len);
+                const ordered = try e.out.alloc(usize, ids.len);
+                var hits: usize = 0;
+                var misses: usize = 0;
+                for (ids) |id| {
+                    const key: CacheKey = .{ .candidate = candidate, .digest = digest, .id = id };
+                    if (e.evaluation_cache.get(key)) |run| {
+                        ordered[hits] = id;
+                        runs[hits] = run;
+                        hits += 1;
+                    } else {
+                        ordered[ids.len - 1 - misses] = id;
+                        misses += 1;
+                    }
+                }
+                assert(hits + misses == ids.len);
+                const uncached = ordered[hits..];
+                std.mem.reverse(usize, uncached);
+                if (misses != 0) {
+                    try e.rolloutIdsInto(candidate, e.valset, uncached, false, runs[hits..]);
+                    try e.cacheRows(candidate, digest, uncached, runs[hits..]);
+                }
+                if (order == .requested) {
+                    for (ids, runs) |id, *run| run.* = e.evaluation_cache.get(.{
+                        .candidate = candidate,
+                        .digest = digest,
+                        .id = id,
+                    }).?;
+                }
+                return .{
+                    .ids = if (order == .requested) ids else ordered,
+                    .runs = runs,
+                    .calls = misses,
+                };
+            }
+
+            fn indexedValidation(e: *const Self) bool {
+                return e.gepa.val_evaluation_policy != null or e.gepa.cache_evaluation;
             }
 
             fn validationIds(e: *const Self) ?[]const []const usize {
-                return if (e.gepa.val_evaluation_policy != null) e.val_ids.items else null;
+                return if (e.indexedValidation()) e.val_ids.items else null;
             }
 
             fn validationBatch(e: *const Self) ![]const usize {
@@ -955,22 +1080,22 @@ pub const GEPA = struct {
 
             fn addProgram(e: *Self, candidate: []const []const u8, parent_ids: []const ?usize) !void {
                 const requested = try e.validationBatch();
-                const runs = try e.rolloutIds(candidate, e.valset, requested, false);
-                try e.commitProgram(candidate, parent_ids, requested, runs);
+                const rows = try e.scoreRows(candidate, requested, .cached_first);
+                try e.commitProgram(candidate, parent_ids, rows);
             }
 
             fn commitProgram(
                 e: *Self,
                 candidate: []const []const u8,
                 parent_ids: []const ?usize,
-                requested: []const usize,
-                evaluated: []Run,
+                rows: ScoredRows,
             ) !void {
-                assert(requested.len == evaluated.len);
+                const requested = rows.ids;
+                assert(requested.len == rows.runs.len);
                 const discovered = e.total_evals;
-                e.total_evals += requested.len;
-                var runs = evaluated;
-                const sparse = e.gepa.val_evaluation_policy != null;
+                e.total_evals += rows.calls;
+                var runs = rows.runs;
+                const sparse = e.indexedValidation();
                 const ids = if (sparse) try e.retainValidationRows(requested, &runs) else requested;
                 const idx = e.candidates.items.len;
                 // Source seeds the metric counter from the number of unique scored IDs.
@@ -1000,8 +1125,9 @@ pub const GEPA = struct {
                     }
                     try e.fronts[k].append(e.out, idx);
                     if (e.best_outputs) |outputs| {
-                        // Full evaluation substitutes an empty prediction on failure.
-                        const prediction = run.prediction.?;
+                        // A cache hit can originate in a failed traced rollout.
+                        const prediction = run.prediction orelse
+                            try optimize.RecordPrediction.init(e.out, .empty);
                         if (improves) outputs[k].clearRetainingCapacity();
                         try outputs[k].append(e.out, .{ .candidate_idx = idx, .prediction = prediction });
                     }
@@ -1027,14 +1153,14 @@ pub const GEPA = struct {
             }
 
             fn instanceFrontCount(e: *const Self) usize {
-                return if (e.gepa.val_evaluation_policy != null)
+                return if (e.indexedValidation())
                     e.val_front_order.items.len
                 else
                     e.fronts.len;
             }
 
             fn instanceFront(e: *const Self, index: usize) []const usize {
-                const id = if (e.gepa.val_evaluation_policy != null)
+                const id = if (e.indexedValidation())
                     e.val_front_order.items[index]
                 else
                     index;
@@ -1329,10 +1455,12 @@ pub const GEPA = struct {
                 const ids = try e.nextMinibatch(parent);
                 const parent_candidate = e.candidates.items[parent];
                 const before = try e.evalIds(parent_candidate, e.trainset, ids, true);
+                try e.cacheReflection(parent_candidate, ids, before);
                 var task: ReflectionTask = .{ .parent = parent, .ids = ids, .before = before };
                 try e.prepareReflection(&task);
                 const child = (try e.proposeChild(&task)) orelse return;
                 const after = try e.evalIds(child, e.trainset, ids, true);
+                try e.cacheReflection(child, ids, after);
                 if (try e.accepts(&task, child, after)) {
                     const parent_ids = try e.out.dupe(?usize, &.{parent});
                     try e.addProgram(child, parent_ids);
@@ -1351,7 +1479,7 @@ pub const GEPA = struct {
                 after: []const Run = &.{},
                 margin: f64 = 0,
                 val_ids: []const usize = &.{},
-                validation: []Run = &.{},
+                validation: ScoredRows = undefined,
             };
 
             fn prepareReflection(e: *Self, task: *ReflectionTask) !void {
@@ -1449,12 +1577,19 @@ pub const GEPA = struct {
                             break prior.before;
                     } else try e.evalIds(candidate, e.trainset, task.ids, true);
                 }
+                if (e.gepa.cache_evaluation) for (tasks) |*task| {
+                    try e.cacheReflection(e.candidates.items[task.parent], task.ids, task.before);
+                };
                 for (tasks) |*task| try e.prepareReflection(task);
                 for (tasks) |*task| task.child = try e.proposeChild(task);
                 for (tasks) |*task| {
                     const child = task.child orelse continue;
                     task.after = try e.evalIds(child, e.trainset, task.ids, true);
                 }
+                if (e.gepa.cache_evaluation) for (tasks) |*task| {
+                    const child = task.child orelse continue;
+                    try e.cacheReflection(child, task.ids, task.after);
+                };
 
                 var selected: [max_proposal_tasks]*ReflectionTask = undefined;
                 const retained = try e.selectProposals(tasks, &selected);
@@ -1467,10 +1602,10 @@ pub const GEPA = struct {
                         ids;
                 }
                 for (retained) |task|
-                    task.validation = try e.rolloutIds(task.child.?, e.valset, task.val_ids, false);
+                    task.validation = try e.scoreRows(task.child.?, task.val_ids, .cached_first);
                 for (retained) |task| {
                     const parents = try e.out.dupe(?usize, &.{task.parent});
-                    try e.commitProgram(task.child.?, parents, task.val_ids, task.validation);
+                    try e.commitProgram(task.child.?, parents, task.validation);
                     e.scheduleMerge();
                 }
             }
@@ -1725,8 +1860,9 @@ pub const GEPA = struct {
                     sum1 += e.validationScore(attempt.id1, id).?;
                     sum2 += e.validationScore(attempt.id2, id).?;
                 }
-                const runs = try e.evalIds(attempt.candidate, e.valset, ids, false);
-                if (sumScores(runs) >= @max(sum1, sum2)) {
+                const rows = try e.scoreRows(attempt.candidate, ids, .requested);
+                e.total_evals += rows.calls;
+                if (sumScores(rows.runs) >= @max(sum1, sum2)) {
                     const parent_ids = try e.out.alloc(?usize, 2);
                     parent_ids[0] = attempt.id1;
                     parent_ids[1] = attempt.id2;
@@ -1847,7 +1983,7 @@ pub const GEPA = struct {
             }
 
             fn validationScore(e: *const Self, candidate: usize, id: usize) ?f64 {
-                const offset = if (e.gepa.val_evaluation_policy != null)
+                const offset = if (e.indexedValidation())
                     e.val_indices.items[candidate].get(id) orelse return null
                 else
                     id;
@@ -2508,6 +2644,18 @@ test "GEPA ranks before deduplicating and snapshots all validation batches befor
     try std.testing.expectEqualSlices(usize, &.{1}, fit.val_ids.?[2]);
     try std.testing.expectEqualSlices(usize, &.{ 0, 8, 9 }, fit.discovery_eval_counts);
     try std.testing.expectEqual(10, fit.total_metric_calls);
+
+    // B was traced against both IDs; A was traced only against row zero.
+    // Validation must hit B's cached row and still evaluate A's uncached row.
+    var cached = optimizer;
+    cached.cache_evaluation = true;
+    script = .{};
+    model.index = 0;
+    const reused = try cached.compile(P, arena, ctx, .{}, &examples, .{});
+    try std.testing.expectEqualSlices(f64, &.{5}, reused.val_subscores[1]);
+    try std.testing.expectEqualSlices(f64, &.{4}, reused.val_subscores[2]);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 8, 8 }, reused.discovery_eval_counts);
+    try std.testing.expectEqual(9, reused.total_metric_calls);
 }
 
 test "GEPA stops after seed evaluation before reflecting or calling later stoppers" {
