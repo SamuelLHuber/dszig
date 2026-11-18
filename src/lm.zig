@@ -3736,7 +3736,7 @@ pub const OpenAI = struct {
         };
     }
 
-    fn responseTruthy(value: @import("runtime_value.zig").Value) error{ParseValue}!bool {
+    pub fn responseTruthy(value: @import("runtime_value.zig").Value) error{ParseValue}!bool {
         return switch (value) {
             .null => false,
             .bool => |b| b,

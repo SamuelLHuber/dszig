@@ -3739,7 +3739,9 @@ The following prevent a claim that DSZig can do everything DSPy can:
   `Gemini.lm()` and `Gemini.completeRequest` support nonstreaming text,
   JSON/schema-constrained generation, and function calls with text results
   on the Gemini Developer API, with `x-goog-api-key` authentication and
-  canonical token accounting. Builtin declarations can be sent, but hosted
+  canonical token accounting. The Gemini codec maps requested token logprobs
+  in buffered and streamed responses when a model serves them. Builtin
+  declarations can be sent, but hosted
   tool outputs and grounding are not supported. Nonstreaming reasoning supports
   Gemini 2.5 budgets and Gemini 3 effort levels, with thought-signature replay
   for reasoning, text, and function calls. Set `Gemini.supports_reasoning` when

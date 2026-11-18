@@ -167,6 +167,14 @@ fn integerValue(raw: Value) Error!Value {
 
 /// Replaces an owned float ID only after its replacement is ready.
 fn normalizeOwnedId(allocator: Allocator, raw: Value) Error!Value {
+    const normalized = try normalizeBorrowedId(allocator, raw);
+    if (raw == .float or (if (python.view(raw)) |builtin| builtin == .float else false))
+        runtime.freeValue(allocator, raw);
+    return normalized;
+}
+
+/// Keep integer leaves borrowed; allocate only when a float ID needs decimal storage.
+pub fn normalizeBorrowedId(allocator: Allocator, raw: Value) Error!Value {
     if (raw == .null) return raw;
     const floating: ?f64 = if (raw == .float) raw.float else if (python.view(raw)) |builtin|
         if (builtin == .float) builtin.float else null
@@ -180,7 +188,6 @@ fn normalizeOwnedId(allocator: Allocator, raw: Value) Error!Value {
             Value{ .number_string = try allocator.dupe(u8, parsed.number_string) }
         else
             parsed;
-        runtime.freeValue(allocator, raw);
         return result;
     }
     _ = try integerValue(raw);

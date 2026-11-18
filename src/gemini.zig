@@ -301,8 +301,13 @@ const GenerateStream = struct {
         }
         var saw_tool = false;
         var saw_delta = false;
+        var scores = try readLogprobs(arena, get(candidate, "logprobsResult"));
         for (elems(get(get(candidate, "content"), "parts")), 0..) |part, index| {
-            const decoded = (try decodePart(arena, part)) orelse continue;
+            var decoded = (try decodePart(arena, part)) orelse continue;
+            if (decoded.data == .text) {
+                decoded.data.text.scores = scores;
+                scores = &.{};
+            }
             try self.start();
             const position = self.slot(index, decoded.kind);
             var buffer: [24]u8 = undefined;
@@ -410,7 +415,7 @@ fn requestBody(
     records: *std.ArrayList(sdk.Adaptation),
 ) Error![]const u8 {
     const config = &fields.config;
-    if (config.cache != null or config.logprobs != .null or
+    if (config.cache != null or
         config.probabilities != null or config.user_id != null or config.extensions != null)
         return error.LMFailure;
     var names: std.StringHashMapUnmanaged([]const u8) = .empty;
@@ -464,6 +469,12 @@ fn requestBody(
         try values.ensureTotalCapacity(config.stop.len);
         for (config.stop) |stop| values.appendAssumeCapacity(str(stop));
         try generation.put(arena, "stopSequences", .{ .array = values });
+    }
+    if (config.logprobs != .null) {
+        try generation.put(arena, "responseLogprobs", .{ .bool = true });
+        const order = @import("value.zig").numericOrder(config.logprobs, .{ .integer = 0 }) catch
+            return error.LMFailure;
+        if (order == .gt) try generation.put(arena, "logprobs", config.logprobs);
     }
     if (config.response_format) |format| {
         const value = format.toValue(arena) catch |err| return codecError(err);
@@ -777,7 +788,7 @@ fn parseResponse(arena: Allocator, model: []const u8, raw: Value, records: []con
     const candidate = if (candidates.len == 0) .null else candidates[0];
     const reason = text(get(candidate, "finishReason"));
     if (invalidFinish(reason)) return error.LMFailure;
-    if (get(candidate, "groundingMetadata") != .null or get(candidate, "logprobsResult") != .null) return error.LMFailure;
+    if (get(candidate, "groundingMetadata") != .null) return error.LMFailure;
     const wire_parts = elems(get(get(candidate, "content"), "parts"));
     const parts = try arena.alloc(sdk.Part, @max(wire_parts.len, 1));
     var visible: std.Io.Writer.Allocating = .init(arena);
@@ -848,7 +859,9 @@ fn parseResponse(arena: Allocator, model: []const u8, raw: Value, records: []con
         parts_len = 1;
     }
     const id = text(get(raw, "responseId"));
+    const scores = try readLogprobs(arena, get(candidate, "logprobsResult"));
     var result: lm_mod.Completion = .{
+        .logprobs = if (scores.len == 0) null else scores,
         .text = if (visible.written().len == 0 and calls.items.len != 0) null else visible.written(),
         .reasoning = if (reasoning.written().len != 0) reasoning.written() else null,
         .tool_calls = calls.items,
@@ -864,6 +877,55 @@ fn parseResponse(arena: Allocator, model: []const u8, raw: Value, records: []con
     };
     try lm_mod.publishResponse(arena, &result, model, .borrowed);
     return result;
+}
+
+fn readLogprobs(arena: Allocator, value: Value) Error![]const lm_mod.TokenLogprob {
+    const chosen = elems(get(value, "chosenCandidates"));
+    const alternatives = elems(get(value, "topCandidates"));
+    var scores: std.ArrayList(lm_mod.TokenLogprob) = .empty;
+    for (chosen, 0..) |item, index| {
+        if (item != .object) continue;
+        var top: std.ArrayList(lm_mod.TopLogprob) = .empty;
+        if (index < alternatives.len) {
+            for (elems(get(alternatives[index], "candidates"))) |alt|
+                if (alt == .object) try top.append(arena, try readScore(arena, alt));
+        }
+        const token = try readScore(arena, item);
+        try scores.append(arena, .{
+            .token = token.token,
+            .token_id = token.token_id,
+            .logprob = token.logprob,
+            .top = top.items,
+        });
+    }
+    return scores.items;
+}
+
+fn readScore(arena: Allocator, item: Value) Error!lm_mod.TopLogprob {
+    const numbers = @import("value.zig");
+    const raw = get(item, "logProbability");
+    const truthy = lm_mod.OpenAI.responseTruthy;
+    const score: f64 = if (!(truthy(raw) catch return error.LMFailure))
+        0
+    else if (raw == .string)
+        numbers.floatFromString(arena, raw.string) catch |err| return codecError(err)
+    else
+        numbers.numericFloat(raw) catch return error.LMFailure;
+    const token = get(item, "token");
+    const bytes = if (!(truthy(token) catch return error.LMFailure)) "" else if (token == .string)
+        token.string
+    else formatted: {
+        var writer: std.Io.Writer.Allocating = .init(arena);
+        @import("pyjson.zig").writeStr(&writer.writer, token) catch |err|
+            return if (err == error.WriteFailed) error.OutOfMemory else error.LMFailure;
+        break :formatted writer.written();
+    };
+    return .{
+        .token = bytes,
+        .token_id = @import("logprobs.zig").normalizeBorrowedId(arena, get(item, "tokenId")) catch |err|
+            return codecError(err),
+        .logprob = score,
+    };
 }
 
 fn parseMedia(value: Value, mode: enum { inline_bytes, uri }) ?sdk.Part {
