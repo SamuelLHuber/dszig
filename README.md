@@ -3734,8 +3734,11 @@ The following prevent a claim that DSZig can do everything DSPy can:
   from inline base64, URLs or existing provider file IDs. The transport does
   not read local paths implicitly. Canonical `CacheConfig` supports ephemeral
   system and message-block markers, including one-hour retention; stored cache
-  resources are not supported. Other media kinds, third-party reasoning
-  dialects, and hosted tools are not implemented.
+  resources are not supported. Canonical requests can declare hosted web
+  search and code execution. Buffered responses expose citations in message
+  order and retain hosted tool blocks in raw provider data rather than
+  treating them as client tool calls. Other media kinds and third-party
+  reasoning dialects are not implemented.
   `Gemini.lm()` and `Gemini.completeRequest` support nonstreaming text,
   JSON/schema-constrained generation, and function calls with text results
   on the Gemini Developer API, with `x-goog-api-key` authentication and

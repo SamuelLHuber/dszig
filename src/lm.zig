@@ -3851,7 +3851,7 @@ pub const OpenAI = struct {
     }
 
     /// lm15's str(value or ""), retaining strings without allocation.
-    fn responseText(arena: Allocator, input: ?@import("runtime_value.zig").Value) Error![]const u8 {
+    pub fn responseText(arena: Allocator, input: ?@import("runtime_value.zig").Value) Error![]const u8 {
         const value = input orelse return "";
         if (!try responseTruthy(value)) return "";
         return responseStringValue(arena, value);

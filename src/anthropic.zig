@@ -151,7 +151,7 @@ pub const Anthropic = struct {
             .context = &stream,
             .consume = MessageStream.consume,
         };
-        const response = try self.send(arena, body, &consumer);
+        const response = try self.send(arena, request, body, &consumer);
         defer self.client.allocator.free(response.body);
         return stream.outcome;
     }
@@ -160,7 +160,7 @@ pub const Anthropic = struct {
         const self: *Anthropic = @ptrCast(@alignCast(ptr));
         var records: std.ArrayList(sdk.Adaptation) = .empty;
         const body = try self.requestBody(arena, request, &records, false);
-        const response = try self.send(arena, body, null);
+        const response = try self.send(arena, request, body, null);
         defer self.client.allocator.free(response.body);
         const input = @import("json_repair.zig").parseJson(arena, response.body) catch |err|
             return codecError(err);
@@ -170,19 +170,29 @@ pub const Anthropic = struct {
     fn send(
         self: *const Anthropic,
         arena: Allocator,
+        request: *const sdk.Request,
         body: []const u8,
         consumer: ?*http.ResponseConsumer,
     ) Error!http.Response {
         const url = try std.fmt.allocPrint(arena, "{s}/messages", .{std.mem.trimEnd(u8, self.base_url, "/")});
         if (self.api_version.len == 0 or std.mem.indexOfAny(u8, self.api_version, "\r\n") != null)
             return error.LMFailure;
-        var headers: [2]std.http.Header = undefined;
+        var headers: [3]std.http.Header = undefined;
         headers[0] = .{ .name = "anthropic-version", .value = self.api_version };
         var headers_len: usize = 1;
         if (self.api_key) |key| {
             if (key.len == 0 or std.mem.indexOfAny(u8, key, "\r\n") != null) return error.LMFailure;
             headers[1] = .{ .name = "x-api-key", .value = key };
             headers_len = 2;
+        }
+        for (request.fields.tools) |tool| {
+            if (tool != .builtin or !is(tool.builtin.name, "code_execution")) continue;
+            headers[headers_len] = .{
+                .name = "anthropic-beta",
+                .value = "code-execution-2025-05-22",
+            };
+            headers_len += 1;
+            break;
         }
         const transport: http.Transport = .{
             .client = self.client,
@@ -381,33 +391,32 @@ pub const Anthropic = struct {
     fn addTools(self: *const Anthropic, arena: Allocator, body: *Object, fields: *const sdk.RequestFields, records: *std.ArrayList(sdk.Adaptation)) Error!void {
         if (fields.tools.len != 0) {
             var tools: runtime.Array = .init(arena);
-            var names: runtime.Array = .init(arena);
             for (fields.tools) |tool| {
-                if (tool != .function) return error.LMFailure;
-                const function = tool.function;
+                const name = switch (tool) {
+                    .function => |function| function.name,
+                    .builtin => |builtin| builtin.name,
+                };
                 if (fields.config.tool_choice) |choice| {
                     const force = choice.mode == .required and choice.allowed.len == 1;
                     if (!force and choice.mode != .none and choice.allowed.len != 0 and
-                        !contains(choice.allowed, function.name)) continue;
+                        !contains(choice.allowed, name)) continue;
                 }
-                var item: Object = .empty;
-                try item.put(arena, "name", str(function.name));
-                if (function.description) |description| if (description.len != 0) {
-                    try item.put(arena, "description", str(description));
-                };
-                try item.put(arena, "input_schema", try project(arena, function.parameters.?));
+                const item = try encodeTool(arena, tool, name);
                 try tools.append(.{ .object = item });
-                try names.append(str(function.name));
             }
-            if (tools.items.len != fields.tools.len) try self.adapt(
-                arena,
-                records,
-                "config.tool_choice.allowed",
-                .client_side,
-                "the Messages API cannot restrict to a subset of the declared tools; only the allowed tools were sent, which is what the allowlist means",
-                try strings(arena, fields.config.tool_choice.?.allowed),
-                .{ .array = names },
-            );
+            if (tools.items.len != fields.tools.len) {
+                var names = try runtime.Array.initCapacity(arena, tools.items.len);
+                for (tools.items) |item| names.appendAssumeCapacity(item.object.get("name").?);
+                try self.adapt(
+                    arena,
+                    records,
+                    "config.tool_choice.allowed",
+                    .client_side,
+                    "the Messages API cannot restrict to a subset of the declared tools; only the allowed tools were sent, which is what the allowlist means",
+                    try strings(arena, fields.config.tool_choice.?.allowed),
+                    .{ .array = names },
+                );
+            }
             try body.put(arena, "tools", .{ .array = tools });
         }
         if (fields.config.tool_choice) |choice| {
@@ -803,10 +812,65 @@ fn parseThinking(arena: Allocator, block: Value, redacted: bool) Error!sdk.Think
     return result;
 }
 
+fn encodeTool(arena: Allocator, tool: sdk.RequestTool, name: []const u8) Error!Object {
+    var item: Object = .empty;
+    switch (tool) {
+        .function => |function| {
+            try item.put(arena, "name", str(name));
+            if (function.description) |description| if (description.len != 0) {
+                try item.put(arena, "description", str(description));
+            };
+            try item.put(arena, "input_schema", try project(arena, function.parameters.?));
+        },
+        .builtin => |builtin| {
+            const kind = if (is(name, "web_search")) "web_search_20250305" else if (is(name, "code_execution")) "code_execution_20250522" else name;
+            try item.put(arena, "type", str(kind));
+            try item.put(arena, "name", str(name));
+            if (builtin.config) |config| {
+                const value = try project(arena, config);
+                if (value != .object) return error.LMFailure;
+                for (value.object.keys(), value.object.values()) |key, field| {
+                    try item.put(arena, key, field);
+                }
+            }
+        },
+    }
+    return item;
+}
+
+fn citationField(arena: Allocator, item: Value, comptime keys: []const []const u8) Error!?[]const u8 {
+    inline for (keys) |key| {
+        const value = try lm_mod.OpenAI.responseText(arena, get(item, key));
+        if (value.len != 0) return value;
+    }
+    return null;
+}
+
+fn appendCitations(
+    arena: Allocator,
+    parts: *std.ArrayList(sdk.Part),
+    citations: *std.ArrayList(sdk.CitationPart),
+    items: Value,
+) Error!void {
+    if (items != .array) return;
+    for (items.array.items) |item| {
+        if (item != .object) continue;
+        const citation: sdk.CitationPart = .{
+            .url = try citationField(arena, item, &.{ "url", "uri" }),
+            .title = try citationField(arena, item, &.{ "title", "document_title", "source_title" }),
+            .text = try citationField(arena, item, &.{ "cited_text", "text", "quote" }),
+        };
+        if (citation.url == null and citation.title == null and citation.text == null) continue;
+        try parts.append(arena, .{ .citation = citation });
+        try citations.append(arena, citation);
+    }
+}
+
 fn parseResponse(arena: Allocator, model: []const u8, input: Value, records: []const sdk.Adaptation) Error!lm_mod.Completion {
     if (input != .object) return error.LMFailure;
     var parts: std.ArrayList(sdk.Part) = .empty;
     var calls: std.ArrayList(lm_mod.ToolCall) = .empty;
+    var citations: std.ArrayList(sdk.CitationPart) = .empty;
     var visible: std.Io.Writer.Allocating = .init(arena);
     var reasoning: std.Io.Writer.Allocating = .init(arena);
     const content = get(input, "content");
@@ -814,11 +878,10 @@ fn parseResponse(arena: Allocator, model: []const u8, input: Value, records: []c
     for (if (content == .array) content.array.items else &.{}) |block| {
         const kind = text(get(block, "type"));
         if (std.mem.eql(u8, kind, "text")) {
-            const chunk = text(get(block, "text"));
-            const citations = get(block, "citations");
-            if (citations != .null and (citations != .array or citations.array.items.len != 0)) return error.LMFailure;
+            const chunk = try lm_mod.OpenAI.responseText(arena, get(block, "text"));
             visible.writer.writeAll(chunk) catch return error.OutOfMemory;
             try parts.append(arena, .{ .text = .{ .text = chunk } });
+            try appendCitations(arena, &parts, &citations, get(block, "citations"));
         } else if (std.mem.eql(u8, kind, "tool_use")) {
             const name = text(get(block, "name"));
             if (name.len == 0) return error.LMFailure;
@@ -838,7 +901,11 @@ fn parseResponse(arena: Allocator, model: []const u8, input: Value, records: []c
             const item = try parseThinking(arena, block, std.mem.eql(u8, kind, "redacted_thinking"));
             reasoning.writer.writeAll(item.text) catch return error.OutOfMemory;
             try parts.append(arena, .{ .thinking = item });
-        } else return error.LMFailure;
+        } else if (!is(kind, "server_tool_use") and !is(kind, "web_search_tool_result") and
+            !is(kind, "code_execution_tool_result"))
+        {
+            return error.LMFailure;
+        }
     }
     if (parts.items.len == 0) try parts.append(arena, .{ .text = .{} });
     const id = text(get(input, "id"));
@@ -847,6 +914,7 @@ fn parseResponse(arena: Allocator, model: []const u8, input: Value, records: []c
         .text = if (visible.written().len == 0 and calls.items.len != 0) null else visible.written(),
         .reasoning = if (reasoning.written().len == 0) null else reasoning.written(),
         .tool_calls = calls.items,
+        .citations = citations.items,
         .message = .{ .role = .assistant, .parts = parts.items },
         .provider_data = try payload(arena, input),
         .adaptations = records,
@@ -994,6 +1062,29 @@ test "Anthropic reasoning replays signed and redacted blocks without showing eit
     const hidden = try encodeBlock(arena, message.parts[1]);
     try std.testing.expectEqualStrings("redacted_thinking", text(get(hidden, "type")));
     try std.testing.expectEqualStrings("hidden", text(get(hidden, "data")));
+}
+
+test "Anthropic hosted blocks do not shift client calls, but citations do" {
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const raw =
+        \\{"content":[{"type":"server_tool_use","id":"server","name":"web_search"},
+        \\{"type":"text","text":"Paris","citations":[{"uri":"https://example.org","quote":"Paris"}]},
+        \\{"type":"web_search_tool_result","tool_use_id":"server"},
+        \\{"type":"tool_use","name":"city","input":{}}]}
+    ;
+    const result = try parseResponse(
+        arena,
+        "fixture",
+        try @import("json_repair.zig").parseJson(arena, raw),
+        &.{},
+    );
+    defer result.response.?.release();
+    const parts = result.response.?.fields.message.parts;
+    try std.testing.expectEqualStrings("Paris", parts[0].text.text);
+    try std.testing.expectEqualStrings("https://example.org", parts[1].citation.url.?);
+    try std.testing.expectEqualStrings("tool_2", parts[2].tool_call.id);
 }
 
 test "Anthropic forcing one function preserves the other declarations" {
