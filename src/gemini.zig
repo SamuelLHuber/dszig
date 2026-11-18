@@ -834,7 +834,7 @@ fn parseResponse(arena: Allocator, model: []const u8, raw: Value, records: []con
     const candidate = if (candidates.len == 0) .null else candidates[0];
     const reason = text(get(candidate, "finishReason"));
     if (invalidFinish(reason)) return error.LMFailure;
-    if (get(candidate, "groundingMetadata") != .null) return error.LMFailure;
+    const grounding = get(candidate, "groundingMetadata");
     const wire_parts = elems(get(get(candidate, "content"), "parts"));
     const parts = try arena.alloc(sdk.Part, @max(wire_parts.len, 1));
     var visible: std.Io.Writer.Allocating = .init(arena);
@@ -872,6 +872,8 @@ fn parseResponse(arena: Allocator, model: []const u8, raw: Value, records: []con
             continue;
         }
         const call = get(part, "functionCall");
+        if (call == .null and (get(part, "executableCode") != .null or
+            get(part, "codeExecutionResult") != .null)) continue;
         const name = text(get(call, "name"));
         if (name.len == 0) return error.LMFailure;
         const states = try parseSignature(arena, if (text(signature).len != 0)
@@ -900,10 +902,18 @@ fn parseResponse(arena: Allocator, model: []const u8, raw: Value, records: []con
         });
         parts_len += 1;
     }
-    if (parts_len == 0) {
-        parts[0] = .{ .text = .{} };
-        parts_len = 1;
-    }
+    const citations = try readCitations(arena, grounding, visible.written());
+    const final_parts = if (citations.len != 0) with_citations: {
+        const combined = try arena.realloc(parts, parts_len + citations.len);
+        for (combined[parts_len..], citations) |*slot, citation| slot.* = .{ .citation = citation };
+        break :with_citations combined;
+    } else without_citations: {
+        if (parts_len == 0) {
+            parts[0] = .{ .text = .{} };
+            parts_len = 1;
+        }
+        break :without_citations parts[0..parts_len];
+    };
     const id = text(get(raw, "responseId"));
     const scores = try readLogprobs(arena, get(candidate, "logprobsResult"));
     var result: lm_mod.Completion = .{
@@ -912,7 +922,8 @@ fn parseResponse(arena: Allocator, model: []const u8, raw: Value, records: []con
         .reasoning = if (reasoning.written().len != 0) reasoning.written() else null,
         .tool_calls = calls.items,
         .adaptations = records,
-        .message = .{ .role = .assistant, .parts = parts[0..parts_len] },
+        .citations = citations,
+        .message = .{ .role = .assistant, .parts = final_parts },
         .provider_data = sdk.PayloadValue.fromBorrowedValue(arena, raw) catch |err| return codecError(err),
         .metadata = .{
             .id = if (id.len != 0) id else null,
@@ -923,6 +934,78 @@ fn parseResponse(arena: Allocator, model: []const u8, raw: Value, records: []con
     };
     try lm_mod.publishResponse(arena, &result, model, .borrowed);
     return result;
+}
+
+const CitationKey = [3][]const u8;
+
+const CitationContext = struct {
+    pub fn hash(_: CitationContext, key: CitationKey) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        for (key) |item| {
+            const len = item.len;
+            hasher.update(std.mem.asBytes(&len));
+            hasher.update(item);
+        }
+        return hasher.final();
+    }
+
+    pub fn eql(_: CitationContext, lhs: CitationKey, rhs: CitationKey) bool {
+        for (lhs, rhs) |a, b| {
+            if (!std.mem.eql(u8, a, b)) return false;
+        }
+        return true;
+    }
+};
+
+fn readCitations(arena: Allocator, grounding: Value, answer: []const u8) Error![]const sdk.CitationPart {
+    const chunks = elems(get(grounding, "groundingChunks"));
+    const supports = elems(get(grounding, "groundingSupports"));
+    var seen: std.HashMapUnmanaged(CitationKey, void, CitationContext, 80) = .empty;
+    defer seen.deinit(arena);
+    var citations: std.ArrayList(sdk.CitationPart) = .empty;
+    for (supports) |support| {
+        const segment = get(support, "segment");
+        const cited = nonempty(get(segment, "text")) orelse try segmentText(segment, answer);
+        for (elems(get(support, "groundingChunkIndices"))) |raw_index| {
+            var source: Value = .null;
+            if (try lm_mod.OpenAI.annotationIndex(raw_index, chunks.len)) |index| {
+                if (index < chunks.len) {
+                    inline for (.{ "web", "retrievedContext", "googleSearch" }) |name| {
+                        const entry = get(chunks[index], name);
+                        if (source == .null and try lm_mod.OpenAI.responseTruthy(entry)) source = entry;
+                    }
+                }
+            }
+            const url = try citationLabel(arena, source, "uri", "url");
+            const title = try citationLabel(arena, source, "title", "name");
+            if (url == null and title == null and cited == null) continue;
+            const entry = try seen.getOrPut(arena, .{ url orelse "", title orelse "", cited orelse "" });
+            if (entry.found_existing) continue;
+            try citations.append(arena, .{ .text = cited, .title = title, .url = url });
+        }
+    }
+    return citations.items;
+}
+
+fn citationLabel(arena: Allocator, source: Value, primary: []const u8, fallback: []const u8) Error!?[]const u8 {
+    const field = get(source, primary);
+    const value = if (try lm_mod.OpenAI.responseTruthy(field)) field else get(source, fallback);
+    if (!try lm_mod.OpenAI.responseTruthy(value)) return null;
+    if (value == .string) return value.string;
+    var writer: std.Io.Writer.Allocating = .init(arena);
+    @import("pyjson.zig").writeStr(&writer.writer, value) catch |err|
+        return if (err == error.WriteFailed) error.OutOfMemory else error.LMFailure;
+    return writer.written();
+}
+
+fn segmentText(segment: Value, answer: []const u8) Error!?[]const u8 {
+    const common = lm_mod.OpenAI;
+    const start = try common.annotationIndex(get(segment, "startIndex"), answer.len) orelse return null;
+    const end = try common.annotationIndex(get(segment, "endIndex"), answer.len) orelse return null;
+    if (start >= end) return null;
+    const first = common.codepointOffset(answer, start) orelse return null;
+    const last = common.codepointOffset(answer[first..], end - start) orelse return null;
+    return answer[first..][0..last];
 }
 
 fn readLogprobs(arena: Allocator, value: Value) Error![]const lm_mod.TokenLogprob {

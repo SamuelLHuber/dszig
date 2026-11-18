@@ -3768,7 +3768,7 @@ pub const OpenAI = struct {
     /// floats and admits Unicode decimal digits; Pydantic integer coercion does
     /// neither, so it is not the right validator here. No big integer allocation
     /// is needed when an index already lies outside the byte-length upper bound.
-    fn annotationIndex(value: @import("runtime_value.zig").Value, bound: usize) Error!?usize {
+    pub fn annotationIndex(value: @import("runtime_value.zig").Value, bound: usize) Error!?usize {
         switch (value) {
             .integer => |n| return if (n >= 0 and @as(u64, @intCast(n)) <= bound) @intCast(n) else null,
             .float => |n| {
@@ -3816,7 +3816,7 @@ pub const OpenAI = struct {
         }
     }
 
-    fn codepointOffset(text: []const u8, index: usize) ?usize {
+    pub fn codepointOffset(text: []const u8, index: usize) ?usize {
         var i: usize = 0;
         var count: usize = 0;
         while (count < index and i < text.len) : (count += 1) {
