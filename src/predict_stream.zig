@@ -44,6 +44,7 @@ pub const Listener = struct {
 pub const Binding = struct {
     listener: Listener,
     parser: Parser = .none,
+    citations: bool = false,
 
     const Parser = union(enum) {
         none,
@@ -136,6 +137,9 @@ pub const Binding = struct {
                 .thinking => |text| if (self.parser == .reasoning and text.len != 0) {
                     try self.emit(sink, .{ .text = text, .is_last_chunk = false });
                 },
+                .citation => |part| if (self.citations) {
+                    try self.receiveCitation(sink, part);
+                },
                 else => {},
             },
             .end => |end| if (self.parser == .xml and end.finish_reason != null) {
@@ -143,6 +147,21 @@ pub const Binding = struct {
             },
             else => {},
         }
+    }
+
+    fn receiveCitation(self: *Binding, sink: Sink, part: lm.sdk.CitationPart) Error!void {
+        const ended = switch (self.parser) {
+            .none, .reasoning => true,
+            inline else => |*parser| parser.state.ended,
+        };
+        if (ended) return;
+        if (part.text == null and part.title == null and part.url == null) return;
+        var writer = std.Io.Writer.fixed(self.listener.output_storage);
+        @import("citation.zig").Citations.writePart(part, &writer) catch |err| return switch (err) {
+            error.WriteFailed => error.BufferTooSmall,
+            error.ParseValue, error.JsonTooDeep => error.UnsupportedStreamField,
+        };
+        try self.emit(sink, .{ .text = writer.buffered(), .is_last_chunk = false });
     }
 };
 
@@ -230,8 +249,14 @@ pub const Attempt = struct {
             if (binding.parser != .none) continue;
             const target = try findWireField(original, wire_fields, binding.listener.field_name, native);
             switch (target) {
-                .reasoning => binding.parser = .reasoning,
-                .text => |name| try binding.configure(arena, kind, wire_fields, name),
+                .reasoning => {
+                    binding.citations = false;
+                    binding.parser = .reasoning;
+                },
+                .text => |field| {
+                    binding.citations = field.native_citations;
+                    try binding.configure(arena, kind, wire_fields, field.name);
+                },
             }
         }
     }
@@ -253,7 +278,7 @@ pub const Attempt = struct {
     }
 };
 
-const WireField = union(enum) { reasoning, text: []const u8 };
+const WireField = union(enum) { reasoning, text: Field };
 
 /// Native adaptation preserves output order while removing native-only
 /// carriers and renaming reasoning fallbacks. Read the actual wire name.
@@ -276,7 +301,7 @@ fn findWireField(
             continue;
         }
         std.debug.assert(index < wire.len);
-        if (selected) return .{ .text = wire[index].name };
+        if (selected) return .{ .text = wire[index] };
         index += 1;
     }
     std.debug.assert(index == wire.len);

@@ -2177,7 +2177,9 @@ before invoking `dszig.callStream`. An implicit binding must identify one
 predictor by its declared output field; to disambiguate, provide the
 predictor's state pointer. Only selected predictors request streaming.
 Listeners use the adapter's prepared output names, including text fallbacks
-for reasoning. Each listener needs disjoint fragment buffers, and XML also
+for reasoning. A declared `Citations` listener emits native citation deltas
+as JSON-list fragments and can still receive the rendered text field.
+Each listener needs disjoint fragment buffers, and XML also
 needs storage for the prepared output field table. Keep the program, binding
 arena and buffers alive throughout the session.
 
@@ -3743,8 +3745,8 @@ The following prevent a claim that DSZig can do everything DSPy can:
 - **Dynamic Python APIs:** no general Python Module/BaseModule/Example/Prediction/
   Completions object model, dynamic signature syntax, arbitrary Pydantic custom
   models/validators, custom Type hierarchy, generic callbacks,
-  settings singleton, asyncify/syncify or streamify equivalents. Native
-  Prediction handles, explicit UsageTracker scopes and automatic LM/Module-call
+  settings singleton, or arbitrary Python asyncify/syncify/streamify behavior.
+  Native Prediction handles, explicit UsageTracker scopes and automatic LM/Module-call
   accounting are available with the lifetime, synchronization and resource
   contracts above; they are not the full dynamic Python object model.
 - **Type and parsing boundaries:** Unequal response-schema definitions with

@@ -608,6 +608,12 @@ pub const Citations = struct {
         return output.toOwnedSlice();
     }
 
+    /// Format one canonical part without allocating intermediate model storage.
+    pub fn writePart(part: inference.CitationPart, writer: *Writer) runtime.CustomWriteError!void {
+        const citations: Citations = .{ .citations = &.{Citation.fromPart(part)} };
+        try citations.writeFormat(writer, 0);
+    }
+
     fn writeFormat(self: Citations, writer: *Writer, depth: u32) runtime.CustomWriteError!void {
         if (depth >= pyjson.max_depth) return error.JsonTooDeep;
         try writer.writeByte('[');
