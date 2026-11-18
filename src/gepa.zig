@@ -99,7 +99,34 @@ pub const ConfiguredInstructionProposer = struct {
     additional_instructions: []const u8 = "",
     skills: []const ReflectionSkill = &.{},
     max_chars: ?u32 = null,
+    /// Compact tool observations in typed History fields, not ordinary JSON records.
+    truncate_history_outputs: bool = false,
     adapter: @import("adapter.zig").Adapter = .json,
+
+    /// Prepare a typed History for insertion into a standalone proposal record.
+    /// Unchanged fields borrow from `history`; the input itself is never mutated.
+    pub fn prepareHistory(
+        options: ConfiguredInstructionProposer,
+        arena: Allocator,
+        history: History,
+    ) value.ParseError!Value {
+        if (!options.truncate_history_outputs) return history.toValue(arena);
+        var messages: ?[]Record = null;
+        for (history.messages, 0..) |message, index| {
+            var copied = false;
+            for (message.keys(), message.values()) |name, item| {
+                if (item != .object or !item.object.contains("tool_calls") or
+                    !item.object.contains("tool_call_results")) continue;
+                const compacted = try compactToolObservations(arena, item) orelse continue;
+                if (messages == null) messages = try arena.dupe(Record, history.messages);
+                const output = &messages.?[index];
+                if (!copied) output.* = try message.clone(arena);
+                copied = true;
+                try output.put(arena, name, compacted);
+            }
+        }
+        return (History{ .messages = messages orelse history.messages }).toValue(arena);
+    }
 
     pub fn propose(
         options: ConfiguredInstructionProposer,
@@ -881,11 +908,14 @@ pub const GEPA = struct {
                         }
                         var item: Record = .empty;
                         const custom = e.gepa.instruction_proposer != null;
-                        const inputs = if (custom) try customInputs(e.out, step) else step.inputs;
+                        const inputs = if (custom)
+                            try customInputs(e.out, step)
+                        else
+                            try builtinInputs(e.out, e.gepa.proposal_options, step);
                         const outputs = if (custom)
                             try customOutputs(e.out, step)
                         else
-                            step.outputs;
+                            try builtinOutputs(e.out, e.gepa.proposal_options, step);
                         try item.put(e.out, "Inputs", .{ .object = inputs });
                         try item.put(e.out, "Generated Outputs", .{ .object = outputs });
                         const text = fb.feedback orelse try std.fmt.allocPrint(e.out, "This trajectory got a score of {s}.", .{try pyFloat(e.out, fb.score)});
@@ -910,7 +940,7 @@ pub const GEPA = struct {
                 const inputs = if (e.gepa.instruction_proposer != null)
                     try customInputs(e.out, &step)
                 else
-                    failure.inputs;
+                    try builtinInputs(e.out, e.gepa.proposal_options, &step);
                 const text = try std.fmt.allocPrint(
                     e.out,
                     "Couldn't parse the output as per the expected output format. " ++
@@ -1633,6 +1663,146 @@ fn invokeProposer(
         error.OutOfMemory => error.OutOfMemory,
         else => null,
     };
+}
+
+fn compactToolObservations(arena: Allocator, item: Value) value.ParseError!?Value {
+    const ToolCalls = @import("tool.zig").ToolCalls;
+    var calls = try ToolCalls.fromValue(arena, item);
+    const results = calls.tool_call_results orelse return null;
+    var replacements: ?[]@import("tool.zig").ToolCallResult = null;
+    for (results.tool_call_results, 0..) |observation, index| {
+        const text = try reflectionString(arena, null, observation.value);
+        const limit = 500;
+        if (text.len <= limit) continue;
+        const view = std.unicode.Utf8View.init(text) catch return error.ParseValue;
+        var iterator = view.iterator();
+        for (0..limit) |_| if (iterator.nextCodepointSlice() == null) break;
+        const prefix_len = iterator.i;
+        if (prefix_len == text.len) continue;
+        const cut = std.unicode.utf8CountCodepoints(text[prefix_len..]) catch unreachable;
+        var cut_buffer: [32]u8 = undefined;
+        var total_buffer: [32]u8 = undefined;
+        if (replacements == null) replacements = try arena.dupe(
+            @import("tool.zig").ToolCallResult,
+            results.tool_call_results,
+        );
+        replacements.?[index].value = .{ .string = try std.fmt.allocPrint(
+            arena,
+            "{s} [{s} of {s} characters cut]",
+            .{ text[0..prefix_len], groupedDecimal(&cut_buffer, cut), groupedDecimal(&total_buffer, cut + limit) },
+        ) };
+    }
+    calls.tool_call_results = .{ .tool_call_results = replacements orelse return null };
+    return try calls.toValue(arena);
+}
+
+fn groupedDecimal(buffer: *[32]u8, number: usize) []const u8 {
+    var remaining = number;
+    var pos: usize = buffer.len;
+    var digits: usize = 0;
+    while (true) {
+        pos -= 1;
+        buffer[pos] = '0' + @as(u8, @intCast(remaining % 10));
+        remaining /= 10;
+        if (remaining == 0) return buffer[pos..];
+        digits += 1;
+        if (digits % 3 == 0) {
+            pos -= 1;
+            buffer[pos] = ',';
+        }
+    }
+}
+
+test "GEPA reflects truncated Unicode tool results without changing history" {
+    var storage: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    const text = try arena.alloc(u8, 2 * 1501);
+    for (0..1501) |i| @memcpy(text[2 * i ..][0..2], "é");
+    const ToolCalls = @import("tool.zig").ToolCalls;
+    const calls: ToolCalls = .{
+        .tool_calls = &.{.{ .id = "one", .name = "lookup", .args = .empty }},
+        .tool_call_results = .{ .tool_call_results = &.{
+            .{ .call_id = "one", .name = "lookup", .value = .{ .string = text }, .is_error = true },
+            .{ .name = "exact", .value = .{ .string = text[0..1000] } },
+        } },
+    };
+    var event: Record = .empty;
+    try event.put(arena, "actions", try calls.toValue(arena));
+    try event.put(arena, "notes", .{ .string = text });
+    const history: History = .{ .messages = &.{event} };
+    const options: ConfiguredInstructionProposer = .{ .truncate_history_outputs = true };
+    const prepared = try History.fromValue(arena, try options.prepareHistory(arena, history));
+    const actual = try ToolCalls.fromValue(arena, prepared.messages[0].get("actions").?);
+    const original = try ToolCalls.fromValue(arena, history.messages[0].get("actions").?);
+    const observations = actual.tool_call_results.?.tool_call_results;
+    const compact = observations[0].value.string;
+    try std.testing.expectEqualStrings(text[0..1000], compact[0..1000]);
+    try std.testing.expectEqualStrings(" [1,001 of 1,501 characters cut]", compact[1000..]);
+    try std.testing.expect(observations[0].is_error);
+    try std.testing.expectEqualStrings(text[0..1000], observations[1].value.string);
+    try std.testing.expectEqualStrings(text, prepared.messages[0].get("notes").?.string);
+    try std.testing.expectEqualStrings(text, original.tool_call_results.?.tool_call_results[0].value.string);
+}
+
+fn isHistory(field: signature.Field) bool {
+    return field.dspy_type and std.mem.eql(u8, field.type_name, "History");
+}
+
+fn prepareHistoryValue(
+    arena: Allocator,
+    options: ConfiguredInstructionProposer,
+    item: Value,
+) value.ParseError!Value {
+    if (!options.truncate_history_outputs) return item;
+    const history = History.fromValue(arena, item) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.ParseValue,
+    };
+    return options.prepareHistory(arena, history);
+}
+
+fn builtinInputs(
+    arena: Allocator,
+    options: ConfiguredInstructionProposer,
+    step: *const Trace.Step,
+) value.ParseError!Record {
+    const fields = step.predictor.fields[0..step.predictor.input_count];
+    var history_key: ?[]const u8 = null;
+    var inputs: Record = .empty;
+    for (fields) |field| {
+        if (!isHistory(field)) continue;
+        const input = step.inputs.get(field.name) orelse continue;
+        if (input == .null) continue;
+        if (history_key != null) return error.ParseValue;
+        history_key = field.name;
+        try inputs.put(arena, "Context", try prepareHistoryValue(arena, options, input));
+    }
+    const key = history_key orelse return step.inputs;
+    for (step.inputs.keys(), step.inputs.values()) |name, input| {
+        if (std.mem.eql(u8, key, name)) continue;
+        try inputs.put(arena, name, input);
+    }
+    return inputs;
+}
+
+fn builtinOutputs(
+    arena: Allocator,
+    options: ConfiguredInstructionProposer,
+    step: *const Trace.Step,
+) value.ParseError!Record {
+    if (!options.truncate_history_outputs) return step.outputs;
+    var outputs = step.outputs;
+    var copied = false;
+    for (step.predictor.fields[step.predictor.input_count..]) |field| {
+        if (!isHistory(field)) continue;
+        const output = step.outputs.get(field.name) orelse continue;
+        if (output == .null) continue;
+        if (!copied) outputs = try step.outputs.clone(arena);
+        copied = true;
+        try outputs.put(arena, field.name, try prepareHistoryValue(arena, options, output));
+    }
+    return outputs;
 }
 
 fn customInputs(arena: Allocator, step: *const Trace.Step) value.ParseError!Record {

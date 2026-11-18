@@ -3826,7 +3826,13 @@ The following prevent a claim that DSZig can do everything DSPy can:
   `gepa.ReflectionSkill` records as `proposal_options.skills` to include
   trusted reference material in caller order (up to 64 skills and 256 KiB
   of input text). The proposer does not read files or parse YAML; resolve
-  those at application startup. History compaction is not implemented.
+  those at application startup. Built-in reflection labels a declared History
+  input `Context`. Set `proposal_options.truncate_history_outputs = true` to
+  shorten recorded tool-result values after 500 Unicode characters, preserving
+  the original History and leaving ordinary JSON fields alone. For standalone
+  proposal records, call `prepareHistory` before inserting a typed History.
+  This does not compact REPL observations or History models erased inside
+  arbitrary JSON containers.
   `add_format_failure_as_feedback = true` includes captured predictor response
   parse failures in the reflection dataset, with the completion text and the
   active adapter's output structure. Such rollouts keep the configured failure
