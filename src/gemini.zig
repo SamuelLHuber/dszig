@@ -69,7 +69,7 @@ pub const Gemini = struct {
         const native = try self.predictionRequest(arena, request);
         defer native.release();
         const result = try arena.alloc(lm_mod.Completion, 1);
-        result[0] = try self.completeFields(arena, &native.fields, .prediction);
+        result[0] = try self.completeFields(arena, native, .prediction);
         return result;
     }
 
@@ -100,22 +100,26 @@ pub const Gemini = struct {
 
     fn canonical(ptr: *anyopaque, arena: Allocator, request: *const sdk.Request) Error!lm_mod.Completion {
         const self: *Gemini = @ptrCast(@alignCast(ptr));
-        return self.completeFields(arena, &request.fields, .canonical);
+        return self.completeFields(arena, request, .canonical);
     }
 
     fn completeFields(
         self: *const Gemini,
         arena: Allocator,
-        fields: *const sdk.RequestFields,
+        request: *const sdk.Request,
         mode: RequestMode,
     ) Error!lm_mod.Completion {
+        const fields = &request.fields;
         var records: std.ArrayList(sdk.Adaptation) = .empty;
         const body = try requestBody(arena, fields, mode, self.adaptations, &records);
         const reply = try self.send(arena, fields.model, body, null);
         defer self.client.allocator.free(reply.body);
         const raw = @import("json_repair.zig").parseJson(arena, reply.body) catch |err|
             return codecError(err);
-        return parseResponse(arena, fields.model, raw, records.items);
+        var result = try parseResponse(arena, fields.model, raw, records.items);
+        try lm_mod.OpenAI.foldJudgments(arena, &result, request);
+        try lm_mod.publishResponse(arena, &result, fields.model, .borrowed);
+        return result;
     }
 
     pub const StreamEvent = lm_mod.OpenAI.StreamEvent;
@@ -415,7 +419,7 @@ fn requestBody(
     records: *std.ArrayList(sdk.Adaptation),
 ) Error![]const u8 {
     const config = &fields.config;
-    if (config.probabilities != null or config.user_id != null or config.extensions != null)
+    if (config.user_id != null or config.extensions != null)
         return error.LMFailure;
     var names: std.StringHashMapUnmanaged([]const u8) = .empty;
     defer names.deinit(arena);
@@ -484,8 +488,12 @@ fn requestBody(
         try generation.put(arena, "responseMimeType", str("application/json"));
         const kind = text(get(value, "type"));
         if (std.mem.eql(u8, kind, "json_schema")) {
-            const schema = get(value, "schema");
-            try generation.put(arena, if (try openApi(arena, schema)) "responseSchema" else "responseJsonSchema", schema);
+            var schema = get(value, "schema");
+            const found = try @import("typesafe.zig").responseJudgments(arena, schema);
+            try noteJudgmentProbabilities(arena, config, policy, records, found);
+            try encodeJudgmentSchema(arena, &schema, found);
+            const field = if (try openApi(arena, schema)) "responseSchema" else "responseJsonSchema";
+            try generation.put(arena, field, schema);
         } else if (!std.mem.eql(u8, kind, "json_object")) return error.LMFailure;
     }
     if (config.reasoning) |reasoning| {
@@ -596,6 +604,98 @@ fn thinkingConfig(
         }
     }
     return .{ .object = thinking };
+}
+
+const Judgment = @import("typesafe.zig").Judgment;
+
+fn noteJudgmentProbabilities(
+    arena: Allocator,
+    config: *const sdk.Config,
+    policy: @FieldType(Gemini, "adaptations"),
+    records: *std.ArrayList(sdk.Adaptation),
+    found: []const Judgment,
+) Error!void {
+    for (found) |judgment| {
+        if (judgment.kind == .box) continue;
+        return switch (config.probabilities orelse .off) {
+            .off => {},
+            .required => error.LMFailure,
+            .if_available => adaptString(
+                arena,
+                policy,
+                records,
+                "config.probabilities",
+                .dropped,
+                "this wire cannot measure a distribution over the declared keys; the answer carries the pick only",
+                "if_available",
+                null,
+            ),
+        };
+    }
+}
+
+fn encodeJudgmentSchema(arena: Allocator, schema: *Value, found: []const Judgment) Error!void {
+    if (found.len == 0) return;
+    const properties = &schema.object.getPtr("properties").?.object;
+    for (found) |judgment| {
+        if (judgment.kind == .boolean or judgment.kind == .box) continue;
+        const property = &properties.getPtr(judgment.name).?.object;
+        const value = property.get("anyOf") orelse continue;
+        const old_enum = property.get("enum") orelse .null;
+        // A recognized explicit enum can coexist with a non-const anyOf.
+        // Only const-branch judgments carry per-key labels.
+        const branches: []const Value = if (old_enum == .array) &.{} else value.array.items;
+        const values = if (old_enum == .array) old_enum.array else from_branches: {
+            std.debug.assert(branches.len == judgment.keys.len);
+            var items: runtime.Array = .init(arena);
+            try items.ensureTotalCapacity(branches.len);
+            for (branches) |branch| items.appendAssumeCapacity(get(branch, "const"));
+            break :from_branches items;
+        };
+        _ = property.orderedRemove("anyOf");
+        const ordered = judgment.kind == .ordered;
+        try property.put(arena, "type", str(if (ordered) "integer" else "string"));
+        try property.put(arena, "enum", .{ .array = values });
+
+        if (try judgmentDescription(arena, property.get("description") orelse .null, judgment, branches)) |description|
+            try property.put(arena, "description", str(description));
+    }
+}
+
+fn judgmentDescription(
+    arena: Allocator,
+    existing: Value,
+    judgment: Judgment,
+    branches: []const Value,
+) Error!?[]const u8 {
+    for (branches) |branch| {
+        if (text(get(branch, "title")).len != 0) break;
+        if (text(get(branch, "description")).len != 0) break;
+    } else return null;
+
+    var out: std.Io.Writer.Allocating = .init(arena);
+    const head = text(existing);
+    if (head.len != 0) {
+        out.writer.writeAll(head) catch return error.OutOfMemory;
+        out.writer.writeByte(' ') catch return error.OutOfMemory;
+    }
+    const heading = if (judgment.kind == .ordered) "Levels: " else "Options: ";
+    out.writer.writeAll(heading) catch return error.OutOfMemory;
+    for (branches, judgment.keys, 0..) |branch, key, index| {
+        if (index != 0) out.writer.writeAll("; ") catch return error.OutOfMemory;
+        out.writer.writeAll(key) catch return error.OutOfMemory;
+        const title = get(branch, "title");
+        const description = get(branch, "description");
+        if (title != .string and description != .string) continue;
+        const label = text(title);
+        const details = text(description);
+        out.writer.writeAll(" = ") catch return error.OutOfMemory;
+        out.writer.writeAll(label) catch return error.OutOfMemory;
+        if (label.len != 0 and details.len != 0)
+            out.writer.writeAll(": ") catch return error.OutOfMemory;
+        out.writer.writeAll(details) catch return error.OutOfMemory;
+    }
+    return @import("value.zig").pyStrip(out.written());
 }
 
 fn startsIgnoreCase(value: []const u8, prefix: []const u8) bool {
@@ -916,7 +1016,7 @@ fn parseResponse(arena: Allocator, model: []const u8, raw: Value, records: []con
     };
     const id = text(get(raw, "responseId"));
     const scores = try readLogprobs(arena, get(candidate, "logprobsResult"));
-    var result: lm_mod.Completion = .{
+    return .{
         .logprobs = if (scores.len == 0) null else scores,
         .text = if (visible.written().len == 0 and calls.items.len != 0) null else visible.written(),
         .reasoning = if (reasoning.written().len != 0) reasoning.written() else null,
@@ -932,8 +1032,6 @@ fn parseResponse(arena: Allocator, model: []const u8, raw: Value, records: []con
             .usage = try readUsage(arena, get(raw, "usageMetadata")),
         },
     };
-    try lm_mod.publishResponse(arena, &result, model, .borrowed);
-    return result;
 }
 
 const CitationKey = [3][]const u8;
@@ -1171,6 +1269,22 @@ test "Gemini separates structured schema dialects and rejects blocked candidates
     try std.testing.expectError(error.LMFailure, parseResponse(arena, "fixture", blocked, &.{}));
 }
 
+test "Gemini judgment enum takes precedence over non-const branches" {
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    var schema = try @import("json_repair.zig").parseJson(arena,
+        \\{"type":"object","properties":{"grade":{
+        \\"enum":["ok","no"],"anyOf":[{"type":"string"}]}}}
+    );
+    const found = try @import("typesafe.zig").responseJudgments(arena, schema);
+    try encodeJudgmentSchema(arena, &schema, found);
+    const grade = get(get(schema, "properties"), "grade");
+    try std.testing.expectEqualStrings("string", text(get(grade, "type")));
+    try std.testing.expect(get(grade, "anyOf") == .null);
+    try std.testing.expectEqualStrings("ok", text(elems(get(grade, "enum"))[0]));
+}
+
 test "Gemini retains tool call position in mixed responses" {
     var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer scratch.deinit();
@@ -1180,7 +1294,7 @@ test "Gemini retains tool call position in mixed responses" {
     );
     const result = try parseResponse(arena, "fixture", raw, &.{});
     try std.testing.expectEqual(sdk.FinishReason.tool_call, result.metadata.finish_reason.?);
-    try std.testing.expectEqualStrings("tool_call_1", result.response.?.fields.message.parts[1].tool_call.id);
+    try std.testing.expectEqualStrings("tool_call_1", result.message.?.parts[1].tool_call.id);
     try std.testing.expectEqualStrings("tool_call_1", result.tool_calls[0].id);
 }
 
@@ -1199,7 +1313,7 @@ test "Gemini separates answer text from signed and unsigned thought summaries" {
     try std.testing.expectEqualStrings("Check the answer", result.reasoning.?);
     try std.testing.expectEqualStrings("Paris", result.text.?);
 
-    const parts = result.response.?.fields.message.parts;
+    const parts = result.message.?.parts;
     const names: std.StringHashMapUnmanaged([]const u8) = .empty;
     const signed = try encodePart(arena, parts[0], &names);
     const unsigned = try encodePart(arena, parts[1], &names);
@@ -1222,7 +1336,7 @@ test "Gemini ignores empty media before assigning a synthetic tool ID" {
         \\]}}]}
     );
     const result = try parseResponse(arena, "fixture", raw, &.{});
-    const parts = result.response.?.fields.message.parts;
+    const parts = result.message.?.parts;
     try std.testing.expectEqualStrings("gs://bucket/audio", parts[0].audio.url.?);
     try std.testing.expectEqualStrings("tool_call_1", parts[1].tool_call.id);
 }

@@ -3746,7 +3746,12 @@ The following prevent a claim that DSZig can do everything DSPy can:
   `Gemini.lm()` and `Gemini.completeRequest` support nonstreaming text,
   JSON/schema-constrained generation, and function calls with text results
   on the Gemini Developer API, with `x-goog-api-key` authentication and
-  canonical token accounting. The Gemini codec maps requested token logprobs
+  canonical token accounting. Gemini converts judgment branches to enum
+  constraints and folds labels into the schema description. A buffered answer
+  with one JSON-object text part becomes a canonical data part. Gemini
+  returns the pick, not a distribution over judgment keys: `if_available`
+  records that limitation and `required` refuses measurable judgments.
+  The Gemini codec maps requested token logprobs
   in buffered and streamed responses when a model serves them. Buffered
   generation maps grounding sources to citations and preserves hosted code
   execution output in raw provider data. Nonstreaming reasoning supports
