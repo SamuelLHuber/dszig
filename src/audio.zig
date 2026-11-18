@@ -22,6 +22,36 @@ pub const Audio = struct {
     pub const Options = struct { audio_format: []const u8 = "wav" };
     pub const PathOptions = struct { max_bytes: usize };
     pub const UrlOptions = media_download.Options;
+    pub const WavOptions = struct {
+        sample_rate_hz: u32,
+        channels: u16 = 1,
+        /// Inclusive limit on the complete WAV before base64.
+        max_bytes: usize,
+        audio_format: []const u8 = "wav",
+    };
+
+    /// Samples are interleaved by frame; all four types produce PCM16.
+    pub const Samples = union(enum) {
+        s16: []const i16,
+        s32: []const i32,
+        f32: []const f32,
+        f64: []const f64,
+
+        fn len(self: Samples) usize {
+            return switch (self) {
+                inline else => |data| data.len,
+            };
+        }
+
+        fn pcm16(self: Samples, index: usize) i16 {
+            return switch (self) {
+                .s16 => |data| data[index],
+                .s32 => |data| @intCast(data[index] >> 16),
+                .f32 => |data| floatPcm16(data[index]),
+                .f64 => |data| floatPcm16(data[index]),
+            };
+        }
+    };
     pub const Fields = struct { data: []const u8, audio_format: []const u8 };
 
     pub const schema_description = "An audio input type for DSPy.\n\nConstruct from in-memory values only: a data URI string, raw ``bytes`` (with\n``audio_format=``), a numpy-like array, a ``{\"data\", \"audio_format\"}`` dict, or another\n``Audio``. Raw base64 is passed as ``Audio(data=..., audio_format=...)``. Construction and\nadapter parsing never access the filesystem or network; use :meth:`from_path` to read a local\nfile, :meth:`from_url` to download a remote resource, or :meth:`from_array` for array data.";
@@ -99,6 +129,42 @@ pub const Audio = struct {
     pub fn fromBytes(allocator: Allocator, bytes: []const u8, options: Options) (Error || Allocator.Error)!Audio {
         if (!std.unicode.utf8ValidateSlice(options.audio_format)) return error.InvalidAudio;
         return fromEncodedBytes(allocator, bytes, if (options.audio_format.len == 0) "wav" else options.audio_format);
+    }
+
+    /// Encode interleaved samples as a conventional RIFF PCM16 WAV.
+    /// Base64 data is owned; the caller's WAV format spelling is borrowed.
+    pub fn fromWavSamples(allocator: Allocator, samples: Samples, options: WavOptions) !Audio {
+        if (!std.ascii.eqlIgnoreCase(options.audio_format, "wav")) return error.InvalidAudio;
+        if (options.channels == 0 or options.sample_rate_hz == 0)
+            return error.InvalidAudioSampleLayout;
+        if (samples.len() % options.channels != 0) return error.InvalidAudioSampleLayout;
+        const frame_bytes = std.math.mul(u16, options.channels, 2) catch
+            return error.InvalidAudioSampleLayout;
+        const byte_rate = std.math.mul(u32, options.sample_rate_hz, frame_bytes) catch
+            return error.InvalidAudioSampleLayout;
+        const data_bytes = std.math.mul(usize, samples.len(), 2) catch return error.AudioTooLarge;
+        if (data_bytes > std.math.maxInt(u32) - 36) return error.AudioTooLarge;
+        const header: [44]u8 = wavHeader(@intCast(data_bytes), options, frame_bytes, byte_rate);
+        const wav_bytes = std.math.add(usize, header.len, data_bytes) catch return error.AudioTooLarge;
+        if (wav_bytes > options.max_bytes) return error.AudioTooLarge;
+        const data = try allocator.alloc(u8, try encodedSize(wav_bytes));
+        const encoder = std.base64.standard.Encoder;
+        // Keep intermediate chunks on sample and base64 group boundaries.
+        var chunk: [3 * 1024]u8 = undefined;
+        @memcpy(chunk[0..header.len], &header);
+        var used: usize = header.len;
+        var encoded: usize = 0;
+        for (0..samples.len()) |i| {
+            std.mem.writeInt(i16, chunk[used..][0..2], samples.pcm16(i), .little);
+            used += 2;
+            if (used == chunk.len) {
+                encoded += encoder.encode(data[encoded..], &chunk).len;
+                used = 0;
+            }
+        }
+        encoded += encoder.encode(data[encoded..], chunk[0..used]).len;
+        std.debug.assert(encoded == data.len);
+        return .{ .data = data, .audio_format = options.audio_format };
     }
 
     /// Borrow fields from a data URI. Source partitions at the first comma
@@ -396,6 +462,33 @@ fn isTruthy(value: Value) error{ParseValue}!bool {
     };
 }
 
+fn floatPcm16(sample: f64) i16 {
+    if (std.math.isNan(sample)) return 0;
+    if (sample >= 1.0) return std.math.maxInt(i16);
+    if (sample <= -1.0) return std.math.minInt(i16);
+    // libsndfile rounds at 32-bit precision before taking the high 16 bits.
+    const scaled = sample * 0x1p31;
+    const floor = @floor(scaled);
+    const lower: i64 = @intFromFloat(floor);
+    const remainder = scaled - floor;
+    const increment = remainder > 0.5 or (remainder == 0.5 and lower & 1 != 0);
+    const rounded = @min(lower + @intFromBool(increment), std.math.maxInt(i32));
+    return @intCast(rounded >> 16);
+}
+
+fn wavHeader(data_bytes: u32, options: Audio.WavOptions, frame_bytes: u16, byte_rate: u32) [44]u8 {
+    var bytes = ("RIFF\x00\x00\x00\x00WAVEfmt \x10\x00\x00\x00" ++
+        "\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x10\x00" ++
+        "data\x00\x00\x00\x00").*;
+    std.mem.writeInt(u32, bytes[4..8], data_bytes + 36, .little);
+    std.mem.writeInt(u16, bytes[22..24], options.channels, .little);
+    std.mem.writeInt(u32, bytes[24..28], options.sample_rate_hz, .little);
+    std.mem.writeInt(u32, bytes[28..32], byte_rate, .little);
+    std.mem.writeInt(u16, bytes[32..34], frame_bytes, .little);
+    std.mem.writeInt(u32, bytes[40..44], data_bytes, .little);
+    return bytes;
+}
+
 fn formatFromMime(media_type: []const u8) (Audio.Error || error{UnsupportedAudioMimeType})![]const u8 {
     const prefix = "audio/";
     if (!std.mem.startsWith(u8, media_type, prefix)) return error.UnsupportedAudioMimeType;
@@ -448,6 +541,21 @@ test "Audio preserves raw fields and emits the Source lm15 part" {
     try std.testing.expectError(error.InvalidAudioBase64, empty.format(arena));
     const invalid = try Audio.fromFields(.{ .data = "Zg=", .audio_format = "wav" });
     try std.testing.expectError(error.InvalidAudioBase64, invalid.serialize(arena));
+}
+
+test "WAV samples preserve the PCM16 rounding boundary and inclusive byte limit" {
+    const allocator = std.testing.allocator;
+    const samples: Audio.Samples = .{ .f64 = &.{ -0x1p-32, -0x1.8p-31, -0x1p-16, 0x1p-16 } };
+    var options: Audio.WavOptions = .{ .sample_rate_hz = 16000, .max_bytes = 51 };
+    try std.testing.expectError(error.AudioTooLarge, Audio.fromWavSamples(allocator, samples, options));
+    options.max_bytes += 1;
+    const audio = try Audio.fromWavSamples(allocator, samples, options);
+    defer allocator.free(audio.data);
+    var bytes: [52]u8 = undefined;
+    try std.base64.standard.Decoder.decode(&bytes, audio.data);
+    try std.testing.expectEqualStrings("RIFF", bytes[0..4]);
+    try std.testing.expectEqual(@as(u32, 8), std.mem.readInt(u32, bytes[40..44], .little));
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 255, 255, 255, 255, 0, 0 }, bytes[44..]);
 }
 
 test "Audio snapshots bytearray fields and runtime clone outlives the source arena" {

@@ -3719,7 +3719,10 @@ The following prevent a claim that DSZig can do everything DSPy can:
   required decompressed byte cap, configurable inactivity timeout and redirect
   limit, and the caller's TLS trust. These helpers do not enforce an SSRF
   allowlist; use only trusted URLs and redirects. The runtime never downloads
-  media implicitly, transcodes audio, or encodes sample arrays. Live public OpenAI
+  media implicitly or transcodes encoded audio. `Audio.fromWavSamples` encodes
+  typed interleaved `i16`, `i32`, `f32`, or `f64` slices as PCM16 WAV with a byte
+  cap, without NumPy or libsndfile. Other sample container formats are not
+  supported. Live public OpenAI
   Chat Completions and Responses checks identified the dominant color of an
   inline PNG through typed `Predict`. This does not verify hosted audio, media
   fine-tuning, or rich-media tool results. Chat Completions does not accept
