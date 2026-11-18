@@ -51,6 +51,10 @@ pub const call = predict.callProgram;
 pub const callStream = predict.callStream;
 pub const stream = @import("predict_stream.zig");
 pub const stream_status = @import("stream_status.zig");
+pub const AsyncProgram = @import("async_stream.zig").AsyncProgram;
+test {
+    _ = @import("async_stream.zig");
+}
 pub const Context = predict.Context;
 pub const TwoStepAdapter = predict.TwoStepAdapter;
 pub const Trace = predict.Trace;
