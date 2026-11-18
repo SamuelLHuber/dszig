@@ -470,6 +470,29 @@ pub fn Reader(comptime codec: anytype) type {
             return error.LMFailure;
         }
 
+        /// Accumulate an already canonical event. Retained leaves other than
+        /// the delta index must live at least as long as the resulting completion.
+        pub fn acceptRetainedEvent(self: *Self, event: Event) lm.Error!void {
+            switch (event) {
+                .start => |start_event| {
+                    self.metadata.id = start_event.id;
+                    self.metadata.model = start_event.model;
+                    self.adaptations = start_event.adaptations;
+                },
+                .delta => |delta| self.accumulateDelta(delta.part_index, delta.data, true) catch |err|
+                    return mapAssemblyError(err),
+                .provider_error => return error.LMFailure,
+                .end => |end_event| {
+                    self.metadata.finish_reason = end_event.finish_reason;
+                    self.metadata.usage = end_event.usage orelse .{};
+                    self.provider_data = end_event.provider_data;
+                    var result = self.assemble(false) catch |err| return mapAssemblyError(err);
+                    result.adaptations = self.adaptations;
+                    self.result = result;
+                },
+            }
+        }
+
         fn foldEvent(
             self: *Self,
             backing: Allocator,
@@ -485,7 +508,7 @@ pub fn Reader(comptime codec: anytype) type {
                     if (start_event.adaptations.len != 0) self.adaptations = start_event.adaptations;
                 },
                 .provider_error => |detail| return .{ .provider_error = detail },
-                .delta => |delta| self.accumulateDelta(delta.part_index, delta.data) catch |err|
+                .delta => |delta| self.accumulateDelta(delta.part_index, delta.data, false) catch |err|
                     return mapAssemblyError(err),
                 .end => |end_event| {
                     self.metadata.finish_reason = end_event.finish_reason;
@@ -515,7 +538,12 @@ pub fn Reader(comptime codec: anytype) type {
             return .{ .missing_end = partial };
         }
 
-        fn accumulateDelta(self: *Self, index: ?[]const u8, data: DeltaData) !void {
+        fn accumulateDelta(
+            self: *Self,
+            index: ?[]const u8,
+            data: DeltaData,
+            comptime copy_index: bool,
+        ) !void {
             const key = index orelse {
                 if (data != .continuation) return error.LMFailure;
                 return self.message_continuation.append(self.arena, data.continuation);
@@ -527,7 +555,7 @@ pub fn Reader(comptime codec: anytype) type {
             }
             if (data == .image and data.image.data == null and data.image.url == null and
                 data.image.file_id == null) return;
-            try self.deliver(.{ .index = try self.internIndex(key, false), .data = data });
+            try self.deliver(.{ .index = try self.internIndex(key, copy_index), .data = data });
         }
 
         fn firstUnnamedTool(self: *const Self) ?[]const u8 {

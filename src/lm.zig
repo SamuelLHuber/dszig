@@ -2976,7 +2976,7 @@ pub const OpenAI = struct {
         return .{ .completion = completion, .parts = parts, .adaptations = wire.adaptations };
     }
 
-    const OpenAIStream = @import("openai_stream.zig").Reader(.{
+    pub const OpenAIStream = @import("openai_stream.zig").Reader(.{
         .parse = parseJson,
         .text = responseText,
         .string = responseStringValue,

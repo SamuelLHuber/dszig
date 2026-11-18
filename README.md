@@ -3727,9 +3727,11 @@ The following prevent a claim that DSZig can do everything DSPy can:
   The Messages implementation has been compared against DSPy over loopback,
   not against a hosted Claude model. `Anthropic.streamRequest` emits
   callback-borrowed canonical SSE events with early cancellation, including
-  tool fragments and reasoning continuation. It does not assemble a typed
-  prediction or route fields. Third-party reasoning dialects, multimodal
-  blocks, prompt caching and hosted tools are not implemented.
+  tool fragments and reasoning continuation. Use `Anthropic.lm()` with the
+  regular program streaming APIs to route typed fields and get a final
+  prediction; cache hits return the prediction without replaying live fields.
+  Third-party reasoning dialects, multimodal blocks, prompt caching and
+  hosted tools are not implemented.
   Native File construction, adapter/typed prediction
   handling, File tool-result markers and bounded Responses document translation
   are implemented as described above. There is still no complete lm15 provider

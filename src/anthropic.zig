@@ -34,6 +34,7 @@ pub const Anthropic = struct {
             .ptr = self,
             .vtable = &.{
                 .complete = complete,
+                .complete_stream = completeStream,
                 .complete_canonical = canonical,
                 .model_name = modelName,
                 .clone = clone,
@@ -63,20 +64,49 @@ pub const Anthropic = struct {
         return copy.lm();
     }
 
-    fn complete(ptr: *anyopaque, arena: Allocator, request: lm_mod.Request) Error![]const lm_mod.Completion {
-        const self: *Anthropic = @ptrCast(@alignCast(ptr));
+    fn predictionRequest(
+        self: *const Anthropic,
+        arena: Allocator,
+        request: lm_mod.Request,
+    ) Error!*const sdk.Request {
         for (request.tools) |tool| if (tool.strict != null) return error.LMFailure;
-        const native = try lm_mod.OpenAI.canonicalPredictionRequest(
+        return lm_mod.OpenAI.canonicalPredictionRequest(
             arena,
             request,
             self.model,
             self.max_tokens,
             null,
         );
+    }
+
+    fn complete(ptr: *anyopaque, arena: Allocator, request: lm_mod.Request) Error![]const lm_mod.Completion {
+        const self: *Anthropic = @ptrCast(@alignCast(ptr));
+        const native = try self.predictionRequest(arena, request);
         defer native.release();
         const results = try arena.alloc(lm_mod.Completion, 1);
         results[0] = try canonical(ptr, arena, native);
         return results;
+    }
+
+    fn completeStream(
+        ptr: *anyopaque,
+        arena: Allocator,
+        request: lm_mod.Request,
+        sink: StreamSink,
+    ) Error!lm_mod.Completion {
+        const self: *Anthropic = @ptrCast(@alignCast(ptr));
+        const native = try self.predictionRequest(arena, request);
+        defer native.release();
+        var assembler: lm_mod.OpenAI.OpenAIStream = .{
+            .arena = arena,
+            .model = native.fields.model,
+            .stop = &.{},
+        };
+        const outcome = try self.runStream(arena, arena, native, sink, &assembler);
+        if (outcome == .stopped) return error.StreamStopped;
+        var completion = assembler.result orelse return error.LMFailure;
+        try lm_mod.publishResponse(arena, &completion, native.fields.model, .borrowed);
+        return completion;
     }
 
     pub fn completeRequest(self: *Anthropic, arena: Allocator, request: *const sdk.Request) Error!*const sdk.Response {
@@ -97,7 +127,17 @@ pub const Anthropic = struct {
     ) Error!StreamOutcome {
         var scratch: std.heap.ArenaAllocator = .init(backing);
         defer scratch.deinit();
-        const arena = scratch.allocator();
+        return self.runStream(scratch.allocator(), backing, request, sink, null);
+    }
+
+    fn runStream(
+        self: *Anthropic,
+        arena: Allocator,
+        backing: Allocator,
+        request: *const sdk.Request,
+        sink: StreamSink,
+        assembler: ?*lm_mod.OpenAI.OpenAIStream,
+    ) Error!StreamOutcome {
         var records: std.ArrayList(sdk.Adaptation) = .empty;
         const body = try self.requestBody(arena, request, &records, true);
         var stream: MessageStream = .{
@@ -105,6 +145,7 @@ pub const Anthropic = struct {
             .model = request.fields.model,
             .adaptations = records.items,
             .sink = sink,
+            .assembler = assembler,
         };
         var consumer: http.ResponseConsumer = .{
             .context = &stream,
@@ -387,6 +428,7 @@ const MessageStream = struct {
     model: []const u8,
     adaptations: []const sdk.Adaptation,
     sink: Anthropic.StreamSink,
+    assembler: ?*lm_mod.OpenAI.OpenAIStream = null,
     outcome: Anthropic.StreamOutcome = .exhausted,
     started: bool = false,
     saw_end: bool = false,
@@ -399,12 +441,15 @@ const MessageStream = struct {
         defer events.deinit();
         var frame: std.heap.ArenaAllocator = .init(self.backing);
         defer frame.deinit();
+        // Typed assembly retains parsed leaves; raw observation reuses frame storage.
+        const temp = if (self.assembler != null) self.backing else frame.allocator();
         var terminal: std.ArrayList(u8) = .empty;
         defer terminal.deinit(self.backing);
+        var retained_terminal: Value = .null;
         const parse = @import("json_repair.zig").parseJson;
         while (try events.next()) |data| {
             if (data.len == 0) continue;
-            const value = try parse(frame.allocator(), data);
+            const value = try parse(temp, data);
             if (value != .object) return error.LMFailure;
             const kind = text(get(value, "type"));
             if (is(kind, "message_delta")) {
@@ -414,52 +459,59 @@ const MessageStream = struct {
                 if (stop != null or has_usage) self.saw_end = true;
                 if (stop) |reason| self.finish = finishReason(reason, false);
                 if (has_usage or (stop != null and !self.usage_frame)) {
-                    terminal.clearRetainingCapacity();
-                    try terminal.appendSlice(self.backing, data);
+                    if (self.assembler != null) {
+                        retained_terminal = value;
+                    } else {
+                        terminal.clearRetainingCapacity();
+                        try terminal.appendSlice(self.backing, data);
+                    }
                     self.usage_frame = has_usage;
                 }
             } else if (is(kind, "message_stop")) {
                 self.saw_end = true;
             } else {
-                try self.dispatch(frame.allocator(), value);
+                try self.dispatch(temp, value);
             }
             if (self.outcome == .stopped) return;
             _ = frame.reset(.retain_capacity);
         }
         if (!self.saw_end) return;
-        const temp = frame.allocator();
-        const final = if (terminal.items.len == 0) .null else try parse(temp, terminal.items);
-        self.start(null, self.model);
-        self.emit(.{ .end = .{
+        const final = if (terminal.items.len == 0) retained_terminal else try parse(temp, terminal.items);
+        try self.start(null, self.model);
+        try self.emit(.{ .end = .{
             .finish_reason = self.finish,
             .usage = if (self.usage_frame) try readUsage(temp, get(final, "usage")) else null,
             .provider_data = if (final != .null) try payload(temp, final) else null,
         } });
     }
 
-    fn emit(self: *MessageStream, event: Anthropic.StreamEvent) void {
+    fn emit(self: *MessageStream, event: Anthropic.StreamEvent) Error!void {
         if (self.outcome == .stopped) return;
-        if (self.sink.on_event(self.sink.context, event) == .stop) self.outcome = .stopped;
+        if (self.sink.on_event(self.sink.context, event) == .stop) {
+            self.outcome = .stopped;
+            return;
+        }
+        if (self.assembler) |assembler| try assembler.acceptRetainedEvent(event);
     }
 
-    fn start(self: *MessageStream, id: ?[]const u8, model: []const u8) void {
+    fn start(self: *MessageStream, id: ?[]const u8, model: []const u8) Error!void {
         if (self.started) return;
         self.started = true;
-        self.emit(.{ .start = .{ .id = id, .model = model, .adaptations = self.adaptations } });
+        try self.emit(.{ .start = .{ .id = id, .model = model, .adaptations = self.adaptations } });
     }
 
     fn dispatch(self: *MessageStream, arena: Allocator, value: Value) Error!void {
         const kind = text(get(value, "type"));
         if (is(kind, "message_start")) {
             const message = get(value, "message");
-            self.start(nonempty(get(message, "id")), nonempty(get(message, "model")) orelse self.model);
+            try self.start(nonempty(get(message, "id")), nonempty(get(message, "model")) orelse self.model);
         } else if (is(kind, "content_block_start") or is(kind, "content_block_delta")) {
             try self.content(arena, value, is(kind, "content_block_start"));
         } else if (is(kind, "error")) {
             const detail = get(value, "error");
             const code = nonempty(get(detail, "type")) orelse nonempty(get(detail, "code")) orelse
                 nonempty(get(value, "code")) orelse nonempty(get(value, "error_type")) orelse "provider";
-            self.emit(.{ .provider_error = .{
+            try self.emit(.{ .provider_error = .{
                 .code = providerError(code),
                 .provider_code = code,
                 .message = nonempty(get(detail, "message")) orelse nonempty(get(value, "message")) orelse code,
@@ -495,8 +547,8 @@ const MessageStream = struct {
             }
             if (!is(kind, "redacted_thinking") or get(item, "data") == .null) return;
             const thinking = try parseThinking(arena, item, true);
-            self.start(null, self.model);
-            self.emit(.{ .delta = .{ .part_index = index, .data = .{ .thinking = "" } } });
+            try self.start(null, self.model);
+            try self.emit(.{ .delta = .{ .part_index = index, .data = .{ .thinking = "" } } });
             break :start_data .{ .continuation = thinking.continuation[0] };
         } else if (is(kind, "text_delta"))
             .{ .text = .{ .text = text(get(item, "text")) } }
@@ -515,8 +567,8 @@ const MessageStream = struct {
                 .url = nonempty(get(source, "url")),
             } };
         } else return;
-        self.start(null, self.model);
-        self.emit(.{ .delta = .{ .part_index = index, .data = data } });
+        try self.start(null, self.model);
+        try self.emit(.{ .delta = .{ .part_index = index, .data = data } });
     }
 };
 
@@ -787,6 +839,52 @@ fn payload(arena: Allocator, value: Value) Error!sdk.PayloadValue {
 
 fn codecError(err: anyerror) Error {
     return if (err == error.OutOfMemory) error.OutOfMemory else error.LMFailure;
+}
+
+test "Anthropic typed stream assembles distinct indexes and requires a terminal event" {
+    const deltas =
+        \\data: {"type":"content_block_delta","index":10,"delta":{"type":"text_delta","text":"second"}}
+        \\
+        \\data: {"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"first"}}
+        \\
+        \\data: {"type":"content_block_delta","index":10,"delta":{"type":"text_delta","text":"!"}}
+        \\
+        \\
+    ;
+    const sink = struct {
+        fn onEvent(_: *anyopaque, _: Anthropic.StreamEvent) Anthropic.StreamSink.Action {
+            return .proceed;
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    for ([_]bool{ false, true }) |terminal| {
+        const wire = if (terminal) deltas ++ "data: {\"type\":\"message_stop\"}\n\n" else deltas;
+        var assembler: lm_mod.OpenAI.OpenAIStream = .{
+            .arena = arena,
+            .model = "fixture",
+            .stop = &.{},
+        };
+        var stream: MessageStream = .{
+            .backing = arena,
+            .model = "fixture",
+            .adaptations = &.{},
+            .sink = .{ .context = &assembler, .on_event = sink.onEvent },
+            .assembler = &assembler,
+        };
+        var reader: std.Io.Reader = .fixed(wire);
+        try MessageStream.consume(&stream, arena, &reader, wire.len);
+        if (!terminal) {
+            try std.testing.expect(assembler.result == null);
+            continue;
+        }
+        const result = assembler.result.?;
+        const parts = result.message.?.parts;
+        try std.testing.expectEqual(@as(usize, 2), parts.len);
+        try std.testing.expectEqualStrings("first", parts[0].text.text);
+        try std.testing.expectEqualStrings("second!", parts[1].text.text);
+    }
 }
 
 test "Anthropic reasoning replays signed and redacted blocks without showing either as the answer" {
