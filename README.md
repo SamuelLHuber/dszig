@@ -2145,6 +2145,14 @@ response and diagnostic strings no longer depend on source storage. Release
 the report with `.release(backing)`. This API does not turn an HTTP push
 stream into a pull iterator or run a DSPy program.
 
+`lm.ChatStreamListener` projects interim text for one ChatAdapter wire field
+from a sequence of text chunks. It uses three disjoint caller-provided buffers
+and reports `BufferTooSmall` instead of allocating. Feed text deltas to
+`.receive()`, then call `.finalize()` when the source ends. The result is
+borrowed until the next call. A chunk containing both field markers suppresses
+interim output, as in DSPy; it does not prove a cache lookup occurred. This
+listener does not parse the final prediction or route chunks to predictors.
+
 Responses requests honor `config.extensions.openai_responses_compat`, its
 `openai_compat` alias and the nested `compat` forms. Null inherits; `"auto"`
 selects the dialect default. Direct empty objects win over aliases, whereas
@@ -3634,6 +3642,7 @@ The following prevent a claim that DSZig can do everything DSPy can:
   training providers or streaming beyond synchronous OpenAI Responses and
   Chat Completions SSE. Completed SDK responses can be projected to events,
   and bounded event sequences or synchronous sources can be assembled.
+  A bounded ChatAdapter text field listener is available separately.
   Asynchronous streaming and DSPy program streaming are not available.
   Document support is not general multimodal support, and Chat Completions
   does not accept document parts.

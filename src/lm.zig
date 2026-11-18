@@ -13,6 +13,7 @@ const http = @import("http.zig");
 pub const inference = @import("inference.zig");
 pub const sdk = @import("sdk_response.zig");
 pub const public_history = @import("lm_history.zig");
+pub const ChatStreamListener = @import("chat_stream_listener.zig").ChatStreamListener;
 const prompt_options = @import("lm_prompt_options.zig");
 /// Canonical SDK token usage; every unknown counter stays null, never zero.
 pub const Usage = @import("lm_usage.zig").Usage;
@@ -4840,6 +4841,31 @@ test "Responses media counts canonical parts and rejects malformed payloads befo
     );
     try testing.expect(!empty.generated_media);
     try testing.expectEqualStrings("", empty.text.?);
+}
+
+test "Chat field listener bounds pending text and held whitespace independently" {
+    var marker: [32]u8 = undefined;
+    var pending: [32]u8 = undefined;
+    var output: [4]u8 = undefined;
+    var listener = try ChatStreamListener.init(.{
+        .wire_field = "answer",
+        .marker_storage = &marker,
+        .pending_storage = &pending,
+        .output_storage = &output,
+    });
+    const oversized: [33]u8 = @splat('[');
+    try testing.expectError(error.BufferTooSmall, listener.receive(&oversized));
+    _ = try listener.receive("[[ ## answer ## ]]");
+    const first = (try listener.receive("x  ")).?;
+    try testing.expectEqualStrings("x", first.text);
+    _ = try listener.receive("  ");
+    try testing.expectError(error.BufferTooSmall, listener.receive("y"));
+    _ = try listener.receive("[[ ## answer ## ]]");
+    const recovered = (try listener.receive("yes")).?;
+    try testing.expectEqualStrings("yes", recovered.text);
+    const last = (try listener.receive("[[ ## completed ## ]]")).?;
+    try testing.expectEqualStrings("", last.text);
+    try testing.expect(last.is_last_chunk);
 }
 
 test "Responses streamed stop preserves whole scores and discards later queued parts" {
