@@ -6,11 +6,10 @@ allocators and execution context are explicit.
 
 **This is not a feature-complete or fully identical implementation of DSPy.** The
 cross-runtime gates cover the behaviors below, not every DSPy capability. In
-particular, the Python-executing RLM/Flex stack, images/audio,
-full provider SDK coverage, and general-purpose LM streaming are not
-implemented. Native File and bounded Responses document support are
-implemented, not general multimodal
-parity. See [Compatibility limits](#compatibility-limits).
+particular, the Python-executing RLM/Flex stack and full provider SDK coverage
+are not implemented. Native image, encoded audio, and document inputs and
+OpenAI streaming cover the paths described below, not general multimodal or
+streaming parity. See [Compatibility limits](#compatibility-limits).
 
 ## Example
 
@@ -3716,10 +3715,11 @@ The following prevent a claim that DSZig can do everything DSPy can:
   Typed `Image` and `Audio` can produce canonical input parts from encoded media.
   `Image.fromEncodedBytes` and both `fromPath` helpers accept explicit byte
   limits; path helpers require caller-trusted paths. The runtime does not fetch
-  remote media, transcode audio, or encode sample arrays. A live public OpenAI
-  Responses check identified the dominant color of an inline PNG through typed
-  `Predict`. This does not verify hosted audio, media fine-tuning, or rich-media
-  tool results. Chat Completions does not accept document parts.
+  remote media, transcode audio, or encode sample arrays. Live public OpenAI
+  Chat Completions and Responses checks identified the dominant color of an
+  inline PNG through typed `Predict`. This does not verify hosted audio, media
+  fine-tuning, or rich-media tool results. Chat Completions does not accept
+  document parts.
 - **File and DocumentPart boundaries:** the constructor smoke explicitly leaves
   606 successful source Python DocumentPart object/repr/bytes operations
   unimplemented; canonical document dictionaries do not replace those
@@ -3797,6 +3797,12 @@ The following prevent a claim that DSZig can do everything DSPy can:
   additional model calls. Unsupported GEPA options include custom code/instruction proposers,
   Flex components, objective-based frontiers, other selection policies, format-failure feedback,
   logging integrations, and some MIPROv2/SIMBA/COPRO statistics/logging options.
+  MIPROv2 `track_stats` retains native program values in trial order with
+  stable score-ranked full and minibatch indices in `Result.tracked_programs`.
+  Trial logs expose cumulative evaluation counts and distinguish minibatch
+  logging mode from a batch that covered the whole validation set. Tracking
+  makes no extra evaluations. This is not Python object deepcopy or LM-call
+  counter parity; opaque program state can still be borrowed.
   Concurrent evaluation and SIMBA/GEPA rollouts use explicit startup-created
   native pools; Python ambient settings and general async execution are not
   implemented. SIMBA uses Zig `@exp`, not NumPy's implementation.

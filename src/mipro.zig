@@ -8,7 +8,7 @@
 //! The program-aware proposer needs the program's code, which DSPy reads with
 //! `inspect.getsource`; DSZig takes it as `Options.program_code` and runs
 //! without it, like `program_aware_proposer=False`, when none is given.
-//! Not supported: `track_stats` program copies and `log_dir`.
+//! Not supported: Python object deepcopy, LM call counters, and `log_dir`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -364,6 +364,8 @@ pub const MIPROv2 = struct {
     concurrent_evaluation: ?optimize.ConcurrentEvaluation = null,
     seed: u32 = 9,
     init_temperature: f64 = 1.0,
+    /// Retain the evaluated native program values and their ranking.
+    track_stats: bool = true,
     /// Used while bootstrapping demo candidates.
     teacher_settings: optimize.TeacherSettings = .{},
 
@@ -417,7 +419,22 @@ pub const MIPROv2 = struct {
         params: ?[]const usize,
         score: f64,
         full_eval: bool,
+        /// Trial logging mode, distinct from whether the batch covered the valset.
+        minibatch_log: bool = false,
+        total_eval_calls_so_far: usize = 0,
     };
+
+    pub fn TrackedPrograms(comptime P: type) type {
+        return struct {
+            /// Native program values in trial-log order, including the baseline.
+            /// As with the winning program, opaque borrowed state is not deep copied.
+            by_trial: []const P,
+            /// Indices into `by_trial` and `Result.trials`, descending by score.
+            /// Ties retain evaluation order.
+            full: []const usize,
+            minibatch: []const usize,
+        };
+    }
 
     pub fn Result(comptime P: type) type {
         return struct {
@@ -430,6 +447,7 @@ pub const MIPROv2 = struct {
             trials: []const TrialLog,
             /// Scores of `candidate_programs` (full evaluations), descending.
             candidates: []const f64,
+            tracked_programs: ?TrackedPrograms(P) = null,
         };
     }
 
@@ -749,9 +767,26 @@ pub const MIPROv2 = struct {
         var history: std.ArrayList(tpe.Trial) = .empty;
         try history.append(out, .{ .params = try zeros(out, params.items.len), .value = default_score });
         var logs: std.ArrayList(TrialLog) = .empty;
-        try logs.append(out, .{ .number = 1, .params = null, .score = default_score, .full_eval = true });
+        var programs: std.ArrayList(P) = .empty;
+        if (self.track_stats) {
+            const program_limit = if (minibatch)
+                adjusted
+            else
+                std.math.add(usize, num_trials, 1) catch return error.InvalidOptions;
+            try programs.ensureTotalCapacity(out, program_limit);
+        }
+        var total_eval_calls = valset.len;
+        try logs.append(out, .{
+            .number = 1,
+            .params = null,
+            .score = default_score,
+            .full_eval = true,
+            .total_eval_calls_so_far = total_eval_calls,
+        });
+        if (self.track_stats) try programs.append(out, program);
         var full_scores: std.ArrayList(f64) = .empty;
-        try full_scores.append(out, default_score);
+        if (!self.track_stats) try full_scores.append(out, default_score);
+        var full_count: usize = 1;
         var best = program;
         var best_score = default_score;
 
@@ -782,8 +817,20 @@ pub const MIPROv2 = struct {
                 best = candidate;
             }
             const full = batch >= valset.len;
-            if (full) try full_scores.append(out, s);
-            try logs.append(out, .{ .number = trial_num, .params = chosen, .score = s, .full_eval = full });
+            if (full) {
+                full_count += 1;
+                if (!self.track_stats) try full_scores.append(out, s);
+            }
+            total_eval_calls += batch;
+            try logs.append(out, .{
+                .number = trial_num,
+                .params = chosen,
+                .score = s,
+                .full_eval = full,
+                .minibatch_log = minibatch,
+                .total_eval_calls_so_far = total_eval_calls,
+            });
+            if (self.track_stats) try programs.append(out, candidate);
             try history.append(out, .{ .params = chosen, .value = s });
             const combo = for (combos.items) |*c| {
                 if (std.mem.eql(usize, c.params, chosen)) break c;
@@ -807,9 +854,18 @@ pub const MIPROv2 = struct {
                 }
                 const target = pick orelse return error.NoCandidate;
                 const full_score = try self.score(P, out, gpa, ctx, &target.program, valset, valset.len, rng);
-                try full_scores.append(out, full_score);
+                full_count += 1;
+                if (!self.track_stats) try full_scores.append(out, full_score);
                 try history.append(out, .{ .params = target.params, .value = full_score });
-                try logs.append(out, .{ .number = trial_num + 1, .params = null, .score = full_score, .full_eval = true });
+                total_eval_calls += valset.len;
+                try logs.append(out, .{
+                    .number = trial_num + 1,
+                    .params = null,
+                    .score = full_score,
+                    .full_eval = true,
+                    .total_eval_calls_so_far = total_eval_calls,
+                });
+                if (self.track_stats) try programs.append(out, target.program);
                 target.evaluated = true;
                 if (full_score > best_score) {
                     best_score = full_score;
@@ -817,15 +873,61 @@ pub const MIPROv2 = struct {
                 }
             }
         }
-        std.sort.insertion(f64, full_scores.items, {}, std.sort.desc(f64));
+        const tracked = if (self.track_stats)
+            try rankPrograms(P, out, programs.items, logs.items, full_count)
+        else
+            null;
+        const ranked_scores = if (tracked) |ranking| ranked: {
+            const scores = try out.alloc(f64, full_count);
+            for (scores, ranking.full) |*s, index| s.* = logs.items[index].score;
+            break :ranked scores;
+        } else ranked: {
+            std.sort.block(f64, full_scores.items, {}, std.sort.desc(f64));
+            break :ranked full_scores.items;
+        };
         return .{
             .program = best,
             .score = best_score,
             .instruction_candidates = instructions,
             .demo_candidates = demos,
             .trials = logs.items,
-            .candidates = full_scores.items,
+            .candidates = ranked_scores,
+            .tracked_programs = tracked,
         };
+    }
+
+    fn rankPrograms(
+        comptime P: type,
+        out: Allocator,
+        programs: []const P,
+        logs: []const TrialLog,
+        full_count: usize,
+    ) Allocator.Error!TrackedPrograms(P) {
+        assert(programs.len == logs.len);
+        const order = try out.alloc(usize, logs.len);
+        var full_index: usize = 0;
+        var mb_index = full_count;
+        for (logs, 0..) |log, index| {
+            if (log.full_eval) {
+                order[full_index] = index;
+                full_index += 1;
+            } else {
+                order[mb_index] = index;
+                mb_index += 1;
+            }
+        }
+        assert(full_index == full_count);
+        assert(mb_index == order.len);
+        const ByScore = struct {
+            fn less(trials: []const TrialLog, left: usize, right: usize) bool {
+                return trials[left].score > trials[right].score;
+            }
+        };
+        const full = order[0..full_count];
+        const minibatch = order[full_count..];
+        std.sort.block(usize, full, logs, ByScore.less);
+        std.sort.block(usize, minibatch, logs, ByScore.less);
+        return .{ .by_trial = programs, .full = full, .minibatch = minibatch };
     }
 
     /// `eval_candidate_program`: a minibatch drawn with `rng` unless
@@ -858,6 +960,23 @@ fn zeros(out: Allocator, n: usize) Allocator.Error![]usize {
 }
 
 const testing = std.testing;
+
+test "MIPRO ranks full-set minibatch trials as full candidates and preserves ties" {
+    var backing: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer backing.deinit();
+    const programs = [_]u8{ 10, 20, 30, 40, 50, 60 };
+    const logs = [_]MIPROv2.TrialLog{
+        .{ .number = 1, .params = null, .score = 40, .full_eval = true },
+        .{ .number = 2, .params = &.{1}, .score = 90, .full_eval = false, .minibatch_log = true },
+        .{ .number = 3, .params = &.{2}, .score = 80, .full_eval = true, .minibatch_log = true },
+        .{ .number = 4, .params = null, .score = 80, .full_eval = true },
+        .{ .number = 5, .params = &.{3}, .score = 90, .full_eval = false, .minibatch_log = true },
+        .{ .number = 6, .params = null, .score = 100, .full_eval = true },
+    };
+    const ranked = try MIPROv2.rankPrograms(u8, backing.allocator(), &programs, &logs, 4);
+    try testing.expectEqualSlices(usize, &.{ 5, 2, 3, 0 }, ranked.full);
+    try testing.expectEqualSlices(usize, &.{ 1, 4 }, ranked.minibatch);
+}
 
 test "stripPrefix matches dspy.propose.utils.strip_prefix" {
     try testing.expectEqualStrings("Answer with ISO dates.", stripPrefix("Proposed Instruction: Answer with ISO dates."));
