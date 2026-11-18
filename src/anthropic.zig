@@ -28,6 +28,8 @@ pub const Anthropic = struct {
     header_provider: ?http.HeaderProvider = null,
     /// Borrowed application instructions sent before the caller's system blocks.
     system_prefix: []const u8 = "",
+    /// Borrowed allowed model prefixes for compatible endpoints. Null allows all.
+    model_prefixes: ?[]const []const u8 = null,
     supports_reasoning: bool = false,
     supports_response_schema: bool = false,
     adaptations: enum { note, silent, refuse } = .note,
@@ -62,12 +64,30 @@ pub const Anthropic = struct {
         errdefer arena.free(base_url);
         const system_prefix = try arena.dupe(u8, self.system_prefix);
         errdefer arena.free(system_prefix);
+        const model_prefixes = if (self.model_prefixes) |prefixes| try clonePrefixes(arena, prefixes) else null;
+        errdefer if (model_prefixes) |prefixes| {
+            for (prefixes) |prefix| arena.free(prefix);
+            arena.free(prefixes);
+        };
         const copy = try arena.create(Anthropic);
         copy.* = self.*;
         copy.model = model;
         copy.base_url = base_url;
         copy.system_prefix = system_prefix;
+        copy.model_prefixes = model_prefixes;
         return copy.lm();
+    }
+
+    fn clonePrefixes(arena: Allocator, prefixes: []const []const u8) Allocator.Error![]const []const u8 {
+        const result = try arena.alloc([]const u8, prefixes.len);
+        errdefer arena.free(result);
+        var copied: usize = 0;
+        errdefer for (result[0..copied]) |prefix| arena.free(prefix);
+        for (result, prefixes) |*entry, prefix| {
+            entry.* = try arena.dupe(u8, prefix);
+            copied += 1;
+        }
+        return result;
     }
 
     fn predictionRequest(
@@ -234,6 +254,11 @@ pub const Anthropic = struct {
         stream: bool,
     ) Error![]const u8 {
         const fields = &request.fields;
+        if (self.model_prefixes) |prefixes| {
+            for (prefixes) |prefix| {
+                if (std.mem.startsWith(u8, fields.model, prefix)) break;
+            } else return error.LMFailure;
+        }
         const config = &fields.config;
         var body: Object = .empty;
         var messages = try encodeMessages(arena, fields.messages);
@@ -1154,6 +1179,44 @@ test "Anthropic hosted blocks do not shift client calls, but citations do" {
     try std.testing.expectEqualStrings("Paris", parts[0].text.text);
     try std.testing.expectEqualStrings("https://example.org", parts[1].citation.url.?);
     try std.testing.expectEqualStrings("tool_2", parts[2].tool_call.id);
+}
+
+test "Anthropic rejects foreign canonical models before credentials" {
+    const Probe = struct {
+        fn prepare(ptr: *anyopaque, _: Allocator, _: []const std.http.Header) anyerror![]const std.http.Header {
+            const called: *bool = @ptrCast(@alignCast(ptr));
+            called.* = true;
+            return error.UnexpectedCredentialRequest;
+        }
+
+        fn onEvent(_: *anyopaque, _: Anthropic.StreamEvent) Anthropic.StreamSink.Action {
+            return .proceed;
+        }
+    };
+    var backing: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer backing.deinit();
+    const arena = backing.allocator();
+    var client: std.http.Client = .{ .allocator = arena, .io = std.testing.io };
+    defer client.deinit();
+    var called = false;
+    var provider: Anthropic = .{
+        .client = &client,
+        .base_url = "http://invalid.invalid",
+        .model = "served-local",
+        .model_prefixes = &.{"served-"},
+        .header_provider = .{ .context = &called, .prepare = Probe.prepare },
+    };
+    const request = try sdk.Request.fromFields(arena, &.{
+        .model = "foreign",
+        .messages = &.{.{ .role = .user, .parts = &.{.{ .text = .{ .text = "Next" } }} }},
+    });
+    defer request.release();
+    try std.testing.expectError(error.LMFailure, provider.completeRequest(arena, request));
+    try std.testing.expectError(error.LMFailure, provider.streamRequest(arena, request, .{
+        .context = &called,
+        .on_event = Probe.onEvent,
+    }));
+    try std.testing.expect(!called);
 }
 
 test "Anthropic system prefix leaves the cache marker on the caller's block" {

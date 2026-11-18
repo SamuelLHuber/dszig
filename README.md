@@ -3726,6 +3726,8 @@ The following prevent a claim that DSZig can do everything DSPy can:
   per-attempt `header_provider`; use a trusted `base_url` ending in `/v1`.
   Set `system_prefix` to prepend application instructions before the caller's
   system blocks, preserving any cache markers on those blocks.
+  For a compatible endpoint, `model_prefixes` restricts model names before
+  credentials or HTTP, avoiding silent substitution of out-of-prefix names.
   For compatible Claude models, set `supports_reasoning = true` to advertise
   native reasoning to typed predictors. Canonical requests support manual
   budgets and adaptive effort; `max_tokens` is the visible budget on manual
