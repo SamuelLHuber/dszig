@@ -3794,10 +3794,18 @@ The following prevent a claim that DSZig can do everything DSPy can:
   validation example, including ties. Set `track_best_outputs = true` to also
   retain their predictions in `best_outputs_valset`, in candidate discovery
   order. The results live in the compilation allocator and do not require
-  additional model calls. Unsupported GEPA options include custom code/instruction proposers,
-  Flex components, objective-based frontiers, other selection policies, format-failure feedback,
-  and logging integrations. Python logging and runtime settings are not
-  mirrored across optimizers.
+  additional model calls. Set `instruction_proposer` to supply a native callback
+  instead of the built-in reflection prompt. It receives the current named
+  instructions, selected component names, and available examples grouped by
+  component. Ordinary inputs and outputs are rendered as Python-style strings,
+  declared DSPy-type inputs use native trace values, and direct `History` inputs
+  become `Context` text. The callback can use the configured reflection `Context`;
+  an empty update skips child evaluation. GEPA retries a callback error once
+  (allocation errors propagate) and copies the returned instruction text.
+  The callback sees native trace representations, not Python objects; original
+  model identity erased from untyped fields cannot be recovered. Custom code
+  proposers, Flex components, objective-based frontiers, other selection
+  policies, format-failure feedback, and logging integrations remain unsupported.
   COPRO `track_stats` exposes per-predictor, per-depth score summaries in
   `Result.stats`. `best` summarizes up to ten retained instruction/prefix
   pairs; `latest` includes repeat evaluations and accumulates the newest

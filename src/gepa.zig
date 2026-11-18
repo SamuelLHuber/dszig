@@ -8,8 +8,8 @@
 //! Python's `random.Random(seed)` is ported (one stream for the engine, one
 //! for the DSPy adapter), so the same LM answers give the same program.
 //!
-//! Not supported: custom proposers, `dspy.Flex` code components, frontier
-//! types other than `"instance"`, `"epsilon_greedy"`/`"top_k_pareto"`,
+//! Not supported: `dspy.Flex` code components, frontier types other than
+//! `"instance"`, `"epsilon_greedy"`/`"top_k_pareto"`,
 //! `add_format_failure_as_feedback`, `log_dir`. DSPy `num_threads` maps to
 //! `rollouts`: each minibatch/valset evaluation then runs on a native pool,
 //! results in example order. CPython iterates small-int sets in ascending
@@ -33,6 +33,7 @@ const Example = optimize.Example;
 const Record = value.Record;
 const Trace = predict.Trace;
 const Value = @import("runtime_value.zig").Value;
+const History = @import("history.zig").History;
 
 /// What a GEPA metric returns: DSPy's float or `dspy.Prediction(score, feedback)`.
 pub const Feedback = struct { score: f64, feedback: ?[]const u8 = null };
@@ -63,6 +64,7 @@ pub const ProposeInstruction = signature.Signature(struct {
 
 pub const GEPA = struct {
     metric: FeedbackMetric,
+    instruction_proposer: ?InstructionProposer = null,
     auto: ?Auto = null,
     max_full_evals: ?usize = null,
     max_metric_calls: ?usize = null,
@@ -96,7 +98,32 @@ pub const GEPA = struct {
         reflection: ?Context = null,
     };
 
-    pub const Error = error{ ZeroWeights, NoBudget };
+    pub const Error = error{ ZeroWeights, NoBudget, UnknownInstructionComponent };
+
+    pub const Instruction = struct {
+        name: []const u8,
+        text: []const u8,
+    };
+
+    pub const ReflectionDataset = struct {
+        name: []const u8,
+        examples: []const Record,
+    };
+
+    pub const InstructionProposal = struct {
+        candidate: []const Instruction,
+        reflective_dataset: []const ReflectionDataset,
+        components_to_update: []const []const u8,
+    };
+
+    /// Called once per reflection task, with a retry on non-allocation failure.
+    /// Inputs are borrowed. Return static data or allocate updates in ctx.arena;
+    /// GEPA copies accepted text before releasing that scratch arena.
+    /// An empty slice skips evaluation; any existing component can be updated.
+    pub const InstructionProposer = struct {
+        ptr: *anyopaque,
+        propose: *const fn (*anyopaque, Context, *const InstructionProposal) anyerror![]const Instruction,
+    };
 
     pub const BestOutput = struct {
         candidate_idx: usize,
@@ -430,19 +457,17 @@ pub const GEPA = struct {
                     },
                     .all => for (0..e.names.len) |k| try components.append(e.out, k),
                 }
-                const datasets = try e.reflectiveDataset(parent_candidate, before, ids, components.items);
-                var any = false;
-                for (datasets) |d| any = any or d != null;
-                if (!any) return;
-                const texts = (try e.proposeTexts(parent_candidate, components.items, datasets)) orelse
-                    (try e.proposeTexts(parent_candidate, components.items, datasets)) orelse return;
-                const child = try e.out.dupe([]const u8, parent_candidate);
-                var changed = false;
-                for (components.items, texts) |k, t| if (t) |text| {
-                    child[k] = text;
-                    changed = true;
-                };
-                if (!changed) return;
+                const datasets = try e.reflectiveDataset(
+                    parent_candidate,
+                    before,
+                    ids,
+                    components.items,
+                );
+                const proposed = if (e.gepa.instruction_proposer) |proposer|
+                    try e.proposeCustomChild(proposer, parent_candidate, components.items, datasets)
+                else
+                    try e.proposeBuiltinChild(parent_candidate, components.items, datasets);
+                const child = proposed orelse return;
                 const after = try e.evalIds(child, e.trainset, ids, true);
                 if (sumScores(after) > sumScores(before)) {
                     const parent_ids = try e.out.alloc(?usize, 1);
@@ -457,13 +482,20 @@ pub const GEPA = struct {
 
             /// `DspyAdapter.make_reflective_dataset`; `null` where no example
             /// produced a usable trace for that predictor.
-            fn reflectiveDataset(e: *Self, candidate: []const []const u8, runs: []const Run, ids: []const usize, components: []const usize) value.ParseError![]?[]const @import("runtime_value.zig").ObjectMap {
+            fn reflectiveDataset(
+                e: *Self,
+                candidate: []const []const u8,
+                runs: []const Run,
+                ids: []const usize,
+                components: []const usize,
+            ) value.ParseError![]?[]const Record {
+                assert(runs.len == ids.len);
                 const program = try e.build(candidate);
                 const preds = try predict.namedPredictors(e.out, program);
-                const result = try e.out.alloc(?[]const @import("runtime_value.zig").ObjectMap, components.len);
+                const result = try e.out.alloc(?[]const Record, components.len);
                 for (components, result) |k, *slot| {
                     const module = preds[k].param.predict;
-                    var items: std.ArrayList(@import("runtime_value.zig").ObjectMap) = .empty;
+                    var items: std.ArrayList(Record) = .empty;
                     for (runs, ids) |run, id| {
                         const prediction = run.prediction orelse continue;
                         var matching: std.ArrayList(*const Trace.Step) = .empty;
@@ -471,9 +503,15 @@ pub const GEPA = struct {
                         if (matching.items.len == 0) continue;
                         const step = matching.items[e.adapter_rng.randbelow(matching.items.len)];
                         const fb = try e.gepa.metric(e.out, &e.trainset[id], &prediction, run.trace, e.names[k], step);
-                        var item: @import("runtime_value.zig").ObjectMap = .empty;
-                        try item.put(e.out, "Inputs", .{ .object = step.inputs });
-                        try item.put(e.out, "Generated Outputs", .{ .object = step.outputs });
+                        var item: Record = .empty;
+                        const custom = e.gepa.instruction_proposer != null;
+                        const inputs = if (custom) try customInputs(e.out, step) else step.inputs;
+                        const outputs = if (custom)
+                            try customOutputs(e.out, step)
+                        else
+                            step.outputs;
+                        try item.put(e.out, "Inputs", .{ .object = inputs });
+                        try item.put(e.out, "Generated Outputs", .{ .object = outputs });
                         const text = fb.feedback orelse try std.fmt.allocPrint(e.out, "This trajectory got a score of {s}.", .{try pyFloat(e.out, fb.score)});
                         try item.put(e.out, "Feedback", .{ .string = text });
                         try items.append(e.out, item);
@@ -483,8 +521,79 @@ pub const GEPA = struct {
                 return result;
             }
 
+            fn proposeCustomChild(
+                e: *Self,
+                proposer: InstructionProposer,
+                candidate: []const []const u8,
+                components: []const usize,
+                datasets: []const ?[]const Record,
+            ) !?[]const []const u8 {
+                assert(candidate.len == e.names.len);
+                assert(components.len == datasets.len);
+                var scratch = std.heap.ArenaAllocator.init(e.out);
+                defer scratch.deinit();
+                const arena = scratch.allocator();
+                const named = try arena.alloc(Instruction, candidate.len);
+                for (e.names, candidate, named) |name, text, *entry| {
+                    entry.* = .{ .name = name, .text = text };
+                }
+                const selected = try arena.alloc([]const u8, components.len);
+                const entries = try arena.alloc(ReflectionDataset, components.len);
+                var dataset_count: usize = 0;
+                for (components, datasets, selected) |index, dataset, *name| {
+                    name.* = e.names[index];
+                    if (dataset) |examples| {
+                        entries[dataset_count] = .{ .name = name.*, .examples = examples };
+                        dataset_count += 1;
+                    }
+                }
+                const input: InstructionProposal = .{
+                    .candidate = named,
+                    .reflective_dataset = entries[0..dataset_count],
+                    .components_to_update = selected,
+                };
+                var context = e.reflection;
+                context.arena = arena;
+                context.trace = null;
+                const updates = (try invokeProposer(proposer, context, &input)) orelse
+                    (try invokeProposer(proposer, context, &input)) orelse return null;
+                if (updates.len == 0) return null;
+                const child = try e.out.dupe([]const u8, candidate);
+                for (updates) |update| {
+                    const index = for (e.names, 0..) |name, index| {
+                        if (std.mem.eql(u8, name, update.name)) break index;
+                    } else return error.UnknownInstructionComponent;
+                    child[index] = try e.out.dupe(u8, update.text);
+                }
+                return child;
+            }
+
+            fn proposeBuiltinChild(
+                e: *Self,
+                candidate: []const []const u8,
+                components: []const usize,
+                datasets: []const ?[]const Record,
+            ) Allocator.Error!?[]const []const u8 {
+                for (datasets) |dataset| {
+                    if (dataset != null) break;
+                } else return null;
+                const texts = (try e.proposeTexts(candidate, components, datasets)) orelse
+                    (try e.proposeTexts(candidate, components, datasets)) orelse return null;
+                const child = try e.out.dupe([]const u8, candidate);
+                // At least one dataset reached a successful built-in proposal.
+                for (components, texts) |index, text| {
+                    if (text) |instruction| child[index] = instruction;
+                }
+                return child;
+            }
+
             /// `InstructionProposer.__call__`; `null` when a call fails.
-            fn proposeTexts(e: *Self, candidate: []const []const u8, components: []const usize, datasets: []const ?[]const @import("runtime_value.zig").ObjectMap) Allocator.Error!?[]?[]const u8 {
+            fn proposeTexts(
+                e: *Self,
+                candidate: []const []const u8,
+                components: []const usize,
+                datasets: []const ?[]const Record,
+            ) Allocator.Error!?[]?[]const u8 {
                 const texts = try e.out.alloc(?[]const u8, components.len);
                 const proposer: predict.Predict(ProposeInstruction) = .{};
                 for (components, datasets, texts) |k, dataset, *t| {
@@ -984,6 +1093,143 @@ test "GEPA best outputs keep ties and replace an older frontier without extra ev
         }
     }
     try std.testing.expectEqual(@as(usize, 6), script.index);
+}
+
+test "GEPA custom dataset separates History and stringifies ordinary values" {
+    var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    const Sig = signature.Signature(struct {
+        pub const Input = struct {
+            question: bool,
+            prior: History,
+            thought: signature.Reasoning,
+        };
+        pub const Output = struct { answer: bool };
+    });
+    const predictor: predict.Predict(Sig) = .{};
+    var event: Record = .empty;
+    try event.put(arena, "answer", .{ .bool = false });
+    const history: History = .{ .messages = &.{event} };
+    var trace: Trace = .{ .arena = arena };
+    var inputs: Record = .empty;
+    try inputs.put(arena, "question", .{ .bool = true });
+    try inputs.put(arena, "prior", try history.toValue(arena));
+    try inputs.put(arena, "thought", .{ .string = "plan" });
+    var outputs: Record = .empty;
+    try outputs.put(arena, "answer", .{ .bool = false });
+    try trace.record(&predictor.state, &inputs, &outputs);
+
+    const step = &trace.steps.items[0];
+    const projected = try customInputs(arena, step);
+    try std.testing.expectEqualStrings("True", projected.get("question").?.string);
+    try std.testing.expectEqualStrings("plan", projected.get("thought").?.string);
+    try std.testing.expectEqualStrings(
+        "```json\n  0: {'answer': False}\n```",
+        projected.get("Context").?.string,
+    );
+    try std.testing.expect(projected.get("prior") == null);
+    const generated = try customOutputs(arena, step);
+    try std.testing.expectEqualStrings("False", generated.get("answer").?.string);
+}
+
+fn invokeProposer(
+    proposer: GEPA.InstructionProposer,
+    context: Context,
+    input: *const GEPA.InstructionProposal,
+) Allocator.Error!?[]const GEPA.Instruction {
+    return proposer.propose(proposer.ptr, context, input) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => null,
+    };
+}
+
+fn customInputs(arena: Allocator, step: *const Trace.Step) value.ParseError!Record {
+    const fields = step.predictor.fields[0..step.predictor.input_count];
+    var history_key: ?[]const u8 = null;
+    var inputs: Record = .empty;
+    for (fields) |field| {
+        if (!field.dspy_type or !std.mem.eql(u8, field.type_name, "History")) continue;
+        const input = step.inputs.get(field.name) orelse continue;
+        if (input == .null) continue;
+        if (history_key != null) return error.ParseValue;
+        history_key = field.name;
+        try inputs.put(arena, "Context", .{ .string = try historyText(arena, input) });
+    }
+    for (step.inputs.keys(), step.inputs.values()) |key, input| {
+        if (history_key) |name| {
+            if (std.mem.eql(u8, name, key)) continue;
+        }
+        const field = findField(fields, key);
+        const projected = if (field != null and field.?.dspy_type and input != .null)
+            input
+        else
+            Value{ .string = try reflectionString(arena, field, input) };
+        try inputs.put(arena, key, projected);
+    }
+    return inputs;
+}
+
+fn customOutputs(arena: Allocator, step: *const Trace.Step) value.ParseError!Record {
+    const fields = step.predictor.fields[step.predictor.input_count..];
+    var outputs: Record = .empty;
+    for (step.outputs.keys(), step.outputs.values()) |key, output| {
+        const text = try reflectionString(arena, findField(fields, key), output);
+        try outputs.put(arena, key, .{ .string = text });
+    }
+    return outputs;
+}
+
+fn findField(fields: []const signature.Field, name: []const u8) ?signature.Field {
+    for (fields) |field| {
+        if (std.mem.eql(u8, field.name, name)) return field;
+    }
+    return null;
+}
+
+fn reflectionString(
+    arena: Allocator,
+    field: ?signature.Field,
+    item: Value,
+) value.ParseError![]const u8 {
+    if (field) |declared| {
+        if (declared.python_str) |render| return render(arena, item) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.ParseValue,
+        };
+    }
+    if (item == .string) return item.string;
+    var writer: Writer.Allocating = .init(arena);
+    defer writer.deinit();
+    pyjson.writeStr(&writer.writer, item) catch |err| return reflectionWriteError(err);
+    return writer.toOwnedSlice();
+}
+
+fn historyText(arena: Allocator, item: Value) value.ParseError![]const u8 {
+    const history = History.fromValue(arena, item) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.ParseValue,
+    };
+    var writer: Writer.Allocating = .init(arena);
+    defer writer.deinit();
+    const w = &writer.writer;
+    w.writeAll("```json\n") catch return error.OutOfMemory;
+    for (history.messages, 0..) |message, index| {
+        w.print("  {d}: ", .{index}) catch return error.OutOfMemory;
+        pyjson.writeRepr(w, .{ .object = message }, 0) catch |err| {
+            return reflectionWriteError(err);
+        };
+        w.writeByte('\n') catch return error.OutOfMemory;
+    }
+    w.writeAll("```") catch return error.OutOfMemory;
+    return writer.toOwnedSlice();
+}
+
+fn reflectionWriteError(err: pyjson.Error) value.ParseError {
+    return switch (err) {
+        error.WriteFailed => error.OutOfMemory,
+        else => error.ParseValue,
+    };
 }
 
 fn sumScores(runs: []const GEPA.Run) f64 {
