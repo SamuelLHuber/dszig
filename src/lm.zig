@@ -1783,6 +1783,17 @@ pub const History = struct {
 /// Project a completed SDK response onto the same events as live streaming.
 pub const responseToEvents = @import("openai_stream.zig").responseToEvents;
 
+pub const MaterializedStream = @import("openai_stream.zig").Materialized;
+
+/// Fold a borrowed sequence of typed canonical events; no HTTP or cache.
+pub fn materializeStream(
+    backing: Allocator,
+    request: *const sdk.Request,
+    events: []const OpenAI.StreamEvent,
+) Error!MaterializedStream {
+    return OpenAI.OpenAIStream.materialize(backing, request, events);
+}
+
 /// OpenAI-compatible Chat Completions and Responses clients on `std.http`.
 pub const OpenAI = struct {
     client: *std.http.Client,
@@ -2644,6 +2655,7 @@ pub const OpenAI = struct {
         .arguments = responseArguments,
         .json = streamJson,
         .project = streamProjection,
+        .fold = foldJudgments,
     });
 
     fn streamProjection(arena: Allocator, completion: *Completion) Error!void {
@@ -5011,4 +5023,25 @@ test "recorded billing uses actual response usage and cannot exhaust generation 
     try testing.expect(recorder.calls.items[1].billing == null);
     // The earlier bill remains independently retained despite later advisory OOM.
     try testing.expectEqual(@as(u64, 0x3f2f75104d551d69), @as(u64, @bitCast(recorder.calls.items[0].billing.?.cost.float)));
+}
+
+test "canonical stream rejects trailing events without changing the owned partial response" {
+    const allocator = testing.allocator;
+    const request = try sdk.Request.fromFields(allocator, &.{
+        .model = "fixture",
+        .messages = &.{.{ .role = .user, .parts = &.{.{ .text = .{ .text = "ask" } }} }},
+    });
+    defer request.release();
+    var fragment = [_]u8{ 'o', 'k' };
+    const events = [_]OpenAI.StreamEvent{
+        .{ .delta = .{ .part_index = "0", .data = .{ .text = .{ .text = &fragment } } } },
+        .{ .end = .{ .finish_reason = .length, .usage = null, .provider_data = null } },
+        .{ .provider_error = .{ .code = .server, .provider_code = "server", .message = "late" } },
+    };
+    const result = try materializeStream(allocator, request, &events);
+    defer result.release();
+    try testing.expect(result == .after_end);
+    fragment[0] = 'x';
+    try testing.expectEqualStrings("ok", result.after_end.fields.message.parts[0].text.text);
+    try testing.expectEqual(FinishReason.length, result.after_end.fields.finish_reason);
 }

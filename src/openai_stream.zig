@@ -50,6 +50,26 @@ pub const Sink = struct {
 
 pub const Outcome = enum { exhausted, stopped };
 
+/// Successful and partial responses are independently owned. Diagnostic strings
+/// (provider error or unnamed-tool index) borrow the original event input.
+pub const Materialized = union(enum) {
+    complete: *const sdk.Response,
+    missing_end: ?*const sdk.Response,
+    after_end: *const sdk.Response,
+    unnamed_tool: struct { part_index: []const u8, partial: *const sdk.Response },
+    provider_error: ErrorDetail,
+
+    pub fn release(self: Materialized) void {
+        const response: ?*const sdk.Response = switch (self) {
+            .complete, .after_end => |r| r,
+            .missing_end => |r| r,
+            .unnamed_tool => |failure| failure.partial,
+            .provider_error => null,
+        };
+        if (response) |r| r.release();
+    }
+};
+
 pub const ReplayError = std.mem.Allocator.Error ||
     error{ UnsupportedPart, IncompleteLogprobs, InvalidToolInput };
 
@@ -215,6 +235,7 @@ pub fn Reader(comptime codec: anytype) type {
         scores: std.ArrayList(lm.TokenLogprob) = .empty,
         metadata: lm.ResponseMetadata = .{},
         provider_data: ?sdk.JsonValue = null,
+        message_continuation: std.ArrayList(sdk.Continuation) = .empty,
         started: bool = false,
         ended: bool = false,
         cut: bool = false,
@@ -234,6 +255,7 @@ pub fn Reader(comptime codec: anytype) type {
             name: ?[]const u8 = null,
             image: ?sdk.MediaPart = null,
             audio: ?std.ArrayList(u8) = null,
+            audio_media_type: ?[]const u8 = null,
             citations: std.ArrayList(sdk.CitationPart) = .empty,
             continuation: std.ArrayList(sdk.Continuation) = .empty,
             seen_text: std.ArrayList(u8) = .empty,
@@ -261,7 +283,7 @@ pub fn Reader(comptime codec: anytype) type {
             if (self.sink != null) return self.finishEvents();
             if (!self.ended) return error.LMFailure;
             if (!self.cut) try self.take(self.pending_text.items.len, false);
-            self.result = self.assemble() catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
+            self.result = self.assemble(false) catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
         }
 
         fn emit(self: *Self, event: Event) void {
@@ -299,10 +321,106 @@ pub fn Reader(comptime codec: anytype) type {
         fn partIndex(self: *Self, value: Value) !usize {
             var buffer: [4301]u8 = undefined;
             const key = try indexText(value, &buffer);
+            return self.internIndex(key, true);
+        }
+
+        fn internIndex(self: *Self, key: []const u8, comptime copy_key: bool) !usize {
             if (self.slots.getIndex(key)) |index| return index;
-            const owned = try self.arena.dupe(u8, key);
+            const owned = if (copy_key) try self.arena.dupe(u8, key) else key;
             try self.slots.put(self.arena, owned, .{ .index = owned });
             return self.slots.count() - 1;
+        }
+
+        pub fn materialize(
+            backing: Allocator,
+            request: *const sdk.Request,
+            events: []const Event,
+        ) lm.Error!Materialized {
+            if (events.len > 65_536) return error.LMFailure;
+            var scratch: std.heap.ArenaAllocator = .init(backing);
+            defer scratch.deinit();
+            const arena = scratch.allocator();
+            var self: Self = .{ .arena = arena, .model = request.fields.model, .stop = &.{} };
+            for (events, 0..) |event, i| switch (event) {
+                .start => |start_event| {
+                    if (start_event.id) |id| {
+                        if (id.len != 0) self.metadata.id = id;
+                    }
+                    if (start_event.model.len != 0) self.metadata.model = start_event.model;
+                    if (start_event.adaptations.len != 0) self.adaptations = start_event.adaptations;
+                },
+                .provider_error => |detail| return .{ .provider_error = detail },
+                .delta => |delta| self.accumulateDelta(delta.part_index, delta.data) catch |err|
+                    return mapAssemblyError(err),
+                .end => |end_event| {
+                    self.metadata.finish_reason = end_event.finish_reason;
+                    self.metadata.usage = end_event.usage orelse .{};
+                    self.provider_data = end_event.provider_data;
+                    const unnamed = self.firstUnnamedTool();
+                    const response = try self.materializedResponse(backing, request);
+                    if (unnamed) |part_index| return .{ .unnamed_tool = .{
+                        .part_index = part_index,
+                        .partial = response,
+                    } };
+                    return if (i == events.len - 1) .{ .complete = response } else .{
+                        .after_end = response,
+                    };
+                },
+            };
+            const partial = self.materializedResponse(backing, request) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => null,
+            };
+            return .{ .missing_end = partial };
+        }
+
+        fn accumulateDelta(self: *Self, index: ?[]const u8, data: DeltaData) !void {
+            const key = index orelse {
+                if (data != .continuation) return error.LMFailure;
+                return self.message_continuation.append(self.arena, data.continuation);
+            };
+            if (key.len == 0 or key.len > 4300) return error.LMFailure;
+            if (key.len != 1 and key[0] == '0') return error.LMFailure;
+            for (key) |digit| {
+                if (digit < '0' or digit > '9') return error.LMFailure;
+            }
+            if (data == .image and data.image.data == null and data.image.url == null and
+                data.image.file_id == null) return;
+            try self.deliver(.{ .index = try self.internIndex(key, false), .data = data });
+        }
+
+        fn firstUnnamedTool(self: *const Self) ?[]const u8 {
+            var first: ?[]const u8 = null;
+            for (self.slots.values()) |entry| {
+                const name: []const u8 = entry.name orelse "";
+                if (entry.arguments == null or name.len != 0) continue;
+                if (first == null or indexLess(entry.index, first.?)) first = entry.index;
+            }
+            return first;
+        }
+
+        fn materializedResponse(
+            self: *Self,
+            backing: Allocator,
+            request: *const sdk.Request,
+        ) lm.Error!*const sdk.Response {
+            var completion = self.assemble(true) catch |err| return mapAssemblyError(err);
+            try codec.fold(self.arena, &completion, request);
+            return sdk.Response.fromFields(backing, &.{
+                .id = completion.metadata.id,
+                .model = completion.metadata.model.?,
+                .message = completion.message.?,
+                .finish_reason = completion.metadata.finish_reason.?,
+                .usage = completion.metadata.usage,
+                .logprobs = completion.logprobs,
+                .logprobs_complete = completion.logprobs_complete,
+                .provider_data = completion.provider_data,
+                .adaptations = self.adaptations,
+            }) catch |err| return mapAssemblyError(err);
+        }
+
+        fn mapAssemblyError(err: anyerror) lm.Error {
+            return if (err == error.OutOfMemory) error.OutOfMemory else error.LMFailure;
         }
 
         fn feed(self: *Self, data: []const u8) !void {
@@ -686,14 +804,23 @@ pub fn Reader(comptime codec: anytype) type {
                 .continuation => |state| try entry.continuation.append(self.arena, state),
                 .citation => |citation| try entry.citations.append(self.arena, citation),
                 .image => |media| {
-                    const data = media.data.?;
-                    if (data.len == 0) return error.LMFailure;
-                    @import("file.zig").validateBase64(data) catch return error.LMFailure;
-                    entry.image = .{ .media_type = "image/png", .data = data };
+                    if (media.data) |data| {
+                        if (data.len == 0) return error.LMFailure;
+                        @import("file.zig").validateBase64(data) catch return error.LMFailure;
+                    }
+                    entry.image = .{
+                        .media_type = media.media_type orelse "image/png",
+                        .data = media.data,
+                        .url = media.url,
+                        .file_id = media.file_id,
+                    };
                 },
                 .audio => |media| {
-                    const data = media.data.?;
-                    if (entry.audio == null) entry.audio = .empty;
+                    if (entry.audio == null) {
+                        entry.audio = .empty;
+                        entry.audio_media_type = media.media_type;
+                    }
+                    const data = media.data orelse "";
                     const decoder = @import("python_base64.zig");
                     const padding: u2 = @intCast((4 - data.len % 4) % 4);
                     // Source retries with padding, then omits chunks which
@@ -705,25 +832,26 @@ pub fn Reader(comptime codec: anytype) type {
             }
         }
 
-        fn assemble(self: *Self) !lm.Completion {
+        fn assemble(self: *Self, comptime canonical_only: bool) !lm.Completion {
             const indexes = try self.arena.alloc(usize, self.slots.count());
             for (indexes, 0..) |*index, i| index.* = i;
             std.mem.sort(usize, indexes, self, struct {
                 fn less(reader: *Self, a: usize, b: usize) bool {
                     const left = reader.slots.values()[a].index;
                     const right = reader.slots.values()[b].index;
-                    return if (left.len != right.len) left.len < right.len else std.mem.lessThan(u8, left, right);
+                    return indexLess(left, right);
                 }
             }.less);
             var parts: std.ArrayList(sdk.Part) = .empty;
             var generated = false;
+            var has_tool = false;
             var calls: std.ArrayList(lm.ToolCall) = .empty;
             var citations: std.ArrayList(sdk.CitationPart) = .empty;
             var continuation: std.ArrayList(sdk.Continuation) = .empty;
             for (indexes) |index| {
                 const entry = &self.slots.values()[index];
                 const states = entry.continuation.items;
-                try continuation.appendSlice(self.arena, states);
+                if (!canonical_only) try continuation.appendSlice(self.arena, states);
                 if (entry.thinking) |value| {
                     try parts.append(self.arena, .{ .thinking = .{ .text = value.items, .continuation = states } });
                 }
@@ -737,34 +865,48 @@ pub fn Reader(comptime codec: anytype) type {
                     generated = true;
                 }
                 if (entry.audio) |audio| {
-                    if (audio.items.len == 0) return error.LMFailure;
-                    const encoded = try self.arena.alloc(u8, std.base64.standard.Encoder.calcSize(audio.items.len));
-                    _ = std.base64.standard.Encoder.encode(encoded, audio.items);
-                    try parts.append(self.arena, .{ .audio = .{ .media_type = "audio/wav", .data = encoded, .continuation = states } });
+                    try parts.append(self.arena, .{ .audio = try audioPart(
+                        self.arena,
+                        audio.items,
+                        entry.audio_media_type,
+                        states,
+                    ) });
                     generated = true;
                 }
                 for (entry.citations.items) |cited| {
                     var citation = cited;
                     citation.continuation = states;
                     try parts.append(self.arena, .{ .citation = citation });
-                    try citations.append(self.arena, citation);
+                    if (!canonical_only) try citations.append(self.arena, citation);
                 }
                 if (entry.arguments) |arguments| {
-                    const name = entry.name orelse return error.LMFailure;
-                    if (name.len == 0) return error.LMFailure;
-                    const id = entry.id orelse try std.fmt.allocPrint(self.arena, "tool_call_{s}", .{entry.index});
+                    const name: []const u8 = entry.name orelse "";
+                    if (name.len == 0) {
+                        if (canonical_only) continue;
+                        return error.LMFailure;
+                    }
+                    const raw_id: []const u8 = entry.id orelse "";
+                    const id = if (raw_id.len != 0) raw_id else try std.fmt.allocPrint(self.arena, "tool_call_{s}", .{entry.index});
                     const input = try self.toolInput(arguments.items);
                     try parts.append(self.arena, .{ .tool_call = .{ .id = id, .name = name, .input = try codec.payload(self.arena, input), .continuation = states } });
-                    try calls.append(self.arena, .{ .id = id, .name = name, .arguments = try codec.arguments(self.arena, input) });
+                    has_tool = true;
+                    if (!canonical_only) try calls.append(self.arena, .{
+                        .id = id,
+                        .name = name,
+                        .arguments = try codec.arguments(self.arena, input),
+                    });
                 } else if (states.len != 0 and entry.thinking == null and entry.text == null and entry.image == null and entry.audio == null and entry.citations.items.len == 0) {
                     try parts.append(self.arena, .{ .text = .{ .text = "", .continuation = states } });
                 }
             }
             if (parts.items.len == 0) try parts.append(self.arena, .{ .text = .{ .text = "" } });
-            if (self.metadata.finish_reason == null or self.metadata.finish_reason == .stop) self.metadata.finish_reason = if (calls.items.len != 0) .tool_call else .stop;
+            if (self.metadata.finish_reason == null or self.metadata.finish_reason == .stop) {
+                self.metadata.finish_reason = if (has_tool) .tool_call else .stop;
+            }
             if (self.metadata.model == null) self.metadata.model = self.model;
             var completion: lm.Completion = .{ .text = null, .message = .{ .role = .assistant, .parts = parts.items }, .tool_calls = calls.items, .citations = citations.items, .continuation = continuation.items, .metadata = self.metadata, .provider_data = self.provider_data, .generated_media = generated, .logprobs = if (self.scores.items.len != 0) self.scores.items else null, .logprobs_complete = self.scores_complete };
-            try codec.project(self.arena, &completion);
+            completion.message.?.continuation = self.message_continuation.items;
+            if (!canonical_only) try codec.project(self.arena, &completion);
             return completion;
         }
 
@@ -796,6 +938,45 @@ pub fn Reader(comptime codec: anytype) type {
             return .{ .object = wrapped };
         }
     };
+}
+
+fn indexLess(left: []const u8, right: []const u8) bool {
+    return if (left.len != right.len) left.len < right.len else std.mem.lessThan(u8, left, right);
+}
+
+fn audioPart(
+    arena: Allocator,
+    bytes: []const u8,
+    media_type: ?[]const u8,
+    continuation: []const sdk.Continuation,
+) !sdk.MediaPart {
+    const kind = media_type orelse "audio/pcm";
+    const pcm = std.mem.eql(u8, kind, "audio/pcm") or std.mem.eql(u8, kind, "audio/pcm16");
+    const raw = if (pcm) try pcmWave(arena, bytes) else bytes;
+    if (raw.len == 0) return error.LMFailure;
+    const encoder = std.base64.standard.Encoder;
+    const encoded = try arena.alloc(u8, encoder.calcSize(raw.len));
+    _ = encoder.encode(encoded, raw);
+    return .{
+        .media_type = if (pcm) "audio/wav" else kind,
+        .data = encoded,
+        .continuation = continuation,
+    };
+}
+
+fn pcmWave(arena: Allocator, bytes: []const u8) ![]const u8 {
+    if (bytes.len > std.math.maxInt(u32) - 36) return error.LMFailure;
+    const raw = try arena.alloc(u8, 44 + bytes.len);
+    // PCM, 24 kHz, mono, 16-bit, with the source's unpadded data chunk.
+    const header = "RIFF\x00\x00\x00\x00WAVEfmt \x10\x00\x00\x00" ++
+        "\x01\x00\x01\x00\xc0\x5d\x00\x00\x80\xbb\x00\x00\x02\x00\x10\x00" ++
+        "data\x00\x00\x00\x00";
+    comptime std.debug.assert(header.len == 44);
+    @memcpy(raw[0..44], header);
+    std.mem.writeInt(u32, raw[4..8], @intCast(36 + bytes.len), .little);
+    std.mem.writeInt(u32, raw[40..44], @intCast(bytes.len), .little);
+    @memcpy(raw[44..], bytes);
+    return raw;
 }
 
 /// Part indexes are correlators, not array offsets. Preserve arbitrary-size

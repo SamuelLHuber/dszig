@@ -2123,7 +2123,16 @@ their completeness on the first text delta, preserves image addresses and
 continuation scopes, and serializes tool arguments with Python JSON
 spelling. Unsupported parts and incomplete scores without a text carrier
 return explicit errors after the events already delivered; a callback stop
-does not inspect later parts. This does not assemble events into responses.
+does not inspect later parts.
+
+`lm.materializeStream(backing, request, events)` folds up to 65,536 typed
+events already supplied by the caller. It distinguishes a complete response,
+a missing end, an event after the end, an unnamed tool, and a provider error.
+Missing-end and unnamed-tool results can carry a partial response; an event
+after the end preserves the response at the first end. Release the result
+with `.release()`. Diagnostic strings borrow the input; the response is owned.
+This API does not read from a transport, manage a source iterator, or run a
+DSPy program.
 
 Responses requests honor `config.extensions.openai_responses_compat`, its
 `openai_compat` alias and the nested `compat` forms. Null inherits; `"auto"`
@@ -3612,9 +3621,9 @@ The following prevent a claim that DSZig can do everything DSPy can:
   catalog/routing/auth/error taxonomy, full provider SDK, embedding providers
   beyond OpenAI/Azure, Image/Audio, general rich-media tool results, non-OpenAI
   training providers or streaming beyond synchronous OpenAI Responses and
-  Chat Completions SSE. Completed SDK responses can be projected to events;
-  a general event-to-response assembler and DSPy program streaming are not
-  available.
+  Chat Completions SSE. Completed SDK responses can be projected to events,
+  and bounded event sequences can be assembled offline. Iterator lifecycle,
+  asynchronous streaming, and DSPy program streaming are not available.
   Document support is not general multimodal support, and Chat Completions
   does not accept document parts.
 - **File and DocumentPart boundaries:** the constructor smoke explicitly leaves
