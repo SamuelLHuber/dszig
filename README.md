@@ -3749,7 +3749,8 @@ The following prevent a claim that DSZig can do everything DSPy can:
   and document parts. `Gemini.streamRequest` delivers canonical SSE events
   with text, thought signatures, function calls, and inline image/audio deltas,
   and can stop reading without waiting for the response tail. Typed Gemini
-  streaming, Gemini Live WebSockets, Vertex AI, local path reads, and file
+  streaming supports `AsyncProgram` field listeners, final predictions, and
+  cancellation. Gemini Live WebSockets, Vertex AI, local path reads, and file
   uploads are not supported.
   Native File construction, adapter/typed prediction
   handling, File tool-result markers and bounded Responses document translation

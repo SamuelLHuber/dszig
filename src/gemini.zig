@@ -27,7 +27,13 @@ pub const Gemini = struct {
     pub fn lm(self: *Gemini) lm_mod.LM {
         return .{
             .ptr = self,
-            .vtable = &.{ .complete = complete, .complete_canonical = canonical, .clone = clone, .model_name = modelName },
+            .vtable = &.{
+                .complete = complete,
+                .complete_stream = completeStream,
+                .complete_canonical = canonical,
+                .clone = clone,
+                .model_name = modelName,
+            },
             .supports_response_format = true,
             .supports_response_schema = true,
             .supports_function_calling = true,
@@ -53,14 +59,39 @@ pub const Gemini = struct {
         return copy.lm();
     }
 
+    fn predictionRequest(self: *const Gemini, arena: Allocator, request: lm_mod.Request) Error!*const sdk.Request {
+        for (request.tools) |tool| if (tool.strict != null) return error.LMFailure;
+        return lm_mod.OpenAI.canonicalPredictionRequest(arena, request, self.model, self.max_tokens, null);
+    }
+
     fn complete(ptr: *anyopaque, arena: Allocator, request: lm_mod.Request) Error![]const lm_mod.Completion {
         const self: *Gemini = @ptrCast(@alignCast(ptr));
-        for (request.tools) |tool| if (tool.strict != null) return error.LMFailure;
-        const native = try lm_mod.OpenAI.canonicalPredictionRequest(arena, request, self.model, self.max_tokens, null);
+        const native = try self.predictionRequest(arena, request);
         defer native.release();
         const result = try arena.alloc(lm_mod.Completion, 1);
         result[0] = try self.completeFields(arena, &native.fields, .prediction);
         return result;
+    }
+
+    fn completeStream(
+        ptr: *anyopaque,
+        arena: Allocator,
+        request: lm_mod.Request,
+        sink: StreamSink,
+    ) Error!lm_mod.Completion {
+        const self: *Gemini = @ptrCast(@alignCast(ptr));
+        const native = try self.predictionRequest(arena, request);
+        defer native.release();
+        var assembler: lm_mod.OpenAI.OpenAIStream = .{
+            .arena = arena,
+            .model = native.fields.model,
+            .stop = &.{},
+        };
+        const outcome = try self.runStream(arena, &native.fields, .prediction, sink, &assembler);
+        if (outcome == .stopped) return error.StreamStopped;
+        var completion = assembler.result orelse return error.LMFailure;
+        try lm_mod.publishResponse(arena, &completion, native.fields.model, .borrowed);
+        return completion;
     }
 
     pub fn completeRequest(self: *Gemini, arena: Allocator, request: *const sdk.Request) Error!*const sdk.Response {
@@ -100,14 +131,24 @@ pub const Gemini = struct {
     ) Error!StreamOutcome {
         var scratch: std.heap.ArenaAllocator = .init(backing);
         defer scratch.deinit();
-        const arena = scratch.allocator();
+        return self.runStream(scratch.allocator(), &request.fields, .canonical, sink, null);
+    }
+
+    fn runStream(
+        self: *Gemini,
+        arena: Allocator,
+        fields: *const sdk.RequestFields,
+        mode: RequestMode,
+        sink: StreamSink,
+        assembler: ?*lm_mod.OpenAI.OpenAIStream,
+    ) Error!StreamOutcome {
         var records: std.ArrayList(sdk.Adaptation) = .empty;
-        const fields = &request.fields;
-        const body = try requestBody(arena, fields, .canonical, self.adaptations, &records);
+        const body = try requestBody(arena, fields, mode, self.adaptations, &records);
         var state: GenerateStream = .{
             .model = fields.model,
             .adaptations = records.items,
             .sink = sink,
+            .assembler = assembler,
         };
         var consumer: http.ResponseConsumer = .{
             .context = &state,
@@ -180,6 +221,7 @@ const GenerateStream = struct {
     model: []const u8,
     adaptations: []const sdk.Adaptation,
     sink: Gemini.StreamSink,
+    assembler: ?*lm_mod.OpenAI.OpenAIStream = null,
     outcome: Gemini.StreamOutcome = .exhausted,
     started: bool = false,
     previous: ?Slot = null,
@@ -197,7 +239,8 @@ const GenerateStream = struct {
         defer frame.deinit();
         while (try events.next()) |bytes| {
             if (bytes.len == 0) continue;
-            const temp = frame.allocator();
+            // Only raw delivery can recycle parsed leaves after each callback.
+            const temp = if (self.assembler != null) arena else frame.allocator();
             const value = try @import("json_repair.zig").parseJson(temp, bytes);
             if (value != .object) continue;
             if (try self.dispatch(temp, value)) return;
@@ -206,15 +249,19 @@ const GenerateStream = struct {
         }
     }
 
-    fn emit(self: *GenerateStream, event: Gemini.StreamEvent) void {
+    fn emit(self: *GenerateStream, event: Gemini.StreamEvent) Error!void {
         if (self.outcome == .stopped) return;
-        if (self.sink.on_event(self.sink.context, event) == .stop) self.outcome = .stopped;
+        if (self.sink.on_event(self.sink.context, event) == .stop) {
+            self.outcome = .stopped;
+            return;
+        }
+        if (self.assembler) |assembler| try assembler.acceptRetainedEvent(event);
     }
 
-    fn start(self: *GenerateStream) void {
+    fn start(self: *GenerateStream) Error!void {
         if (self.started) return;
         self.started = true;
-        self.emit(.{ .start = .{ .id = null, .model = self.model, .adaptations = self.adaptations } });
+        try self.emit(.{ .start = .{ .id = null, .model = self.model, .adaptations = self.adaptations } });
     }
 
     fn slot(self: *GenerateStream, index: usize, kind: Kind) usize {
@@ -235,7 +282,7 @@ const GenerateStream = struct {
         if (get(value, "error") != .null) {
             const detail = get(value, "error");
             const status = nonempty(get(detail, "status")) orelse "provider";
-            self.emit(.{ .provider_error = .{
+            try self.emit(.{ .provider_error = .{
                 .code = providerError(status),
                 .provider_code = status,
                 .message = nonempty(get(detail, "message")) orelse status,
@@ -245,7 +292,7 @@ const GenerateStream = struct {
         if (invalidFinish(finish) or (block.len != 0 and
             !std.mem.eql(u8, block, "BLOCK_REASON_UNSPECIFIED")))
         {
-            self.emit(.{ .provider_error = .{
+            try self.emit(.{ .provider_error = .{
                 .code = .invalid_request,
                 .provider_code = "inband_finish_reason",
                 .message = if (block.len != 0) block else finish,
@@ -256,15 +303,15 @@ const GenerateStream = struct {
         var saw_delta = false;
         for (elems(get(get(candidate, "content"), "parts")), 0..) |part, index| {
             const decoded = (try decodePart(arena, part)) orelse continue;
-            self.start();
+            try self.start();
             const position = self.slot(index, decoded.kind);
             var buffer: [24]u8 = undefined;
             const key = std.fmt.bufPrint(&buffer, "{d}", .{position}) catch unreachable;
-            self.emit(.{ .delta = .{ .part_index = key, .data = decoded.data } });
+            try self.emit(.{ .delta = .{ .part_index = key, .data = decoded.data } });
             if (self.outcome == .stopped) return true;
             const continuation = try parseSignature(arena, decoded.signature);
             if (continuation.len != 0) {
-                self.emit(.{ .delta = .{
+                try self.emit(.{ .delta = .{
                     .part_index = key,
                     .data = .{ .continuation = continuation[0] },
                 } });
@@ -275,8 +322,8 @@ const GenerateStream = struct {
         }
         const usage = get(value, "usageMetadata");
         if (finish.len != 0 or (!saw_delta and usage != .null)) {
-            self.start();
-            self.emit(.{ .end = .{
+            try self.start();
+            try self.emit(.{ .end = .{
                 .finish_reason = finishReason(finish, saw_tool),
                 .usage = if (usage != .null) try readUsage(arena, usage) else null,
                 .provider_data = sdk.PayloadValue.fromBorrowedValue(arena, value) catch |err|
