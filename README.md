@@ -2189,8 +2189,15 @@ is always available; `emit_prediction` reports whether the streaming caller
 should also publish it, after all final fragments. A cache hit can therefore
 return a prediction without any fragments. A session cannot be shared across
 concurrent calls, and selected predictor generations cannot overlap. This
-does not implement asynchronous `streamify`, status messages, arbitrary
-custom streamable types, or routed TwoStep/native decision streaming.
+does not implement asynchronous `streamify`, arbitrary custom streamable
+types, or routed TwoStep/native decision streaming.
+
+Set `Context.status_sink` to observe synchronous module, adapter LM, and
+tool calls. Its default provider emits DSPy's tool progress messages and
+omits `finish` starts and `Completed.` results. A custom provider can inspect
+borrowed inputs, outputs, and failures, or suppress any event by returning
+an empty message. Status messages can coexist with routed field fragments.
+They do not change the underlying result or error.
 
 Responses requests honor `config.extensions.openai_responses_compat`, its
 `openai_compat` alias and the nested `compat` forms. Null inherits; `"auto"`
@@ -3683,7 +3690,8 @@ The following prevent a claim that DSZig can do everything DSPy can:
   and bounded event sequences or synchronous sources can be assembled.
   Bounded Chat, JSON, and XML text field listeners are available separately.
   Native programs can receive raw OpenAI events or routed field fragments
-  synchronously. Status callbacks and asynchronous streaming are not available.
+  synchronously, with optional program status callbacks. Asynchronous
+  streaming is not available.
   Document support is not general multimodal support, and Chat Completions
   does not accept document parts.
 - **File and DocumentPart boundaries:** the constructor smoke explicitly leaves

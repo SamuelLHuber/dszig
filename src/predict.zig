@@ -22,6 +22,7 @@ const Graph = usage_mod.Graph;
 pub const Prediction = prediction_mod.Prediction;
 const Adapter = adapter_mod.Adapter;
 const stream = @import("predict_stream.zig");
+const status = @import("stream_status.zig");
 const Field = signature.Field;
 const Record = value.Record;
 
@@ -73,6 +74,8 @@ pub const Context = struct {
     stream_sink: ?lm_mod.OpenAI.StreamSink = null,
     /// Scoped by callStream; callers normally leave this null.
     stream_session: ?*stream.Session = null,
+    /// Synchronous status observer for module, adapter LM, and tool calls.
+    status_sink: ?status.Sink = null,
     /// ChatAdapter and XMLAdapter retry once with JSONAdapter on parse failure.
     json_fallback: bool = true,
     /// Implicit XML and JSON enable native History; explicit Chat opts in.
@@ -659,17 +662,29 @@ fn adapterCompletions(
     native: stream.NativeFields,
     request: lm_mod.Request,
 ) Error![]const lm_mod.Completion {
-    const session = ctx.stream_session orelse return ctx.lm.completeResponses(ctx.arena, request);
-    const target = predictor orelse return ctx.lm.completeResponses(ctx.arena, request);
-    if (!session.selects(target)) return ctx.lm.completeResponses(ctx.arena, request);
+    const session = ctx.stream_session orelse return completeWithStatus(ctx, request);
+    const target = predictor orelse return completeWithStatus(ctx, request);
+    if (!session.selects(target)) return completeWithStatus(ctx, request);
     if (session.in_flight.swap(true, .acquire)) return error.StreamSessionBusy;
     defer session.in_flight.store(false, .release);
     var attempt: stream.Attempt = .{ .session = session, .target = target };
     try attempt.prepare(ctx.arena, kind, original.outputs, wire, native);
     var routed = request;
     routed.stream_sink = attempt.sink();
-    const result = ctx.lm.completeResponses(ctx.arena, routed);
+    const result = completeWithStatus(ctx, routed);
     if (attempt.failure) |err| return err;
+    return result;
+}
+
+fn completeWithStatus(ctx: Context, request: lm_mod.Request) lm_mod.Error![]const lm_mod.Completion {
+    const sink = ctx.status_sink orelse return ctx.lm.completeResponses(ctx.arena, request);
+    sink.notify(.{ .lm_start = .{ .instance = ctx.lm, .request = &request } });
+    const result = ctx.lm.completeResponses(ctx.arena, request);
+    if (result) |output| {
+        sink.notify(.{ .lm_end = .{ .output = output } });
+    } else |failure| {
+        sink.notify(.{ .lm_end = .{ .failure = failure } });
+    }
     return result;
 }
 
@@ -1209,6 +1224,25 @@ fn attach(comptime T: type, arena: Allocator, target: T, usage: Graph.Value) All
 /// Prediction (or a tuple's first) after success. Any active tracker, however
 /// it was configured, suppresses both the scope and the attachment.
 pub fn callProgram(
+    program: anytype,
+    ctx: Context,
+    input: InputOf(@TypeOf(program)),
+) (Failure(Forwarded(@TypeOf(program), true)) || usage_mod.Error)!CallResult(Payload(Forwarded(@TypeOf(program), true))) {
+    const sink = ctx.status_sink orelse return callProgramCore(program, ctx, input);
+    sink.notify(.{ .module_start = .{
+        .instance = status.View.borrow(ProgramOf(@TypeOf(program)), program),
+        .input = status.View.borrow(@TypeOf(input), &input),
+    } });
+    const result = callProgramCore(program, ctx, input);
+    if (result) |output| {
+        sink.notify(.{ .module_end = .{ .output = status.View.borrow(@TypeOf(output), &output) } });
+    } else |failure| {
+        sink.notify(.{ .module_end = .{ .failure = failure } });
+    }
+    return result;
+}
+
+fn callProgramCore(
     program: anytype,
     ctx: Context,
     input: InputOf(@TypeOf(program)),

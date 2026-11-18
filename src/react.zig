@@ -67,6 +67,18 @@ pub const Tool = struct {
 
     /// Shared native invocation, including typed argument normalization.
     pub fn call(comptime self: Tool, ctx: Context, input: *const Record) ToolError!Value {
+        const sink = ctx.status_sink orelse return self.callCore(ctx, input);
+        sink.notify(.{ .tool_start = .{ .name = self.name, .input = input } });
+        const result = self.callCore(ctx, input);
+        if (result) |output| {
+            sink.notify(.{ .tool_end = .{ .output = output } });
+        } else |failure| {
+            sink.notify(.{ .tool_end = .{ .failure = failure } });
+        }
+        return result;
+    }
+
+    fn callCore(comptime self: Tool, ctx: Context, input: *const Record) ToolError!Value {
         const normalized = try normalizeArgs(self, ctx.arena, input);
         return self.func(ctx, &normalized);
     }
