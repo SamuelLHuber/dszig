@@ -8,8 +8,8 @@
 //! Python's `random.Random(seed)` is ported (one stream for the engine, one
 //! for the DSPy adapter), so the same LM answers give the same program.
 //!
-//! Not supported: `dspy.Flex` code components, frontier types other than
-//! `"instance"`, or `log_dir`. DSPy `num_threads` maps to
+//! Not supported: `dspy.Flex` code components or `log_dir`.
+//! DSPy `num_threads` maps to
 //! `rollouts`: each minibatch/valset evaluation then runs on a native pool,
 //! results in example order. CPython iterates small-int sets in ascending
 //! order; DSZig assumes it always does.
@@ -34,8 +34,16 @@ const Trace = predict.Trace;
 const Value = @import("runtime_value.zig").Value;
 const History = @import("history.zig").History;
 
-/// What a GEPA metric returns: DSPy's float or `dspy.Prediction(score, feedback)`.
-pub const Feedback = struct { score: f64, feedback: ?[]const u8 = null };
+pub const ObjectiveScore = struct { name: []const u8, score: f64 };
+pub const ObjectiveLeaders = struct { name: []const u8, candidates: []const usize };
+
+/// What a GEPA metric returns: DSPy's score, feedback and named objectives.
+pub const Feedback = struct {
+    score: f64,
+    feedback: ?[]const u8 = null,
+    /// Unique names in metric order. Return static or metric-arena storage.
+    objective_scores: []const ObjectiveScore = &.{},
+};
 
 /// `metric(gold, pred, trace, pred_name, pred_trace)`. `pred_name` and
 /// `pred_step` are set only when GEPA asks for feedback on one predictor.
@@ -278,6 +286,7 @@ pub const GEPA = struct {
     stop_callbacks: []const StopCallback = &.{},
     reflection_minibatch_size: usize = 3,
     candidate_selection_strategy: Selection = .pareto,
+    frontier_type: Frontier = .instance,
     skip_perfect_score: bool = true,
     /// Use genuine predictor parse failures as reflection examples.
     add_format_failure_as_feedback: bool = false,
@@ -301,6 +310,7 @@ pub const GEPA = struct {
 
     pub const Auto = enum { light, medium, heavy };
     pub const Selection = enum { pareto, current_best, epsilon_greedy, top_k_pareto };
+    pub const Frontier = enum { instance, objective, hybrid, cartesian };
     pub const ComponentSelector = union(enum) {
         round_robin,
         all,
@@ -402,6 +412,10 @@ pub const GEPA = struct {
             parents: []const []const ?usize,
             val_aggregate_scores: []const f64,
             val_subscores: []const []const f64,
+            /// Indexed by candidate; each objective averages only rows that supplied it.
+            val_aggregate_subscores: ?[]const []const ObjectiveScore,
+            per_objective_best_candidates: ?[]const ObjectiveLeaders,
+            objective_pareto_front: ?[]const ObjectiveScore,
             /// Indexed by validation row; tied candidates are in discovery order.
             per_val_instance_best_candidates: []const []const usize,
             /// Indexed by validation row, in candidate discovery order.
@@ -426,6 +440,7 @@ pub const GEPA = struct {
         trace: *const Trace,
         score: f64,
         format_failure: ?FormatFailure = null,
+        objective_scores: []const ObjectiveScore = &.{},
     };
 
     pub const FormatFailure = struct {
@@ -435,6 +450,94 @@ pub const GEPA = struct {
     };
 
     const Desc = struct { id1: usize, id2: usize, picks: []const usize };
+
+    const Leader = struct {
+        score: ?f64 = null,
+        candidates: std.ArrayList(usize) = .empty,
+
+        fn update(leader: *Leader, out: Allocator, candidate: usize, score: f64) !void {
+            const previous = leader.score orelse -std.math.inf(f64);
+            if (candidate == 0 or score > previous) {
+                leader.score = score;
+                leader.candidates.clearRetainingCapacity();
+            } else if (score != previous) return;
+            try leader.candidates.append(out, candidate);
+        }
+    };
+
+    const Objectives = struct {
+        named: std.StringArrayHashMapUnmanaged(Leader) = .empty,
+        cartesian: std.AutoArrayHashMapUnmanaged([2]usize, Leader) = .empty,
+        aggregates: std.ArrayList([]const ObjectiveScore) = .empty,
+        totals: std.StringArrayHashMapUnmanaged(Total) = .empty,
+
+        const Total = struct { sum: f64 = 0, count: usize = 0, last_row: ?usize = null };
+
+        fn update(
+            state: *Objectives,
+            out: Allocator,
+            mode: Frontier,
+            candidate: usize,
+            runs: []const Run,
+        ) !void {
+            const totals = &state.totals;
+            defer totals.clearRetainingCapacity();
+            for (runs, 0..) |run, row| for (run.objective_scores) |entry| {
+                const total = try totals.getOrPut(out, entry.name);
+                if (!total.found_existing) total.value_ptr.* = .{};
+                if (total.value_ptr.last_row == row) return error.DuplicateObjective;
+                total.value_ptr.last_row = row;
+                total.value_ptr.sum += entry.score;
+                total.value_ptr.count += 1;
+            };
+            if (totals.count() == 0) {
+                if (mode != .instance) return error.MissingObjectiveScores;
+                if (state.aggregates.items.len != 0) try state.aggregates.append(out, &.{});
+                return;
+            }
+            if (state.aggregates.items.len == 0) try state.aggregates.appendNTimes(out, &.{}, candidate);
+            assert(state.aggregates.items.len == candidate);
+            const aggregate = try out.alloc(ObjectiveScore, totals.count());
+            for (aggregate, totals.keys(), totals.values()) |*entry, name, total| {
+                const score = total.sum / @as(f64, @floatFromInt(total.count));
+                const named = try state.named.getOrPut(out, name);
+                if (!named.found_existing) {
+                    named.key_ptr.* = try out.dupe(u8, name);
+                    named.value_ptr.* = .{};
+                }
+                try named.value_ptr.update(out, candidate, score);
+                entry.* = .{ .name = named.key_ptr.*, .score = score };
+            }
+            try state.aggregates.append(out, aggregate);
+            if (mode == .cartesian) {
+                for (runs, 0..) |run, row| for (run.objective_scores) |entry| {
+                    const key = [2]usize{ row, state.named.getIndex(entry.name).? };
+                    const front = try state.cartesian.getOrPut(out, key);
+                    if (!front.found_existing) front.value_ptr.* = .{};
+                    try front.value_ptr.update(out, candidate, entry.score);
+                };
+            }
+        }
+
+        fn results(state: *const Objectives, out: Allocator) !struct {
+            leaders: ?[]const ObjectiveLeaders,
+            scores: ?[]const ObjectiveScore,
+        } {
+            var leaders: std.ArrayList(ObjectiveLeaders) = .empty;
+            var scores: std.ArrayList(ObjectiveScore) = .empty;
+            for (state.named.keys(), state.named.values()) |name, front| {
+                if (front.candidates.items.len > 0) try leaders.append(out, .{
+                    .name = name,
+                    .candidates = front.candidates.items,
+                });
+                if (front.score) |score| try scores.append(out, .{ .name = name, .score = score });
+            }
+            return .{
+                .leaders = if (leaders.items.len == 0) null else leaders.items,
+                .scores = if (scores.items.len == 0) null else scores.items,
+            };
+        }
+    };
 
     fn Engine(comptime P: type) type {
         return struct {
@@ -456,6 +559,7 @@ pub const GEPA = struct {
             next_pred: std.ArrayList(usize) = .empty,
             front_score: []f64,
             fronts: []std.ArrayList(usize),
+            objectives: Objectives = .{},
             best_outputs: ?[]std.ArrayList(BestOutput) = null,
             total_evals: usize = 0,
             full_evals: usize = 0,
@@ -558,7 +662,12 @@ pub const GEPA = struct {
                     if (err == error.OutOfMemory) return error.OutOfMemory;
                     return e.failedRun(trace, capture);
                 };
-                return .{ .prediction = prediction, .trace = trace, .score = feedback.score };
+                return .{
+                    .prediction = prediction,
+                    .trace = trace,
+                    .score = feedback.score,
+                    .objective_scores = if (capture) &.{} else feedback.objective_scores,
+                };
             }
 
             fn formatFailure(
@@ -619,6 +728,7 @@ pub const GEPA = struct {
                 const runs = try e.evalIds(candidate, e.valset, all, false);
                 e.full_evals += 1;
                 const idx = e.candidates.items.len;
+                try e.objectives.update(e.out, e.gepa.frontier_type, idx, runs);
                 const scores = try e.out.alloc(f64, runs.len);
                 for (scores, runs) |*s, r| s.* = r.score;
                 var next: usize = 0;
@@ -647,6 +757,28 @@ pub const GEPA = struct {
                 }
             }
 
+            fn activeFrontCount(e: *const Self) usize {
+                return switch (e.gepa.frontier_type) {
+                    .instance => e.fronts.len,
+                    .objective => e.objectives.named.count(),
+                    .hybrid => e.fronts.len + e.objectives.named.count(),
+                    .cartesian => e.objectives.cartesian.count(),
+                };
+            }
+
+            fn activeFront(e: *const Self, index: usize) []const usize {
+                assert(index < e.activeFrontCount());
+                return switch (e.gepa.frontier_type) {
+                    .instance => e.fronts[index].items,
+                    .objective => e.objectives.named.values()[index].candidates.items,
+                    .hybrid => if (index < e.fronts.len)
+                        e.fronts[index].items
+                    else
+                        e.objectives.named.values()[index - e.fronts.len].candidates.items,
+                    .cartesian => e.objectives.cartesian.values()[index].candidates.items,
+                };
+            }
+
             /// `remove_dominated_programs`: returns the dominated flags.
             fn dominated(
                 e: *const Self,
@@ -660,7 +792,7 @@ pub const GEPA = struct {
                     flags[id] = false;
                 };
                 var programs: std.ArrayList(usize) = .empty;
-                for (e.fronts) |front| for (front.items) |p| {
+                for (0..e.activeFrontCount()) |index| for (e.activeFront(index)) |p| {
                     if (flags[p]) continue;
                     if (std.mem.indexOfScalar(usize, programs.items, p) == null)
                         try programs.append(e.out, p);
@@ -688,9 +820,10 @@ pub const GEPA = struct {
             }
 
             fn isDominated(e: *const Self, y: usize, flags: []const bool) bool {
-                for (e.fronts) |front| {
-                    if (std.mem.indexOfScalar(usize, front.items, y) == null) continue;
-                    const covered = for (front.items) |p| {
+                for (0..e.activeFrontCount()) |index| {
+                    const front = e.activeFront(index);
+                    if (std.mem.indexOfScalar(usize, front, y) == null) continue;
+                    const covered = for (front) |p| {
                         if (p != y and !flags[p]) break true;
                     } else false;
                     if (!covered) return false;
@@ -707,7 +840,7 @@ pub const GEPA = struct {
                 const flags = try e.dominated(eligible, ranked_scores);
                 var order: std.ArrayList(usize) = .empty;
                 var freq: std.ArrayList(usize) = .empty;
-                for (e.fronts) |front| for (front.items) |p| {
+                for (0..e.activeFrontCount()) |index| for (e.activeFront(index)) |p| {
                     if (flags[p]) continue;
                     if (std.mem.indexOfScalar(usize, order.items, p)) |k| {
                         freq.items[k] += 1;
@@ -1096,8 +1229,8 @@ pub const GEPA = struct {
                 var dominators: std.ArrayList(usize) = .empty;
                 for (0..e.candidates.items.len) |p| {
                     if (flags[p]) continue;
-                    const on_front = for (e.fronts) |front| {
-                        if (std.mem.indexOfScalar(usize, front.items, p) != null) break true;
+                    const on_front = for (0..e.activeFrontCount()) |index| {
+                        if (std.mem.indexOfScalar(usize, e.activeFront(index), p) != null) break true;
                     } else false;
                     if (on_front) try dominators.append(e.out, p);
                 }
@@ -1376,12 +1509,19 @@ pub const GEPA = struct {
             for (rows, outputs) |*row, outputs_for_row| row.* = outputs_for_row.items;
             break :rows rows;
         } else null;
+        const objectives = try e.objectives.results(out);
         return .{
             .program = program.*,
             .candidates = e.candidates.items,
             .parents = e.parents.items,
             .val_aggregate_scores = try e.averages(),
             .val_subscores = e.subscores.items,
+            .val_aggregate_subscores = if (e.objectives.aggregates.items.len == 0)
+                null
+            else
+                e.objectives.aggregates.items,
+            .per_objective_best_candidates = objectives.leaders,
+            .objective_pareto_front = objectives.scores,
             .per_val_instance_best_candidates = per_instance,
             .best_outputs_valset = best_outputs,
             .discovery_eval_counts = e.discovery.items,
@@ -1561,6 +1701,88 @@ test "GEPA candidate selection preserves exploration, filtered frontiers, and RN
             try std.testing.expectEqual(rng_after, snapshot.nextU32());
         }
     }
+}
+
+// Frozen gepa 0.1.4 state and selectors, seed 17. Sparse keys arrive in later candidates.
+test "GEPA objective frontiers select different parents without changing the RNG clock" {
+    const rows: [4][3][]const ObjectiveScore = .{
+        .{ &.{ .{ .name = "q", .score = 3 }, .{ .name = "cost", .score = 0 } }, &.{.{ .name = "q", .score = 0 }}, &.{.{ .name = "ok", .score = 1 }} },
+        .{ &.{ .{ .name = "q", .score = 1 }, .{ .name = "cost", .score = 1 } }, &.{ .{ .name = "q", .score = 4 }, .{ .name = "cost", .score = 2 } }, &.{.{ .name = "ok", .score = 1 }} },
+        .{ &.{ .{ .name = "q", .score = 0 }, .{ .name = "cost", .score = 2 } }, &.{.{ .name = "q", .score = 0 }}, &.{.{ .name = "ok", .score = 1 }} },
+        .{ &.{ .{ .name = "q", .score = 2 }, .{ .name = "cost", .score = 3 } }, &.{ .{ .name = "q", .score = 2 }, .{ .name = "cost", .score = -1 } }, &.{.{ .name = "ok", .score = 2 }} },
+    };
+    const scores: []const []const f64 = &.{ &.{ 1, 0, 0.5 }, &.{ 0, 1, 0.5 }, &.{ 0.8, 0.8, 0.8 }, &.{ 0, 0, 1 } };
+    const cases = [_]struct {
+        mode: GEPA.Frontier,
+        leaders: []const usize,
+        draws: [16]usize,
+        next: [16]u32,
+    }{
+        .{ .mode = .instance, .leaders = &.{ 0, 1, 3 }, .draws = .{ 3, 1, 1, 1, 1, 0, 3, 3, 3, 3, 1, 0, 0, 0, 1, 3 }, .next = .{ 1778837931, 3464710496, 4125293655, 1243931546, 750280511, 3290406397, 3024601294, 2320078575, 2840618605, 1195188523, 473142372, 3940602561, 1069030695, 1650002322, 3501197581, 1802024078 } },
+        .{ .mode = .objective, .leaders = &.{ 1, 2, 3 }, .draws = .{ 3, 2, 2, 2, 2, 1, 3, 3, 3, 3, 2, 1, 1, 1, 2, 3 }, .next = .{ 1778837931, 3464710496, 4125293655, 1243931546, 750280511, 3290406397, 3024601294, 2320078575, 2840618605, 1195188523, 473142372, 3940602561, 1069030695, 1650002322, 3501197581, 1802024078 } },
+        .{ .mode = .hybrid, .leaders = &.{ 0, 1, 3, 1, 2, 3 }, .draws = .{ 3, 3, 1, 1, 1, 1, 2, 2, 3, 2, 1, 0, 0, 1, 3, 2 }, .next = .{ 1778837931, 3464710496, 4125293655, 1243931546, 750280511, 3290406397, 3024601294, 2320078575, 2840618605, 1195188523, 473142372, 3940602561, 1069030695, 1650002322, 3501197581, 1802024078 } },
+        .{ .mode = .cartesian, .leaders = &.{ 0, 3, 1, 3, 1 }, .draws = .{ 1, 1, 3, 3, 3, 3, 1, 3, 0, 0, 3, 1, 1, 3, 1, 3 }, .next = .{ 1778837931, 3464710496, 4125293655, 1243931546, 750280511, 3290406397, 2840618605, 473142372, 3940602561, 1069030695, 1650002322, 3501197581, 1083980018, 3692404330, 3446169948, 2751033102 } },
+    };
+    var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    for (cases) |case| {
+        var fronts: [3]std.ArrayList(usize) = .{ .fromOwnedSlice(try arena.dupe(usize, &.{0})), .fromOwnedSlice(try arena.dupe(usize, &.{1})), .fromOwnedSlice(try arena.dupe(usize, &.{3})) };
+        var engine: GEPA.Engine(void) = .{
+            .gepa = .{ .metric = undefined, .frontier_type = case.mode },
+            .out = arena,
+            .ctx = undefined,
+            .reflection = undefined,
+            .student = undefined,
+            .names = &.{},
+            .trainset = &.{},
+            .valset = &.{},
+            .rng = .init(17),
+            .adapter_rng = .init(0),
+            .front_score = &.{},
+            .fronts = &fronts,
+        };
+        try engine.candidates.appendNTimes(arena, &.{}, rows.len);
+        try engine.subscores.appendSlice(arena, scores);
+        for (rows, 0..) |entries, i| {
+            var runs: [3]GEPA.Run = undefined;
+            for (&runs, entries, scores[i]) |*run, row, score| run.* = .{ .prediction = null, .trace = undefined, .score = score, .objective_scores = row };
+            try engine.objectives.update(arena, case.mode, i, &runs);
+        }
+        try std.testing.expectEqual(case.leaders.len, engine.activeFrontCount());
+        for (case.leaders, 0..) |leader, i| try std.testing.expectEqualSlices(usize, &.{leader}, engine.activeFront(i));
+        for ([_]GEPA.Selection{ .pareto, .top_k_pareto }) |selection| {
+            engine.gepa.candidate_selection_strategy = selection;
+            engine.rng = .init(17);
+            for (case.draws, case.next) |draw, word| {
+                try std.testing.expectEqual(draw, try engine.selectParent());
+                var snapshot = engine.rng;
+                try std.testing.expectEqual(word, snapshot.nextU32());
+            }
+        }
+    }
+}
+
+test "GEPA objective batches require scores only for non-instance frontiers" {
+    var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    const empty: GEPA.Run = .{ .prediction = null, .trace = undefined, .score = 1 };
+    var state: GEPA.Objectives = .{};
+    try std.testing.expectError(error.MissingObjectiveScores, state.update(arena, .hybrid, 0, &.{empty}));
+    try state.update(arena, .instance, 0, &.{empty});
+    var scored = empty;
+    scored.objective_scores = &.{.{ .name = "quality", .score = 0.5 }};
+    try state.update(arena, .instance, 1, &.{ scored, empty });
+    try state.update(arena, .instance, 2, &.{scored});
+    try state.update(arena, .instance, 3, &.{empty});
+    const result = try state.results(arena);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2 }, result.leaders.?[0].candidates);
+    try std.testing.expectEqual(@as(f64, 0.5), state.aggregates.items[1][0].score);
+    try std.testing.expectEqual(@as(usize, 0), state.aggregates.items[0].len);
+    try std.testing.expectEqual(@as(usize, 0), state.aggregates.items[3].len);
+    scored.objective_scores = &.{ scored.objective_scores[0], scored.objective_scores[0] };
+    try std.testing.expectError(error.DuplicateObjective, state.update(arena, .instance, 4, &.{scored}));
 }
 
 test "GEPA empty validation evaluates the entire training set" {

@@ -117,7 +117,7 @@ retain the actual continuation and raw provider response independently.
 | Evaluation and few-shot search | `optimize.evaluate`, concurrent `parallel.Evaluator`, `bootstrapTraceData` with real parse-failure capture and ordered native rollouts, `LabeledFewShot`, `BootstrapFewShot`, `BootstrapFewShotWithRandomSearch`, `BootstrapFewShotWithOptuna`, teacher context, zero thresholds and positional multi-use trace selection |
 | Fine-tuning | Chat/XML `Adapter.formatFinetuneData`; native `BootstrapFinetune` over bounded OpenAI HTTP jobs, startup workers, retained model names and joined failure cleanup |
 | Optimizer composition | Native `BetterTogether`, real default prompt/weight optimization, typed custom registries, retained candidate LM snapshots and joined lifecycle cleanup |
-| Instruction optimization | `InferRules`; `MIPROv2`, its program-aware proposer and an Optuna 4.5.0 TPE port; `COPRO`; `SIMBA`; supported instance-frontier `GEPA` paths against gepa 0.1.4 |
+| Instruction optimization | `InferRules`; `MIPROv2`, its program-aware proposer and an Optuna 4.5.0 TPE port; `COPRO`; `SIMBA`; native `GEPA` with instance and named-objective frontiers |
 | Agents and tools | `ReAct`, bounded native `Avatar` and `AvatarOptimizer`, comptime `Tool`, `History`, `ToolCalls`, tool results, native declarations and text tool calls, typed submit, retained history |
 | Generated native execution | `generated_zig.Generator` (`Predict(Code[zig])`) and fixed-storage Linux `Executor`: restricted compiler, kernel-confined guest, exact native capability RPC, pending output and whole-tree join; not Python RLM/Flex |
 | Voting | `Ensemble`, `ensemble.majority`, Unicode text normalization; exact Python numeric equality, NaN object identity and source-order fallback behavior |
@@ -3804,8 +3804,15 @@ The following prevent a claim that DSZig can do everything DSPy can:
   (allocation errors propagate) and copies the returned instruction text.
   The callback sees native trace representations, not Python objects; original
   model identity erased from untyped fields cannot be recovered. Custom code
-  proposers, Flex components, objective-based frontiers, and logging integrations
-  remain unsupported. Candidate selection supports `pareto`, `current_best`,
+  proposers, Flex components, and logging integrations remain unsupported.
+  A metric can return named `Feedback.objective_scores`, with unique names per
+  row. GEPA averages each objective over the validation rows that supply it
+  and returns the aggregates, best scores, and tied leaders. `frontier_type`
+  selects `.instance` (default), `.objective` (named aggregates), `.hybrid`
+  (instances and named aggregates), or `.cartesian` (per-row objectives).
+  Non-instance frontiers require at least one objective per evaluated validation
+  batch. The winning program is still chosen by mean validation score.
+  Candidate selection supports `pareto`, `current_best`,
   `epsilon_greedy` (epsilon 0.1), and `top_k_pareto` (top five). Top-five
   selection restricts the validation frontiers before removing dominated
   candidates and falls back to the best aggregate candidate if none remain.
