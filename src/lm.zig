@@ -37,6 +37,7 @@ pub const ResponseFormat = inference.ResponseFormat;
 pub const ToolChoice = inference.ToolChoice;
 /// TypeSafe System One decision backend (`POST /v1/systemone`).
 pub const TypeSafe = @import("typesafe.zig").TypeSafe;
+pub const Anthropic = @import("anthropic.zig").Anthropic;
 
 pub const Options = struct {
     temperature: ?f64 = null,
@@ -2317,23 +2318,33 @@ pub const OpenAI = struct {
     }
 
     fn predictionRequest(self: *const OpenAI, arena: Allocator, request: Request) Error!*const sdk.Request {
+        return canonicalPredictionRequest(arena, request, self.model, self.max_tokens, self);
+    }
+
+    pub fn canonicalPredictionRequest(
+        arena: Allocator,
+        request: Request,
+        model: []const u8,
+        max_tokens: ?u32,
+        openai: ?*const OpenAI,
+    ) Error!*const sdk.Request {
         if (request.decision != null or request.options.n != 1) return error.LMFailure;
         const runtime = @import("runtime_value.zig");
         var fields: runtime.ObjectMap = .empty;
-        try fields.put(arena, "model", .{ .string = self.model });
+        try fields.put(arena, "model", .{ .string = model });
         const has_system = request.messages.len != 0 and request.messages[0].role == .system;
         if (has_system) try fields.put(arena, "system", nativeContent(arena, request.messages[0].content));
         var messages: runtime.Array = .init(arena);
         try messages.ensureTotalCapacity(request.messages.len - @intFromBool(has_system));
         const turns = request.messages[@intFromBool(has_system)..];
-        const attachment: ?AttachmentKind = switch (self.api) {
+        const attachment: ?AttachmentKind = if (openai) |self| switch (self.api) {
             .responses => if (hasToolAttachments(turns, .audio)) .audio else null,
             .chat_completions => if (hasToolAttachments(turns, .image) and
                 (try self.chatCompatibility(self.model)).content_policy.tool_result_media == .reject)
                 .image
             else
                 null,
-        };
+        } else null;
         if (attachment) |kind| {
             try appendToolAttachments(arena, &messages, turns, kind);
         } else {
@@ -2351,7 +2362,7 @@ pub const OpenAI = struct {
         }
         try fields.put(arena, "tools", .{ .array = tools });
         var config: runtime.ObjectMap = .empty;
-        if (self.max_tokens) |limit| try config.put(arena, "max_tokens", .{ .integer = limit });
+        if (max_tokens) |limit| try config.put(arena, "max_tokens", .{ .integer = limit });
         if (request.options.temperature) |temperature| try config.put(arena, "temperature", .{ .float = temperature });
         if (request.options.logprobs != .null) try config.put(arena, "logprobs", request.options.logprobs);
         if (request.options.reasoning_effort) |effort| {
@@ -2395,7 +2406,7 @@ pub const OpenAI = struct {
                 try selection.put(arena, "parallel", .{ .bool = parallel });
             try config.put(arena, "tool_choice", .{ .object = selection });
         }
-        try self.nativeToolOverrides(arena, request.tools, &config);
+        if (openai) |self| try self.nativeToolOverrides(arena, request.tools, &config);
         try fields.put(arena, "config", .{ .object = config });
         return sdk.Request.fromValue(arena, .{ .object = fields }) catch |err| return sdkCodecError(err);
     }
@@ -3649,7 +3660,7 @@ pub const OpenAI = struct {
     /// Wire counts may be negative: settle_usage first withholds an inconsistent
     /// whole, then SDK Usage validates the counters which remain. Refusing here
     /// changes that observable order. Bool and nonintegral values still refuse.
-    fn wireCount(arena: Allocator, raw: @import("runtime_value.zig").Value) Error!@import("runtime_value.zig").Value {
+    pub fn wireCount(arena: Allocator, raw: @import("runtime_value.zig").Value) Error!@import("runtime_value.zig").Value {
         switch (raw) {
             .null, .integer => return raw,
             .number_string => |digits| {
@@ -3672,7 +3683,7 @@ pub const OpenAI = struct {
     /// numbers do not determine instead of failing or estimating. A part
     /// larger than its whole withholds the whole; a total which is not
     /// input + output withholds both and keeps the provider's total.
-    fn settleUsage(arena: Allocator, counts: Usage) Error!Usage {
+    pub fn settleUsage(arena: Allocator, counts: Usage) Error!Usage {
         var usage = counts;
         if (usage.input_tokens != .null) {
             const cached = if (usage.cache_read_tokens == .null and usage.cache_write_tokens == .null)
@@ -3717,7 +3728,7 @@ pub const OpenAI = struct {
     }
 
     /// Exact integer sum; counters never round through binary64.
-    fn countSum(arena: Allocator, a: @import("runtime_value.zig").Value, b: @import("runtime_value.zig").Value) Error!@import("runtime_value.zig").Value {
+    pub fn countSum(arena: Allocator, a: @import("runtime_value.zig").Value, b: @import("runtime_value.zig").Value) Error!@import("runtime_value.zig").Value {
         return @import("value.zig").numericSum(arena, a, b) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.LMFailure,

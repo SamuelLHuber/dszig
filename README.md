@@ -3714,7 +3714,16 @@ The following prevent a claim that DSZig can do everything DSPy can:
   mutation and Python frozen-assignment exceptions are not reproduced. The
   citation proof retains 150 unsupported Decimal/bytearray/dynamic-model rows;
   its finite passing observations do not establish complete Citations parity.
-- **Providers and media:** native File construction, adapter/typed prediction
+- **Providers and media:** `dszig.Anthropic` supports nonstreaming Messages
+  generation with text turns, function calls and text tool results, and
+  explicit JSON schemas (`supports_response_schema = true` for a compatible
+  model). Supply an existing `std.http.Client` and an API key or a
+  per-attempt `header_provider`; use a trusted `base_url` ending in `/v1`.
+  Set `max_tokens` explicitly to control the output budget. The Messages
+  implementation has been compared against DSPy over loopback, not against a
+  hosted Claude model. Messages streaming, reasoning, multimodal blocks,
+  prompt caching and hosted tools are not implemented.
+  Native File construction, adapter/typed prediction
   handling, File tool-result markers and bounded Responses document translation
   are implemented as described above. There is still no complete lm15 provider
   catalog/routing/auth/error taxonomy, full provider SDK, embedding providers
