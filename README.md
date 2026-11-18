@@ -3837,6 +3837,15 @@ The following prevent a claim that DSZig can do everything DSPy can:
   reflection minibatch, and leave `reflection_minibatch_size` unset. Repeated
   indices are evaluated in order; empty, out-of-range, and over-capacity
   batches are rejected before rollout.
+  Set `val_evaluation_policy` to choose an ordered subset of validation rows
+  for each accepted candidate. The seed still uses all rows unless the policy
+  supplies `seed_batch`. With a custom policy, `result.val_ids` pairs each
+  score with its original validation row; unevaluated rows have no Pareto
+  leaders or best outputs. Merge sampling uses only IDs scored by both
+  parents, with `merge_val_overlap_floor` controlling the required overlap.
+  The returned best program still uses mean validation score. Python-only
+  policy hooks for choosing the reported best program or logging custom
+  validation scores are not implemented.
   A custom `component_selector` can inspect borrowed candidate instructions,
   validation scores, and the current minibatch's traced rollouts before
   returning predictor names in reflection order. An empty selection skips

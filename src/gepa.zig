@@ -287,6 +287,8 @@ pub const GEPA = struct {
     /// Defaults to three with the built-in sampler; leave null with `batch_sampler`.
     reflection_minibatch_size: ?usize = null,
     batch_sampler: ?BatchSampler = null,
+    val_evaluation_policy: ?ValidationPolicy = null,
+    merge_val_overlap_floor: usize = 5,
     candidate_selection_strategy: Selection = .pareto,
     frontier_type: Frontier = .instance,
     acceptance_criterion: Acceptance = .strict_improvement,
@@ -346,6 +348,7 @@ pub const GEPA = struct {
         names: []const []const u8,
         candidates: []const []const []const u8,
         val_subscores: []const []const f64,
+        val_ids: ?[]const []const usize,
         parents: []const []const ?usize,
         discovery_eval_counts: []const usize,
         iteration: usize,
@@ -384,6 +387,7 @@ pub const GEPA = struct {
         total_metric_calls: usize,
         candidates: []const []const []const u8,
         val_subscores: []const []const f64,
+        val_ids: ?[]const []const usize,
         parents: []const []const ?usize,
         trainset: []const Example,
         minibatch_ids: []const usize,
@@ -402,6 +406,7 @@ pub const GEPA = struct {
         names: []const []const u8,
         candidates: []const []const []const u8,
         val_subscores: []const []const f64,
+        val_ids: ?[]const []const usize,
         parents: []const []const ?usize,
         parent_idx: usize,
         total_metric_calls: usize,
@@ -429,6 +434,7 @@ pub const GEPA = struct {
         max_metric_calls: usize,
         candidates: []const []const []const u8,
         val_subscores: []const []const f64,
+        val_ids: ?[]const []const usize,
         parents: []const []const ?usize,
         discovery_eval_counts: []const usize,
     };
@@ -446,6 +452,7 @@ pub const GEPA = struct {
     };
 
     pub const Error = error{
+        InvalidValidationBatch,
         ZeroWeights,
         NoBudget,
         UnknownInstructionComponent,
@@ -493,6 +500,8 @@ pub const GEPA = struct {
             candidates: []const []const []const u8,
             parents: []const []const ?usize,
             val_aggregate_scores: []const f64,
+            /// Null with full validation. Otherwise, row IDs in score order.
+            val_ids: ?[]const []const usize,
             val_subscores: []const []const f64,
             /// Indexed by candidate; each objective averages only rows that supplied it.
             val_aggregate_subscores: ?[]const []const ObjectiveScore,
@@ -511,7 +520,26 @@ pub const GEPA = struct {
         };
     }
 
-    const merge_overlap_floor = 5;
+    /// Batch selection from a fixed ordered validation set. Returned IDs must
+    /// stay readable through the selected batch's evaluation.
+    pub const ValidationPolicy = struct {
+        ptr: *anyopaque,
+        /// Custom batches must be nonempty and fit this limit.
+        max_batch_size: usize,
+        seed_batch: ?*const fn (*anyopaque, []const Example) anyerror![]const usize = null,
+        next_batch: *const fn (*anyopaque, *const ValidationState) anyerror![]const usize,
+    };
+
+    /// Borrowed during the callback. Score rows follow their matching ID rows.
+    pub const ValidationState = struct {
+        valset: []const Example,
+        candidates: []const []const []const u8,
+        val_ids: []const []const usize,
+        val_subscores: []const []const f64,
+        parents: []const []const ?usize,
+        iteration: usize,
+        total_metric_calls: usize,
+    };
     const merge_subsample = 5;
     const max_attempts = 10;
 
@@ -561,7 +589,9 @@ pub const GEPA = struct {
             mode: Frontier,
             candidate: usize,
             runs: []const Run,
+            ids: ?[]const usize,
         ) !void {
+            assert(ids == null or ids.?.len == runs.len);
             const totals = &state.totals;
             defer totals.clearRetainingCapacity();
             for (runs, 0..) |run, row| for (run.objective_scores) |entry| {
@@ -593,7 +623,8 @@ pub const GEPA = struct {
             try state.aggregates.append(out, aggregate);
             if (mode == .cartesian) {
                 for (runs, 0..) |run, row| for (run.objective_scores) |entry| {
-                    const key = [2]usize{ row, state.named.getIndex(entry.name).? };
+                    const id = if (ids) |rows| rows[row] else row;
+                    const key = [2]usize{ id, state.named.getIndex(entry.name).? };
                     const front = try state.cartesian.getOrPut(out, key);
                     if (!front.found_existing) front.value_ptr.* = .{};
                     try front.value_ptr.update(out, candidate, entry.score);
@@ -636,6 +667,10 @@ pub const GEPA = struct {
             adapter_rng: pyrandom.Random,
             candidates: std.ArrayList([]const []const u8) = .empty,
             subscores: std.ArrayList([]const f64) = .empty,
+            all_val_ids: []const usize = &.{},
+            val_ids: std.ArrayList([]const usize) = .empty,
+            val_indices: std.ArrayList(std.AutoArrayHashMapUnmanaged(usize, usize)) = .empty,
+            val_front_order: std.ArrayList(usize) = .empty,
             parents: std.ArrayList([]const ?usize) = .empty,
             discovery: std.ArrayList(usize) = .empty,
             next_pred: std.ArrayList(usize) = .empty,
@@ -668,6 +703,7 @@ pub const GEPA = struct {
                         .max_metric_calls = max_calls,
                         .candidates = e.candidates.items,
                         .val_subscores = e.subscores.items,
+                        .val_ids = e.validationIds(),
                         .parents = e.parents.items,
                         .discovery_eval_counts = e.discovery.items,
                     };
@@ -803,14 +839,42 @@ pub const GEPA = struct {
                 return runs;
             }
 
+            fn validationIds(e: *const Self) ?[]const []const usize {
+                return if (e.gepa.val_evaluation_policy != null) e.val_ids.items else null;
+            }
+
+            fn validationBatch(e: *const Self) ![]const usize {
+                const policy = e.gepa.val_evaluation_policy orelse return e.all_val_ids;
+                const ids = if (e.candidates.items.len == 0)
+                    if (policy.seed_batch) |seed| try seed(policy.ptr, e.valset) else return e.all_val_ids
+                else
+                    try policy.next_batch(policy.ptr, &.{
+                        .valset = e.valset,
+                        .candidates = e.candidates.items,
+                        .val_ids = e.val_ids.items,
+                        .val_subscores = e.subscores.items,
+                        .parents = e.parents.items,
+                        .iteration = e.i,
+                        .total_metric_calls = e.total_evals,
+                    });
+                if (ids.len == 0 or ids.len > policy.max_batch_size)
+                    return error.InvalidValidationBatch;
+                for (ids) |id| if (id >= e.valset.len) return error.InvalidValidationBatch;
+                return ids;
+            }
+
             fn addProgram(e: *Self, candidate: []const []const u8, parent_ids: []const ?usize) !void {
-                const all = try e.out.alloc(usize, e.valset.len);
-                for (all, 0..) |*a, k| a.* = k;
+                const requested = try e.validationBatch();
                 const discovered = e.total_evals;
-                const runs = try e.evalIds(candidate, e.valset, all, false);
-                e.full_evals += 1;
+                var runs = try e.evalIds(candidate, e.valset, requested, false);
+                const sparse = e.gepa.val_evaluation_policy != null;
+                const ids = if (sparse) try e.retainValidationRows(requested, &runs) else requested;
                 const idx = e.candidates.items.len;
-                try e.objectives.update(e.out, e.gepa.frontier_type, idx, runs);
+                // Source seeds the metric counter from the number of unique scored IDs.
+                // Subsequent evaluations count every rollout sent to the adapter.
+                if (idx == 0) e.total_evals = ids.len;
+                e.full_evals += 1;
+                try e.objectives.update(e.out, e.gepa.frontier_type, idx, runs, if (sparse) ids else null);
                 const scores = try e.out.alloc(f64, runs.len);
                 for (scores, runs) |*s, r| s.* = r.score;
                 var next: usize = 0;
@@ -822,8 +886,10 @@ pub const GEPA = struct {
                 try e.parents.append(e.out, parent_ids);
                 try e.discovery.append(e.out, discovered);
                 try e.next_pred.append(e.out, next);
-                for (runs, 0..) |run, k| {
-                    const improves = idx == 0 or run.score > e.front_score[k];
+                for (runs, ids) |run, k| {
+                    const first = e.fronts[k].items.len == 0;
+                    const improves = first or run.score > e.front_score[k];
+                    if (first and sparse) try e.val_front_order.append(e.out, k);
                     if (!improves and run.score != e.front_score[k]) continue;
                     if (improves) {
                         e.front_score[k] = run.score;
@@ -839,11 +905,43 @@ pub const GEPA = struct {
                 }
             }
 
+            fn retainValidationRows(e: *Self, ids: []const usize, runs: *[]Run) ![]const usize {
+                assert(ids.len == runs.len);
+                // The first occurrence determines order; the last rollout supplies its value.
+                var indices: std.AutoArrayHashMapUnmanaged(usize, usize) = .empty;
+                for (ids, 0..) |id, i| try indices.put(e.out, id, i);
+                for (indices.values(), 0..) |*last, i| {
+                    assert(last.* >= i);
+                    runs.*[i] = runs.*[last.*];
+                    last.* = i;
+                }
+                const retained = indices.keys();
+                runs.* = runs.*[0..retained.len];
+                try e.val_ids.append(e.out, retained);
+                if (e.gepa.use_merge) try e.val_indices.append(e.out, indices);
+                return retained;
+            }
+
+            fn instanceFrontCount(e: *const Self) usize {
+                return if (e.gepa.val_evaluation_policy != null)
+                    e.val_front_order.items.len
+                else
+                    e.fronts.len;
+            }
+
+            fn instanceFront(e: *const Self, index: usize) []const usize {
+                const id = if (e.gepa.val_evaluation_policy != null)
+                    e.val_front_order.items[index]
+                else
+                    index;
+                return e.fronts[id].items;
+            }
+
             fn activeFrontCount(e: *const Self) usize {
                 return switch (e.gepa.frontier_type) {
-                    .instance => e.fronts.len,
+                    .instance => e.instanceFrontCount(),
                     .objective => e.objectives.named.count(),
-                    .hybrid => e.fronts.len + e.objectives.named.count(),
+                    .hybrid => e.instanceFrontCount() + e.objectives.named.count(),
                     .cartesian => e.objectives.cartesian.count(),
                 };
             }
@@ -851,12 +949,12 @@ pub const GEPA = struct {
             fn activeFront(e: *const Self, index: usize) []const usize {
                 assert(index < e.activeFrontCount());
                 return switch (e.gepa.frontier_type) {
-                    .instance => e.fronts[index].items,
+                    .instance => e.instanceFront(index),
                     .objective => e.objectives.named.values()[index].candidates.items,
-                    .hybrid => if (index < e.fronts.len)
-                        e.fronts[index].items
+                    .hybrid => if (index < e.instanceFrontCount())
+                        e.instanceFront(index)
                     else
-                        e.objectives.named.values()[index - e.fronts.len].candidates.items,
+                        e.objectives.named.values()[index - e.instanceFrontCount()].candidates.items,
                     .cartesian => e.objectives.cartesian.values()[index].candidates.items,
                 };
             }
@@ -960,6 +1058,7 @@ pub const GEPA = struct {
                     .names = e.names,
                     .candidates = e.candidates.items,
                     .val_subscores = e.subscores.items,
+                    .val_ids = e.validationIds(),
                     .parents = e.parents.items,
                     .discovery_eval_counts = e.discovery.items,
                     .iteration = e.i,
@@ -1097,6 +1196,7 @@ pub const GEPA = struct {
                             .names = e.names,
                             .candidates = e.candidates.items,
                             .val_subscores = e.subscores.items,
+                            .val_ids = e.validationIds(),
                             .parents = e.parents.items,
                             .parent_idx = parent,
                             .total_metric_calls = e.total_evals,
@@ -1160,6 +1260,7 @@ pub const GEPA = struct {
                         .total_metric_calls = e.total_evals,
                         .candidates = e.candidates.items,
                         .val_subscores = e.subscores.items,
+                        .val_ids = e.validationIds(),
                         .parents = e.parents.items,
                         .trainset = e.trainset,
                         .minibatch_ids = ids,
@@ -1376,13 +1477,14 @@ pub const GEPA = struct {
                 const agg = try e.averages();
                 const attempt = (try e.attemptMerge(dominators.items, agg)) orelse return false;
                 try e.triplets.append(e.out, .{ attempt.id1, attempt.id2, attempt.ancestor });
-                const ids = try e.mergeSubsample(e.subscores.items[attempt.id1], e.subscores.items[attempt.id2]);
+                const common = try e.commonValidationIds(attempt.id1, attempt.id2);
+                const ids = try e.mergeSubsample(attempt.id1, attempt.id2, common);
                 if (ids.len == 0) return false;
                 var sum1: f64 = 0;
                 var sum2: f64 = 0;
                 for (ids) |id| {
-                    sum1 += e.subscores.items[attempt.id1][id];
-                    sum2 += e.subscores.items[attempt.id2][id];
+                    sum1 += e.validationScore(attempt.id1, id).?;
+                    sum2 += e.validationScore(attempt.id2, id).?;
                 }
                 const runs = try e.evalIds(attempt.candidate, e.valset, ids, false);
                 if (sumScores(runs) >= @max(sum1, sum2)) {
@@ -1428,7 +1530,7 @@ pub const GEPA = struct {
                     for (e.descs.items) |d| {
                         if (d.id1 == id1 and d.id2 == id2 and std.mem.eql(usize, d.picks, picks)) continue :attempts;
                     }
-                    if (e.valset.len < merge_overlap_floor) continue;
+                    if (!e.hasValidationOverlap(id1, id2)) continue;
                     try e.descs.append(e.out, .{ .id1 = id1, .id2 = id2, .picks = picks });
                     return .{ .candidate = merged, .id1 = id1, .id2 = id2, .ancestor = ancestor };
                 }
@@ -1505,10 +1607,48 @@ pub const GEPA = struct {
                 return false;
             }
 
+            fn validationScore(e: *const Self, candidate: usize, id: usize) ?f64 {
+                const offset = if (e.gepa.val_evaluation_policy != null)
+                    e.val_indices.items[candidate].get(id) orelse return null
+                else
+                    id;
+                return e.subscores.items[candidate][offset];
+            }
+
+            fn hasValidationOverlap(e: *const Self, left: usize, right: usize) bool {
+                const floor = e.gepa.merge_val_overlap_floor;
+                if (e.gepa.val_evaluation_policy == null) return e.valset.len >= floor;
+                if (floor == 0) return true;
+                var count: usize = 0;
+                for (e.val_ids.items[left]) |id| {
+                    if (!e.val_indices.items[right].contains(id)) continue;
+                    count += 1;
+                    if (count == floor) return true;
+                }
+                return false;
+            }
+
+            fn commonValidationIds(e: *const Self, left: usize, right: usize) ![]const usize {
+                if (e.gepa.val_evaluation_policy == null) return e.all_val_ids;
+                var common: std.ArrayList(usize) = .empty;
+                for (e.val_ids.items[left]) |id| {
+                    if (e.val_indices.items[right].contains(id)) try common.append(e.out, id);
+                }
+                std.mem.sortUnstable(usize, common.items, {}, std.sort.asc(usize));
+                return common.items;
+            }
+
             /// `select_eval_subsample_for_merged_program`.
-            fn mergeSubsample(e: *Self, scores1: []const f64, scores2: []const f64) Allocator.Error![]const usize {
+            fn mergeSubsample(
+                e: *Self,
+                left: usize,
+                right: usize,
+                common: []const usize,
+            ) Allocator.Error![]const usize {
                 var buckets: [3]std.ArrayList(usize) = .{ .empty, .empty, .empty };
-                for (scores1, scores2, 0..) |a, b, id| {
+                for (common) |id| {
+                    const a = e.validationScore(left, id).?;
+                    const b = e.validationScore(right, id).?;
                     const k: usize = if (a > b) 0 else if (b > a) 1 else 2;
                     try buckets[k].append(e.out, id);
                 }
@@ -1522,15 +1662,15 @@ pub const GEPA = struct {
                 const remaining = merge_subsample - selected.items.len;
                 if (remaining > 0) {
                     var unused: std.ArrayList(usize) = .empty;
-                    for (0..scores1.len) |id| {
+                    for (common) |id| {
                         if (std.mem.indexOfScalar(usize, selected.items, id) == null) try unused.append(e.out, id);
                     }
                     if (unused.items.len >= remaining) {
                         try e.sampleInto(&selected, unused.items, remaining);
-                    } else if (scores1.len > 0) {
+                    } else if (common.len > 0) {
                         for (0..remaining) |_| {
-                            const r = e.rng.random() * @as(f64, @floatFromInt(scores1.len));
-                            try selected.append(e.out, @intFromFloat(@floor(r)));
+                            const r = e.rng.random() * @as(f64, @floatFromInt(common.len));
+                            try selected.append(e.out, common[@intFromFloat(@floor(r))]);
                         }
                     }
                 }
@@ -1571,6 +1711,9 @@ pub const GEPA = struct {
         options: Options,
     ) !Result(P) {
         assert(trainset.len > 0);
+        if (self.val_evaluation_policy) |policy| {
+            if (policy.max_batch_size == 0) return error.InvalidValidationBatch;
+        }
         if (self.batch_sampler) |sampler| {
             if (self.reflection_minibatch_size != null or sampler.max_batch_size == 0)
                 return error.InvalidBatchSamplerConfiguration;
@@ -1604,6 +1747,8 @@ pub const GEPA = struct {
             n.* = p.name;
             s.* = p.param.predict.instructions;
         }
+        const all_val_ids = try out.alloc(usize, valset.len);
+        for (all_val_ids, 0..) |*id, k| id.* = k;
         const fronts = try out.alloc(std.ArrayList(usize), valset.len);
         for (fronts) |*f| f.* = .empty;
         var e: Engine(P) = .{
@@ -1615,6 +1760,7 @@ pub const GEPA = struct {
             .names = names,
             .trainset = trainset,
             .valset = valset,
+            .all_val_ids = all_val_ids,
             .rng = .init(self.seed),
             .adapter_rng = .init(self.seed),
             .front_score = try out.alloc(f64, valset.len),
@@ -1659,6 +1805,7 @@ pub const GEPA = struct {
             .candidates = e.candidates.items,
             .parents = e.parents.items,
             .val_aggregate_scores = try e.averages(),
+            .val_ids = e.validationIds(),
             .val_subscores = e.subscores.items,
             .val_aggregate_subscores = if (e.objectives.aggregates.items.len == 0)
                 null
@@ -1932,7 +2079,7 @@ test "GEPA objective frontiers select different parents without changing the RNG
         for (rows, 0..) |entries, i| {
             var runs: [3]GEPA.Run = undefined;
             for (&runs, entries, scores[i]) |*run, row, score| run.* = .{ .prediction = null, .trace = undefined, .score = score, .objective_scores = row };
-            try engine.objectives.update(arena, case.mode, i, &runs);
+            try engine.objectives.update(arena, case.mode, i, &runs, null);
         }
         try std.testing.expectEqual(case.leaders.len, engine.activeFrontCount());
         for (case.leaders, 0..) |leader, i| try std.testing.expectEqualSlices(usize, &.{leader}, engine.activeFront(i));
@@ -1954,20 +2101,20 @@ test "GEPA objective batches require scores only for non-instance frontiers" {
     const arena = storage.allocator();
     const empty: GEPA.Run = .{ .prediction = null, .trace = undefined, .score = 1 };
     var state: GEPA.Objectives = .{};
-    try std.testing.expectError(error.MissingObjectiveScores, state.update(arena, .hybrid, 0, &.{empty}));
-    try state.update(arena, .instance, 0, &.{empty});
+    try std.testing.expectError(error.MissingObjectiveScores, state.update(arena, .hybrid, 0, &.{empty}, null));
+    try state.update(arena, .instance, 0, &.{empty}, null);
     var scored = empty;
     scored.objective_scores = &.{.{ .name = "quality", .score = 0.5 }};
-    try state.update(arena, .instance, 1, &.{ scored, empty });
-    try state.update(arena, .instance, 2, &.{scored});
-    try state.update(arena, .instance, 3, &.{empty});
+    try state.update(arena, .instance, 1, &.{ scored, empty }, null);
+    try state.update(arena, .instance, 2, &.{scored}, null);
+    try state.update(arena, .instance, 3, &.{empty}, null);
     const result = try state.results(arena);
     try std.testing.expectEqualSlices(usize, &.{ 1, 2 }, result.leaders.?[0].candidates);
     try std.testing.expectEqual(@as(f64, 0.5), state.aggregates.items[1][0].score);
     try std.testing.expectEqual(@as(usize, 0), state.aggregates.items[0].len);
     try std.testing.expectEqual(@as(usize, 0), state.aggregates.items[3].len);
     scored.objective_scores = &.{ scored.objective_scores[0], scored.objective_scores[0] };
-    try std.testing.expectError(error.DuplicateObjective, state.update(arena, .instance, 4, &.{scored}));
+    try std.testing.expectError(error.DuplicateObjective, state.update(arena, .instance, 4, &.{scored}, null));
 }
 
 test "GEPA empty validation evaluates the entire training set" {
@@ -2095,6 +2242,7 @@ test "GEPA best outputs keep ties and replace an older frontier without extra ev
         .adapter_rng = .init(0),
         .front_score = &front_scores,
         .fronts = &fronts,
+        .all_val_ids = &.{ 0, 1 },
         .best_outputs = &outputs,
     };
     try engine.addProgram(&.{"first"}, &.{null});
