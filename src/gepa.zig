@@ -1,5 +1,5 @@
-//! `dspy.GEPA` (DSPy 3.4.1 on gepa 0.1.4): reflective prompt evolution.
-//! Each iteration picks a parent from the per-example Pareto front, runs it
+//! `dspy.GEPA` (DSPy 3.5.0 on gepa 0.1.4): reflective prompt evolution.
+//! Each iteration picks a parent with the configured selector, runs it
 //! on a minibatch with traces, asks a reflection LM (`ProposeInstruction`,
 //! JSONAdapter) for a better instruction from the metric's textual
 //! feedback, and keeps the child when its minibatch score sum strictly
@@ -9,8 +9,7 @@
 //! for the DSPy adapter), so the same LM answers give the same program.
 //!
 //! Not supported: `dspy.Flex` code components, frontier types other than
-//! `"instance"`, `"epsilon_greedy"`/`"top_k_pareto"`,
-//! `log_dir`. DSPy `num_threads` maps to
+//! `"instance"`, or `log_dir`. DSPy `num_threads` maps to
 //! `rollouts`: each minibatch/valset evaluation then runs on a native pool,
 //! results in example order. CPython iterates small-int sets in ascending
 //! order; DSZig assumes it always does.
@@ -90,7 +89,7 @@ pub const GEPA = struct {
     pub const Rollouts = parallel.Rollouts(Run);
 
     pub const Auto = enum { light, medium, heavy };
-    pub const Selection = enum { pareto, current_best };
+    pub const Selection = enum { pareto, current_best, epsilon_greedy, top_k_pareto };
     pub const ComponentSelector = enum { round_robin, all };
 
     pub const Options = struct {
@@ -366,15 +365,25 @@ pub const GEPA = struct {
             }
 
             /// `remove_dominated_programs`: returns the dominated flags.
-            fn dominated(e: *const Self) Allocator.Error![]bool {
+            fn dominated(
+                e: *const Self,
+                eligible: ?[]const usize,
+                ranked_scores: ?[]const f64,
+            ) Allocator.Error![]bool {
                 const n = e.candidates.items.len;
                 const flags = try e.out.alloc(bool, n);
-                @memset(flags, false);
+                @memset(flags, eligible != null);
+                if (eligible) |ids| for (ids) |id| {
+                    flags[id] = false;
+                };
                 var programs: std.ArrayList(usize) = .empty;
                 for (e.fronts) |front| for (front.items) |p| {
-                    if (std.mem.indexOfScalar(usize, programs.items, p) == null) try programs.append(e.out, p);
+                    if (flags[p]) continue;
+                    if (std.mem.indexOfScalar(usize, programs.items, p) == null)
+                        try programs.append(e.out, p);
                 };
-                const scores = try e.averages();
+                if (programs.items.len == 0) return flags;
+                const scores = ranked_scores orelse try e.averages();
                 std.sort.insertion(usize, programs.items, scores, struct {
                     fn less(s: []const f64, a: usize, b: usize) bool {
                         return s[a] < s[b];
@@ -407,8 +416,12 @@ pub const GEPA = struct {
             }
 
             /// `select_program_candidate_from_pareto_front`.
-            fn selectPareto(e: *Self) Allocator.Error!usize {
-                const flags = try e.dominated();
+            fn selectPareto(
+                e: *Self,
+                eligible: ?[]const usize,
+                ranked_scores: ?[]const f64,
+            ) Allocator.Error!usize {
+                const flags = try e.dominated(eligible, ranked_scores);
                 var order: std.ArrayList(usize) = .empty;
                 var freq: std.ArrayList(usize) = .empty;
                 for (e.fronts) |front| for (front.items) |p| {
@@ -422,8 +435,44 @@ pub const GEPA = struct {
                 };
                 var sampling: std.ArrayList(usize) = .empty;
                 for (order.items, freq.items) |p, f| for (0..f) |_| try sampling.append(e.out, p);
-                assert(sampling.items.len > 0);
+                if (sampling.items.len == 0) {
+                    const ranked = eligible orelse unreachable;
+                    assert(ranked.len > 0);
+                    return ranked[0];
+                }
                 return sampling.items[e.rng.randbelow(sampling.items.len)];
+            }
+
+            fn selectParent(e: *Self) Allocator.Error!usize {
+                assert(e.candidates.items.len > 0);
+                return switch (e.gepa.candidate_selection_strategy) {
+                    .pareto => e.selectPareto(null, null),
+                    .current_best => e.selectBest(),
+                    .epsilon_greedy => if (e.rng.random() < 0.1)
+                        e.rng.randbelow(e.candidates.items.len)
+                    else
+                        e.selectBest(),
+                    .top_k_pareto => e.selectTopPareto(),
+                };
+            }
+
+            // Stable top five; equal scores retain discovery order.
+            fn selectTopPareto(e: *Self) Allocator.Error!usize {
+                var top: [5]usize = undefined;
+                const scores = try e.averages();
+                var len: usize = 0;
+                for (scores, 0..) |score, id| {
+                    var slot: usize = 0;
+                    while (slot < len) : (slot += 1) {
+                        if (score > scores[top[slot]]) break;
+                    }
+                    if (slot == top.len) continue;
+                    len = @min(len + 1, top.len);
+                    std.mem.copyBackwards(usize, top[slot + 1 .. len], top[slot .. len - 1]);
+                    top[slot] = id;
+                }
+                assert(len == @min(top.len, e.candidates.items.len));
+                return e.selectPareto(top[0..len], scores);
             }
 
             fn selectBest(e: *const Self) usize {
@@ -482,10 +531,7 @@ pub const GEPA = struct {
 
             /// One `ReflectiveMutationProposer.propose` + acceptance.
             fn reflect(e: *Self) !void {
-                const parent = switch (e.gepa.candidate_selection_strategy) {
-                    .pareto => try e.selectPareto(),
-                    .current_best => e.selectBest(),
-                };
+                const parent = try e.selectParent();
                 const ids = try e.nextMinibatch();
                 const parent_candidate = e.candidates.items[parent];
                 const before = try e.evalIds(parent_candidate, e.trainset, ids, true);
@@ -708,7 +754,7 @@ pub const GEPA = struct {
             /// `MergeProposer.propose` + the engine's merge acceptance.
             /// Returns whether a merge was evaluated (the iteration ends).
             fn merge(e: *Self) !bool {
-                const flags = try e.dominated();
+                const flags = try e.dominated(null, null);
                 var dominators: std.ArrayList(usize) = .empty;
                 for (0..e.candidates.items.len) |p| {
                     if (flags[p]) continue;
@@ -1094,6 +1140,86 @@ test "GEPA scoring failures preserve capture-specific outputs while feedback err
         try std.testing.expectError(error.OutOfMemory, engine.runOne(engine.ctx, &built, &examples[0], capture));
     }
     try std.testing.expectEqual(@as(usize, 5), script.index);
+}
+
+// Pinned GEPA selectors, including the shared RNG position after each draw.
+test "GEPA candidate selection preserves exploration, filtered frontiers, and RNG state" {
+    const cases = [_]struct {
+        strategy: GEPA.Selection,
+        seed: u32,
+        scores: []const f64,
+        fronts: []const []const usize,
+        draws: [12]usize,
+        rng_after: [12]u32,
+    }{
+        .{
+            .strategy = .epsilon_greedy,
+            .seed = 31,
+            .scores = &.{ 0.2, 0.8, 0.8 },
+            .fronts = &.{ &.{1}, &.{2} },
+            .draws = .{ 0, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1, 1 },
+            .rng_after = .{ 3281255694, 604968615, 185835555, 2298718664, 3055913604, 599541520, 4216431881, 142230572, 586600295, 2300649693, 1923075604, 1771975039 },
+        },
+        .{
+            .strategy = .epsilon_greedy,
+            .seed = 0,
+            .scores = &.{0.5},
+            .fronts = &.{&.{0}},
+            .draws = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+            .rng_after = .{ 3255389356, 1806341205, 1112038970, 2195908194, 1739178872, 3366389305, 1302718217, 2046968324, 2505606783, 3900315155, 2167613558, 1210484339 },
+        },
+        .{
+            .strategy = .top_k_pareto,
+            .seed = 7,
+            .scores = &.{ 0.2, 0.8, 0.8, 0.6, 0.5, 0.6, 0.1 },
+            .fronts = &.{ &.{ 0, 1, 2 }, &.{ 1, 6 }, &.{ 3, 5 }, &.{4}, &.{6} },
+            .draws = .{ 5, 1, 4, 1, 1, 1, 5, 1, 1, 1, 1, 4 },
+            .rng_after = .{ 4071050724, 1695753998, 2795742288, 311111475, 3527346212, 1570621944, 2503055453, 3907149204, 161042648, 369140570, 1862494042, 1796035739 },
+        },
+        .{
+            .strategy = .top_k_pareto,
+            .seed = 15,
+            .scores = &.{ 0.2, 0.8, 0.8, 0.6, 0.5, 0.6, 0.1 },
+            .fronts = &.{&.{ 0, 6 }},
+            .draws = .{ 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 },
+            .rng_after = .{ 4145683452, 4145683452, 4145683452, 4145683452, 4145683452, 4145683452, 4145683452, 4145683452, 4145683452, 4145683452, 4145683452, 4145683452 },
+        },
+    };
+    for (cases) |case| {
+        var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer storage.deinit();
+        const arena = storage.allocator();
+        const candidates = try arena.alloc([]const []const u8, case.scores.len);
+        @memset(candidates, &.{});
+        const scores = try arena.alloc([]const f64, case.scores.len);
+        for (scores, 0..) |*row, idx| row.* = case.scores[idx..][0..1];
+        const fronts = try arena.alloc(std.ArrayList(usize), case.fronts.len);
+        for (fronts, case.fronts) |*front, ids| {
+            front.* = .empty;
+            try front.appendSlice(arena, ids);
+        }
+        var engine: GEPA.Engine(void) = .{
+            .gepa = .{ .metric = undefined, .candidate_selection_strategy = case.strategy },
+            .out = arena,
+            .ctx = undefined,
+            .reflection = undefined,
+            .student = undefined,
+            .names = &.{},
+            .trainset = &.{},
+            .valset = &.{},
+            .rng = .init(case.seed),
+            .adapter_rng = .init(0),
+            .candidates = .fromOwnedSlice(candidates),
+            .subscores = .fromOwnedSlice(scores),
+            .front_score = &.{},
+            .fronts = fronts,
+        };
+        for (case.draws, case.rng_after) |draw, rng_after| {
+            try std.testing.expectEqual(draw, try engine.selectParent());
+            var snapshot = engine.rng;
+            try std.testing.expectEqual(rng_after, snapshot.nextU32());
+        }
+    }
 }
 
 test "GEPA empty validation evaluates the entire training set" {

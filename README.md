@@ -3804,8 +3804,11 @@ The following prevent a claim that DSZig can do everything DSPy can:
   (allocation errors propagate) and copies the returned instruction text.
   The callback sees native trace representations, not Python objects; original
   model identity erased from untyped fields cannot be recovered. Custom code
-  proposers, Flex components, objective-based frontiers, other selection
-  policies, and logging integrations remain unsupported.
+  proposers, Flex components, objective-based frontiers, and logging integrations
+  remain unsupported. Candidate selection supports `pareto`, `current_best`,
+  `epsilon_greedy` (epsilon 0.1), and `top_k_pareto` (top five). Top-five
+  selection restricts the validation frontiers before removing dominated
+  candidates and falls back to the best aggregate candidate if none remain.
   `add_format_failure_as_feedback = true` includes captured predictor response
   parse failures in the reflection dataset, with the completion text and the
   active adapter's output structure. Such rollouts keep the configured failure
