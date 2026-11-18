@@ -614,6 +614,8 @@ pub const MIPROv2 = struct {
         const preds = try predict.namedPredictors(out, program);
         const num_demos = @max(if (demo_sets.len > 0) demo_sets[0].len else n_instruct, 1);
         const per_pred = @min(n_instruct, num_demos);
+        // A nonempty predictor graph needs slot zero for the original instructions.
+        if (preds.len != 0 and per_pred == 0) return error.InvalidOptions;
         const result = try out.alloc([]const []const u8, preds.len);
         for (preds, result, 0..) |p, *list, pred_i| {
             const state = p.param.predict;
@@ -1057,6 +1059,42 @@ test "MIPRO compile demo overrides select zero-shot and seed zero samples indepe
         const expected = try std.fmt.allocPrint(arena, "<question>\n{s}\n</question>", .{first_sample});
         try testing.expect(std.mem.indexOf(u8, actual, expected) != null);
     }
+}
+
+test "MIPRO refuses an empty instruction-candidate space" {
+    const P = predict.Predict(@import("signature.zig").Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: i64 };
+    }));
+    const metric = struct {
+        fn score(
+            _: Allocator,
+            _: *const Example,
+            _: ?*const optimize.RecordPrediction,
+            _: ?*const predict.Trace,
+        ) value.ParseError!f64 {
+            return 1;
+        }
+    }.score;
+    var backing: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer backing.deinit();
+    const arena = backing.allocator();
+    var lm: @import("lm.zig").ScriptedLM = .{ .responses = &.{} };
+    const ctx: Context = .{ .arena = arena, .lm = lm.lm() };
+    const row = try Example.fromJson(arena, "{\"question\":\"test\",\"answer\":1}", &.{"question"});
+    const optimizer: MIPROv2 = .{ .metric = metric, .auto = null, .num_candidates = 0 };
+    const student: P = .{};
+    try testing.expectError(error.InvalidOptions, optimizer.compile(
+        P,
+        arena,
+        arena,
+        ctx,
+        null,
+        student,
+        student,
+        &.{row},
+        .{ .valset = &.{row}, .num_trials = 1, .minibatch = false, .data_aware_proposer = false },
+    ));
 }
 
 test "MIPRO ranks full-set minibatch trials as full candidates and preserves ties" {
