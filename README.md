@@ -3736,10 +3736,12 @@ The following prevent a claim that DSZig can do everything DSPy can:
   system and message-block markers, including one-hour retention; stored cache
   resources are not supported. Other media kinds, third-party reasoning
   dialects, and hosted tools are not implemented.
-  `Gemini.lm()` and `Gemini.completeRequest` support nonstreaming text and
-  JSON/schema-constrained generation on the Gemini Developer API, with
-  `x-goog-api-key` authentication and canonical token accounting. This path
-  does not yet support Gemini tools, reasoning, media, streaming, or Vertex AI.
+  `Gemini.lm()` and `Gemini.completeRequest` support nonstreaming text,
+  JSON/schema-constrained generation, and function calls with text results
+  on the Gemini Developer API, with `x-goog-api-key` authentication and
+  canonical token accounting. Builtin declarations can be sent, but hosted
+  tool outputs and grounding are not supported. Gemini reasoning, media,
+  streaming, and Vertex AI are not supported.
   Native File construction, adapter/typed prediction
   handling, File tool-result markers and bounded Responses document translation
   are implemented as described above. There is still no complete lm15 provider

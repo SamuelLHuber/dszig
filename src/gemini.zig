@@ -21,6 +21,7 @@ pub const Gemini = struct {
     timeout_ns: ?u64 = null,
     connect_timeout_ns: ?u64 = null,
     header_provider: ?http.HeaderProvider = null,
+    adaptations: enum { note, silent, refuse } = .note,
 
     pub fn lm(self: *Gemini) lm_mod.LM {
         return .{
@@ -28,6 +29,7 @@ pub const Gemini = struct {
             .vtable = &.{ .complete = complete, .complete_canonical = canonical, .clone = clone, .model_name = modelName },
             .supports_response_format = true,
             .supports_response_schema = true,
+            .supports_function_calling = true,
         };
     }
 
@@ -51,7 +53,7 @@ pub const Gemini = struct {
 
     fn complete(ptr: *anyopaque, arena: Allocator, request: lm_mod.Request) Error![]const lm_mod.Completion {
         const self: *Gemini = @ptrCast(@alignCast(ptr));
-        if (request.tools.len != 0) return error.LMFailure;
+        for (request.tools) |tool| if (tool.strict != null) return error.LMFailure;
         const native = try lm_mod.OpenAI.canonicalPredictionRequest(arena, request, self.model, self.max_tokens, null);
         defer native.release();
         const result = try arena.alloc(lm_mod.Completion, 1);
@@ -65,7 +67,8 @@ pub const Gemini = struct {
 
     fn canonical(ptr: *anyopaque, arena: Allocator, request: *const sdk.Request) Error!lm_mod.Completion {
         const self: *Gemini = @ptrCast(@alignCast(ptr));
-        const body = try requestBody(arena, &request.fields);
+        var records: std.ArrayList(sdk.Adaptation) = .empty;
+        const body = try requestBody(arena, &request.fields, self.adaptations, &records);
         const url = try endpoint(arena, self.base_url, request.fields.model);
         var headers: [1]std.http.Header = undefined;
         var headers_len: usize = 0;
@@ -95,7 +98,7 @@ pub const Gemini = struct {
         }) catch |err| return codecError(err);
         defer self.client.allocator.free(reply.body);
         const raw = @import("json_repair.zig").parseJson(arena, reply.body) catch |err| return codecError(err);
-        return parseResponse(arena, request.fields.model, raw);
+        return parseResponse(arena, request.fields.model, raw, records.items);
     }
 };
 
@@ -118,11 +121,16 @@ fn endpoint(arena: Allocator, base_url: []const u8, model: []const u8) Error![]c
     return writer.written();
 }
 
-fn requestBody(arena: Allocator, fields: *const sdk.RequestFields) Error![]const u8 {
+fn requestBody(arena: Allocator, fields: *const sdk.RequestFields, policy: @FieldType(Gemini, "adaptations"), records: *std.ArrayList(sdk.Adaptation)) Error![]const u8 {
     const config = &fields.config;
-    if (fields.tools.len != 0 or config.tool_choice != null or config.reasoning != null or
-        config.cache != null or config.logprobs != .null or config.probabilities != null or
-        config.user_id != null or config.extensions != null) return error.LMFailure;
+    if (config.reasoning != null or config.cache != null or config.logprobs != .null or
+        config.probabilities != null or config.user_id != null or config.extensions != null)
+        return error.LMFailure;
+    var names: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer names.deinit(arena);
+    for (fields.messages) |message| for (message.parts) |part| {
+        if (part == .tool_call) try names.put(arena, part.tool_call.id, part.tool_call.name);
+    };
     var rows: runtime.Array = .init(arena);
     try rows.ensureTotalCapacity(fields.messages.len);
     for (fields.messages) |message| {
@@ -133,10 +141,7 @@ fn requestBody(arena: Allocator, fields: *const sdk.RequestFields) Error![]const
         else blk: {
             var values: runtime.Array = .init(arena);
             try values.ensureTotalCapacity(message.parts.len);
-            for (message.parts) |part| {
-                if (part != .text or part.text.continuation.len != 0) return error.LMFailure;
-                values.appendAssumeCapacity(try textPart(arena, part.text.text));
-            }
+            for (message.parts) |part| values.appendAssumeCapacity(try encodePart(arena, part, &names));
             break :blk Value{ .array = values };
         };
         try row.put(arena, "parts", parts);
@@ -183,12 +188,104 @@ fn requestBody(arena: Allocator, fields: *const sdk.RequestFields) Error![]const
         } else if (!std.mem.eql(u8, kind, "json_object")) return error.LMFailure;
     }
     if (generation.count() != 0) try body.put(arena, "generationConfig", .{ .object = generation });
+    try addTools(arena, &body, fields, policy, records);
     if (config.store) |store| try body.put(arena, "store", .{ .bool = store });
     if (config.service_tier) |tier| try body.put(arena, "serviceTier", str(tier));
     var writer: std.Io.Writer.Allocating = .init(arena);
     @import("pyjson.zig").writeJson(&writer.writer, .{ .object = body }, .minified) catch |err|
         return if (err == error.WriteFailed) error.OutOfMemory else error.LMFailure;
     return writer.written();
+}
+
+fn encodePart(arena: Allocator, part: sdk.Part, names: *const std.StringHashMapUnmanaged([]const u8)) Error!Value {
+    switch (part) {
+        .text => |value| {
+            if (value.continuation.len != 0) return error.LMFailure;
+            return textPart(arena, value.text);
+        },
+        .tool_call => |call| {
+            if (call.continuation.len != 0) return error.LMFailure;
+            var row: Object = .empty;
+            try row.put(arena, "name", str(call.name));
+            try row.put(arena, "args", call.input.toValue(arena) catch |err| return codecError(err));
+            try row.put(arena, "id", str(call.id));
+            return wrapped(arena, "functionCall", .{ .object = row });
+        },
+        .tool_result => |result| {
+            if (result.continuation.len != 0) return error.LMFailure;
+            const name = result.name orelse names.get(result.id) orelse return error.LMFailure;
+            const bytes = try joinText(arena, "", result.content);
+            var row: Object = .empty;
+            try row.put(arena, "name", str(name));
+            try row.put(arena, "response", try wrapped(arena, if (result.is_error) "error" else "result", str(bytes)));
+            try row.put(arena, "id", str(result.id));
+            return wrapped(arena, "functionResponse", .{ .object = row });
+        },
+        else => return error.LMFailure,
+    }
+}
+
+fn addTools(arena: Allocator, body: *Object, fields: *const sdk.RequestFields, policy: @FieldType(Gemini, "adaptations"), records: *std.ArrayList(sdk.Adaptation)) Error!void {
+    var declarations: runtime.Array = .init(arena);
+    var tools: runtime.Array = .init(arena);
+    for (fields.tools) |tool| switch (tool) {
+        .function => |function| {
+            const schema: Value = if (function.parameters) |params|
+                params.toValue(arena) catch |err| return codecError(err)
+            else
+                .{ .object = .empty };
+            var row: Object = .empty;
+            try row.put(arena, "name", str(function.name));
+            if (function.description) |description| if (description.len != 0)
+                try row.put(arena, "description", str(description));
+            try row.put(arena, if (try openApi(arena, schema)) "parameters" else "parametersJsonSchema", schema);
+            try declarations.append(.{ .object = row });
+        },
+        .builtin => {},
+    };
+    if (declarations.items.len != 0) try tools.append(try wrapped(arena, "functionDeclarations", .{ .array = declarations }));
+    for (fields.tools) |tool| if (tool == .builtin) {
+        const builtin = tool.builtin;
+        const key = if (std.mem.eql(u8, builtin.name, "web_search")) "googleSearch" else if (std.mem.eql(u8, builtin.name, "code_execution")) "codeExecution" else builtin.name;
+        const config: Value = if (builtin.config) |value|
+            value.toValue(arena) catch |err| return codecError(err)
+        else
+            .{ .object = .empty };
+        try tools.append(try wrapped(arena, key, config));
+    };
+    if (tools.items.len != 0) try body.put(arena, "tools", .{ .array = tools });
+    const choice = fields.config.tool_choice orelse return;
+    if (choice.parallel == false) switch (policy) {
+        .refuse => return error.LMFailure,
+        .silent => {},
+        .note => try records.append(arena, .{
+            .field = "config.tool_choice.parallel",
+            .action = .dropped,
+            .reason = "GenerateContent has no parallel-tool-calls knob and may return several calls (OpenAI and Anthropic carry it)",
+            .asked = sdk.PayloadValue.fromBorrowedValue(arena, .{ .bool = false }) catch |err| return codecError(err),
+        }),
+    };
+    var row: Object = .empty;
+    try row.put(arena, "mode", str(switch (choice.mode) {
+        .none => "NONE",
+        .required => "ANY",
+        .auto => if (choice.allowed.len == 0) "AUTO" else "VALIDATED",
+    }));
+    if (choice.allowed.len != 0) {
+        for (fields.tools) |tool|
+            if (tool == .builtin and contains(choice.allowed, tool.builtin.name)) return error.LMFailure;
+        var allowed: runtime.Array = .init(arena);
+        try allowed.ensureTotalCapacity(choice.allowed.len);
+        for (choice.allowed) |name| allowed.appendAssumeCapacity(str(name));
+        try row.put(arena, "allowedFunctionNames", .{ .array = allowed });
+    }
+    try body.put(arena, "toolConfig", try wrapped(arena, "functionCallingConfig", .{ .object = row }));
+}
+
+fn wrapped(arena: Allocator, key: []const u8, value: Value) Error!Value {
+    var object: Object = .empty;
+    try object.put(arena, key, value);
+    return .{ .object = object };
 }
 
 fn openApi(arena: Allocator, root: Value) Error!bool {
@@ -219,7 +316,7 @@ const schema_fields = [_][]const u8{
     "default",  "items",         "minimum",       "maximum",
 };
 
-fn parseResponse(arena: Allocator, model: []const u8, raw: Value) Error!lm_mod.Completion {
+fn parseResponse(arena: Allocator, model: []const u8, raw: Value, records: []const sdk.Adaptation) Error!lm_mod.Completion {
     if (raw != .object or get(raw, "error") != .null) return error.LMFailure;
     const block = text(get(get(raw, "promptFeedback"), "blockReason"));
     if (block.len != 0 and !std.mem.eql(u8, block, "BLOCK_REASON_UNSPECIFIED")) return error.LMFailure;
@@ -231,23 +328,43 @@ fn parseResponse(arena: Allocator, model: []const u8, raw: Value) Error!lm_mod.C
     const wire_parts = elems(get(get(candidate, "content"), "parts"));
     const parts = try arena.alloc(sdk.Part, @max(wire_parts.len, 1));
     var visible: std.Io.Writer.Allocating = .init(arena);
-    for (wire_parts, parts[0..wire_parts.len]) |part, *dest| {
+    var calls: std.ArrayList(lm_mod.ToolCall) = .empty;
+    for (wire_parts, parts[0..wire_parts.len], 0..) |part, *dest, index| {
+        if (get(part, "thoughtSignature") != .null) return error.LMFailure;
         const value = get(part, "text");
         const thought = get(part, "thought");
-        if (value != .string or (thought == .bool and thought.bool) or get(part, "thoughtSignature") != .null) return error.LMFailure;
-        dest.* = .{ .text = .{ .text = value.string } };
-        visible.writer.writeAll(value.string) catch return error.OutOfMemory;
+        if (thought == .bool and thought.bool) return error.LMFailure;
+        if (value == .string) {
+            dest.* = .{ .text = .{ .text = value.string } };
+            visible.writer.writeAll(value.string) catch return error.OutOfMemory;
+            continue;
+        }
+        const call = get(part, "functionCall");
+        const name = text(get(call, "name"));
+        if (name.len == 0 or get(call, "thoughtSignature") != .null) return error.LMFailure;
+        const wire_id = text(get(call, "id"));
+        const call_id = if (wire_id.len != 0) wire_id else try std.fmt.allocPrint(arena, "tool_call_{d}", .{index});
+        const args = get(call, "args");
+        const input: Value = if (args == .object) args else .{ .object = .empty };
+        const parsed = sdk.JsonValue.fromBorrowedValue(arena, input) catch |err| return codecError(err);
+        var json: std.Io.Writer.Allocating = .init(arena);
+        @import("pyjson.zig").writeJson(&json.writer, input, .minified) catch |err|
+            return if (err == error.WriteFailed) error.OutOfMemory else error.LMFailure;
+        dest.* = .{ .tool_call = .{ .name = name, .id = call_id, .input = parsed } };
+        try calls.append(arena, .{ .name = name, .id = call_id, .arguments = json.written() });
     }
     if (wire_parts.len == 0) parts[0] = .{ .text = .{} };
     const id = text(get(raw, "responseId"));
     var result: lm_mod.Completion = .{
-        .text = visible.written(),
+        .text = if (visible.written().len == 0 and calls.items.len != 0) null else visible.written(),
+        .tool_calls = calls.items,
+        .adaptations = records,
         .message = .{ .role = .assistant, .parts = parts },
         .provider_data = sdk.PayloadValue.fromBorrowedValue(arena, raw) catch |err| return codecError(err),
         .metadata = .{
             .id = if (id.len != 0) id else null,
             .model = model,
-            .finish_reason = if (std.ascii.eqlIgnoreCase(reason, "MAX_TOKENS")) .length else .stop,
+            .finish_reason = if (calls.items.len != 0) .tool_call else if (std.ascii.eqlIgnoreCase(reason, "MAX_TOKENS")) .length else .stop,
             .usage = try readUsage(arena, get(raw, "usageMetadata")),
         },
     };
@@ -290,6 +407,10 @@ fn modality(arena: Allocator, details: Value) Error!Value {
 }
 
 fn joinedParts(arena: Allocator, prefix: []const u8, parts: anytype) Error!Value {
+    return singleton(arena, try textPart(arena, try joinText(arena, prefix, parts)));
+}
+
+fn joinText(arena: Allocator, prefix: []const u8, parts: anytype) Error![]const u8 {
     var writer: std.Io.Writer.Allocating = .init(arena);
     writer.writer.writeAll(prefix) catch return error.OutOfMemory;
     for (parts, 0..) |part, index| {
@@ -297,7 +418,7 @@ fn joinedParts(arena: Allocator, prefix: []const u8, parts: anytype) Error!Value
         if (index != 0) writer.writer.writeByte('\n') catch return error.OutOfMemory;
         writer.writer.writeAll(part.text.text) catch return error.OutOfMemory;
     }
-    return singleton(arena, try textPart(arena, writer.written()));
+    return writer.written();
 }
 
 fn singleton(arena: Allocator, part: Value) Error!Value {
@@ -348,5 +469,18 @@ test "Gemini separates structured schema dialects and rejects blocked candidates
     const blocked = try parse(arena,
         \\{"candidates":[{"finishReason":"MALFORMED_FUNCTION_CALL"}]}
     );
-    try std.testing.expectError(error.LMFailure, parseResponse(arena, "fixture", blocked));
+    try std.testing.expectError(error.LMFailure, parseResponse(arena, "fixture", blocked, &.{}));
+}
+
+test "Gemini retains tool call position in mixed responses" {
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    const raw = try @import("json_repair.zig").parseJson(arena,
+        \\{"candidates":[{"content":{"parts":[{"text":"Looking up"},{"functionCall":{"name":"weather","args":{"city":"Paris"}}}]},"finishReason":"MAX_TOKENS"}]}
+    );
+    const result = try parseResponse(arena, "fixture", raw, &.{});
+    try std.testing.expectEqual(sdk.FinishReason.tool_call, result.metadata.finish_reason.?);
+    try std.testing.expectEqualStrings("tool_call_1", result.response.?.fields.message.parts[1].tool_call.id);
+    try std.testing.expectEqualStrings("tool_call_1", result.tool_calls[0].id);
 }
