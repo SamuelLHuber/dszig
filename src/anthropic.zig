@@ -1,4 +1,4 @@
-//! Native nonstreaming Anthropic Messages generation.
+//! Native Anthropic Messages generation.
 const std = @import("std");
 const lm_mod = @import("lm.zig");
 const http = @import("http.zig");
@@ -83,10 +83,55 @@ pub const Anthropic = struct {
         return (try canonical(self, arena, request)).response.?;
     }
 
+    pub const StreamEvent = lm_mod.OpenAI.StreamEvent;
+    pub const StreamSink = lm_mod.OpenAI.StreamSink;
+    pub const StreamOutcome = lm_mod.OpenAI.StreamOutcome;
+
+    /// Events borrow their frame for the duration of the callback. Returning
+    /// `.stop` closes the connection without waiting for another event.
+    pub fn streamRequest(
+        self: *Anthropic,
+        backing: Allocator,
+        request: *const sdk.Request,
+        sink: StreamSink,
+    ) Error!StreamOutcome {
+        var scratch: std.heap.ArenaAllocator = .init(backing);
+        defer scratch.deinit();
+        const arena = scratch.allocator();
+        var records: std.ArrayList(sdk.Adaptation) = .empty;
+        const body = try self.requestBody(arena, request, &records, true);
+        var stream: MessageStream = .{
+            .backing = backing,
+            .model = request.fields.model,
+            .adaptations = records.items,
+            .sink = sink,
+        };
+        var consumer: http.ResponseConsumer = .{
+            .context = &stream,
+            .consume = MessageStream.consume,
+        };
+        const response = try self.send(arena, body, &consumer);
+        defer self.client.allocator.free(response.body);
+        return stream.outcome;
+    }
+
     fn canonical(ptr: *anyopaque, arena: Allocator, request: *const sdk.Request) Error!lm_mod.Completion {
         const self: *Anthropic = @ptrCast(@alignCast(ptr));
         var records: std.ArrayList(sdk.Adaptation) = .empty;
-        const body = try self.requestBody(arena, request, &records);
+        const body = try self.requestBody(arena, request, &records, false);
+        const response = try self.send(arena, body, null);
+        defer self.client.allocator.free(response.body);
+        const input = @import("json_repair.zig").parseJson(arena, response.body) catch |err|
+            return codecError(err);
+        return parseResponse(arena, request.fields.model, input, records.items);
+    }
+
+    fn send(
+        self: *const Anthropic,
+        arena: Allocator,
+        body: []const u8,
+        consumer: ?*http.ResponseConsumer,
+    ) Error!http.Response {
         const url = try std.fmt.allocPrint(arena, "{s}/messages", .{std.mem.trimEnd(u8, self.base_url, "/")});
         if (self.api_version.len == 0 or std.mem.indexOfAny(u8, self.api_version, "\r\n") != null)
             return error.LMFailure;
@@ -110,17 +155,14 @@ pub const Anthropic = struct {
             .failure_error = error.LMFailure,
             .response_limit_error = error.LMFailure,
         };
-        const response = transport.send(arena, .{
+        return transport.send(arena, .{
             .url = url,
             .method = .POST,
             .body = body,
             .content_type = "application/json",
             .headers = headers[0..headers_len],
+            .response_consumer = consumer,
         }) catch |err| return codecError(err);
-        defer self.client.allocator.free(response.body);
-        const input = @import("json_repair.zig").parseJson(arena, response.body) catch |err|
-            return codecError(err);
-        return parseResponse(arena, request.fields.model, input, records.items);
     }
 
     fn requestBody(
@@ -128,6 +170,7 @@ pub const Anthropic = struct {
         arena: Allocator,
         request: *const sdk.Request,
         records: *std.ArrayList(sdk.Adaptation),
+        stream: bool,
     ) Error![]const u8 {
         const fields = &request.fields;
         const config = &fields.config;
@@ -136,7 +179,7 @@ pub const Anthropic = struct {
         const budget = try self.addReasoning(arena, &body, fields, records);
         try body.put(arena, "model", str(fields.model));
         try body.put(arena, "messages", try encodeMessages(arena, fields.messages));
-        try body.put(arena, "stream", .{ .bool = false });
+        try body.put(arena, "stream", .{ .bool = stream });
         var max_tokens = config.max_tokens;
         if (max_tokens == .null) {
             const ceiling = outputCeiling(fields.model);
@@ -315,9 +358,10 @@ pub const Anthropic = struct {
             while (iterator.next()) |entry| {
                 const key = entry.key_ptr.*;
                 if (std.mem.eql(u8, key, "prompt_caching")) continue;
-                // Do not let a raw extension turn a bounded JSON read into SSE.
+                // The HTTP consumer and the requested framing must agree.
                 if (std.mem.eql(u8, key, "stream")) {
-                    if (entry.value_ptr.* != .bool or entry.value_ptr.bool) return error.LMFailure;
+                    if (entry.value_ptr.* != .bool or
+                        entry.value_ptr.bool != body.get("stream").?.bool) return error.LMFailure;
                 }
                 try body.put(arena, key, entry.value_ptr.*);
             }
@@ -337,6 +381,166 @@ pub const Anthropic = struct {
         });
     }
 };
+
+const MessageStream = struct {
+    backing: Allocator,
+    model: []const u8,
+    adaptations: []const sdk.Adaptation,
+    sink: Anthropic.StreamSink,
+    outcome: Anthropic.StreamOutcome = .exhausted,
+    started: bool = false,
+    saw_end: bool = false,
+    finish: ?sdk.FinishReason = null,
+    usage_frame: bool = false,
+
+    fn consume(context: *anyopaque, arena: Allocator, reader: *std.Io.Reader, limit: usize) !void {
+        const self: *MessageStream = @ptrCast(@alignCast(context));
+        var events = @import("sse.zig").Iterator.init(arena, reader, limit);
+        defer events.deinit();
+        var frame: std.heap.ArenaAllocator = .init(self.backing);
+        defer frame.deinit();
+        var terminal: std.ArrayList(u8) = .empty;
+        defer terminal.deinit(self.backing);
+        const parse = @import("json_repair.zig").parseJson;
+        while (try events.next()) |data| {
+            if (data.len == 0) continue;
+            const value = try parse(frame.allocator(), data);
+            if (value != .object) return error.LMFailure;
+            const kind = text(get(value, "type"));
+            if (is(kind, "message_delta")) {
+                const stop = nonempty(get(get(value, "delta"), "stop_reason"));
+                const usage = get(value, "usage");
+                const has_usage = usage == .object and usage.object.count() != 0;
+                if (stop != null or has_usage) self.saw_end = true;
+                if (stop) |reason| self.finish = finishReason(reason, false);
+                if (has_usage or (stop != null and !self.usage_frame)) {
+                    terminal.clearRetainingCapacity();
+                    try terminal.appendSlice(self.backing, data);
+                    self.usage_frame = has_usage;
+                }
+            } else if (is(kind, "message_stop")) {
+                self.saw_end = true;
+            } else {
+                try self.dispatch(frame.allocator(), value);
+            }
+            if (self.outcome == .stopped) return;
+            _ = frame.reset(.retain_capacity);
+        }
+        if (!self.saw_end) return;
+        const temp = frame.allocator();
+        const final = if (terminal.items.len == 0) .null else try parse(temp, terminal.items);
+        self.start(null, self.model);
+        self.emit(.{ .end = .{
+            .finish_reason = self.finish,
+            .usage = if (self.usage_frame) try readUsage(temp, get(final, "usage")) else null,
+            .provider_data = if (final != .null) try payload(temp, final) else null,
+        } });
+    }
+
+    fn emit(self: *MessageStream, event: Anthropic.StreamEvent) void {
+        if (self.outcome == .stopped) return;
+        if (self.sink.on_event(self.sink.context, event) == .stop) self.outcome = .stopped;
+    }
+
+    fn start(self: *MessageStream, id: ?[]const u8, model: []const u8) void {
+        if (self.started) return;
+        self.started = true;
+        self.emit(.{ .start = .{ .id = id, .model = model, .adaptations = self.adaptations } });
+    }
+
+    fn dispatch(self: *MessageStream, arena: Allocator, value: Value) Error!void {
+        const kind = text(get(value, "type"));
+        if (is(kind, "message_start")) {
+            const message = get(value, "message");
+            self.start(nonempty(get(message, "id")), nonempty(get(message, "model")) orelse self.model);
+        } else if (is(kind, "content_block_start") or is(kind, "content_block_delta")) {
+            try self.content(arena, value, is(kind, "content_block_start"));
+        } else if (is(kind, "error")) {
+            const detail = get(value, "error");
+            const code = nonempty(get(detail, "type")) orelse nonempty(get(detail, "code")) orelse
+                nonempty(get(value, "code")) orelse nonempty(get(value, "error_type")) orelse "provider";
+            self.emit(.{ .provider_error = .{
+                .code = providerError(code),
+                .provider_code = code,
+                .message = nonempty(get(detail, "message")) orelse nonempty(get(value, "message")) orelse code,
+            } });
+        }
+    }
+
+    fn content(self: *MessageStream, arena: Allocator, value: Value, block_start: bool) Error!void {
+        const item = get(value, if (block_start) "content_block" else "delta");
+        const kind = text(get(item, "type"));
+        const index_value = get(value, "index");
+        var index_buffer: [24]u8 = undefined;
+        const index = switch (index_value) {
+            .null => "0",
+            .integer => |n| if (n >= 0)
+                std.fmt.bufPrint(&index_buffer, "{d}", .{n}) catch unreachable
+            else
+                return error.LMFailure,
+            else => return error.LMFailure,
+        };
+        const data: @import("openai_stream.zig").DeltaData = if (block_start) start_data: {
+            if (is(kind, "tool_use")) {
+                const input = get(item, "input");
+                var json: std.Io.Writer.Allocating = .init(arena);
+                if (input == .object and input.object.count() != 0)
+                    @import("pyjson.zig").writeJson(&json.writer, input, .minified) catch |err|
+                        return if (err == error.WriteFailed) error.OutOfMemory else error.LMFailure;
+                break :start_data .{ .tool_call = .{
+                    .input = nonempty(input) orelse json.written(),
+                    .id = nonempty(get(item, "id")),
+                    .name = nonempty(get(item, "name")),
+                } };
+            }
+            if (!is(kind, "redacted_thinking") or get(item, "data") == .null) return;
+            const thinking = try parseThinking(arena, item, true);
+            self.start(null, self.model);
+            self.emit(.{ .delta = .{ .part_index = index, .data = .{ .thinking = "" } } });
+            break :start_data .{ .continuation = thinking.continuation[0] };
+        } else if (is(kind, "text_delta"))
+            .{ .text = .{ .text = text(get(item, "text")) } }
+        else if (is(kind, "thinking_delta"))
+            .{ .thinking = text(get(item, "thinking")) }
+        else if (is(kind, "input_json_delta"))
+            .{ .tool_call = .{ .input = text(get(item, "partial_json")), .id = null, .name = null } }
+        else if (is(kind, "signature_delta") and nonempty(get(item, "signature")) != null)
+            .{ .continuation = (try parseThinking(arena, item, false)).continuation[0] }
+        else if (is(kind, "citation_delta") or is(kind, "citations_delta")) citation: {
+            const nested = get(item, "citation");
+            const source = if (nested == .object) nested else item;
+            break :citation .{ .citation = .{
+                .text = nonempty(get(source, "cited_text")) orelse nonempty(get(source, "text")),
+                .title = nonempty(get(source, "title")),
+                .url = nonempty(get(source, "url")),
+            } };
+        } else return;
+        self.start(null, self.model);
+        self.emit(.{ .delta = .{ .part_index = index, .data = data } });
+    }
+};
+
+fn providerError(code: []const u8) @FieldType(@import("openai_stream.zig").ErrorDetail, "code") {
+    if (is(code, "overloaded_error") or is(code, "api_error")) return .server;
+    if (is(code, "rate_limit_error")) return .rate_limit;
+    if (is(code, "invalid_request_error") or is(code, "request_too_large") or
+        is(code, "not_found_error") or is(code, "resource_not_found_error")) return .invalid_request;
+    if (is(code, "authentication_error") or is(code, "permission_error") or
+        is(code, "invalid_authentication_error")) return .auth;
+    if (is(code, "DeploymentNotFound")) return .unsupported_model;
+    if (is(code, "timeout_error")) return .timeout;
+    if (is(code, "billing_error")) return .billing;
+    return .provider;
+}
+
+fn is(value: []const u8, expected: []const u8) bool {
+    return std.mem.eql(u8, value, expected);
+}
+
+fn nonempty(value: Value) ?[]const u8 {
+    const bytes = text(value);
+    return if (bytes.len == 0) null else bytes;
+}
 
 fn outputCeiling(model: []const u8) ?i64 {
     const rules = .{
@@ -624,7 +828,7 @@ test "Anthropic forcing one function preserves the other declarations" {
     });
     defer request.release();
     var records: std.ArrayList(sdk.Adaptation) = .empty;
-    const body = try provider.requestBody(arena, request, &records);
+    const body = try provider.requestBody(arena, request, &records, false);
     const value = try @import("json_repair.zig").parseJson(arena, body);
     const tools = get(value, "tools");
     try std.testing.expectEqual(@as(usize, 2), tools.array.items.len);
