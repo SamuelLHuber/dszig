@@ -14,6 +14,13 @@ pub const inference = @import("inference.zig");
 pub const sdk = @import("sdk_response.zig");
 pub const public_history = @import("lm_history.zig");
 pub const ChatStreamListener = @import("chat_stream_listener.zig").ChatStreamListener;
+pub const JsonStreamListener = @import("json_stream_listener.zig").JsonStreamListener;
+pub const XmlStreamListener = @import("xml_stream_listener.zig").XmlStreamListener;
+
+test {
+    _ = @import("json_stream_listener.zig");
+    _ = @import("xml_stream_listener.zig");
+}
 const prompt_options = @import("lm_prompt_options.zig");
 /// Canonical SDK token usage; every unknown counter stays null, never zero.
 pub const Usage = @import("lm_usage.zig").Usage;

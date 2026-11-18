@@ -2153,6 +2153,16 @@ borrowed until the next call. A chunk containing both field markers suppresses
 interim output, as in DSPy; it does not prove a cache lookup occurred. This
 listener does not parse the final prediction or route chunks to predictors.
 
+`lm.JsonStreamListener` and `lm.XmlStreamListener` also accept text chunks
+and write fragments into caller-provided storage. JSON emits raw value text,
+without unescaping it. It bounds nesting to 64 levels and top-level keys
+to 256 bytes and does not support escaped secondary keys or JSON repair.
+XML uses the declared output fields to locate literal boundaries; pass a
+provider terminal chunk to `.finishChunk()` (or call `.finish()` for a
+terminal without text). Nested targets emit raw text rather than parsed
+children. A literal XML listener cannot skip a non-self-closing structured
+predecessor. Both listeners leave final prediction parsing to the adapter.
+
 Set `Context.stream_sink` to receive raw OpenAI events during a normal native
 program call. The same HTTP request both emits events and assembles the
 completion for adapter parsing; the call still returns its ordinary prediction.
@@ -3652,8 +3662,9 @@ The following prevent a claim that DSZig can do everything DSPy can:
   training providers or streaming beyond synchronous OpenAI Responses and
   Chat Completions SSE. Completed SDK responses can be projected to events,
   and bounded event sequences or synchronous sources can be assembled.
-  A bounded ChatAdapter text field listener is available separately.
-  Asynchronous streaming and DSPy program streaming are not available.
+  Bounded Chat, JSON, and XML text field listeners are available separately.
+  Native programs can receive raw OpenAI events synchronously; automatic
+  field routing, status callbacks, and asynchronous streaming are not available.
   Document support is not general multimodal support, and Chat Completions
   does not accept document parts.
 - **File and DocumentPart boundaries:** the constructor smoke explicitly leaves
