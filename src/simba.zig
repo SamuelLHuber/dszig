@@ -13,7 +13,7 @@
 //! DSPy `num_threads` maps to `rollouts`: trajectory, candidate and final
 //! evaluations then run on a startup-created native pool, results kept in
 //! submission order, with every random draw made before execution as in DSPy.
-//! Not supported: metrics returning a `dspy.Prediction` with feedback.
+//! Metrics can return either a numeric score or a score with rule-writing metadata.
 //! `np.exp` is Zig's `@exp`.
 
 const std = @import("std");
@@ -89,7 +89,9 @@ pub const OfferFeedback = signature.Signature(struct {
 });
 
 pub const SIMBA = struct {
-    metric: Metric,
+    metric: ?Metric = null,
+    /// Set exactly one of `metric` and `feedback_metric`.
+    feedback_metric: ?FeedbackMetric = null,
     bsize: usize = 32,
     num_candidates: usize = 6,
     max_steps: usize = 8,
@@ -107,6 +109,19 @@ pub const SIMBA = struct {
     /// the metric. Predictions and traces are allocated from `out`, which must
     /// then be thread-safe (an ArenaAllocator over a thread-safe child is).
     pub const Rollouts = parallel.Rollouts(Run);
+
+    /// Return metadata backed by the supplied arena or immutable static data.
+    /// The score is separate, so `metadata` contains only the additional fields.
+    pub const FeedbackMetric = *const fn (
+        Allocator,
+        *const Example,
+        ?*const optimize.RecordPrediction,
+    ) value.ParseError!Feedback;
+
+    pub const Feedback = struct {
+        score: f64,
+        metadata: Record = .empty,
+    };
 
     pub const Options = struct {
         seed: u32 = 0,
@@ -146,6 +161,7 @@ pub const SIMBA = struct {
         prediction: ?optimize.RecordPrediction,
         steps: []const predict.Trace.Step,
         names: []const predict.NamedParam,
+        metadata: Record = .empty,
         /// `null` is DSPy's masked `"N/A"`.
         score: ?f64,
         example: *const Example,
@@ -238,6 +254,8 @@ pub const SIMBA = struct {
         trainset: []const Example,
         options: Options,
     ) !Result(P) {
+        if ((self.metric == null) == (self.feedback_metric == null))
+            return error.InvalidMetricConfiguration;
         assert(self.bsize > 0);
         assert(self.num_candidates > 0);
         assert(trainset.len >= self.bsize);
@@ -473,11 +491,28 @@ pub const SIMBA = struct {
         };
         // Source invokes the metric even after program failure, with None.
         // Scoring failure must not discard a successful prediction or trace.
-        const score = self.metric(out, example, if (prediction) |*p| p else null, null) catch |err| switch (err) {
+        const feedback = self.scoreRun(out, example, if (prediction) |*p| p else null) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
-            else => 0.0,
+            else => Feedback{ .score = 0.0 },
         };
-        return .{ .prediction = prediction, .steps = trace.steps.items, .names = names, .score = score, .example = example };
+        return .{
+            .prediction = prediction,
+            .steps = trace.steps.items,
+            .names = names,
+            .score = feedback.score,
+            .metadata = feedback.metadata,
+            .example = example,
+        };
+    }
+
+    fn scoreRun(
+        self: SIMBA,
+        out: Allocator,
+        example: *const Example,
+        prediction: ?*const optimize.RecordPrediction,
+    ) value.ParseError!Feedback {
+        if (self.feedback_metric) |metric| return metric(out, example, prediction);
+        return .{ .score = try self.metric.?(out, example, prediction, null) };
     }
 
     /// `append_a_demo`: the best run's last trace step per predictor becomes
@@ -569,8 +604,8 @@ pub const SIMBA = struct {
         try inputs.put(out, "worse_program_outputs", try dumps(out, .{ .object = worse_outputs }));
         try inputs.put(out, "worse_reward_value", try reward(out, bad.score));
         try inputs.put(out, "better_reward_value", try reward(out, good.score));
-        try inputs.put(out, "worse_reward_info", .{ .string = "{}" });
-        try inputs.put(out, "better_reward_info", .{ .string = "{}" });
+        try inputs.put(out, "worse_reward_info", try rewardInfo(out, bad.metadata));
+        try inputs.put(out, "better_reward_info", try rewardInfo(out, good.metadata));
         try inputs.put(out, "module_names", try dumps(out, .{ .array = module_names }));
 
         var c = options.prompt orelse ctx;
@@ -611,6 +646,11 @@ fn mask(out: Allocator, run: anytype) Allocator.Error!void {
     run.steps = &.{};
     run.score = null;
     run.prediction = try optimize.RecordPrediction.init(out, na);
+}
+
+fn rewardInfo(out: Allocator, metadata: Record) (@import("feedback.zig").Error || error{ParseValue})!Value {
+    if (metadata.count() == 0) return .{ .string = "{}" };
+    return dumps(out, .{ .object = metadata });
 }
 
 fn reward(out: Allocator, score: ?f64) (@import("feedback.zig").Error || error{ParseValue})!Value {

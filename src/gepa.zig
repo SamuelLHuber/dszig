@@ -310,7 +310,41 @@ pub const GEPA = struct {
     pub const Rollouts = parallel.Rollouts(Run);
 
     pub const Auto = enum { light, medium, heavy };
-    pub const Selection = enum { pareto, current_best, epsilon_greedy, top_k_pareto };
+    pub const Selection = union(enum) {
+        pareto,
+        current_best,
+        epsilon_greedy,
+        top_k_pareto,
+        custom: CustomCandidateSelector,
+    };
+
+    pub const CustomCandidateSelector = struct {
+        ptr: *anyopaque,
+        select: *const fn (*anyopaque, *const CandidateSelection) anyerror!usize,
+    };
+
+    /// Borrowed for one callback before each reflection minibatch.
+    /// Candidate instructions follow `names`; indices follow discovery order.
+    pub const CandidateSelection = struct {
+        names: []const []const u8,
+        candidates: []const []const []const u8,
+        val_subscores: []const []const f64,
+        parents: []const []const ?usize,
+        discovery_eval_counts: []const usize,
+        iteration: usize,
+        total_metric_calls: usize,
+        num_full_val_evals: usize,
+        frontier_type: Frontier,
+        frontier_count: usize,
+        engine: *const anyopaque,
+        get_front: *const fn (*const anyopaque, usize) []const usize,
+
+        /// Validation leader indices in the active frontier's native order.
+        pub fn front(self: *const CandidateSelection, index: usize) ?[]const usize {
+            if (index >= self.frontier_count) return null;
+            return self.get_front(self.engine, index);
+        }
+    };
     pub const Frontier = enum { instance, objective, hybrid, cartesian };
     pub const Acceptance = union(enum) {
         strict_improvement,
@@ -399,6 +433,7 @@ pub const GEPA = struct {
         NoBudget,
         UnknownInstructionComponent,
         InvalidComponentSelection,
+        InvalidCandidateSelection,
     };
 
     pub const Instruction = struct {
@@ -887,7 +922,7 @@ pub const GEPA = struct {
                 return sampling.items[e.rng.randbelow(sampling.items.len)];
             }
 
-            fn selectParent(e: *Self) Allocator.Error!usize {
+            fn selectParent(e: *Self) !usize {
                 assert(e.candidates.items.len > 0);
                 return switch (e.gepa.candidate_selection_strategy) {
                     .pareto => e.selectPareto(null, null),
@@ -897,7 +932,33 @@ pub const GEPA = struct {
                     else
                         e.selectBest(),
                     .top_k_pareto => e.selectTopPareto(),
+                    .custom => |selector| e.selectCustomParent(selector),
                 };
+            }
+
+            fn selectCustomParent(e: *const Self, selector: CustomCandidateSelector) !usize {
+                const selection: CandidateSelection = .{
+                    .names = e.names,
+                    .candidates = e.candidates.items,
+                    .val_subscores = e.subscores.items,
+                    .parents = e.parents.items,
+                    .discovery_eval_counts = e.discovery.items,
+                    .iteration = e.i,
+                    .total_metric_calls = e.total_evals,
+                    .num_full_val_evals = e.full_evals,
+                    .frontier_type = e.gepa.frontier_type,
+                    .frontier_count = e.activeFrontCount(),
+                    .engine = e,
+                    .get_front = selectionFront,
+                };
+                const index = try selector.select(selector.ptr, &selection);
+                if (index >= e.candidates.items.len) return error.InvalidCandidateSelection;
+                return index;
+            }
+
+            fn selectionFront(ptr: *const anyopaque, index: usize) []const usize {
+                const e: *const Self = @ptrCast(@alignCast(ptr));
+                return e.activeFront(index);
             }
 
             // Stable top five; equal scores retain discovery order.
@@ -1667,6 +1728,47 @@ test "GEPA scoring failures preserve capture-specific outputs while feedback err
         try std.testing.expectError(error.OutOfMemory, engine.runOne(engine.ctx, &built, &examples[0], capture));
     }
     try std.testing.expectEqual(@as(usize, 5), script.index);
+}
+
+test "GEPA custom selection can choose off frontier without advancing the shared RNG" {
+    const Selector = struct {
+        fn select(ptr: *anyopaque, state: *const GEPA.CandidateSelection) !usize {
+            const index: *const usize = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualSlices(usize, &.{1}, state.front(0).?);
+            try std.testing.expectEqual(@as(?[]const usize, null), state.front(1));
+            return index.*;
+        }
+    };
+    var index: usize = 0;
+    var candidates = [_][]const []const u8{ &.{"seed"}, &.{"child"} };
+    var leaders = [_]usize{1};
+    var fronts = [_]std.ArrayList(usize){.fromOwnedSlice(&leaders)};
+    var engine: GEPA.Engine(void) = .{
+        .gepa = .{
+            .metric = undefined,
+            .candidate_selection_strategy = .{ .custom = .{
+                .ptr = &index,
+                .select = Selector.select,
+            } },
+        },
+        .out = std.testing.failing_allocator,
+        .ctx = undefined,
+        .reflection = undefined,
+        .student = undefined,
+        .names = &.{"self"},
+        .trainset = &.{},
+        .valset = &.{},
+        .rng = .init(13),
+        .adapter_rng = .init(0),
+        .candidates = .fromOwnedSlice(&candidates),
+        .front_score = &.{},
+        .fronts = &fronts,
+    };
+    var expected_rng = engine.rng;
+    try std.testing.expectEqual(@as(usize, 0), try engine.selectParent());
+    index = candidates.len;
+    try std.testing.expectError(error.InvalidCandidateSelection, engine.selectParent());
+    try std.testing.expectEqual(expected_rng.nextU32(), engine.rng.nextU32());
 }
 
 // Pinned GEPA selectors, including the shared RNG position after each draw.

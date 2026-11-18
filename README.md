@@ -3829,6 +3829,10 @@ The following prevent a claim that DSZig can do everything DSPy can:
   `epsilon_greedy` (epsilon 0.1), and `top_k_pareto` (top five). Top-five
   selection restricts the validation frontiers before removing dominated
   candidates and falls back to the best aggregate candidate if none remain.
+  A custom `candidate_selection_strategy` receives a read-only snapshot of
+  candidate instructions, validation subscores, ancestry, and active frontier
+  leaders before each reflection minibatch. It returns a zero-based candidate
+  index; invalid indices fail before evaluating the minibatch.
   A custom `component_selector` can inspect borrowed candidate instructions,
   validation scores, and the current minibatch's traced rollouts before
   returning predictor names in reflection order. An empty selection skips
@@ -3876,6 +3880,9 @@ The following prevent a claim that DSZig can do everything DSPy can:
   SIMBA `Result.candidate_programs` retains the final native program values
   alongside their full-trainset scores, descending and stable across ties.
   It reuses the final evaluations and does not deep-copy opaque program state.
+  Set `feedback_metric` instead of `metric` to return a numeric score with
+  additional fields for the rule writer. The metadata is masked and rendered
+  in the better/worse reward inputs; it does not participate in ranking.
   Concurrent evaluation and SIMBA/GEPA rollouts use explicit startup-created
   native pools; Python ambient settings and general async execution are not
   implemented. SIMBA uses Zig `@exp`, not NumPy's implementation.
