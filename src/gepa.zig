@@ -520,6 +520,37 @@ pub const GEPA = struct {
         all,
         best,
         top_k: isize,
+        custom: CustomProposalSelector,
+    };
+
+    pub const Proposal = struct {
+        child: []const []const u8,
+        parent_idx: usize,
+        minibatch_ids: []const usize,
+        before: []const Run,
+        after: []const Run,
+    };
+
+    /// Borrowed for one invocation. Query `shouldAccept` only during selection.
+    pub const ProposalBatch = struct {
+        names: []const []const u8,
+        proposals: []const Proposal,
+        state: ValidationState,
+        decision_context: *anyopaque,
+        decide: *const fn (*anyopaque, usize) anyerror!bool,
+
+        pub fn shouldAccept(batch: *const ProposalBatch, index: usize) !bool {
+            if (index >= batch.proposals.len) return error.InvalidProposalIndex;
+            return batch.decide(batch.decision_context, index);
+        }
+    };
+
+    /// Write proposal indices in selection order and return their count.
+    /// Unknown indices and duplicate candidates are ignored; the selector
+    /// may choose a proposal even if the acceptance criterion rejects it.
+    pub const CustomProposalSelector = struct {
+        ptr: *anyopaque,
+        select: *const fn (*anyopaque, *const ProposalBatch, []usize) anyerror!usize,
     };
 
     /// `DspyGEPAResult` (`track_stats=True`) plus the optimized program.
@@ -1617,6 +1648,8 @@ pub const GEPA = struct {
             ) ![]*ReflectionTask {
                 assert(tasks.len <= max_proposal_tasks);
                 const strategy = e.gepa.selection_strategy;
+                if (strategy == .custom)
+                    return e.selectCustomProposals(strategy.custom, tasks, selected);
                 var count: usize = 0;
                 for (tasks) |*task| {
                     const child = task.child orelse continue;
@@ -1640,6 +1673,7 @@ pub const GEPA = struct {
                         count -| @abs(k)
                     else
                         @min(count, @as(usize, @intCast(k))),
+                    .custom => unreachable,
                 };
                 var unique: usize = 0;
                 for (selected[0..limit]) |task| {
@@ -1651,6 +1685,75 @@ pub const GEPA = struct {
                     }
                 }
                 return selected[0..unique];
+            }
+
+            const ProposalDecisions = struct {
+                engine: *Self,
+                tasks: []const *ReflectionTask,
+                verdicts: [max_proposal_tasks]?bool = @splat(null),
+
+                fn decide(ptr: *anyopaque, idx: usize) anyerror!bool {
+                    const memo: *ProposalDecisions = @ptrCast(@alignCast(ptr));
+                    assert(idx < memo.tasks.len);
+                    if (memo.verdicts[idx]) |cached| return cached;
+                    const task = memo.tasks[idx];
+                    const verdict = try memo.engine.accepts(task, task.child.?, task.after);
+                    memo.verdicts[idx] = verdict;
+                    return verdict;
+                }
+            };
+
+            fn selectCustomProposals(
+                e: *Self,
+                selector: CustomProposalSelector,
+                tasks: []ReflectionTask,
+                selected: *[max_proposal_tasks]*ReflectionTask,
+            ) ![]*ReflectionTask {
+                var proposals: [max_proposal_tasks]Proposal = undefined;
+                var by_index: [max_proposal_tasks]*ReflectionTask = undefined;
+                var len: usize = 0;
+                for (tasks) |*task| {
+                    const child = task.child orelse continue;
+                    proposals[len] = .{
+                        .child = child,
+                        .parent_idx = task.parent,
+                        .minibatch_ids = task.ids,
+                        .before = task.before,
+                        .after = task.after,
+                    };
+                    by_index[len] = task;
+                    len += 1;
+                }
+                if (len == 0) return selected[0..0];
+                var memo: ProposalDecisions = .{ .engine = e, .tasks = by_index[0..len] };
+                const batch: ProposalBatch = .{
+                    .names = e.names,
+                    .proposals = proposals[0..len],
+                    .state = e.validationState(e.i),
+                    .decision_context = &memo,
+                    .decide = ProposalDecisions.decide,
+                };
+                var requested: [max_proposal_tasks]usize = undefined;
+                const count = try selector.select(selector.ptr, &batch, &requested);
+                if (count > requested.len) return error.ProposalTaskLimitExceeded;
+                var considered: [max_proposal_tasks]bool = @splat(false);
+                var retained: usize = 0;
+                for (requested[0..count]) |idx| {
+                    if (idx >= len or considered[idx]) continue;
+                    considered[idx] = true;
+                    const task = by_index[idx];
+                    for (selected[0..retained]) |prior| {
+                        if (sameCandidate(prior.child.?, task.child.?)) break;
+                    } else {
+                        selected[retained] = task;
+                        retained += 1;
+                    }
+                }
+                // Source consults the criterion for rejection reporting, except for duplicates.
+                for (considered[0..len], 0..) |was_selected, idx| {
+                    if (!was_selected) _ = try batch.shouldAccept(idx);
+                }
+                return selected[0..retained];
             }
 
             /// `DspyAdapter.make_reflective_dataset`; `null` where no example

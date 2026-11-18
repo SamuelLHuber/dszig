@@ -3846,8 +3846,12 @@ The following prevent a claim that DSZig can do everything DSPy can:
   the evaluated children are then added in selection order. The metric
   budget is checked between iterations, so a whole batch can cross it.
   Tasks run in order within each phase; the optional rollout runner can
-  parallelize examples within a task, not across tasks. Custom proposal
-  sampling/selection strategies and batched reflection backends are not supported.
+  parallelize examples within a task, not across tasks. A `.custom`
+  selection strategy receives the evaluated proposals and can return their
+  indices in any order, even if they fail acceptance. `shouldAccept` lazily
+  memoizes the criterion for each proposal in that batch. Unknown indices and
+  repeated candidates are ignored. Custom sampling strategies and batched
+  reflection backends are not supported.
   Set `cache_evaluation = true` to reuse a candidate's scored rows during
   validation and merge. As in DSPy, training and validation share numeric
   row IDs for these lookups even if the datasets differ. Traced reflection
