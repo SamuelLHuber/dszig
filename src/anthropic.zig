@@ -3,6 +3,7 @@ const std = @import("std");
 const lm_mod = @import("lm.zig");
 const http = @import("http.zig");
 const runtime = @import("runtime_value.zig");
+const content_codec = @import("openai_content.zig");
 const sdk = lm_mod.sdk;
 const Allocator = std.mem.Allocator;
 const Error = lm_mod.Error;
@@ -231,15 +232,18 @@ pub const Anthropic = struct {
         const config = &fields.config;
         var body: Object = .empty;
         var messages = try encodeMessages(arena, fields.messages);
-        const system_text = if (fields.system) |system| switch (system) {
-            .text => |value| value,
-            else => return error.LMFailure,
-        } else "";
+        const system_text: ?[]const u8 = if (fields.system) |system| switch (system) {
+            .text => |value| if (value.len != 0) value else null,
+            .parts => |parts| if (parts.len != 0)
+                try content_codec.partsText(arena, parts, null)
+            else
+                null,
+        } else null;
         const marker = try self.cacheMarker(
             arena,
             config.cache,
             &messages.array,
-            system_text.len != 0,
+            system_text != null,
             records,
         );
         const budget = try self.addReasoning(arena, &body, fields, records);
@@ -265,15 +269,15 @@ pub const Anthropic = struct {
                 "the Messages API requires max_tokens and none was set; 16384 was used (this server's ceiling is its own)", .null, max_tokens);
         }
         try body.put(arena, "max_tokens", if (budget == .null) max_tokens else try lm_mod.OpenAI.countSum(arena, budget, max_tokens));
-        if (system_text.len != 0) {
+        if (system_text) |rendered| {
             if (marker) |cache_control| {
-                var block = try textBlock(arena, system_text);
+                var block = try textBlock(arena, rendered);
                 try block.object.put(arena, "cache_control", cache_control);
                 var blocks: runtime.Array = .init(arena);
                 try blocks.append(block);
                 try body.put(arena, "system", .{ .array = blocks });
             } else {
-                try body.put(arena, "system", str(system_text));
+                try body.put(arena, "system", str(rendered));
             }
         }
         try self.addSampling(arena, &body, config, records);
@@ -710,15 +714,8 @@ fn encodeMessages(arena: Allocator, messages: []const sdk.Message) Error!Value {
     for (messages) |message| {
         var blocks: runtime.Array = .init(arena);
         if (message.role == .developer) {
-            var joined: std.Io.Writer.Allocating = .init(arena);
-            const writer = &joined.writer;
-            writer.writeAll("[developer]\n") catch return error.OutOfMemory;
-            for (message.parts, 0..) |part, index| {
-                if (part != .text) return error.LMFailure;
-                if (index != 0) writer.writeByte('\n') catch return error.OutOfMemory;
-                writer.writeAll(part.text.text) catch return error.OutOfMemory;
-            }
-            try blocks.append(try textBlock(arena, joined.written()));
+            const rendered = try content_codec.partsText(arena, message.parts, "[developer]");
+            try blocks.append(try textBlock(arena, rendered));
         } else {
             for (message.parts) |part| try blocks.append(try encodeBlock(arena, part));
         }
@@ -734,6 +731,7 @@ fn encodeBlock(arena: Allocator, part: sdk.Part) Error!Value {
     var block: Object = .empty;
     switch (part) {
         .text => |item| return textBlock(arena, item.text),
+        .data => |item| return textBlock(arena, try content_codec.dataText(arena, item.value)),
         .image => |item| return encodeMedia(arena, "image", &item),
         .document => |item| return encodeMedia(arena, "document", &item),
         .thinking => |item| return encodeThinking(arena, &item),
@@ -748,16 +746,21 @@ fn encodeBlock(arena: Allocator, part: sdk.Part) Error!Value {
             try block.put(arena, "tool_use_id", str(item.id));
             if (item.content.len == 1 and item.content[0] == .text) {
                 try block.put(arena, "content", str(item.content[0].text.text));
+            } else if (item.content.len == 1 and item.content[0] == .data) {
+                const rendered = try content_codec.dataText(arena, item.content[0].data.value);
+                try block.put(arena, "content", str(rendered));
             } else if (item.content.len != 0) {
                 var blocks: runtime.Array = .init(arena);
+                try blocks.ensureTotalCapacity(item.content.len);
                 for (item.content) |child| {
                     const content = switch (child) {
                         .text => |text_part| try textBlock(arena, text_part.text),
+                        .data => |data| try textBlock(arena, try content_codec.dataText(arena, data.value)),
                         .image => |media| try encodeMedia(arena, "image", &media),
                         .document => |media| try encodeMedia(arena, "document", &media),
                         else => return error.LMFailure,
                     };
-                    try blocks.append(content);
+                    blocks.appendAssumeCapacity(content);
                 }
                 try block.put(arena, "content", .{ .array = blocks });
             }
@@ -1151,6 +1154,24 @@ test "Anthropic judgment encoding does not change the caller schema" {
     try std.testing.expectEqualStrings("string", text(get(get(wire_pick, "anyOf").array.items[0], "type")));
     try std.testing.expectEqualStrings("string", text(get(own_pick, "type")));
     try std.testing.expect(get(get(own_pick, "anyOf").array.items[0], "type") == .null);
+}
+
+test "Anthropic sends a single data tool result as compact JSON text" {
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const raw =
+        \\{"type":"tool_result","id":"lookup-1","content":[
+        \\{"type":"data","value":{"city":"Zürich","count":9007199254740993}}]}
+    ;
+    const parsed = try @import("json_repair.zig").parseJson(arena, raw);
+    const part = try sdk.Part.fromValue(arena, parsed);
+    defer part.free(arena);
+    const wire = try encodeBlock(arena, part);
+    try std.testing.expectEqualStrings(
+        "{\"city\":\"Zürich\",\"count\":9007199254740993}",
+        text(get(wire, "content")),
+    );
 }
 
 test "Anthropic forcing one function preserves the other declarations" {
