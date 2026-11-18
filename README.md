@@ -3833,6 +3833,10 @@ The following prevent a claim that DSZig can do everything DSPy can:
   candidate instructions, validation subscores, ancestry, and active frontier
   leaders before each reflection minibatch. It returns a zero-based candidate
   index; invalid indices fail before evaluating the minibatch.
+  Set `batch_sampler` to choose the ordered training indices for each
+  reflection minibatch, and leave `reflection_minibatch_size` unset. Repeated
+  indices are evaluated in order; empty, out-of-range, and over-capacity
+  batches are rejected before rollout.
   A custom `component_selector` can inspect borrowed candidate instructions,
   validation scores, and the current minibatch's traced rollouts before
   returning predictor names in reflection order. An empty selection skips

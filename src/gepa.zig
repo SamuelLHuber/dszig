@@ -284,7 +284,9 @@ pub const GEPA = struct {
     max_metric_calls: ?usize = null,
     /// Checked in caller order after seed evaluation and between iterations.
     stop_callbacks: []const StopCallback = &.{},
-    reflection_minibatch_size: usize = 3,
+    /// Defaults to three with the built-in sampler; leave null with `batch_sampler`.
+    reflection_minibatch_size: ?usize = null,
+    batch_sampler: ?BatchSampler = null,
     candidate_selection_strategy: Selection = .pareto,
     frontier_type: Frontier = .instance,
     acceptance_criterion: Acceptance = .strict_improvement,
@@ -308,6 +310,21 @@ pub const GEPA = struct {
     rollouts: ?Rollouts = null,
 
     pub const Rollouts = parallel.Rollouts(Run);
+
+    /// Choose training indices in evaluation order. Repeated indices are allowed.
+    /// The returned slice must remain valid until the next sampler call or compile exit.
+    pub const BatchSampler = struct {
+        ptr: *anyopaque,
+        max_batch_size: usize,
+        next: *const fn (*anyopaque, *const BatchSample) anyerror![]const usize,
+    };
+
+    pub const BatchSample = struct {
+        trainset: []const Example,
+        parent_idx: usize,
+        iteration: usize,
+        total_metric_calls: usize,
+    };
 
     pub const Auto = enum { light, medium, heavy };
     pub const Selection = union(enum) {
@@ -434,6 +451,8 @@ pub const GEPA = struct {
         UnknownInstructionComponent,
         InvalidComponentSelection,
         InvalidCandidateSelection,
+        InvalidBatchSamplerConfiguration,
+        InvalidBatchSample,
     };
 
     pub const Instruction = struct {
@@ -989,8 +1008,21 @@ pub const GEPA = struct {
             }
 
             /// `EpochShuffledBatchSampler.next_minibatch_ids`.
-            fn nextMinibatch(e: *Self) Allocator.Error![]const usize {
-                const mb = e.gepa.reflection_minibatch_size;
+            fn nextMinibatch(e: *Self, parent: usize) ![]const usize {
+                if (e.gepa.batch_sampler) |sampler| {
+                    const sample: BatchSample = .{
+                        .trainset = e.trainset,
+                        .parent_idx = parent,
+                        .iteration = e.i,
+                        .total_metric_calls = e.total_evals,
+                    };
+                    const ids = try sampler.next(sampler.ptr, &sample);
+                    if (ids.len == 0 or ids.len > sampler.max_batch_size)
+                        return error.InvalidBatchSample;
+                    for (ids) |id| if (id >= e.trainset.len) return error.InvalidBatchSample;
+                    return ids;
+                }
+                const mb = e.gepa.reflection_minibatch_size orelse 3;
                 if (e.sampler_iteration == e.i) {
                     e.calls_in_iteration += 1;
                 } else {
@@ -1010,7 +1042,7 @@ pub const GEPA = struct {
 
             fn reshuffle(e: *Self) Allocator.Error!void {
                 const n = e.trainset.len;
-                const mb = e.gepa.reflection_minibatch_size;
+                const mb = e.gepa.reflection_minibatch_size orelse 3;
                 e.shuffled = .empty;
                 for (0..n) |k| try e.shuffled.append(e.out, k);
                 e.rng.shuffle(usize, e.shuffled.items);
@@ -1090,7 +1122,7 @@ pub const GEPA = struct {
             /// One `ReflectiveMutationProposer.propose` + acceptance.
             fn reflect(e: *Self) !void {
                 const parent = try e.selectParent();
-                const ids = try e.nextMinibatch();
+                const ids = try e.nextMinibatch(parent);
                 const parent_candidate = e.candidates.items[parent];
                 const before = try e.evalIds(parent_candidate, e.trainset, ids, true);
                 if (e.gepa.skip_perfect_score) {
@@ -1539,7 +1571,12 @@ pub const GEPA = struct {
         options: Options,
     ) !Result(P) {
         assert(trainset.len > 0);
-        assert(self.reflection_minibatch_size > 0);
+        if (self.batch_sampler) |sampler| {
+            if (self.reflection_minibatch_size != null or sampler.max_batch_size == 0)
+                return error.InvalidBatchSamplerConfiguration;
+        } else {
+            assert((self.reflection_minibatch_size orelse 3) > 0);
+        }
         if (self.instruction_proposer == null and self.proposal_options.max_chars == 0)
             return error.InvalidInstructionLimit;
         // Source computes its budget from the supplied set before applying
