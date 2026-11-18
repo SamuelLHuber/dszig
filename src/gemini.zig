@@ -415,17 +415,18 @@ fn requestBody(
     records: *std.ArrayList(sdk.Adaptation),
 ) Error![]const u8 {
     const config = &fields.config;
-    if (config.cache != null or
-        config.probabilities != null or config.user_id != null or config.extensions != null)
+    if (config.probabilities != null or config.user_id != null or config.extensions != null)
         return error.LMFailure;
     var names: std.StringHashMapUnmanaged([]const u8) = .empty;
     defer names.deinit(arena);
     for (fields.messages) |message| for (message.parts) |part| {
         if (part == .tool_call) try names.put(arena, part.tool_call.id, part.tool_call.name);
     };
+    const cache = try cachePrefix(arena, fields, policy, records);
+    const messages = fields.messages[cache.suffix..];
     var rows: runtime.Array = .init(arena);
-    try rows.ensureTotalCapacity(fields.messages.len);
-    for (fields.messages) |message| {
+    try rows.ensureTotalCapacity(messages.len);
+    for (messages) |message| {
         var row: Object = .empty;
         try row.put(arena, "role", str(if (message.role == .assistant) "model" else "user"));
         const parts = if (message.role == .developer)
@@ -441,7 +442,9 @@ fn requestBody(
     }
     var body: Object = .empty;
     try body.put(arena, "contents", .{ .array = rows });
-    if (fields.system) |system| {
+    if (cache.resource) |resource| {
+        try body.put(arena, "cachedContent", str(resource));
+    } else if (fields.system) |system| {
         var row: Object = .empty;
         const parts = switch (system) {
             .text => |bytes| try singleton(arena, try textPart(arena, bytes)),
@@ -494,13 +497,54 @@ fn requestBody(
         try generation.put(arena, "thinkingConfig", thinking);
     }
     if (generation.count() != 0) try body.put(arena, "generationConfig", .{ .object = generation });
-    try addTools(arena, &body, fields, policy, records);
+    if (cache.resource == null) try addTools(arena, &body, fields, policy, records);
     if (config.store) |store| try body.put(arena, "store", .{ .bool = store });
     if (config.service_tier) |tier| try body.put(arena, "serviceTier", str(tier));
     var writer: std.Io.Writer.Allocating = .init(arena);
     @import("pyjson.zig").writeJson(&writer.writer, .{ .object = body }, .minified) catch |err|
         return if (err == error.WriteFailed) error.OutOfMemory else error.LMFailure;
     return writer.written();
+}
+
+const CachePrefix = struct {
+    suffix: usize = 0,
+    resource: ?[]const u8 = null,
+};
+
+fn cachePrefix(
+    arena: Allocator,
+    fields: *const sdk.RequestFields,
+    policy: @FieldType(Gemini, "adaptations"),
+    records: *std.ArrayList(sdk.Adaptation),
+) Error!CachePrefix {
+    const config = fields.config.cache orelse return .{};
+    if (config.mode == .off) return .{};
+    if (config.key) |key| {
+        try adaptString(arena, policy, records, "config.cache.key", .dropped, "GenerateContent has no cache affinity key; implicit caching applies, and a " ++
+            "stored cache (lm.cache(prefix), cache.resource) is the explicit tier", key, null);
+    }
+    if (config.retention == .long) {
+        try adaptString(arena, policy, records, "config.cache.retention", .dropped, "GenerateContent takes no lifetime in-request; it belongs to the stored cache " ++
+            "(cache_create(..., ttl_seconds=...) / cache_update)", "long", null);
+    }
+    const resource = config.resource orelse return .{};
+    if (fields.messages.len == 0) return error.LMFailure;
+    var result: CachePrefix = .{
+        .resource = if (std.mem.startsWith(u8, resource, "cachedContents/")) resource else try std.fmt.allocPrint(arena, "cachedContents/{s}", .{resource}),
+    };
+    if (config.prefix_until_index != .null) {
+        const last = fields.messages.len - 1;
+        const order = @import("value.zig").numericOrder(
+            config.prefix_until_index,
+            .{ .integer = @intCast(last) },
+        ) catch return error.LMFailure;
+        if (order != .lt) return error.LMFailure;
+        if (config.prefix_until_index != .integer) return error.LMFailure;
+        result.suffix = std.math.cast(usize, config.prefix_until_index.integer) orelse
+            return error.LMFailure;
+        result.suffix += 1;
+    }
+    return result;
 }
 
 fn thinkingConfig(
@@ -517,14 +561,14 @@ fn thinkingConfig(
         const reason = try std.fmt.allocPrint(arena, "{s} cannot disable thinking " ++
             "(the Gemini 3 class honours no off switch); the lowest level was sent and " ++
             "the thinking spend is visible in usage", .{model});
-        try reasoningAdapt(arena, policy, records, "config.reasoning.effort", .substituted, reason, "off", "minimal");
+        try adaptString(arena, policy, records, "config.reasoning.effort", .substituted, reason, "off", "minimal");
         effort = .minimal;
     }
 
     var thinking: Object = .empty;
     if (reasoning.summary) |summary| {
         if (summary != .auto) {
-            try reasoningAdapt(arena, policy, records, "config.reasoning.summary", .substituted, "GenerateContent has includeThoughts only, no detail levels; 'auto' shows the thoughts", @tagName(summary), "auto");
+            try adaptString(arena, policy, records, "config.reasoning.summary", .substituted, "GenerateContent has includeThoughts only, no detail levels; 'auto' shows the thoughts", @tagName(summary), "auto");
         }
         try thinking.put(arena, "includeThoughts", .{ .bool = true });
     }
@@ -534,7 +578,7 @@ fn thinkingConfig(
         var selected = effort orelse return error.LMFailure;
         if (level) {
             if (selected == .xhigh or selected == .max) {
-                try reasoningAdapt(arena, policy, records, "config.reasoning.effort", .clamped, "the Gemini 3 class has thinkingLevel minimal|low|medium|high; 'high' is the ceiling", @tagName(selected), "high");
+                try adaptString(arena, policy, records, "config.reasoning.effort", .clamped, "the Gemini 3 class has thinkingLevel minimal|low|medium|high; 'high' is the ceiling", @tagName(selected), "high");
                 selected = .high;
             }
             try thinking.put(arena, "thinkingLevel", str(@tagName(selected)));
@@ -558,7 +602,7 @@ fn startsIgnoreCase(value: []const u8, prefix: []const u8) bool {
     return value.len >= prefix.len and std.ascii.eqlIgnoreCase(value[0..prefix.len], prefix);
 }
 
-fn reasoningAdapt(
+fn adaptString(
     arena: Allocator,
     policy: @FieldType(Gemini, "adaptations"),
     records: *std.ArrayList(sdk.Adaptation),
@@ -566,7 +610,7 @@ fn reasoningAdapt(
     action: sdk.AdaptationAction,
     reason: []const u8,
     asked: []const u8,
-    applied: []const u8,
+    applied: ?[]const u8,
 ) Error!void {
     switch (policy) {
         .silent => {},
@@ -577,8 +621,10 @@ fn reasoningAdapt(
             .reason = reason,
             .asked = sdk.PayloadValue.fromBorrowedValue(arena, str(asked)) catch |err|
                 return codecError(err),
-            .applied = sdk.PayloadValue.fromBorrowedValue(arena, str(applied)) catch |err|
-                return codecError(err),
+            .applied = if (applied) |bytes|
+                sdk.PayloadValue.fromBorrowedValue(arena, str(bytes)) catch |err| return codecError(err)
+            else
+                .{},
         }),
     }
 }

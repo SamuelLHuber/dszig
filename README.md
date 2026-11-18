@@ -3748,7 +3748,9 @@ The following prevent a claim that DSZig can do everything DSPy can:
   the configured model supports native reasoning for typed prediction. Gemini
   accepts inline bytes, URIs, and file IDs for media, including image and
   document attachments in function results. It decodes returned image, audio,
-  and document parts. `Gemini.streamRequest` delivers canonical SSE events
+  and document parts. Generation supports implicit caching and references to
+  existing `cachedContents` resources; it does not create or manage those
+  resources. `Gemini.streamRequest` delivers canonical SSE events
   with text, thought signatures, function calls, and inline image/audio deltas,
   and can stop reading without waiting for the response tail. Typed Gemini
   streaming supports `AsyncProgram` field listeners, final predictions, and
