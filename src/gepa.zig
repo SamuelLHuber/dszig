@@ -528,6 +528,9 @@ pub const GEPA = struct {
         max_batch_size: usize,
         seed_batch: ?*const fn (*anyopaque, []const Example) anyerror![]const usize = null,
         next_batch: *const fn (*anyopaque, *const ValidationState) anyerror![]const usize,
+        /// Diagnostic hooks do not affect the returned candidate or aggregate scores.
+        get_best_program: ?*const fn (*anyopaque, *const ValidationState) anyerror!usize = null,
+        get_valset_score: ?*const fn (*anyopaque, usize, *const ValidationState) anyerror!f64 = null,
     };
 
     /// Borrowed during the callback. Score rows follow their matching ID rows.
@@ -538,6 +541,8 @@ pub const GEPA = struct {
         val_subscores: []const []const f64,
         parents: []const []const ?usize,
         iteration: usize,
+        /// True only for final diagnostics when the seed was the only evaluation.
+        before_first_iteration: bool = false,
         total_metric_calls: usize,
     };
     const merge_subsample = 5;
@@ -848,19 +853,71 @@ pub const GEPA = struct {
                 const ids = if (e.candidates.items.len == 0)
                     if (policy.seed_batch) |seed| try seed(policy.ptr, e.valset) else return e.all_val_ids
                 else
-                    try policy.next_batch(policy.ptr, &.{
-                        .valset = e.valset,
-                        .candidates = e.candidates.items,
-                        .val_ids = e.val_ids.items,
-                        .val_subscores = e.subscores.items,
-                        .parents = e.parents.items,
-                        .iteration = e.i,
-                        .total_metric_calls = e.total_evals,
-                    });
+                    try policy.next_batch(policy.ptr, &e.validationState(e.i));
                 if (ids.len == 0 or ids.len > policy.max_batch_size)
                     return error.InvalidValidationBatch;
                 for (ids) |id| if (id >= e.valset.len) return error.InvalidValidationBatch;
                 return ids;
+            }
+
+            fn validationState(e: *const Self, iteration: ?usize) ValidationState {
+                return .{
+                    .valset = e.valset,
+                    .candidates = e.candidates.items,
+                    .val_ids = e.val_ids.items,
+                    .val_subscores = e.subscores.items,
+                    .parents = e.parents.items,
+                    .iteration = iteration orelse 0,
+                    .before_first_iteration = iteration == null,
+                    .total_metric_calls = e.total_evals,
+                };
+            }
+
+            fn validationDiagnosticBest(
+                e: *const Self,
+                policy: ValidationPolicy,
+                state: *const ValidationState,
+            ) !usize {
+                if (policy.get_best_program) |select| {
+                    const best = try select(policy.ptr, state);
+                    if (best >= state.candidates.len) return error.InvalidValidationBest;
+                    return best;
+                }
+                // The default diagnostic policy breaks equal-score ties by coverage.
+                var best: usize = 0;
+                var best_score = e.average(best);
+                for (1..state.candidates.len) |i| {
+                    const score = e.average(i);
+                    if (score > best_score or
+                        (score == best_score and
+                            state.val_ids[i].len > state.val_ids[best].len))
+                    {
+                        best = i;
+                        best_score = score;
+                    }
+                }
+                return best;
+            }
+
+            fn validationDiagnostics(e: *const Self, child: ?usize, iteration: ?usize) !void {
+                const policy = e.gepa.val_evaluation_policy orelse return;
+                const score = policy.get_valset_score;
+                if (policy.get_best_program == null and score == null) return;
+                const state = e.validationState(iteration);
+                // GEPA first computes the update summary, then its detailed log.
+                if (child) |idx| {
+                    if (score) |get| _ = try get(policy.ptr, idx, &state);
+                    if (policy.get_best_program != null)
+                        _ = try e.validationDiagnosticBest(policy, &state);
+                }
+                const best = try e.validationDiagnosticBest(policy, &state);
+                if (score) |get| {
+                    _ = try get(policy.ptr, best, &state);
+                    if (child) |idx| {
+                        _ = try get(policy.ptr, idx, &state);
+                        _ = try get(policy.ptr, idx, &state);
+                    }
+                }
             }
 
             fn addProgram(e: *Self, candidate: []const []const u8, parent_ids: []const ?usize) !void {
@@ -903,6 +960,7 @@ pub const GEPA = struct {
                         try outputs[k].append(e.out, .{ .candidate_idx = idx, .prediction = prediction });
                     }
                 }
+                if (idx != 0) try e.validationDiagnostics(idx, e.i);
             }
 
             fn retainValidationRows(e: *Self, ids: []const usize, runs: *[]Run) ![]const usize {
@@ -1793,6 +1851,7 @@ pub const GEPA = struct {
             }
             try e.reflect();
         }
+        try e.validationDiagnostics(null, if (started) e.i else null);
 
         var best: usize = 0;
         for (0..e.candidates.items.len) |idx| {

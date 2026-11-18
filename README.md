@@ -3853,9 +3853,11 @@ The following prevent a claim that DSZig can do everything DSPy can:
   score with its original validation row; unevaluated rows have no Pareto
   leaders or best outputs. Merge sampling uses only IDs scored by both
   parents, with `merge_val_overlap_floor` controlling the required overlap.
-  The returned best program still uses mean validation score. Python-only
-  policy hooks for choosing the reported best program or logging custom
-  validation scores are not implemented.
+  The optional `get_best_program` and `get_valset_score` validation hooks run
+  on accepted children and at optimization end, in DSPy 3.5's diagnostic
+  order. Callback errors abort compilation, and invalid best indices fail
+  explicitly. Diagnostic scores and picks do not replace the raw aggregates
+  or change the returned program; external experiment loggers are not invoked.
   A custom `component_selector` can inspect borrowed candidate instructions,
   validation scores, and the current minibatch's traced rollouts before
   returning predictor names in reflection order. An empty selection skips
