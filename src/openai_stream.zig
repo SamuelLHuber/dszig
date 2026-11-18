@@ -270,6 +270,8 @@ pub fn Reader(comptime codec: anytype) type {
         stop: []const []const u8,
         chat_reasoning_usage: ?@FieldType(@import("openai_request.zig").Compat, "reasoning_usage") = null,
         sink: ?Sink = null,
+        assemble_events: bool = false,
+        provider_failed: bool = false,
         adaptations: []const sdk.Adaptation = &.{},
         outcome: Outcome = .exhausted,
         terminal_usage: ?lm.Usage = null,
@@ -324,11 +326,18 @@ pub fn Reader(comptime codec: anytype) type {
             defer events.deinit();
             while (events.next() catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err) |data| {
                 self.feed(data) catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
-                if (self.cut or self.outcome == .stopped) break;
+                if (self.cut or self.outcome == .stopped or
+                    (self.assemble_events and self.provider_failed)) break;
             }
-            if (self.sink != null) return self.finishEvents();
+            if (self.sink != null) {
+                try self.finishEvents();
+                if (!self.assemble_events) return;
+                if (self.outcome == .stopped or self.provider_failed) return;
+                self.metadata.usage = self.terminal_usage orelse .{};
+            } else if (!self.cut) {
+                try self.take(self.pending_text.items.len, false);
+            }
             if (!self.ended) return error.LMFailure;
-            if (!self.cut) try self.take(self.pending_text.items.len, false);
             self.result = self.assemble(false) catch |err| return if (err == error.WriteFailed) error.OutOfMemory else err;
         }
 
@@ -349,7 +358,8 @@ pub fn Reader(comptime codec: anytype) type {
         }
 
         fn finishEvents(self: *Self) !void {
-            if (!self.ended or self.outcome == .stopped) return;
+            if (!self.ended or self.outcome == .stopped or
+                (self.assemble_events and self.provider_failed)) return;
             self.start();
             if (!self.cut) try self.take(self.pending_text.items.len, false);
             self.emit(.{ .end = .{
@@ -586,6 +596,7 @@ pub fn Reader(comptime codec: anytype) type {
             }
             if (std.mem.eql(u8, kind, "response.error") or std.mem.eql(u8, kind, "error")) {
                 if (self.sink == null) return error.LMFailure;
+                self.provider_failed = true;
                 try self.take(self.pending_text.items.len, false);
                 if (self.outcome != .stopped) self.emit(.{ .provider_error = try self.errorDetail(frame) });
                 return;
@@ -600,6 +611,7 @@ pub fn Reader(comptime codec: anytype) type {
             if (err == .object) {
                 const code = try codec.identity(self.arena, err.object.get("code")) orelse
                     try codec.identity(self.arena, err.object.get("type")) orelse "provider";
+                self.provider_failed = true;
                 self.emit(.{ .provider_error = try self.makeError(code, err.object.get("message")) });
                 return;
             }
@@ -609,13 +621,16 @@ pub fn Reader(comptime codec: anytype) type {
             const primary = field(delta, "reasoning_content");
             const thinking = if (try codec.truthy(primary)) primary else field(delta, "reasoning");
             if (try codec.truthy(thinking)) {
-                self.chatDelta("0", .{ .thinking = try codec.string(self.arena, thinking) });
+                try self.chatDelta("0", .{ .thinking = try codec.string(self.arena, thinking) });
                 if (self.outcome == .stopped) return;
             }
             const text = field(delta, "content");
             if (text == .string and text.string.len != 0) {
                 const scores = field(field(choice, "logprobs"), "content");
-                self.chatDelta("0", .{ .text = .{ .text = text.string, .scores = try codec.scores(self.arena, scores) } });
+                try self.chatDelta("0", .{ .text = .{
+                    .text = text.string,
+                    .scores = try codec.scores(self.arena, scores),
+                } });
                 if (self.outcome == .stopped) return;
             }
             try self.chatTools(field(delta, "tool_calls"));
@@ -623,9 +638,15 @@ pub fn Reader(comptime codec: anytype) type {
             try self.chatTerminal(frame, field(choice, "finish_reason"), reasoning_usage);
         }
 
-        fn chatDelta(self: *Self, part_index: []const u8, data: DeltaData) void {
+        fn chatDelta(self: *Self, part_index: []const u8, data: DeltaData) !void {
             self.start();
-            self.emit(.{ .delta = .{ .part_index = part_index, .data = data } });
+            if (self.outcome == .stopped) return;
+            if (self.assemble_events) {
+                const index = try self.internIndex(part_index, true);
+                try self.deliver(.{ .index = index, .data = data });
+            } else {
+                self.emit(.{ .delta = .{ .part_index = part_index, .data = data } });
+            }
         }
 
         fn chatTools(self: *Self, calls: Value) !void {
@@ -637,7 +658,7 @@ pub fn Reader(comptime codec: anytype) type {
                 var digits: [4301]u8 = undefined;
                 const index = try indexText(if (try codec.truthy(raw)) raw else .{ .integer = 0 }, &digits);
                 if (index[0] == '-') return error.LMFailure;
-                self.chatDelta(index, .{ .tool_call = .{
+                try self.chatDelta(index, .{ .tool_call = .{
                     .input = try codec.text(self.arena, field(function, "arguments")),
                     .id = try codec.identity(self.arena, field(call, "id")),
                     .name = try codec.identity(self.arena, field(function, "name")),
@@ -918,7 +939,7 @@ pub fn Reader(comptime codec: anytype) type {
             const entry = try self.slot(delta.index);
             if (self.sink != null) {
                 self.emit(.{ .delta = .{ .part_index = entry.index, .data = delta.data } });
-                return;
+                if (!self.assemble_events or self.outcome == .stopped) return;
             }
             switch (delta.data) {
                 .text => |text| {

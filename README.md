@@ -2153,6 +2153,16 @@ borrowed until the next call. A chunk containing both field markers suppresses
 interim output, as in DSPy; it does not prove a cache lookup occurred. This
 listener does not parse the final prediction or route chunks to predictors.
 
+Set `Context.stream_sink` to receive raw OpenAI events during a normal native
+program call. The same HTTP request both emits events and assembles the
+completion for adapter parsing; the call still returns its ordinary prediction.
+Cache hits return their stored completion without emitting events. On a miss,
+each physical generation has its own event sequence. Returning `.stop` aborts
+the active generation with `error.StreamStopped` and does not cache a partial
+completion. Event payloads are borrowed only during the callback. This is
+synchronous raw delivery, not DSPy's asynchronous `streamify`, named field
+routing, status callbacks, or automatic field listener finalization.
+
 Responses requests honor `config.extensions.openai_responses_compat`, its
 `openai_compat` alias and the nested `compat` forms. Null inherits; `"auto"`
 selects the dialect default. Direct empty objects win over aliases, whereas

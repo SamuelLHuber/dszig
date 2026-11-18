@@ -65,6 +65,10 @@ pub const Context = struct {
     trace: ?*Trace = null,
     retriever: ?Retriever = null,
     lm_options: lm_mod.Options = .{},
+    /// Synchronous raw events from physical adapter generations. Cache hits
+    /// and non-streaming engines emit none. Concurrent calls need disjoint or
+    /// synchronized sinks. A stop aborts the active prediction.
+    stream_sink: ?lm_mod.OpenAI.StreamSink = null,
     /// ChatAdapter and XMLAdapter retry once with JSONAdapter on parse failure.
     json_fallback: bool = true,
     /// Implicit XML and JSON enable native History; explicit Chat opts in.
@@ -735,6 +739,7 @@ fn runAdapterMany(ctx: Context, signature_class: ?*const anyopaque, adapter: Ada
         .messages = messages,
         .options = options,
         .tools = request_tools,
+        .stream_sink = ctx.stream_sink,
         .usage_tracker = ctx.usage_tracker,
         .usage_failure = ctx.usage_failure,
     });

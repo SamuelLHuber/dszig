@@ -64,6 +64,9 @@ pub const Request = struct {
     messages: []const Message,
     options: Options = .{},
     tools: []const FunctionTool = &.{},
+    /// Observe physical generations on engines with streaming support.
+    /// Borrowed for this call, never serialized, hashed, or retained.
+    stream_sink: ?OpenAI.StreamSink = null,
     /// Present only for LMs advertising `supports_decision_requests`.
     decision: ?DecisionRequest = null,
     /// Execution-local collector, never serialized, hashed or retained.
@@ -112,7 +115,7 @@ pub fn decisionFromValue(arena: Allocator, input: @import("runtime_value.zig").V
     });
 }
 
-pub const Error = error{ NoLM, LMFailure, ScriptExhausted, MissingUsageModel } ||
+pub const Error = error{ NoLM, LMFailure, ScriptExhausted, MissingUsageModel, StreamStopped } ||
     @import("runtime_value.zig").CustomError || accounting.Error || @import("call_result.zig").Error;
 
 pub const AccountingFailure = struct {
@@ -809,6 +812,13 @@ pub const LM = struct {
     pub const VTable = struct {
         /// Returns `request.options.n` completions, allocated in `arena`.
         complete: *const fn (ptr: *anyopaque, arena: Allocator, request: Request) Error![]const Completion,
+        /// Optional streaming equivalent of one physical adapter generation.
+        complete_stream: ?*const fn (
+            ptr: *anyopaque,
+            arena: Allocator,
+            request: Request,
+            sink: OpenAI.StreamSink,
+        ) Error!Completion = null,
         /// One public SDK request at the engine boundary; no adapter defaults.
         complete_canonical: ?*const fn (
             ptr: *anyopaque,
@@ -1167,8 +1177,7 @@ pub const LM = struct {
                 completion.* = try lm.completeSdkCandidate(arena, canonical, @intCast(index));
             } else {
                 if (request.options.n > 1) candidate.options.rollout_id = .{ .array = rollout };
-                const completions = try lm.completeCandidate(arena, candidate);
-                completion.* = completions[0];
+                completion.* = try lm.completeCandidate(arena, candidate);
             }
             completion.cache_hit = false;
             if (execution.pricing) |pricing| completion.billing = lm.price(pricing, completion);
@@ -1229,7 +1238,7 @@ pub const LM = struct {
         return @import("lm_cost.zig").estimate(pricing.arena, pricing.catalogue, &facts) catch null;
     }
 
-    fn completeCandidate(lm: LM, arena: Allocator, request: Request) Error![]const Completion {
+    fn completeCandidate(lm: LM, arena: Allocator, request: Request) Error!Completion {
         assert(request.options.n == 1);
         var physical = request;
         // A custom engine can delegate internally without charging or recording
@@ -1238,9 +1247,16 @@ pub const LM = struct {
         physical.usage_failure = null;
         physical.recordings = null;
         physical.execution = null;
+        const sink = physical.stream_sink;
+        physical.stream_sink = null;
+        if (sink) |observer| {
+            if (lm.vtable.complete_stream) |stream| {
+                return stream(lm.ptr, arena, physical, observer);
+            }
+        }
         const completions = try lm.vtable.complete(lm.ptr, arena, physical);
         if (completions.len != 1) return error.LMFailure;
-        return completions;
+        return completions[0];
     }
 
     fn notifyRecordings(request: Request, completions: []const Completion) Error!void {
@@ -2004,6 +2020,7 @@ pub const OpenAI = struct {
             .ptr = self,
             .vtable = &.{
                 .complete = complete,
+                .complete_stream = completeStream,
                 .complete_canonical = completeCanonical,
                 .dump_state = dumpState,
                 .finetune = startFinetune,
@@ -2089,9 +2106,29 @@ pub const OpenAI = struct {
     pub fn streamRequest(self: *OpenAI, backing: Allocator, request: *const sdk.Request, sink: StreamSink) Error!StreamOutcome {
         var scratch = std.heap.ArenaAllocator.init(backing);
         defer scratch.deinit();
-        const arena = scratch.allocator();
+        const stream = try self.runStream(scratch.allocator(), request, sink, false);
+        return stream.outcome;
+    }
+
+    const StreamRun = struct {
+        outcome: StreamOutcome,
+        completion: ?Completion,
+        model: []const u8,
+        adaptations: []const sdk.Adaptation,
+    };
+
+    fn runStream(
+        self: *OpenAI,
+        arena: Allocator,
+        request: *const sdk.Request,
+        sink: StreamSink,
+        assemble: bool,
+    ) Error!StreamRun {
         const wire_module = @import("openai_request.zig");
-        const chat_compat = if (self.api == .chat_completions) try self.chatCompatibility(request.fields.model) else null;
+        const chat_compat = if (self.api == .chat_completions)
+            try self.chatCompatibility(request.fields.model)
+        else
+            null;
         const dialect: wire_module.Dialect = if (chat_compat == null) .responses else .chat;
         var wire = if (chat_compat) |compat|
             try wire_module.prepare(arena, self.client.io, request, .{
@@ -2110,6 +2147,7 @@ pub const OpenAI = struct {
             .chat_reasoning_usage = if (chat_compat) |compat| compat.reasoning_usage else null,
             .adaptations = if (self.adaptations == .silent) &.{} else wire.adaptations,
             .sink = sink,
+            .assemble_events = assemble,
         };
         var consumer: http.ResponseConsumer = .{ .context = &stream, .consume = OpenAIStream.consume };
         const path = if (dialect == .responses) "responses" else "chat/completions";
@@ -2124,7 +2162,12 @@ pub const OpenAI = struct {
             .authorization = auth,
         }) catch |err| return sdkCodecError(err);
         defer self.client.allocator.free(response.body);
-        return stream.outcome;
+        return .{
+            .outcome = stream.outcome,
+            .completion = stream.result,
+            .model = stream.model,
+            .adaptations = stream.adaptations,
+        };
     }
 
     /// Execute one SDK request. Candidate scoring may use several HTTP calls;
@@ -2366,6 +2409,24 @@ pub const OpenAI = struct {
         const out = try arena.alloc(Completion, 1);
         out[0] = try completeCanonical(ptr, arena, canonical);
         return out;
+    }
+
+    fn completeStream(
+        ptr: *anyopaque,
+        arena: Allocator,
+        request: Request,
+        sink: StreamSink,
+    ) Error!Completion {
+        const self: *OpenAI = @ptrCast(@alignCast(ptr));
+        const canonical = try self.predictionRequest(arena, request);
+        defer canonical.release();
+        const stream = try self.runStream(arena, canonical, sink, true);
+        if (stream.outcome == .stopped) return error.StreamStopped;
+        var completion = stream.completion orelse return error.LMFailure;
+        try foldJudgments(arena, &completion, canonical);
+        completion.adaptations = stream.adaptations;
+        try publishResponse(arena, &completion, stream.model, .borrowed);
+        return completion;
     }
 
     fn completeCanonical(
