@@ -27,7 +27,7 @@ const BootstrapTracePair = struct {
 fn bootstrapTraceMetric(
     _: Allocator,
     _: *const dszig.Example,
-    prediction: ?*const dszig.value.Record,
+    prediction: ?*const dszig.optimize.RecordPrediction,
     trace: ?*const dszig.Trace,
 ) dszig.value.ParseError!f64 {
     if (trace != null or prediction == null) return error.ParseValue;
@@ -271,7 +271,7 @@ test "trace metric failure reports successful evaluation before unpacking fails"
         fn metric(
             _: Allocator,
             _: *const dszig.Example,
-            _: ?*const dszig.value.Record,
+            _: ?*const dszig.optimize.RecordPrediction,
             _: ?*const dszig.Trace,
         ) dszig.value.ParseError!f64 {
             return error.ParseValue;
@@ -445,7 +445,7 @@ test "Evaluate uses Python decimal ties-to-even without intermediate rounding or
         pub fn forward(_: *const @This(), _: dszig.Context, _: Input) !Output {
             return .{};
         }
-        fn metric(_: Allocator, example: *const dszig.Example, _: ?*const dszig.value.Record, _: ?*const dszig.Trace) dszig.value.ParseError!f64 {
+        fn metric(_: Allocator, example: *const dszig.Example, _: ?*const dszig.optimize.RecordPrediction, _: ?*const dszig.Trace) dszig.value.ParseError!f64 {
             return example.record.get("score").?.float;
         }
     };
@@ -500,7 +500,8 @@ test "native input decoding needs no projection allocation and never admits labe
     const ctx: dszig.Context = .{ .arena = testing.failing_allocator, .lm = unused.lm() };
     var product: i64 = -1;
     const program: P = .{ .product = &product };
-    _ = try dszig.optimize.runProgram(P, ctx, &program, &example);
+    // Input decoding itself allocates nothing; a retained Prediction would.
+    _ = try dszig.optimize.forwardProgram(P, ctx, &program, &example, null);
     try testing.expectEqual(@as(i64, 21), product);
 
     // An existing training label is not an input just because the program asks for it.
@@ -508,7 +509,7 @@ test "native input decoding needs no projection allocation and never admits labe
     product = -1;
     try testing.expectError(
         error.MissingField,
-        dszig.optimize.runProgram(P, ctx, &program, &example),
+        dszig.optimize.forwardProgram(P, ctx, &program, &example, null),
     );
     try testing.expectEqual(@as(i64, -1), product);
 
@@ -516,7 +517,7 @@ test "native input decoding needs no projection allocation and never admits labe
     try example.record.put(arena, "number", .{ .bool = true });
     try testing.expectError(
         error.TypeMismatch,
-        dszig.optimize.runProgram(P, ctx, &program, &example),
+        dszig.optimize.forwardProgram(P, ctx, &program, &example, null),
     );
     try testing.expectEqual(@as(i64, -1), product);
 }
@@ -534,10 +535,10 @@ test "prepared native predictions preserve mutable metrics and retained results"
             };
         }
 
-        fn metric(_: Allocator, _: *const dszig.Example, prediction: ?*const dszig.value.Record, _: ?*const dszig.Trace) dszig.value.ParseError!f64 {
+        fn metric(_: Allocator, _: *const dszig.Example, prediction: ?*const dszig.optimize.RecordPrediction, _: ?*const dszig.Trace) dszig.value.ParseError!f64 {
             const record = prediction orelse return error.ParseValue;
             const answer = record.get("answer").?.integer;
-            record.getPtr("answer").?.* = .{ .integer = -100 };
+            record.fields().getPtr("answer").?.* = .{ .integer = -100 };
             return if (answer == 21) 1 else 0;
         }
     };
@@ -549,16 +550,20 @@ test "prepared native predictions preserve mutable metrics and retained results"
         "{\"number\":7,\"text\":\"abc\",\"answer\":999}",
         &.{ "number", "text" },
     );
-    var prediction: dszig.value.Record = .empty;
-    try prediction.ensureTotalCapacity(testing.allocator, 2);
-    defer prediction.deinit(testing.allocator);
+    var state: dszig.optimize.RecordPrediction.State = .{ .output = .empty };
+    try state.output.ensureTotalCapacity(testing.allocator, 2);
+    defer state.output.deinit(testing.allocator);
     var unused: dszig.lm.ScriptedLM = .{ .responses = &.{} };
     const ctx: dszig.Context = .{ .arena = testing.failing_allocator, .lm = unused.lm() };
     const program: P = .{};
     var output: P.Output = undefined;
 
-    // The actual runner must use only provisioned outer storage for scalar fields.
-    try dszig.optimize.runProgramInto(P, ctx, &program, &example, &output, &prediction);
+    // The actual runner must use only provisioned outer storage for scalar
+    // fields: neither the Prediction instance nor its record allocates.
+    const prediction = try dszig.optimize.runProgramInto(P, ctx, &program, &example, &output, &state);
+    try testing.expect(prediction.fields() == &state.output);
+    try testing.expect(prediction.getLMUsage() == null);
+    try testing.expect(prediction.completions() == null);
     try testing.expectEqual(@as(i64, 21), prediction.get("answer").?.integer);
     try testing.expectEqualStrings("abc", prediction.get("echo").?.string);
     const retained = try dszig.optimize.runProgram(
@@ -574,7 +579,9 @@ test "prepared native predictions preserve mutable metrics and retained results"
 
     try example.record.put(arena, "number", .{ .integer = 8 });
     try example.record.put(arena, "text", .{ .string = "xy" });
-    try dszig.optimize.runProgramInto(P, ctx, &program, &example, &output, &prediction);
+    // The next attempt rewrites the one borrowed instance every copy aliases.
+    const next = try dszig.optimize.runProgramInto(P, ctx, &program, &example, &output, &state);
+    try testing.expect(next.fields() == prediction.fields());
     try testing.expectEqual(@as(i64, 16), prediction.get("answer").?.integer);
     try testing.expectEqualStrings("xy", prediction.get("echo").?.string);
     try testing.expectEqual(@as(i64, 21), retained.get("answer").?.integer);
@@ -596,22 +603,23 @@ test "prepared prediction failures clear stale records and partial conversions" 
     defer memory.deinit();
     const arena = memory.allocator();
     var example = try dszig.Example.fromJson(arena, "{\"number\":7}", &.{"number"});
-    var prediction: dszig.value.Record = .empty;
-    try prediction.ensureTotalCapacity(testing.allocator, 2);
-    defer prediction.deinit(testing.allocator);
+    var state: dszig.optimize.RecordPrediction.State = .{ .output = .empty };
+    try state.output.ensureTotalCapacity(testing.allocator, 2);
+    defer state.output.deinit(testing.allocator);
+    const prediction = &state.output;
     var unused: dszig.lm.ScriptedLM = .{ .responses = &.{} };
     const ctx: dszig.Context = .{ .arena = testing.failing_allocator, .lm = unused.lm() };
     const program: P = .{};
     var output: P.Output = undefined;
 
-    try dszig.optimize.runProgramInto(P, ctx, &program, &example, &output, &prediction);
+    _ = try dszig.optimize.runProgramInto(P, ctx, &program, &example, &output, &state);
     try example.record.put(arena, "number", .{ .bool = true });
-    try testing.expectError(error.TypeMismatch, dszig.optimize.runProgramInto(P, ctx, &program, &example, &output, &prediction));
+    try testing.expectError(error.TypeMismatch, dszig.optimize.runProgramInto(P, ctx, &program, &example, &output, &state));
     try testing.expectEqual(@as(usize, 0), prediction.count());
     try example.record.put(arena, "number", .{ .integer = 7 });
-    try dszig.optimize.runProgramInto(P, ctx, &program, &example, &output, &prediction);
+    _ = try dszig.optimize.runProgramInto(P, ctx, &program, &example, &output, &state);
     try example.record.put(arena, "number", .{ .integer = -1 });
-    try testing.expectError(error.LMFailure, dszig.optimize.runProgramInto(P, ctx, &program, &example, &output, &prediction));
+    try testing.expectError(error.LMFailure, dszig.optimize.runProgramInto(P, ctx, &program, &example, &output, &state));
     try testing.expectEqual(@as(usize, 0), prediction.count());
 
     // A later conversion failure must discard already-written earlier fields.
@@ -620,12 +628,123 @@ test "prepared prediction failures clear stale records and partial conversions" 
         testing.failing_allocator,
         Nested,
         &.{ .answer = 5, .notes = &.{"note"} },
-        &prediction,
+        prediction,
     ));
     try testing.expectEqual(@as(usize, 0), prediction.count());
     try example.record.put(arena, "number", .{ .integer = 8 });
-    try dszig.optimize.runProgramInto(P, ctx, &program, &example, &output, &prediction);
+    _ = try dszig.optimize.runProgramInto(P, ctx, &program, &example, &output, &state);
     try testing.expectEqual(@as(i64, 16), prediction.get("answer").?.integer);
+}
+
+fn metricPromptTokens(arena: Allocator, prediction: dszig.optimize.RecordPrediction) !?i64 {
+    const usage = prediction.getLMUsage() orelse return null;
+    const total = try dszig.prediction.Graph.toValue(arena, usage);
+    return total.object.get("configured").?.object.get("prompt_tokens").?.integer;
+}
+
+test "evaluation metrics observe each run's LM usage and retained clones survive prepared reuse" {
+    const Sig = dszig.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: i64 };
+    });
+    const P = dszig.Predict(Sig);
+    const Seen = struct {
+        var tokens: [2]i64 = @splat(-1);
+        var count: usize = 0;
+
+        fn metric(arena: Allocator, _: *const dszig.Example, prediction: ?*const dszig.optimize.RecordPrediction, _: ?*const dszig.Trace) dszig.value.ParseError!f64 {
+            const run = prediction orelse return error.ParseValue;
+            const completions = run.completions() orelse return error.ParseValue;
+            if (completions.len != 1 or completions[0].get("answer").?.integer != run.get("answer").?.integer)
+                return error.ParseValue;
+            const prompt = (metricPromptTokens(arena, run.*) catch return error.ParseValue) orelse return error.ParseValue;
+            tokens[count] = prompt;
+            count += 1;
+            // The score depends on both the usage and the fields of this run.
+            return @floatFromInt(prompt * run.get("answer").?.integer);
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+
+    const counts = [_]i64{ 3, 5, 7, 11, 13, 17, 19 };
+    var metadata: [counts.len]dszig.lm.ResponseMetadata = undefined;
+    for (&metadata, counts) |*item, count| item.* = .{ .usage = .{ .input_tokens = .{ .integer = count } } };
+    var engine: dszig.lm.ScriptedLM = .{
+        .responses = &.{
+            "<answer>1</answer>", "<answer>2</answer>", "<answer>3</answer>", "<answer>4</answer>",
+            "<answer>5</answer>", "<answer>6</answer>", "<answer>7</answer>",
+        },
+        .model = "configured",
+        .metadata = &metadata,
+    };
+    var storage: dszig.usage_tracker.Storage = .{ .arena = arena, .io = testing.io };
+    const plain: dszig.Context = .{ .arena = scratch.allocator(), .lm = engine.lm() };
+    var tracked = plain;
+    tracked.track_usage = .{ .storage = &storage, .limits = .{ .models = 1, .entries = 2 } };
+    const program: P = .{};
+    const devset = [_]dszig.Example{
+        try dszig.Example.fromJson(arena, "{\"question\":\"a\"}", &.{"question"}),
+        try dszig.Example.fromJson(arena, "{\"question\":\"b\"}", &.{"question"}),
+    };
+
+    // Every evaluated example hands the metric its own invocation's usage.
+    const evaluation = try dszig.optimize.evaluate(P, testing.allocator, tracked, &program, &devset, Seen.metric, 1);
+    try testing.expectEqual(@as(usize, 2), Seen.count);
+    try testing.expectEqualSlices(i64, &.{ 3, 5 }, &Seen.tokens);
+    try testing.expectEqual(@as(f64, 3 * 1 + 5 * 2), evaluation.sum);
+    try testing.expectEqual(@as(usize, 0), evaluation.errors);
+
+    // A clone outlives both the scratch reset and the next prepared attempt.
+    var record_storage: dszig.value.RecordStorage(1) = undefined;
+    try record_storage.init();
+    var state: dszig.optimize.RecordPrediction.State = .{ .output = record_storage.record };
+    var output: P.Output = undefined;
+    const first = try dszig.optimize.runProgramInto(P, tracked, &program, &devset[0], &output, &state);
+    try testing.expectEqual(@as(?i64, 7), try metricPromptTokens(arena, first));
+    first.fields().getPtr("answer").?.* = .{ .integer = 99 };
+    try testing.expectEqual(@as(i64, 3), first.completions().?[0].get("answer").?.integer);
+    first.fields().getPtr("answer").?.* = .{ .integer = 3 };
+    const retained = try first.clone(arena);
+    try testing.expect(retained.fields() != first.fields());
+    _ = scratch.reset(.free_all);
+    const second = try dszig.optimize.runProgramInto(P, tracked, &program, &devset[1], &output, &state);
+    try testing.expect(second.fields() == first.fields());
+    try testing.expectEqual(@as(i64, 4), first.get("answer").?.integer);
+    try testing.expectEqual(@as(?i64, 11), try metricPromptTokens(arena, first));
+    try testing.expectEqual(@as(i64, 3), retained.get("answer").?.integer);
+    try testing.expectEqual(@as(i64, 3), retained.completions().?[0].get("answer").?.integer);
+    try testing.expectEqual(@as(?i64, 7), try metricPromptTokens(arena, retained));
+
+    // Tracking off, or any already-active tracker, leaves the run without usage.
+    const untracked = try dszig.optimize.runProgramInto(P, plain, &program, &devset[0], &output, &state);
+    try testing.expectEqual(@as(i64, 5), untracked.get("answer").?.integer);
+    try testing.expect(untracked.getLMUsage() == null);
+    var tracker: dszig.UsageTracker = undefined;
+    try tracker.init(&storage, .{ .models = 1, .entries = 1 });
+    var explicit = tracked;
+    explicit.usage_tracker = &tracker;
+    const suppressed = try dszig.optimize.runProgram(P, explicit, &program, &devset[0]);
+    try testing.expectEqual(@as(i64, 6), suppressed.get("answer").?.integer);
+    try testing.expect(suppressed.getLMUsage() == null);
+    const charged = try dszig.prediction.Graph.toValue(arena, try tracker.getTotalTokens(arena));
+    try testing.expectEqual(@as(i64, 17), charged.object.get("configured").?.object.get("prompt_tokens").?.integer);
+
+    // A failed run leaves neither the previous usage nor its record behind.
+    const last = try dszig.optimize.runProgramInto(P, tracked, &program, &devset[1], &output, &state);
+    try testing.expectEqual(@as(?i64, 19), try metricPromptTokens(arena, last));
+    try testing.expectError(
+        error.ScriptExhausted,
+        dszig.optimize.runProgramInto(P, tracked, &program, &devset[1], &output, &state),
+    );
+    try testing.expect(state.usage == null);
+    try testing.expect(state.outputs == null);
+    try testing.expectEqual(@as(usize, 0), state.output.count());
+    try testing.expectEqual(@as(?i64, 7), try metricPromptTokens(arena, retained));
+    try testing.expectEqual(counts.len, engine.index);
 }
 
 test "Evaluate borrows stable native model outputs without allocating boxes" {
@@ -662,7 +781,7 @@ test "Evaluate borrows stable native model outputs without allocating boxes" {
             };
         }
 
-        fn metric(arena: Allocator, example: *const dszig.Example, prediction: ?*const dszig.value.Record, _: ?*const dszig.Trace) dszig.value.ParseError!f64 {
+        fn metric(arena: Allocator, example: *const dszig.Example, prediction: ?*const dszig.optimize.RecordPrediction, _: ?*const dszig.Trace) dszig.value.ParseError!f64 {
             const record = prediction orelse return error.ParseValue;
             const text = example.record.get("text").?.string;
             if (!std.mem.eql(u8, text, record.get("code").?.custom.get(dszig.Code).?.code)) return 0;
@@ -679,7 +798,7 @@ test "Evaluate borrows stable native model outputs without allocating boxes" {
             } else if (optional != .null) return 0;
             if (record.get("absent_code").? != .null) return 0;
             // A metric may release a borrowed handle, but cannot destroy its frame.
-            for (record.values()) |item| {
+            for (record.fields().values()) |item| {
                 if (item == .custom) item.custom.deinit(arena);
             }
             if (!std.mem.eql(u8, text, record.get("code").?.custom.get(dszig.Code).?.code)) return 0;
@@ -865,14 +984,16 @@ test "prepared native output storage supports indexed fields and reuse" {
     const program: P = .{};
     var output: P.Output = undefined;
 
-    try dszig.optimize.runProgramInto(P, ctx, &program, &example, &output, &storage.record);
-    try testing.expectEqual(@as(i64, 21), storage.record.get("a").?.integer);
-    try testing.expectEqual(@as(i64, 29), storage.record.get("i").?.integer);
-    try testing.expectEqual(@as(usize, 9), storage.record.count());
+    // The state adopts the startup storage's record and is its only header.
+    var state: dszig.optimize.RecordPrediction.State = .{ .output = storage.record };
+    const prediction = try dszig.optimize.runProgramInto(P, ctx, &program, &example, &output, &state);
+    try testing.expectEqual(@as(i64, 21), prediction.get("a").?.integer);
+    try testing.expectEqual(@as(i64, 29), prediction.get("i").?.integer);
+    try testing.expectEqual(@as(usize, 9), prediction.fields().count());
     try example.record.put(arena, "number", .{ .integer = -21 });
-    try dszig.optimize.runProgramInto(P, ctx, &program, &example, &output, &storage.record);
-    try testing.expectEqual(@as(i64, -21), storage.record.get("a").?.integer);
-    try testing.expectEqual(@as(i64, -13), storage.record.get("i").?.integer);
+    _ = try dszig.optimize.runProgramInto(P, ctx, &program, &example, &output, &state);
+    try testing.expectEqual(@as(i64, -21), prediction.get("a").?.integer);
+    try testing.expectEqual(@as(i64, -13), prediction.get("i").?.integer);
 }
 
 test "Evaluate counts program and metric failures together and keeps allocation failures fatal" {
@@ -888,7 +1009,7 @@ test "Evaluate counts program and metric failures together and keeps allocation 
             return .{};
         }
 
-        fn metric(_: Allocator, example: *const dszig.Example, _: ?*const dszig.value.Record, _: ?*const dszig.Trace) dszig.value.ParseError!f64 {
+        fn metric(_: Allocator, example: *const dszig.Example, _: ?*const dszig.optimize.RecordPrediction, _: ?*const dszig.Trace) dszig.value.ParseError!f64 {
             const question = example.record.get("question").?.string;
             if (std.mem.eql(u8, question, "metric_fail")) return error.ParseValue;
             if (std.mem.eql(u8, question, "metric_oom")) return error.OutOfMemory;
@@ -954,7 +1075,7 @@ test "BootstrapFewShot counts metric failures with program failures after restor
         }
     };
     const Metric = struct {
-        fn run(_: Allocator, example: *const dszig.Example, _: ?*const dszig.value.Record, trace: ?*const dszig.Trace) dszig.value.ParseError!f64 {
+        fn run(_: Allocator, example: *const dszig.Example, _: ?*const dszig.optimize.RecordPrediction, trace: ?*const dszig.Trace) dszig.value.ParseError!f64 {
             const steps = trace.?.steps.items;
             // A successful metric must see the teacher's full, restored demos,
             // not the per-example filtered slice used during prediction.
@@ -1119,7 +1240,8 @@ test "BootstrapFewShot zero threshold accepts a zero score while null rejects it
     const demos = accepted.program.generate_answer.predict.state.demos;
     try testing.expectEqual(@as(usize, 1), demos.len);
     try testing.expectEqualStrings("Munich", demos[0].get("answer").?.string);
-    try testing.expectEqual(@as(f64, 0.0), try rag.keywordMetric(arena, &trainset[0], &demos[0], null));
+    const demo_prediction = try dszig.optimize.RecordPrediction.init(arena, demos[0]);
+    try testing.expectEqual(@as(f64, 0.0), try rag.keywordMetric(arena, &trainset[0], &demo_prediction, null));
     try testing.expectEqualStrings("Not sure.", (try dszig.Reasoning.fromValue(demos[0].get("reasoning").?)).content);
 
     optimizer.metric_threshold = null;
@@ -1370,7 +1492,7 @@ const FewShotOptionsProgram = struct {
     }
 };
 
-fn fewShotOptionsMetric(_: Allocator, example: *const dszig.Example, prediction: ?*const dszig.value.Record, trace: ?*const dszig.Trace) dszig.value.ParseError!f64 {
+fn fewShotOptionsMetric(_: Allocator, example: *const dszig.Example, prediction: ?*const dszig.optimize.RecordPrediction, trace: ?*const dszig.Trace) dszig.value.ParseError!f64 {
     if (trace != null) return 1;
     const row = prediction orelse return error.ParseValue;
     const question = std.fmt.parseInt(i64, example.record.get("question").?.string, 10) catch return error.ParseValue;
@@ -1378,12 +1500,12 @@ fn fewShotOptionsMetric(_: Allocator, example: *const dszig.Example, prediction:
     return @floatFromInt(@mod(sum, 7));
 }
 
-fn fewShotOptionsTiedMetric(_: Allocator, _: *const dszig.Example, _: ?*const dszig.value.Record, _: ?*const dszig.Trace) dszig.value.ParseError!f64 {
+fn fewShotOptionsTiedMetric(_: Allocator, _: *const dszig.Example, _: ?*const dszig.optimize.RecordPrediction, _: ?*const dszig.Trace) dszig.value.ParseError!f64 {
     return 1;
 }
 
 /// Bootstrap accepts a trace only when the supplied teacher actually ran.
-fn fewShotOptionsTeacherMetric(_: Allocator, _: *const dszig.Example, prediction: ?*const dszig.value.Record, trace: ?*const dszig.Trace) dszig.value.ParseError!f64 {
+fn fewShotOptionsTeacherMetric(_: Allocator, _: *const dszig.Example, prediction: ?*const dszig.optimize.RecordPrediction, trace: ?*const dszig.Trace) dszig.value.ParseError!f64 {
     const row = prediction orelse return error.ParseValue;
     if (trace == null) return @floatFromInt(row.get("nz").?.integer);
     return if (row.get("z").?.integer == 88 and row.get("a").?.integer == 77) 1 else 0;
@@ -1944,6 +2066,9 @@ test "Chat text blocks preserve canonical indices and reasoning-only responses h
 test "citation completion clones unwind every failed allocation" {
     const Clone = struct {
         fn run(allocator: std.mem.Allocator) !void {
+            const payload = try dszig.sdk_response.JsonValue.fromValue(allocator, .{ .object = .empty });
+            defer payload.free();
+            try payload.root.object.put(payload.storage.?.allocator(), "opaque", .{ .string = "state" });
             const completion = try dszig.lm.cloneCompletion(allocator, .{
                 .text = "answer",
                 .citations = &.{
@@ -1951,14 +2076,19 @@ test "citation completion clones unwind every failed allocation" {
                         .text = "quoted",
                         .title = "source",
                         .url = "https://example.org",
-                        .continuation = &.{.{ .provider = "fixture", .kind = "citation", .data = .{ .string = "state" } }},
+                        .continuation = &.{.{
+                            .provider = "fixture",
+                            .kind = "citation",
+                            .data = payload,
+                        }},
                     },
                     .{ .url = "https://example.net" },
                 },
             });
             defer dszig.lm.freeCompletion(allocator, completion);
             try testing.expectEqualStrings("quoted", completion.citations[0].text.?);
-            try testing.expectEqualStrings("state", completion.citations[0].continuation[0].data.string);
+            try payload.root.object.put(payload.storage.?.allocator(), "opaque", .{ .string = "changed" });
+            try testing.expectEqualStrings("state", completion.citations[0].continuation[0].data.root.object.get("opaque").?.string);
             try testing.expectEqualStrings("https://example.net", completion.citations[1].url.?);
         }
     };
@@ -1990,69 +2120,6 @@ test "Responses distinguish absent text from empty output and retain fallback ca
     try testing.expectError(error.LMFailure, dszig.lm.OpenAI.parseResponsesResponse(arena, "{\"error\":{\"code\":\"fixture_error\",\"message\":\"source fixture error\"},\"output_text\":\"not a successful response\"}"));
 }
 
-test "provider request bodies select reasoning JSON and completion-count contracts" {
-    var out: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer out.deinit();
-    const arena = out.allocator();
-    var provider: dszig.lm.OpenAI = .{
-        .client = undefined,
-        .base_url = "http://unused",
-        .model = "reasoning-model",
-        .api = .responses,
-        .max_tokens = 1024,
-        .supports_reasoning = true,
-        .supports_response_format = true,
-    };
-    const messages = [_]dszig.adapter.Message{
-        .{ .role = .system, .content = .{ .text = "Use the supplied fact." } },
-        .{ .role = .user, .content = .{ .text = "Capital?" } },
-    };
-    const request: dszig.lm.Request = .{
-        .messages = &messages,
-        .options = .{ .n = 3, .response_format = .json_object, .reasoning_effort = "low", .rollout_id = .{ .integer = 7 } },
-    };
-    const responses = (try std.json.parseFromSliceLeaky(dszig.Value, arena, try provider.requestBody(arena, request), .{})).object;
-    try testing.expectEqualStrings("reasoning-model", responses.get("model").?.string);
-    try testing.expectEqual(@as(i64, 1024), responses.get("max_output_tokens").?.integer);
-    try testing.expect(!responses.contains("store"));
-    try testing.expect(!responses.contains("messages") and !responses.contains("n"));
-    try testing.expect(!responses.contains("rollout_id"));
-    try testing.expectEqualStrings(messages[0].content.text, responses.get("instructions").?.string);
-    const input = responses.get("input").?.array.items;
-    try testing.expectEqual(@as(usize, 1), input.len);
-    try testing.expectEqualStrings("user", input[0].object.get("role").?.string);
-    const content = input[0].object.get("content").?.array.items;
-    try testing.expectEqual(@as(usize, 1), content.len);
-    try testing.expectEqualStrings("input_text", content[0].object.get("type").?.string);
-    try testing.expectEqualStrings(messages[1].content.text, content[0].object.get("text").?.string);
-    const reasoning = responses.get("reasoning").?.object;
-    try testing.expectEqualStrings("low", reasoning.get("effort").?.string);
-    try testing.expectEqualStrings("auto", reasoning.get("summary").?.string);
-    try testing.expectEqualStrings("json_object", responses.get("text").?.object.get("format").?.object.get("type").?.string);
-    try testing.expect(provider.lm().supports_reasoning);
-
-    for ([_][]const u8{ "none", "off" }) |effort| {
-        var disabled = request;
-        disabled.options.reasoning_effort = effort;
-        const body = (try std.json.parseFromSliceLeaky(dszig.Value, arena, try provider.requestBody(arena, disabled), .{})).object;
-        try testing.expectEqualStrings("none", body.get("reasoning").?.object.get("effort").?.string);
-        try testing.expect(!body.get("reasoning").?.object.contains("summary"));
-    }
-
-    provider.api = .chat_completions;
-    const chat = (try std.json.parseFromSliceLeaky(dszig.Value, arena, try provider.requestBody(arena, request), .{})).object;
-    try testing.expectEqual(@as(i64, 3), chat.get("n").?.integer);
-    try testing.expectEqual(@as(i64, 1024), chat.get("max_tokens").?.integer);
-    try testing.expectEqualStrings("low", chat.get("reasoning_effort").?.string);
-    try testing.expectEqualStrings("json_object", chat.get("response_format").?.object.get("type").?.string);
-    try testing.expectEqual(messages.len, chat.get("messages").?.array.items.len);
-    try testing.expect(!chat.contains("input") and !chat.contains("store") and !chat.contains("rollout_id"));
-
-    const ordinary = (try std.json.parseFromSliceLeaky(dszig.Value, arena, try provider.requestBody(arena, .{ .messages = &messages }), .{})).object;
-    try testing.expect(!ordinary.contains("reasoning_effort"));
-    try testing.expect(!ordinary.contains("response_format") and !ordinary.contains("n"));
-}
-
 test "Chat replays assistant reasoning as text without dropping answers or native calls" {
     var out: std.heap.ArenaAllocator = .init(testing.allocator);
     defer out.deinit();
@@ -2066,21 +2133,32 @@ test "Chat replays assistant reasoning as text without dropping answers or nativ
     };
     const cases = [_]Case{
         .{ .reasoning = "thought", .content = "answer", .expected = "thought\nanswer" },
-        .{ .reasoning = "thought", .content = "", .expected = "thought" },
         .{ .reasoning = "", .content = "answer", .expected = "answer" },
         .{ .reasoning = null, .content = "answer", .expected = "answer" },
         .{ .reasoning = "thought", .content = "answer", .expected = "thought\nanswer", .calls = &native_calls },
     };
-    const provider: dszig.lm.OpenAI = .{ .client = undefined, .base_url = "http://unused", .model = "m" };
+    var client: std.http.Client = .{ .allocator = testing.allocator, .io = testing.io };
+    defer client.deinit();
+    const provider: dszig.lm.OpenAI = .{ .client = &client, .base_url = "http://unused", .model = "wrong-bound-model" };
     for (cases) |case| {
-        const messages = [_]dszig.adapter.Message{.{
-            .role = .assistant,
-            .content = .{ .text = case.content },
-            .reasoning = case.reasoning,
-            .tool_calls = case.calls,
-        }};
-        const body = try provider.requestBody(arena, .{ .messages = &messages });
-        const root = try std.json.parseFromSliceLeaky(dszig.Value, arena, body, .{});
+        var parts: std.ArrayList(dszig.lm.sdk.Part) = .empty;
+        if (case.reasoning) |reasoning| try parts.append(arena, .{ .thinking = .{ .text = reasoning } });
+        try parts.append(arena, .{ .text = .{ .text = case.content } });
+        for (case.calls) |call| {
+            const input = try std.json.parseFromSliceLeaky(dszig.Value, arena, call.arguments, .{});
+            try parts.append(arena, .{ .tool_call = .{
+                .id = call.id,
+                .name = call.name,
+                .input = try dszig.lm.sdk.JsonValue.fromBorrowedValue(arena, input),
+            } });
+        }
+        const request = try dszig.lm.sdk.Request.fromFields(arena, &.{
+            .model = "m",
+            .messages = &.{.{ .role = .assistant, .parts = parts.items }},
+        });
+        defer request.release();
+        const wire = try provider.requestBody(arena, request);
+        const root = try std.json.parseFromSliceLeaky(dszig.Value, arena, wire.body, .{});
         const projected = root.object.get("messages").?.array.items;
         try testing.expectEqual(@as(usize, 1), projected.len);
         const message = projected[0].object;
@@ -2097,7 +2175,9 @@ test "Chat replays assistant reasoning as text without dropping answers or nativ
                 try testing.expectEqualStrings("function", got.object.get("type").?.string);
                 const function = got.object.get("function").?.object;
                 try testing.expectEqualStrings(want.name, function.get("name").?.string);
-                try testing.expectEqualStrings(want.arguments, function.get("arguments").?.string);
+                const expected = try std.json.parseFromSliceLeaky(dszig.Value, arena, want.arguments, .{});
+                const actual = try std.json.parseFromSliceLeaky(dszig.Value, arena, function.get("arguments").?.string, .{});
+                try testing.expect(try dszig.value.recordEqual(&expected.object, &actual.object));
             }
         }
     }
@@ -2234,128 +2314,6 @@ test "native function-only completions preserve identifiers and normalize Respon
     try testing.expectEqualStrings("call_responses", responses.tool_calls[0].id);
     try testing.expectEqualStrings("lookup", responses.tool_calls[0].name);
     try testing.expectEqualStrings("{\"query\": \"Paris\", \"limit\": 2}", responses.tool_calls[0].arguments);
-}
-
-test "native schemas tools choices and tool results use each provider's actual wire format" {
-    var out: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer out.deinit();
-    const arena = out.allocator();
-    const parameters = try std.json.parseFromSliceLeaky(dszig.Value, arena,
-        \\{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}
-    , .{});
-    const output_schema = try std.json.parseFromSliceLeaky(dszig.Value, arena,
-        \\{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}
-    , .{});
-    const arguments = "{ \"query\": \"Paris\" }";
-    const calls = [_]dszig.lm.ToolCall{.{ .id = "call_lookup", .name = "lookup", .arguments = arguments }};
-    const messages = [_]dszig.adapter.Message{
-        .{ .role = .user, .content = .{ .text = "Capital?" } },
-        .{ .role = .assistant, .content = .{ .text = "" }, .tool_calls = &calls },
-        .{ .role = .tool, .content = .{ .text = "Paris" }, .tool_call_id = "call_lookup" },
-    };
-    const tools = [_]dszig.lm.FunctionTool{.{
-        .name = "lookup",
-        .description = "Look up a fact.",
-        .parameters = parameters,
-        .strict = true,
-    }};
-    const request: dszig.lm.Request = .{
-        .messages = &messages,
-        .tools = &tools,
-        .options = .{
-            .response_format = .{ .json_schema = .{ .name = "TaskOutput", .schema = output_schema, .description = "Answer only.", .strict = true } },
-            .tool_choice = .{ .function = "lookup" },
-            .parallel_tool_calls = false,
-        },
-    };
-    var provider: dszig.lm.OpenAI = .{
-        .client = undefined,
-        .base_url = "http://unused",
-        .model = "native-model",
-        .supports_response_format = true,
-        .supports_response_schema = true,
-        .supports_function_calling = true,
-    };
-    try testing.expect(provider.lm().supports_response_format);
-    try testing.expect(provider.lm().supports_response_schema);
-    try testing.expect(provider.lm().supports_function_calling);
-
-    const chat = (try std.json.parseFromSliceLeaky(dszig.Value, arena, try provider.requestBody(arena, request), .{})).object;
-    const chat_tools = chat.get("tools").?.array.items;
-    try testing.expectEqual(@as(usize, 1), chat_tools.len);
-    try testing.expectEqualStrings("function", chat_tools[0].object.get("type").?.string);
-    const chat_function = chat_tools[0].object.get("function").?.object;
-    try testing.expectEqualStrings("lookup", chat_function.get("name").?.string);
-    try testing.expectEqualStrings("Look up a fact.", chat_function.get("description").?.string);
-    try testing.expect(chat_function.get("strict").?.bool);
-    try testing.expectEqualStrings(
-        try std.json.Stringify.valueAlloc(arena, parameters, .{}),
-        try std.json.Stringify.valueAlloc(arena, chat_function.get("parameters").?, .{}),
-    );
-    const chat_format = chat.get("response_format").?.object;
-    try testing.expectEqualStrings("json_schema", chat_format.get("type").?.string);
-    const chat_schema = chat_format.get("json_schema").?.object;
-    try testing.expectEqualStrings("TaskOutput", chat_schema.get("name").?.string);
-    try testing.expectEqualStrings("Answer only.", chat_schema.get("description").?.string);
-    try testing.expect(chat_schema.get("strict").?.bool);
-    try testing.expectEqualStrings(
-        try std.json.Stringify.valueAlloc(arena, output_schema, .{}),
-        try std.json.Stringify.valueAlloc(arena, chat_schema.get("schema").?, .{}),
-    );
-    try testing.expectEqualStrings("function", chat.get("tool_choice").?.object.get("type").?.string);
-    try testing.expectEqualStrings("lookup", chat.get("tool_choice").?.object.get("function").?.object.get("name").?.string);
-    try testing.expect(!chat.get("parallel_tool_calls").?.bool);
-    const chat_messages = chat.get("messages").?.array.items;
-    try testing.expectEqual(messages.len, chat_messages.len);
-    const chat_call = chat_messages[1].object.get("tool_calls").?.array.items[0].object;
-    try testing.expectEqualStrings("call_lookup", chat_call.get("id").?.string);
-    try testing.expectEqualStrings("lookup", chat_call.get("function").?.object.get("name").?.string);
-    try testing.expectEqualStrings(arguments, chat_call.get("function").?.object.get("arguments").?.string);
-    try testing.expectEqualStrings("tool", chat_messages[2].object.get("role").?.string);
-    try testing.expectEqualStrings("call_lookup", chat_messages[2].object.get("tool_call_id").?.string);
-    try testing.expectEqualStrings("Paris", chat_messages[2].object.get("content").?.string);
-
-    provider.api = .responses;
-    const responses = (try std.json.parseFromSliceLeaky(dszig.Value, arena, try provider.requestBody(arena, request), .{})).object;
-    const response_tools = responses.get("tools").?.array.items;
-    try testing.expectEqual(@as(usize, 1), response_tools.len);
-    try testing.expectEqualStrings("function", response_tools[0].object.get("type").?.string);
-    try testing.expectEqualStrings("lookup", response_tools[0].object.get("name").?.string);
-    try testing.expectEqualStrings("Look up a fact.", response_tools[0].object.get("description").?.string);
-    try testing.expect(response_tools[0].object.get("strict").?.bool);
-    try testing.expectEqualStrings(
-        try std.json.Stringify.valueAlloc(arena, parameters, .{}),
-        try std.json.Stringify.valueAlloc(arena, response_tools[0].object.get("parameters").?, .{}),
-    );
-    const response_format = responses.get("text").?.object.get("format").?.object;
-    try testing.expectEqualStrings("json_schema", response_format.get("type").?.string);
-    try testing.expectEqualStrings("TaskOutput", response_format.get("name").?.string);
-    try testing.expectEqualStrings("Answer only.", response_format.get("description").?.string);
-    try testing.expect(response_format.get("strict").?.bool);
-    try testing.expectEqualStrings(
-        try std.json.Stringify.valueAlloc(arena, output_schema, .{}),
-        try std.json.Stringify.valueAlloc(arena, response_format.get("schema").?, .{}),
-    );
-    try testing.expectEqualStrings("function", responses.get("tool_choice").?.object.get("type").?.string);
-    try testing.expectEqualStrings("lookup", responses.get("tool_choice").?.object.get("name").?.string);
-    try testing.expect(!responses.get("parallel_tool_calls").?.bool);
-    var call_count: usize = 0;
-    var result_count: usize = 0;
-    for (responses.get("input").?.array.items) |item| {
-        const kind = item.object.get("type") orelse continue;
-        if (std.mem.eql(u8, kind.string, "function_call")) {
-            call_count += 1;
-            try testing.expectEqualStrings("call_lookup", item.object.get("call_id").?.string);
-            try testing.expectEqualStrings("lookup", item.object.get("name").?.string);
-            try testing.expectEqualStrings(arguments, item.object.get("arguments").?.string);
-        } else if (std.mem.eql(u8, kind.string, "function_call_output")) {
-            result_count += 1;
-            try testing.expectEqualStrings("call_lookup", item.object.get("call_id").?.string);
-            try testing.expectEqualStrings("Paris", item.object.get("output").?.string);
-        }
-    }
-    try testing.expectEqual(@as(usize, 1), call_count);
-    try testing.expectEqual(@as(usize, 1), result_count);
 }
 
 const SubmitDetails = struct { city: []const u8, zip_code: i64 };

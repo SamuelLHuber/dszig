@@ -39,8 +39,19 @@ pub const FailedPrediction = struct {
     format_reward: ?f64 = null,
 };
 
-/// Source stores either a `dspy.Prediction` or a `FailedPrediction`.
+/// The program's own result: Source stores either the `dspy.Prediction` the
+/// Module call returned or a `FailedPrediction`. A success keeps the genuine
+/// instance, including the usage of that one invocation, exactly as the
+/// metric saw it.
 pub const Prediction = union(enum) {
+    success: optimize.RecordPrediction,
+    failed: FailedPrediction,
+};
+
+/// A predictor's result inside a trace. Native trace steps record output
+/// fields only, so this is deliberately the field projection that demos and
+/// fine-tuning data serialize: a step never carries usage.
+pub const StepPrediction = union(enum) {
     success: Record,
     failed: FailedPrediction,
 };
@@ -49,7 +60,7 @@ pub const Prediction = union(enum) {
 pub const TraceStep = struct {
     predictor: *const PredictState,
     inputs: Record,
-    prediction: Prediction,
+    prediction: StepPrediction,
 };
 
 /// `TraceData`. `score` is null exactly where Source omits the key (no metric).
@@ -334,7 +345,7 @@ const Collector = struct {
     }
 };
 
-fn retain(out: Allocator, index: usize, example: *const Example, row: Run.Row) Allocator.Error!TraceData {
+fn retain(out: Allocator, index: usize, example: *const Example, row: Run.Row) value.ConvertError!TraceData {
     if (row.failed_predictor != null) assert(row.prediction == .failed);
     const extra: usize = if (row.failed_predictor != null) 1 else 0;
     const trace = try out.alloc(TraceStep, row.steps.len + extra);
@@ -343,8 +354,10 @@ fn retain(out: Allocator, index: usize, example: *const Example, row: Run.Row) A
         .inputs = try value.cloneRecord(out, &source.inputs),
         .prediction = .{ .success = try value.cloneRecord(out, &source.outputs) },
     };
+    // The attempt's Prediction lives in attempt scratch: an owning clone
+    // keeps fields and usage (and objects they share) past its reset.
     const prediction: Prediction = switch (row.prediction) {
-        .success => |*record| .{ .success = try value.cloneRecord(out, record) },
+        .success => |source| .{ .success = try source.clone(out) },
         .failed => |failed| .{ .failed = .{
             .completion_text = try out.dupe(u8, failed.completion_text),
             .format_reward = failed.format_reward,
@@ -355,7 +368,7 @@ fn retain(out: Allocator, index: usize, example: *const Example, row: Run.Row) A
     if (row.failed_predictor) |predictor| trace[row.steps.len] = .{
         .predictor = predictor,
         .inputs = try example.inputs(out),
-        .prediction = prediction,
+        .prediction = .{ .failed = prediction.failed },
     };
     return .{ .example_ind = index, .example = example, .prediction = prediction, .trace = trace, .score = row.score };
 }

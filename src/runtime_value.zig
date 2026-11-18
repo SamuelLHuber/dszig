@@ -92,6 +92,10 @@ pub const CustomVTable = struct {
     iterate: ?*const fn (Allocator, *const anyopaque) CustomError![]Value = null,
     enumeration: ?*const fn (*const anyopaque) EnumValue = null,
     raw_value: *const fn (Allocator, *const anyopaque) Allocator.Error!Value,
+    /// Genuine BaseModel's default Python-mode serializer, before recursively
+    /// projecting its children. Null means this object is not a BaseModel.
+    /// Unlike serialized, this must retain bytes, Enum and nonfinite values.
+    model_dump: ?*const fn (Allocator, *const anyopaque) CustomError!Value = null,
     /// Complete strict JSON-mode projection; nested callbacks preserve depth.
     /// PythonSerializeFallback is handled only by serialize_for_json's root.
     serialized: *const fn (Allocator, *const anyopaque, u32) SerializationError!Value,
@@ -168,6 +172,14 @@ pub const Custom = struct {
 
     pub fn rawValue(self: Custom, allocator: Allocator) Allocator.Error!Value {
         return self.vtable.raw_value(allocator, self.ptr);
+    }
+
+    /// Default Python-mode model_dump, not raw iteration or JSON encoding.
+    /// Container storage belongs to arena; leaf objects and strings may borrow
+    /// this model. Clone the result when it must outlive the source model.
+    pub fn modelDump(self: Custom, arena: Allocator) CustomError!Value {
+        if (self.vtable.model_dump == null) return error.ParseValue;
+        return @import("python_model_dump.zig").project(arena, .{ .custom = self });
     }
 
     pub fn serialize(self: Custom, allocator: Allocator) SerializationError!Value {

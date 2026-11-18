@@ -166,7 +166,9 @@ fn CodeType(comptime language_name: []const u8, comptime is_default: bool, compt
             .is_type = true,
             .hashable = false,
             .code = .{ .language = language, .content = runtimeContent },
+            .iterate = iterateRuntime,
             .raw_value = rawRuntimeValue,
+            .model_dump = rawRuntimeValue,
             .serialized = serializedRuntimeValue,
             .write_str = writeRuntimeStr,
             .write_repr = writeRuntimeRepr,
@@ -183,6 +185,17 @@ fn CodeType(comptime language_name: []const u8, comptime is_default: bool, compt
 
         fn runtimeContent(ptr: *const anyopaque) []const u8 {
             return runtimeCode(ptr).code;
+        }
+
+        fn iterateRuntime(arena: Allocator, ptr: *const anyopaque) runtime.CustomError![]Value {
+            const items = try arena.alloc(Value, 1);
+            errdefer arena.free(items);
+            const pair = try arena.dupe(Value, &.{
+                .{ .string = "code" }, .{ .string = runtimeCode(ptr).code },
+            });
+            errdefer arena.free(pair);
+            items[0] = try @import("python_value.zig").tuple(arena, pair);
+            return items;
         }
 
         fn rawRuntimeValue(_: Allocator, ptr: *const anyopaque) Allocator.Error!Value {

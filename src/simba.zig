@@ -127,7 +127,9 @@ pub const SIMBA = struct {
     }
 
     pub const Run = struct {
-        prediction: ?Record,
+        /// The program's Prediction as the metric saw it. Rule prompts
+        /// serialize `fields()` only, so its usage never reaches an LM.
+        prediction: ?optimize.RecordPrediction,
         steps: []const predict.Trace.Step,
         names: []const predict.NamedParam,
         /// `null` is DSPy's masked `"N/A"`.
@@ -423,7 +425,7 @@ pub const SIMBA = struct {
             fn invoke(ptr: *anyopaque, attempt: parallel.Attempt, run: *Run) anyerror!void {
                 const call: *const @This() = @ptrCast(@alignCast(ptr));
                 try attempt.cancellation.check();
-                const c = call.simba.rollouts.?.context(call.job.ctx, attempt, call.job.shared_lm);
+                const c = try call.simba.rollouts.?.context(call.job.ctx, attempt, call.job.shared_lm);
                 run.* = try call.simba.wrap(P, call.out, c, call.job.program, call.job.example);
             }
         };
@@ -443,7 +445,7 @@ pub const SIMBA = struct {
         c.arena = out;
         c.trace = &trace;
         const names = try predict.namedPredictors(out, program);
-        const prediction: ?Record = optimize.runProgram(P, c, program, example) catch |err| switch (err) {
+        const prediction: ?optimize.RecordPrediction = optimize.runProgram(P, c, program, example) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => null,
         };
@@ -532,8 +534,8 @@ pub const SIMBA = struct {
         var it = example.record.iterator();
         while (it.next()) |e| if (!example.isInput(e.key_ptr.*)) try labels.put(out, e.key_ptr.*, e.value_ptr.*);
 
-        const better_outputs = good.prediction orelse return error.StrategyFailed;
-        const worse_outputs = bad.prediction orelse Record.empty;
+        const better_outputs = (good.prediction orelse return error.StrategyFailed).fields().*;
+        const worse_outputs = if (bad.prediction) |prediction| prediction.fields().* else Record.empty;
         var inputs: Record = .empty;
         try inputs.put(out, "program_code", .{ .string = options.program_code });
         try inputs.put(out, "modules_defn", .{ .string = try inspectModules(out, preds) });
@@ -586,7 +588,7 @@ fn mask(out: Allocator, run: anytype) Allocator.Error!void {
     try na.put(out, "N/A", .{ .string = "Prediction not available" });
     run.steps = &.{};
     run.score = null;
-    run.prediction = na;
+    run.prediction = try optimize.RecordPrediction.init(out, na);
 }
 
 fn reward(out: Allocator, score: ?f64) (@import("feedback.zig").Error || error{ParseValue})!Value {
@@ -733,11 +735,11 @@ test "SIMBA metric failures keep successful predictions and traces but allocatio
     });
     const P = predict.Predict(Sig);
     const FailingMetric = struct {
-        fn failure(_: Allocator, _: *const Example, _: ?*const Record, _: ?*const predict.Trace) value.ParseError!f64 {
+        fn failure(_: Allocator, _: *const Example, _: ?*const optimize.RecordPrediction, _: ?*const predict.Trace) value.ParseError!f64 {
             return error.ParseValue;
         }
 
-        fn allocationFailure(_: Allocator, _: *const Example, _: ?*const Record, _: ?*const predict.Trace) value.ParseError!f64 {
+        fn allocationFailure(_: Allocator, _: *const Example, _: ?*const optimize.RecordPrediction, _: ?*const predict.Trace) value.ParseError!f64 {
             return error.OutOfMemory;
         }
     };
@@ -772,7 +774,7 @@ test "SIMBA lets metrics score missing predictions after program failure" {
         }
     };
     const MissingPredictionMetric = struct {
-        fn score(_: Allocator, example: *const Example, prediction: ?*const Record, _: ?*const predict.Trace) value.ParseError!f64 {
+        fn score(_: Allocator, example: *const Example, prediction: ?*const optimize.RecordPrediction, _: ?*const predict.Trace) value.ParseError!f64 {
             if (prediction != null) return error.ParseValue;
             return example.record.get("fallback").?.float;
         }

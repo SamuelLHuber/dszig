@@ -672,7 +672,7 @@ const TestTeacherProbe = struct {
         return request.student_ref.*;
     }
 };
-fn testMetric(_: Allocator, _: *const optimize.Example, _: ?*const value.Record, _: ?*const predict.Trace) value.ParseError!f64 {
+fn testMetric(_: Allocator, _: *const optimize.Example, _: ?*const optimize.RecordPrediction, _: ?*const predict.Trace) value.ParseError!f64 {
     return 1;
 }
 fn testOptimizer() BetterTogether {

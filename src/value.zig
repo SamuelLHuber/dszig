@@ -865,6 +865,78 @@ pub fn floatAtLeast(f: f64, input: Value) error{InvalidNumber}!bool {
     };
 }
 
+/// Python float(text), including Unicode Nd digits, surrounding whitespace
+/// and digit separators. Ordinary ASCII decimal input allocates nothing.
+pub fn floatFromString(arena: Allocator, source: []const u8) (Allocator.Error || error{InvalidNumber})!f64 {
+    var text = source;
+    for (source) |byte| {
+        if (byte < 128) continue;
+        text = try floatAscii(arena, source);
+        break;
+    }
+    text = std.mem.trim(u8, text, " \t\r\n\x0b\x0c");
+    if (text.len == 0) return error.InvalidNumber;
+    const negative = text[0] == '-';
+    const unsigned = text[@intFromBool(text[0] == '-' or text[0] == '+')..];
+    if (std.ascii.eqlIgnoreCase(unsigned, "inf") or
+        std.ascii.eqlIgnoreCase(unsigned, "infinity"))
+        return if (negative) -std.math.inf(f64) else std.math.inf(f64);
+    if (std.ascii.eqlIgnoreCase(unsigned, "nan"))
+        return if (negative) -std.math.nan(f64) else std.math.nan(f64);
+    if (std.mem.indexOfScalar(u8, text, '_') != null) {
+        const clean = try arena.alloc(u8, text.len);
+        var written: usize = 0;
+        for (text, 0..) |byte, index| {
+            if (byte == '_') {
+                if (index == 0 or index + 1 == text.len) return error.InvalidNumber;
+                if (!std.ascii.isDigit(text[index - 1])) return error.InvalidNumber;
+                if (!std.ascii.isDigit(text[index + 1])) return error.InvalidNumber;
+            } else {
+                clean[written] = byte;
+                written += 1;
+            }
+        }
+        text = clean[0..written];
+    }
+    if (!floatGrammar(text)) return error.InvalidNumber;
+    return std.fmt.parseFloat(f64, text) catch error.InvalidNumber;
+}
+
+fn floatAscii(arena: Allocator, source: []const u8) (Allocator.Error || error{InvalidNumber})![]const u8 {
+    const unicode = @import("unicode.zig");
+    const view = std.unicode.Utf8View.init(source) catch return error.InvalidNumber;
+    var iterator = view.iterator();
+    const out = try arena.alloc(u8, source.len);
+    var written: usize = 0;
+    while (iterator.nextCodepoint()) |cp| {
+        out[written] = if (cp < 128) @intCast(cp) else if (unicode.decimalDigit(cp)) |digit|
+            '0' + digit
+        else if (unicode.isSpace(cp)) ' ' else return error.InvalidNumber;
+        written += 1;
+    }
+    return out[0..written];
+}
+
+fn floatGrammar(text: []const u8) bool {
+    var index: usize = @intFromBool(text[0] == '-' or text[0] == '+');
+    var digits: usize = 0;
+    while (index < text.len and std.ascii.isDigit(text[index])) : (index += 1)
+        digits += 1;
+    if (index < text.len and text[index] == '.') {
+        index += 1;
+        while (index < text.len and std.ascii.isDigit(text[index])) : (index += 1)
+            digits += 1;
+    }
+    if (digits == 0) return false;
+    if (index < text.len and (text[index] == 'e' or text[index] == 'E')) {
+        index += 1;
+        if (index < text.len and (text[index] == '-' or text[index] == '+')) index += 1;
+        const start = index;
+        while (index < text.len and std.ascii.isDigit(text[index])) : (index += 1) {}
+        if (index == start) return false;
+    }
+    return index == text.len;
+}
 /// Python arithmetic's implicit float conversion, including integer overflow.
 pub fn numericFloat(input: Value) error{InvalidNumber}!f64 {
     const v = numericBase(input);

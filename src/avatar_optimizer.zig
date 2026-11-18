@@ -216,11 +216,15 @@ pub const AvatarOptimizer = struct {
     fn processExample(self: AvatarOptimizer, comptime P: type, ctx: Context, program: *const P, example: *const Example) Allocator.Error!EvalResult {
         const inputs = try example.inputs(ctx.arena);
         const failed: EvalResult = .{ .example = inputs, .score = 0 };
-        const output = optimize.forwardProgram(P, ctx, program, example) catch |err| switch (err) {
+        var usage: ?@import("prediction.zig").Graph.Value = null;
+        const output = optimize.forwardProgram(P, ctx, program, example, &usage) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return failed,
         };
-        const prediction = try value.toRecord(ctx.arena, P.Output, output);
+        // The typed output stays for `actions`; the metric gets the same
+        // call's Prediction, and only score and actions are retained.
+        const prediction = try optimize.RecordPrediction.init(ctx.arena, try value.toRecord(ctx.arena, P.Output, output));
+        prediction.setLMUsage(usage);
         const score = self.metric(ctx.arena, example, &prediction, null) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return failed,
@@ -248,7 +252,7 @@ const TestQA = signature.Signature(struct {
     pub const Output = struct { answer: []const u8 };
 });
 
-fn testMetric(_: Allocator, example: *const Example, prediction: ?*const value.Record, _: ?*const predict.Trace) value.ParseError!f64 {
+fn testMetric(_: Allocator, example: *const Example, prediction: ?*const optimize.RecordPrediction, _: ?*const predict.Trace) value.ParseError!f64 {
     const got = prediction.?.get("answer") orelse return error.ParseValue;
     const want = example.record.get("answer") orelse return error.ParseValue;
     if (got != .string or want != .string) return error.ParseValue;

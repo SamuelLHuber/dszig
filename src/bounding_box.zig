@@ -115,6 +115,7 @@ pub const BoundingBox = struct {
         .is_type = true,
         .hashable = true,
         .raw_value = rawRuntimeValue,
+        .model_dump = rawRuntimeValue,
         .serialized = serializedRuntimeValue,
         .write_str = writeRuntimeStr,
         .write_repr = writeRuntimeRepr,

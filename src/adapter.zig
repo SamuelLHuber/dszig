@@ -498,7 +498,34 @@ pub fn formattedValue(arena: Allocator, field: Field, input: Value) Error!Value 
 }
 
 pub fn writeFieldValue(arena: Allocator, w: *Writer, field: Field, input: Value) Error!void {
-    value.formatFieldValue(w, field, try formattedValue(arena, field, input)) catch |err| return mapWriteError(err);
+    const formatted = if (canStreamScalarDecision(input)) input else try formattedValue(arena, field, input);
+    value.formatFieldValue(w, field, formatted) catch |err| return mapWriteError(err);
+}
+
+/// Scalar-only decision fields cannot trigger Python's whole-object serializer
+/// fallback. Nested/custom fields still use materialization before any output.
+fn canStreamScalarDecision(input: Value) bool {
+    if (input != .custom) return false;
+    const metadata = input.custom.vtable.decision orelse return false;
+    inline for (.{ "confidence", "value", "probability", "probabilities", "level" }) |name| {
+        if (metadata.field(input.custom.ptr, name)) |item| switch (item) {
+            .custom, .array, .object => return false,
+            else => {},
+        };
+    }
+    return true;
+}
+
+/// `format_field_value(..., assume_text=False)`. The canonical text part and its
+/// rendered bytes belong to arena; pass it directly to Content.parts.
+pub fn formatFieldContent(arena: Allocator, field: Field, input: Value) Error!Value {
+    var rendered: Writer.Allocating = .init(arena);
+    try writeFieldValue(arena, &rendered.writer, field, input);
+    var part: @import("runtime_value.zig").ObjectMap = .empty;
+    try part.ensureTotalCapacity(arena, 2);
+    part.putAssumeCapacity("type", .{ .string = "text" });
+    part.putAssumeCapacity("text", .{ .string = rendered.written() });
+    return .{ .object = part };
 }
 
 /// `translate_field_type`.
@@ -1086,6 +1113,38 @@ test "JSON nullable custom Reasoning retains its model schema and accepts explic
         try testing.expectEqualStrings("", (try signature.Reasoning.fromValue(empty.get("analysis").?)).content);
     }
     try testing.expectError(error.AdapterParse, Adapter.json.parse(arena, view, "{\"analysis\":{\"content\":7},\"answer\":\"yes\"}"));
+}
+
+test "scalar decision rendering needs no scratch but custom fallback stays whole" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const decision = @import("decision.zig");
+    const field: Field = .{ .name = "answer", .kind = .json, .type_name = "Choice", .desc = "", .prefix = "" };
+    const scalar = try (decision.Score{ .value = 0.5, .confidence = 0.75 }).toRuntime(arena);
+    var empty_storage: [0]u8 = .{};
+    var empty: std.heap.FixedBufferAllocator = .init(&empty_storage);
+    var buffer: [256]u8 = undefined;
+    var output: Writer = .fixed(&buffer);
+    try writeFieldValue(empty.allocator(), &output, field, scalar);
+    try testing.expectEqualStrings("{\"confidence\": 0.75, \"value\": 0.5}", output.buffered());
+
+    const binary = try @import("python_value.zig").bytearray(arena, &.{0xff});
+    const elements = try arena.dupe(Value, &.{binary});
+    const cases = [_]Value{ binary, .{ .array = .fromOwnedSlice(arena, elements) } };
+    const expected = [_][]const u8{
+        "confidence=0.75 value=bytearray(b'\\xff') probabilities=None",
+        "confidence=0.75 value=[bytearray(b'\\xff')] probabilities=None",
+    };
+    for (cases, expected) |input, wanted| {
+        var fields: @import("runtime_value.zig").ObjectMap = .empty;
+        try fields.put(arena, "confidence", .{ .float = 0.75 });
+        try fields.put(arena, "value", input);
+        const model = try decision.Choice.modelConstruct(arena, .{ .object = fields });
+        var rendered: Writer.Allocating = .init(arena);
+        try writeFieldValue(arena, &rendered.writer, field, model);
+        try testing.expectEqualStrings(wanted, rendered.written());
+    }
 }
 
 test "adapter defaults follow signature order and preserve explicit null" {

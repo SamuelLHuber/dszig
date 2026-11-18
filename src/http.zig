@@ -10,6 +10,22 @@ pub const HeaderProvider = struct {
     prepare: *const fn (*anyopaque, Allocator, []const std.http.Header) anyerror![]const std.http.Header,
 };
 
+/// Payload preparation follows credential refresh on every attempt. The
+/// context and returned bytes must survive until that attempt completes.
+pub const BodyProvider = struct {
+    context: *anyopaque,
+    prepare: *const fn (*anyopaque, Allocator) anyerror![]const u8,
+};
+
+/// A successful response can be consumed incrementally without retaining its
+/// wire body. Returning early closes the unread connection during request
+/// cleanup. The consumer must enforce the supplied decompressed byte limit.
+pub const ResponseConsumer = struct {
+    context: *anyopaque,
+    consume: *const fn (*anyopaque, Allocator, *std.Io.Reader, usize) anyerror!void,
+    failure: ?anyerror = null,
+};
+
 pub const Response = struct {
     status: std.http.Status,
     /// Owned by the underlying HTTP client's allocator.
@@ -23,9 +39,22 @@ pub const Request = struct {
     url: []const u8,
     method: std.http.Method = .GET,
     body: ?[]const u8 = null,
+    body_provider: ?BodyProvider = null,
+    response_consumer: ?*ResponseConsumer = null,
     content_type: ?[]const u8 = null,
     authorization: ?[]const u8 = null,
     headers: []const std.http.Header = &.{},
+
+    /// Both discarded preparation and actual attempts observe credentials
+    /// before serialization, without opening a connection.
+    pub fn prepare(self: *const Request, arena: Allocator, headers: ?HeaderProvider) anyerror!Request {
+        var prepared = self.*;
+        if (headers) |provider|
+            prepared.headers = try provider.prepare(provider.context, arena, self.headers);
+        if (self.body_provider) |provider|
+            prepared.body = try provider.prepare(provider.context, arena);
+        return prepared;
+    }
 };
 
 pub const Transport = struct {
@@ -87,9 +116,7 @@ pub const Transport = struct {
     fn sendRetried(self: *const Transport, arena: Allocator, input: Request, timed: ?*TimedIo) anyerror!Response {
         var attempt: u8 = 0;
         while (true) : (attempt += 1) {
-            var prepared = input;
-            if (self.header_provider) |provider|
-                prepared.headers = try provider.prepare(provider.context, arena, input.headers);
+            const prepared = try input.prepare(arena, self.header_provider);
             if (timed) |timer| timer.resetFailure();
             var last_error = self.failure_error;
             const response: ?Response = self.fetch(arena, prepared) catch |err| switch (err) {
@@ -100,6 +127,15 @@ pub const Transport = struct {
                     if (cause) |failure| {
                         if (failure == error.Canceled) return error.Canceled;
                     } else if (err == error.Canceled) return error.Canceled;
+                    // Parsing has already consumed a successful response.
+                    // It is not an opening failure and must not replay a POST.
+                    if (err == error.ResponseConsumerFailed) {
+                        const failure = input.response_consumer.?.failure.?;
+                        return cause orelse if (failure == error.StreamTooLong)
+                            self.response_limit_error
+                        else
+                            failure;
+                    }
                     last_error = cause orelse self.failure_error;
                     break :failed null;
                 },
@@ -176,7 +212,7 @@ pub const Transport = struct {
             .headers = selected_headers,
         });
         defer request.deinit();
-        return self.transferRequest(arena, &request, input.body) catch |err| {
+        return self.transferRequest(arena, &request, &input) catch |err| {
             if (request.connection) |connection| {
                 if (connection.stream_reader.err) |read_error| {
                     if (read_error == error.Canceled) return error.Canceled;
@@ -189,9 +225,9 @@ pub const Transport = struct {
         };
     }
 
-    fn transferRequest(self: *const Transport, arena: Allocator, request: *std.http.Client.Request, body: ?[]const u8) !WireResponse {
-        if (body != null or request.method.requestHasBody()) {
-            const bytes = body orelse "";
+    fn transferRequest(self: *const Transport, arena: Allocator, request: *std.http.Client.Request, input: *const Request) !WireResponse {
+        if (input.body != null or request.method.requestHasBody()) {
+            const bytes = input.body orelse "";
             request.transfer_encoding = .{ .content_length = bytes.len };
             var payload = try request.sendBodyUnflushed(&.{});
             try payload.writer.writeAll(bytes);
@@ -225,6 +261,16 @@ pub const Transport = struct {
         var transfer_buffer: [64]u8 = undefined;
         var decompress: std.http.Decompress = undefined;
         const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
+        if (status == .ok) {
+            if (input.response_consumer) |consumer| {
+                consumer.failure = null;
+                consumer.consume(consumer.context, arena, reader, self.max_response_bytes) catch |err| {
+                    consumer.failure = err;
+                    return error.ResponseConsumerFailed;
+                };
+                return .{ .response = .{ .status = status, .body = &.{}, .request_id = request_id }, .location = null };
+            }
+        }
         return .{
             .response = .{
                 .status = status,

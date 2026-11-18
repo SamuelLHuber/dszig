@@ -342,7 +342,10 @@ pub fn callsFromNative(arena: Allocator, input: []const inference.ToolCall) type
             try out.ensureTotalCapacity(arena, 3);
             out.putAssumeCapacity("provider", .{ .string = state.provider });
             out.putAssumeCapacity("kind", .{ .string = state.kind });
-            out.putAssumeCapacity("data", state.data);
+            out.putAssumeCapacity("data", state.data.toValue(arena) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.ParseValue,
+            });
         }
         call.* = .{ .id = native.id, .name = native.name, .args = args.object, .continuation = continuation };
     }
@@ -367,7 +370,14 @@ pub fn callsToNative(arena: Allocator, input: []const ToolCall) Error![]const in
             const data = state.get("data") orelse return error.ParseValue;
             if (provider != .string or kind != .string or data != .object) return error.ParseValue;
             if (provider.string.len == 0 or kind.string.len == 0) return error.ParseValue;
-            out.* = .{ .provider = provider.string, .kind = kind.string, .data = data };
+            out.* = .{
+                .provider = provider.string,
+                .kind = kind.string,
+                .data = @import("sdk_json.zig").Value.fromBorrowedValue(arena, data) catch |err| return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    else => error.ParseValue,
+                },
+            };
         }
         native.* = .{ .id = id, .name = call.name, .arguments = arguments.written(), .continuation = continuation };
     }

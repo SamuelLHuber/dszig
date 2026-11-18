@@ -72,7 +72,7 @@ const Bare = struct {
     }
 };
 
-fn metric(_: Allocator, example: *const Example, prediction: ?*const Record, trace: ?*const dszig.Trace) dszig.value.ParseError!f64 {
+fn metric(_: Allocator, example: *const Example, prediction: ?*const dszig.optimize.RecordPrediction, trace: ?*const dszig.Trace) dszig.value.ParseError!f64 {
     metric_calls += 1;
     if (trace != null) return 1;
     const row = prediction orelse return error.ParseValue;
@@ -81,12 +81,12 @@ fn metric(_: Allocator, example: *const Example, prediction: ?*const Record, tra
     return @floatFromInt(@mod(sum, 7));
 }
 
-fn tiedMetric(_: Allocator, _: *const Example, _: ?*const Record, _: ?*const dszig.Trace) dszig.value.ParseError!f64 {
+fn tiedMetric(_: Allocator, _: *const Example, _: ?*const dszig.optimize.RecordPrediction, _: ?*const dszig.Trace) dszig.value.ParseError!f64 {
     metric_calls += 1;
     return 1;
 }
 
-fn teacherMetric(_: Allocator, _: *const Example, prediction: ?*const Record, trace: ?*const dszig.Trace) dszig.value.ParseError!f64 {
+fn teacherMetric(_: Allocator, _: *const Example, prediction: ?*const dszig.optimize.RecordPrediction, trace: ?*const dszig.Trace) dszig.value.ParseError!f64 {
     metric_calls += 1;
     const row = prediction orelse return error.ParseValue;
     if (trace == null) return @floatFromInt(row.get("nz").?.integer);

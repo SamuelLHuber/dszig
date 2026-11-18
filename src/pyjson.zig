@@ -177,19 +177,31 @@ fn writePlainDictionary(w: *Writer, entries: []const @import("runtime_value.zig"
     try w.writeByte('{');
     for (entries, 0..) |entry, index| {
         try writeSeparator(w, style, depth + 1, index == 0);
-        switch (entry.key) {
-            .string => |s| try writeJsonAsciiString(w, s),
-            .null, .bool, .integer, .float, .number_string => {
-                try w.writeByte('"');
-                try writeJsonOptions(w, entry.key, style, depth + 1, true, false);
-                try w.writeByte('"');
-            },
-            else => return error.ParseValue,
-        }
+        try writeJsonKey(w, entry.key, style, depth + 1, true);
         try w.writeAll(if (style == .minified) ":" else ": ");
         try writeJsonOptions(w, entry.value, style, depth + 1, true, false);
     }
     try writeClose(w, style, depth, '}');
+}
+
+/// Python JSON accepts string, numeric, boolean and None dictionary keys.
+/// Keep this policy shared with graph-backed provider wire serialization.
+pub fn writeJsonKey(
+    w: *Writer,
+    key: Value,
+    style: Style,
+    depth: u32,
+    comptime ascii: bool,
+) Error!void {
+    switch (key) {
+        .string => try writeJsonDepth(w, key, style, depth, ascii),
+        .null, .bool, .integer, .float, .number_string => {
+            try w.writeByte('"');
+            try writeJsonOptions(w, key, style, depth, true, false);
+            try w.writeByte('"');
+        },
+        else => return error.ParseValue,
+    }
 }
 
 fn checkIntegerRepr(text: []const u8) error{ParseValue}!void {

@@ -16,6 +16,10 @@ const signature = @import("signature.zig");
 const value = @import("value.zig");
 const tool_mod = @import("tool.zig");
 const inference = @import("inference.zig");
+const usage_mod = @import("usage_tracker.zig");
+const prediction_mod = @import("prediction.zig");
+const Graph = usage_mod.Graph;
+pub const Prediction = prediction_mod.Prediction;
 const Adapter = adapter_mod.Adapter;
 const Field = signature.Field;
 const Record = value.Record;
@@ -73,6 +77,17 @@ pub const Context = struct {
     /// empties it first, so only a final `error.AdapterParse` from parsing a
     /// completion leaves it set. One capture per concurrently running context.
     parse_failure: ?*ParseFailure = null,
+    /// Effective execution-local tracker; workers share its synchronized
+    /// collector, never a mutable settings slot.
+    usage_tracker: ?*usage_mod.UsageTracker = null,
+    usage_failure: ?*lm_mod.AccountingFailure = null,
+    /// Enables automatic Module-call scopes with caller-provisioned resources.
+    track_usage: ?UsageTracking = null,
+};
+
+pub const UsageTracking = struct {
+    storage: *usage_mod.Storage,
+    limits: usage_mod.UsageTracker.Limits,
 };
 
 /// Source record_evidence entries are captured before decision decoding.
@@ -153,6 +168,9 @@ pub const TwoStepAdapter = struct {
             .lm = self.extraction_model,
             .adapter = .chat,
             .lm_options = self.extraction_options,
+            .usage_tracker = base.usage_tracker,
+            .usage_failure = base.usage_failure,
+            .track_usage = base.track_usage,
         };
         // Extraction failures are reported against the outer signature and the
         // main completion by the caller, so this context captures nothing.
@@ -316,12 +334,7 @@ pub const PredictState = struct {
 
     /// Run one LM call: format, complete, parse (with JSON fallback), trace.
     pub fn call(state: *const PredictState, ctx_in: Context, inputs: *const Record) Error!Record {
-        if (ctx_in.parse_failure) |capture| capture.* = .{};
-        const ctx = try state.resolveContext(ctx_in);
-        const prepared = try state.prepare(ctx, inputs);
-        const outputs = (try runPredict(state, ctx, prepared))[0];
-        if (ctx.trace) |t| try t.record(state, prepared.inputs, &outputs);
-        return outputs;
+        return (try state.callMany(ctx_in, inputs, ctx_in.lm_options.n))[0];
     }
 
     /// `Predict(..., n=n)`: one LM call for `n` completions, all parsed with
@@ -521,7 +534,7 @@ fn runSystemOne(ctx: Context, prepared: PreparedCall, demos: []const Record, sna
     const options = ctx.lm_options;
     if (options.temperature != null or options.rollout_id != null or options.n != 1 or
         options.reasoning_effort != null or options.reasoning_effort_present or options.response_format != null or
-        options.tool_choice != null or options.parallel_tool_calls != null) return error.InvalidDecision;
+        options.tool_choice != null or options.parallel_tool_calls != null or options.logprobs != .null) return error.InvalidDecision;
     var state: Record = .empty;
     try state.put(ctx.arena, "instructions", .{ .string = prepared.view.instructions });
     try state.put(ctx.arena, "input_fields", .{ .string = try adapter_mod.fieldDescriptionString(ctx.arena, prepared.view.inputs) });
@@ -599,6 +612,8 @@ fn runSystemOne(ctx: Context, prepared: PreparedCall, demos: []const Record, sna
     try response_schema.put(ctx.arena, "properties", .{ .object = properties });
     const completions = try ctx.lm.completeResponses(ctx.arena, .{
         .messages = &.{},
+        .usage_tracker = ctx.usage_tracker,
+        .usage_failure = ctx.usage_failure,
         .decision = .{
             .state = value.serializedValue(ctx.arena, .{ .object = state }) catch |err| return switch (err) {
                 error.OutOfMemory => error.OutOfMemory,
@@ -609,7 +624,11 @@ fn runSystemOne(ctx: Context, prepared: PreparedCall, demos: []const Record, sna
         },
     });
     if (completions.len != 1) return error.InvalidDecision;
-    const provider_data = completions[0].provider_data orelse return error.InvalidDecision;
+    const payload = completions[0].provider_data orelse return error.InvalidDecision;
+    const provider_data = payload.toValue(ctx.arena) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidDecision,
+    };
     if (provider_data != .object) return error.InvalidDecision;
     const typesafe = provider_data.object.get("typesafe") orelse return error.InvalidDecision;
     if (typesafe != .object) return error.InvalidDecision;
@@ -712,7 +731,13 @@ fn runAdapterMany(ctx: Context, signature_class: ?*const anyopaque, adapter: Ada
     // Explicit-null intent has now been resolved into the effective signature.
     options.reasoning_effort_present = false;
     const messages = try adapter.format(ctx.arena, processed, processed_demos, inputs);
-    const completions = try ctx.lm.completeResponses(ctx.arena, .{ .messages = messages, .options = options, .tools = request_tools });
+    const completions = try ctx.lm.completeResponses(ctx.arena, .{
+        .messages = messages,
+        .options = options,
+        .tools = request_tools,
+        .usage_tracker = ctx.usage_tracker,
+        .usage_failure = ctx.usage_failure,
+    });
     const outputs = try ctx.arena.alloc(Record, completions.len);
     var has_citation_field = false;
     for (original.outputs) |field| has_citation_field = has_citation_field or field.native_citations;
@@ -864,6 +889,22 @@ pub fn Predict(comptime Sig: type) type {
             const outputs = try self.state.call(ctx, &inputs);
             return value.fromRecord(ctx.arena, Output, &outputs);
         }
+
+        /// `forward` as a genuine Prediction retaining every parsed completion
+        /// of the one public LM call (`ctx.lm_options.n`). No Module-call
+        /// scope: usage stays unset, like a direct Source `forward`.
+        pub fn forwardPrediction(self: *const Self, ctx: Context, input: Input) Error!Prediction(Output) {
+            const inputs = try value.toRecord(ctx.arena, Input, input);
+            const records = try self.state.callMany(ctx, &inputs, ctx.lm_options.n);
+            const outputs = try ctx.arena.alloc(Output, records.len);
+            for (records, outputs) |*record, *output| output.* = try value.fromRecord(ctx.arena, Output, record);
+            return Prediction(Output).fromCompletions(ctx.arena, outputs);
+        }
+
+        /// `Module.__call__`: see `callProgram`.
+        pub fn call(self: *const Self, ctx: Context, input: Input) Error!Prediction(Output) {
+            return callProgram(self, ctx, input);
+        }
     };
 }
 
@@ -955,7 +996,219 @@ pub fn ChainOfThoughtWithOptions(comptime Sig: type, comptime options: ChainOfTh
         pub fn forward(self: *const Self, ctx: Context, input: Input) Error!Output {
             return self.predict.forward(ctx, input);
         }
+
+        /// Source `forward` invokes the inner predictor as a Module call, so
+        /// a direct use scopes and attaches usage on that child itself.
+        pub fn forwardPrediction(self: *const Self, ctx: Context, input: Input) Error!Prediction(Output) {
+            return self.predict.call(ctx, input);
+        }
+
+        /// `Module.__call__`: returns the inner predictor's own instance.
+        pub fn call(self: *const Self, ctx: Context, input: Input) Error!Prediction(Output) {
+            return callProgram(self, ctx, input);
+        }
     };
+}
+
+fn ProgramOf(comptime Pointer: type) type {
+    return switch (@typeInfo(Pointer)) {
+        .pointer => |pointer| pointer.child,
+        else => @compileError("dszig: a module call takes a program pointer, found " ++ @typeName(Pointer)),
+    };
+}
+
+fn InputOf(comptime Pointer: type) type {
+    const P = ProgramOf(Pointer);
+    if (!@hasDecl(P, "Input")) @compileError("dszig: program " ++ @typeName(P) ++ " declares no Input");
+    return P.Input;
+}
+
+/// Return type of the invoked method: `forwardPrediction` when a Module call
+/// asks for it and the program has one, the typed `forward` otherwise.
+fn Forwarded(comptime Pointer: type, comptime prediction: bool) type {
+    const P = ProgramOf(Pointer);
+    const program: Pointer = undefined;
+    const ctx: Context = undefined;
+    const input: P.Input = undefined;
+    if (prediction and @hasDecl(P, "forwardPrediction")) return @TypeOf(program.forwardPrediction(ctx, input));
+    return @TypeOf(program.forward(ctx, input));
+}
+
+fn Payload(comptime Result: type) type {
+    return switch (@typeInfo(Result)) {
+        .error_union => |info| info.payload,
+        else => Result,
+    };
+}
+
+fn Failure(comptime Result: type) type {
+    return switch (@typeInfo(Result)) {
+        .error_union => |info| info.error_set,
+        else => error{},
+    };
+}
+
+fn invoke(
+    comptime prediction: bool,
+    program: anytype,
+    ctx: Context,
+    input: InputOf(@TypeOf(program)),
+) Failure(Forwarded(@TypeOf(program), prediction))!Payload(Forwarded(@TypeOf(program), prediction)) {
+    if (comptime prediction and @hasDecl(ProgramOf(@TypeOf(program)), "forwardPrediction")) return program.forwardPrediction(ctx, input);
+    return program.forward(ctx, input);
+}
+
+/// One automatic Module-call scope. It has no parent: only an explicit
+/// `UsageScope` rolls up. Context is passed by value, so its private tracker
+/// never changes the caller's slot and needs no restoration or rollup.
+/// Retained tracker references stay valid until Storage reset. Totals are
+/// snapshotted into ctx.arena, and only after a successful program call.
+fn invokeScoped(
+    comptime prediction: bool,
+    program: anytype,
+    ctx: Context,
+    input: InputOf(@TypeOf(program)),
+    tracking: UsageTracking,
+    usage: ?*Graph.Value,
+) (Failure(Forwarded(@TypeOf(program), prediction)) || usage_mod.Error)!Payload(Forwarded(@TypeOf(program), prediction)) {
+    assert(ctx.usage_tracker == null);
+    const tracker = try usage_mod.UsageTracker.create(tracking.storage, tracking.limits);
+    var scoped = ctx;
+    scoped.usage_tracker = tracker;
+    const output = try invoke(prediction, program, scoped, input);
+    // Source computes totals even when the returned value cannot carry them.
+    // Skipping this would suppress invalid-merge and resource failures.
+    const totals = try tracker.getTotalTokens(ctx.arena);
+    if (usage) |target| target.* = totals;
+    return output;
+}
+
+/// Reflected field structs become Predictions. Native value models keep their
+/// own protocols, and scalars, slices and maps stay bare, like the Source
+/// outputs that cannot carry usage.
+fn isFields(comptime T: type) bool {
+    const info = @typeInfo(T);
+    if (info != .@"struct" or info.@"struct".is_tuple or prediction_mod.isPrediction(T)) return false;
+    if (T == @import("runtime_value.zig").ObjectMap or T == signature.StrDict or @import("types.zig").isDict(T)) return false;
+    return !(@hasDecl(T, "toRuntime") or @hasDecl(T, "toValue") or @hasDecl(T, "fromValue"));
+}
+
+fn Wrapped(comptime T: type) type {
+    if (prediction_mod.isPrediction(T)) return T;
+    if (@typeInfo(T) == .optional) return ?Wrapped(@typeInfo(T).optional.child);
+    return if (isFields(T)) Prediction(T) else T;
+}
+
+/// Result type of `callProgram` for a program output `T`. Only a tuple's
+/// first element is transformed; its other elements keep their types.
+pub fn CallResult(comptime T: type) type {
+    const info = @typeInfo(T);
+    if (info != .@"struct" or !info.@"struct".is_tuple or info.@"struct".field_types.len == 0) return Wrapped(T);
+    const fields = info.@"struct".field_types;
+    if (Wrapped(fields[0]) == fields[0]) return T;
+    var types = fields[0..fields.len].*;
+    types[0] = Wrapped(fields[0]);
+    return @Tuple(&types);
+}
+
+fn wrapOne(comptime T: type, arena: Allocator, output: T) Allocator.Error!Wrapped(T) {
+    if (comptime Wrapped(T) == T) return output;
+    if (comptime @typeInfo(T) == .optional) {
+        return if (output) |item| try wrapOne(@typeInfo(T).optional.child, arena, item) else null;
+    }
+    return Prediction(T).init(arena, output);
+}
+
+fn wrap(comptime T: type, arena: Allocator, output: T) Allocator.Error!CallResult(T) {
+    const Result = CallResult(T);
+    if (comptime Result == T) return output;
+    if (comptime Result == Wrapped(T)) return wrapOne(T, arena, output);
+    var result: Result = undefined;
+    inline for (@typeInfo(T).@"struct".field_types, 0..) |Item, index| {
+        result[index] = if (index == 0) try wrapOne(Item, arena, output[0]) else output[index];
+    }
+    return result;
+}
+
+/// Type that Source `_set_lm_usage` inspects: the output or a tuple's first item.
+fn UsageTarget(comptime Result: type) type {
+    const info = @typeInfo(Result);
+    if (info == .@"struct" and info.@"struct".is_tuple and info.@"struct".field_types.len != 0) return info.@"struct".field_types[0];
+    return Result;
+}
+
+/// A Source Prediction without fields is falsy and never receives usage.
+fn carriesUsage(comptime T: type) bool {
+    if (@typeInfo(T) == .optional) return carriesUsage(@typeInfo(T).optional.child);
+    if (!prediction_mod.isPrediction(T)) return false;
+    const info = @typeInfo(T.Fields);
+    return info != .@"struct" or info.@"struct".field_types.len != 0;
+}
+
+fn attach(comptime T: type, arena: Allocator, target: T, usage: Graph.Value) Allocator.Error!void {
+    if (comptime @typeInfo(T) == .optional) {
+        if (target) |item| try attach(@typeInfo(T).optional.child, arena, item, usage);
+    } else {
+        if (comptime T.Fields == @import("runtime_value.zig").ObjectMap) {
+            if (target.fields().count() == 0) return;
+        }
+        target.setLMUsage(try Graph.clone(arena, usage));
+    }
+}
+
+/// Canonical `Module.__call__` for any native program pointer. A reflected
+/// output struct becomes a `Prediction`; a genuine Prediction is returned as
+/// the same instance; an optional keeps null; a tuple transforms only its
+/// first element; every other output stays bare.
+///
+/// With `ctx.track_usage` set and no active `ctx.usage_tracker`, the program
+/// runs under one automatic scope whose totals are attached to the returned
+/// Prediction (or a tuple's first) after success. Any active tracker, however
+/// it was configured, suppresses both the scope and the attachment.
+pub fn callProgram(
+    program: anytype,
+    ctx: Context,
+    input: InputOf(@TypeOf(program)),
+) (Failure(Forwarded(@TypeOf(program), true)) || usage_mod.Error)!CallResult(Payload(Forwarded(@TypeOf(program), true))) {
+    const Output = Payload(Forwarded(@TypeOf(program), true));
+    const Result = CallResult(Output);
+    const tracking = ctx.track_usage orelse return wrap(Output, ctx.arena, try invoke(true, program, ctx, input));
+    if (ctx.usage_tracker != null) return wrap(Output, ctx.arena, try invoke(true, program, ctx, input));
+    if (comptime carriesUsage(UsageTarget(Result))) {
+        var usage: Graph.Value = undefined;
+        const result = try wrap(Output, ctx.arena, try invokeScoped(true, program, ctx, input, tracking, &usage));
+        if (comptime UsageTarget(Result) == Result) {
+            try attach(Result, ctx.arena, result, usage);
+        } else try attach(UsageTarget(Result), ctx.arena, result[0], usage);
+        return result;
+    } else {
+        return wrap(Output, ctx.arena, try invokeScoped(true, program, ctx, input, tracking, null));
+    }
+}
+
+/// Module-call scoping around the typed `forward`, for execution entry points
+/// that build their own Prediction around reflected output fields
+/// (evaluation). Nested Module calls see an active tracker
+/// exactly as under `callProgram`.
+///
+/// `usage` receives what `callProgram` would attach: an owned snapshot of
+/// this invocation's totals in ctx.arena after a successful automatic scope,
+/// and null when tracking is off, a tracker is already active, or the call
+/// fails. A caller passing null declares that its result cannot carry usage;
+/// the scope still runs and its totals are still validated.
+pub fn forwardScoped(
+    program: anytype,
+    ctx: Context,
+    input: InputOf(@TypeOf(program)),
+    usage: ?*?Graph.Value,
+) (Failure(Forwarded(@TypeOf(program), false)) || usage_mod.Error)!Payload(Forwarded(@TypeOf(program), false)) {
+    if (usage) |target| target.* = null;
+    const tracking = ctx.track_usage orelse return program.forward(ctx, input);
+    if (ctx.usage_tracker != null) return program.forward(ctx, input);
+    var captured: Graph.Value = undefined;
+    const output = try invokeScoped(false, program, ctx, input, tracking, if (usage != null) &captured else null);
+    if (usage) |target| target.* = try Graph.clone(ctx.arena, captured);
+    return output;
 }
 
 pub const Retriever = struct {
@@ -1030,11 +1283,43 @@ pub const InMemoryRetriever = struct {
 pub const Retrieve = struct {
     k: i64 = 3,
 
+    pub const Input = []const u8;
+    pub const Output = []const []const u8;
+    pub const Fields = struct { passages: Output };
+
+    pub fn forwardPrediction(self: *const Retrieve, ctx: Context, query: Input) anyerror!Prediction(Fields) {
+        return Prediction(Fields).init(ctx.arena, .{ .passages = try self.forward(ctx, query) });
+    }
+
+    pub fn call(self: *const Retrieve, ctx: Context, query: Input) anyerror!Prediction(Fields) {
+        return callProgram(self, ctx, query);
+    }
+
     pub fn forward(self: *const Retrieve, ctx: Context, query: []const u8) anyerror![]const []const u8 {
         const r = ctx.retriever orelse return error.NoRetriever;
         return r.search(ctx.arena, query, self.k);
     }
 };
+
+test "canonical empty record Prediction remains without usage" {
+    const P = struct {
+        pub const Input = void;
+        pub const Output = Prediction(Record);
+
+        pub fn forward(_: *const @This(), ctx: Context, _: Input) Allocator.Error!Output {
+            return Output.init(ctx.arena, .empty);
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var storage: usage_mod.Storage = .{ .arena = arena, .io = std.testing.io };
+    const result = try callProgram(&P{}, .{
+        .arena = arena,
+        .track_usage = .{ .storage = &storage, .limits = .{ .models = 0, .entries = 0 } },
+    }, {});
+    try std.testing.expect(result.getLMUsage() == null);
+}
 
 pub const Param = union(enum) {
     predict: *PredictState,
@@ -1195,6 +1480,118 @@ test "bound LM precedence includes explicit null and fanout and resets without c
     try testing.expectEqual(@as(u32, 0), capture.expected_count);
     try testing.expectEqual(@as(i64, 6), (try copy.forward(.{ .arena = arena }, input)).answer);
     try testing.expectEqual(@as(i64, 2), (try program.forward(.{ .arena = arena, .lm = fallback.lm() }, input)).answer);
+}
+
+fn testPromptTokens(arena: Allocator, usage: ?Graph.Value) !i64 {
+    const total = try Graph.toValue(arena, usage.?);
+    return total.object.get("configured").?.object.get("prompt_tokens").?.integer;
+}
+
+test "module calls scope usage onto the returned prediction instance unless a tracker is active" {
+    const Sig = signature.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: i64 };
+    });
+    const Child = Predict(Sig);
+    const Pair = struct {
+        child: Child = .{},
+        seen: *?Prediction(Sig.Output),
+        compiled: bool = false,
+
+        pub const Input = Sig.Input;
+        pub const Output = struct { Prediction(Sig.Output), []const u8 };
+
+        pub fn forward(self: *const @This(), ctx: Context, input: Input) Error!Output {
+            const first = try self.child.call(ctx, input);
+            self.seen.* = first;
+            return .{ first, "extra" };
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const one: lm_mod.ResponseMetadata = .{ .usage = .{ .input_tokens = .{ .integer = 1 } } };
+    var engine: lm_mod.ScriptedLM = .{
+        .responses = &.{ "<answer>1</answer>", "<answer>2</answer>", "<answer>3</answer>", "<answer>4</answer>", "<answer>5</answer>", "<answer>6</answer>" },
+        .model = "configured",
+        .metadata = &.{ one, one, one, one, one, one },
+    };
+    var storage: usage_mod.Storage = .{ .arena = arena, .io = testing.io };
+    const plain: Context = .{ .arena = arena, .lm = engine.lm() };
+    var tracked = plain;
+    tracked.track_usage = .{ .storage = &storage, .limits = .{ .models = 1, .entries = 2 } };
+    const input: Sig.Input = .{ .question = "q" };
+
+    // The outer call's totals land on the returned child instance, so a copy
+    // taken before the tuple was returned observes them too.
+    var seen: ?Prediction(Sig.Output) = null;
+    const pair: Pair = .{ .seen = &seen };
+    const tuple = try callProgram(&pair, tracked, input);
+    try testing.expect(tuple[0].fields() == seen.?.fields());
+    try testing.expectEqual(@as(i64, 1), tuple[0].fields().answer);
+    try testing.expectEqualStrings("extra", tuple[1]);
+    try testing.expectEqual(@as(i64, 1), try testPromptTokens(arena, seen.?.getLMUsage()));
+    const retained = seen.?;
+
+    // A direct forward is no Module call, but its child call scopes itself.
+    const direct = try pair.forward(tracked, input);
+    try testing.expectEqual(@as(i64, 1), try testPromptTokens(arena, direct[0].getLMUsage()));
+    try testing.expect(direct[0].fields() != retained.fields());
+
+    // Any active tracker suppresses the automatic scope and the attachment.
+    var tracker: usage_mod.UsageTracker = undefined;
+    try tracker.init(&storage, .{ .models = 1, .entries = 1 });
+    var explicit = tracked;
+    explicit.usage_tracker = &tracker;
+    const suppressed = try pair.child.call(explicit, input);
+    try testing.expect(suppressed.getLMUsage() == null);
+    try testing.expectEqual(@as(i64, 1), try testPromptTokens(arena, try tracker.getTotalTokens(arena)));
+    try testing.expect((try pair.child.call(plain, input)).getLMUsage() == null);
+
+    // One public call keeps every completion and one combined usage entry.
+    var many = tracked;
+    many.lm_options.n = 2;
+    const group = try pair.child.call(many, input);
+    try testing.expectEqual(@as(usize, 2), group.completions().?.len);
+    try testing.expectEqual(@as(i64, 5), group.fields().answer);
+    try testing.expectEqual(@as(i64, 6), group.completions().?[1].answer);
+    try testing.expectEqual(@as(i64, 2), try testPromptTokens(arena, group.getLMUsage()));
+    try testing.expectEqual(@as(usize, 6), engine.index);
+
+    // A failed call returns no prediction, and earlier ones keep their own state.
+    try testing.expectError(error.ScriptExhausted, pair.child.call(tracked, input));
+    try testing.expectEqual(@as(i64, 1), try testPromptTokens(arena, retained.getLMUsage()));
+    const copy = try group.clone(arena);
+    copy.fields().answer = 9;
+    copy.setLMUsage(null);
+    try testing.expectEqual(@as(usize, 2), copy.completions().?.len);
+    try testing.expectEqual(@as(i64, 5), group.fields().answer);
+    try testing.expectEqual(@as(i64, 5), copy.completions().?[0].answer);
+    try testing.expectEqual(@as(i64, 2), try testPromptTokens(arena, group.getLMUsage()));
+}
+
+test "automatic scope propagates invalid totals even when its result cannot carry usage" {
+    const Program = struct {
+        pub const Input = struct {};
+        pub const Output = i64;
+        pub fn forward(_: *const @This(), ctx: Context, _: Input) anyerror!Output {
+            if (ctx.usage_tracker) |tracker| {
+                try tracker.addUsage("manual", try Graph.parse(ctx.arena, "{\"field\":{\"count\":1}}"));
+                try tracker.addUsage("manual", try Graph.parse(ctx.arena, "{\"field\":false}"));
+            }
+            return 17;
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var storage: usage_mod.Storage = .{ .arena = arena, .io = testing.io };
+    const ctx: Context = .{
+        .arena = arena,
+        .track_usage = .{ .storage = &storage, .limits = .{ .models = 1, .entries = 2 } },
+    };
+    const program: Program = .{};
+    try testing.expectError(error.ParseValue, callProgram(&program, ctx, .{}));
 }
 
 test "module LM aggregation distinguishes shared identities mixed bindings and no predictors" {
@@ -1574,4 +1971,11 @@ test "in-memory retriever ranks by overlap" {
     const got = try r.forward(ctx, "What is the capital of France?");
     try testing.expectEqualStrings("Paris is the capital of France.", got[0]);
     try testing.expectEqualStrings("France has wine.", got[1]);
+    var storage: usage_mod.Storage = .{ .arena = arena.allocator(), .io = testing.io };
+    var tracked = ctx;
+    tracked.track_usage = .{ .storage = &storage, .limits = .{ .models = 0, .entries = 0 } };
+    const prediction = try callProgram(&r, tracked, "What is the capital of France?");
+    try testing.expectEqualStrings(got[0], prediction.fields().passages[0]);
+    try testing.expectEqualStrings(got[1], prediction.fields().passages[1]);
+    try testing.expectEqual(@as(usize, 0), prediction.getLMUsage().?.object.count());
 }

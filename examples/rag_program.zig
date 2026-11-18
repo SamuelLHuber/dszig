@@ -71,7 +71,7 @@ pub fn keywordLM() dszig.lm.KeywordLM {
 }
 
 /// `example.answer.lower() in pred.answer.lower()`.
-pub fn keywordMetric(arena: Allocator, example: *const dszig.Example, prediction: ?*const dszig.value.Record, _: ?*const dszig.Trace) dszig.value.ParseError!f64 {
+pub fn keywordMetric(arena: Allocator, example: *const dszig.Example, prediction: ?*const dszig.optimize.RecordPrediction, _: ?*const dszig.Trace) dszig.value.ParseError!f64 {
     const want = example.record.get("answer").?.string;
     const pred = prediction orelse return error.ParseValue;
     const got = (pred.get("answer") orelse return 0).string;

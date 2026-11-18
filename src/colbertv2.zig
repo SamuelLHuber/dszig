@@ -211,7 +211,7 @@ fn parsePayload(gpa: Allocator, bytes: []const u8, post_requests: bool, k: i64) 
     };
     if (response != .object) return error.InvalidColBERTResponse;
     if (response.object.get("error")) |server_error| {
-        if (graph.truthy(server_error)) return error.ColBERTServerError;
+        if (try graph.truthy(server_error)) return error.ColBERTServerError;
     }
     const topk = response.object.get("topk") orelse return error.InvalidColBERTResponse;
     if (topk != .array) return error.InvalidColBERTResponse;

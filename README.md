@@ -7,8 +7,9 @@ allocators and execution context are explicit.
 **This is not a feature-complete or fully identical implementation of DSPy.** The
 cross-runtime gates cover the behaviors below, not every DSPy capability. In
 particular, the Python-executing RLM/Flex stack, images/audio,
-full provider SDK coverage, and streaming are not implemented. Native File and
-bounded Responses document support are implemented, not general multimodal
+full provider SDK coverage, and general-purpose LM streaming are not
+implemented. Native File and bounded Responses document support are
+implemented, not general multimodal
 parity. See [Compatibility limits](#compatibility-limits).
 
 ## Example
@@ -123,7 +124,7 @@ retain the actual continuation and raw provider response independently.
 | Voting | `Ensemble`, `ensemble.majority`, Unicode text normalization; exact Python numeric equality, NaN object identity and source-order fallback behavior |
 | Answer metrics | `metrics.emScore`, `f1Score`, `hotpotF1Score`, `precisionScore`, multi-reference `em`/`f1`/`hotpotF1`, thresholded and record-based answer matching, DPR-token passage matching |
 | LM boundary | `LM`, native `lm.OpenAI` Chat Completions/Responses and `lm.TypeSafe` SystemOne, shared bounded `http.Transport`, scripted/keyword LMs, recording/replay wrappers and typed native protocol metadata |
-| Cache | `CachedLM`, per-candidate/request identity, LRU eviction, rich-response JSON dump/load; failed calls are not cached |
+| Cache | `CachedLM`, whole public candidate-group/request identity, LRU eviction and rich-response JSON dump/load; engine-group failures are not cached |
 | State | `state.save`, `saveAlloc`, `load`/`loadState` with explicit load options, native OpenAI configuration reconstruction, DSPy 3.5.0 dependency metadata and program JSON artifact comparisons |
 
 A named surface in this table is not a claim that every Python option or provider
@@ -226,10 +227,823 @@ fallback and exact counts through recording, replay and cache dump/load after
 the original response arena was destroyed. This is finite protocol evidence,
 not authenticated inference.
 
-Reading token usage is not usage accounting: scoped tracking, per-module
-Prediction usage, costs/pricing, Python Response/Prediction object APIs,
-asynchronous execution and streaming remain open. The xAI separate-reasoning
-usage dialect is not configured by this native OpenAI transport.
+LM calls can account canonical response usage into an explicit native tracker;
+Module calls can also create a scope and attach its totals to their returned
+`Prediction`. The collector and automatic-call contracts below are separate
+from costs/pricing, a complete Python Response/Prediction object model,
+asynchronous execution and streaming.
+
+For Chat servers such as xAI, set `OpenAI.chat_reasoning_usage = .separate`
+when reasoning tokens are reported outside `completion_tokens`; the default
+`.in_completion` keeps the inclusive counter unchanged. Separate accounting
+adds exact integers before SDK settlement. If reasoning is absent, output stays
+unknown unless the reported total equals prompt plus completion. Responses
+continues to use its own inclusive output counter. The policy survives native
+LM state save/restore and model copies.
+
+A fresh 20-case actual Source HTTP corpus exposed nine native response
+mismatches before this policy was integrated. Debug and ReleaseSafe now each
+match all 16 complete SDK responses, four acceptance/refusal outcomes and all
+20 ordered HTTP path/auth/body records through both `completeRequest` and the
+native LM caller. Canonical SDK request snapshots and both routes' credential
+call counts also match. Cases include sums beyond 64 bits, missing counters, inconsistent totals,
+negative/integral-float counts and malformed reasoning counts. These are local
+protocol proofs for the bound Chat usage policy, not authenticated homelab
+inference. The current Debug and ReleaseSafe gates each pass all 38 build steps
+and 652 tests, alongside the 687-request replay and actual examples.
+
+`UsageTracker` records arbitrary provider fields in `usage_tracker.Graph`
+values, separately from SDK `lm.Usage` validation. Initialize its fixed model
+and entry capacities against shared, stable-address `usage_tracker.Storage`:
+
+```zig
+var storage: dszig.usage_tracker.Storage = .{ .arena = arena, .io = io };
+var tracker: dszig.UsageTracker = undefined;
+try tracker.init(&storage, .{ .models = 16, .entries = 1024 });
+try tracker.addUsage("configured/model", try dszig.usage_tracker.Graph.parse(
+    arena, "{\\\"prompt_tokens\\\":13,\\\"is_byok\\\":true}",
+));
+const totals = try tracker.getTotalTokens(arena);
+```
+
+Entries copy their root dictionary, flatten only direct genuine BaseModels
+with default Python-mode `model_dump`, and borrow ordinary nested graph values.
+Totals recompute in entry order: integer/float counts sum exactly as Python
+does, booleans never sum, and first nonnumeric values remain unchanged. Nested
+dictionary merging preserves Source's asymmetric iterable-pair conversion and
+refusal ordering. Neither recorded entries nor totals are deep snapshots;
+`Graph.clone` makes an owning arena copy when needed.
+
+`UsageScope.init` takes the same storage and an explicit context-local
+`?*UsageTracker` slot. Its `run(body, args)` rolls up on success and error,
+restoring the prior slot even when rollup fails; `finish` supports explicit
+lifetime management. Rollup copies entry references once, grouped by model,
+so later child additions do not reach the parent. Related scopes share one
+allocator/collector lock. Their graph inputs still require external
+synchronization; serializer callbacks must not reenter collection. Storage,
+input leaves and output arenas must remain alive for their borrowed users.
+This is an explicit native context, not Python settings or garbage collection.
+
+Model/entry capacities do not grow. Merge uses a fixed stack of at most 1,000
+child merges and a 1,048,576-step budget shared across a totals snapshot.
+Capacity refusal is explicit; child rollup preflights capacity without partial
+publication. These are native safety/resource contracts, not Python limits or
+Python MemoryError transition equivalence.
+
+Both Debug and ReleaseSafe native CLIs consumed the unchanged **635-row**
+actual Source tracker corpus with **zero mismatches or unconsumed rows**:
+525 accepted results, 108 refusals and two scope-only rows. Comparisons include
+ordered fields, genuine scalar/container kinds, direct model snapshots, alias
+observations and scope restoration; Python exception classes/messages are not
+compared. Four independently corrupted result/alias/scope outputs each failed
+the comparator. A separate real four-thread smoke retained all 128 entries,
+observed ten consistent snapshots and joined every worker. Those collector
+proofs do not establish all Python models/protocols, authenticated inference or
+whole-runtime static allocation.
+
+### Canonical token logprobs
+
+Set `lm.Options.logprobs` to a nonnegative integer `Value`: `.null` leaves
+scoring off, `.{ .integer = 0 }` requests chosen-token scores, and positive
+values request alternatives. Integral builtin floats normalize to integers;
+booleans, negative counts and fractional counts refuse before engine execution.
+Provider caps are not imposed locally. Chat sends `logprobs: true`, adding
+`top_logprobs` only for positive counts; Responses sends `top_logprobs` and
+`include: ["message.output_text.logprobs"]`.
+
+`lm.Completion.logprobs` is an optional sequence of native `TokenLogprob`
+records. Unknown and reported-empty sequences remain distinct. Records retain
+the token, binary64 logprob, optional byte sequence, optional vocabulary ID and
+ordered `top` alternatives. SDK byte entries are nonnegative integer `Value`s,
+not narrowed to octets: the Source permits values greater than 255 and 64 bits.
+Vocabulary IDs may be signed. The SDK permits nonfinite scores; the native
+implementation does not clamp, sort or invent them. `logprobs_complete` retains
+the provider/editor completeness fact separately from score presence.
+
+Both OpenAI dialects use the shared Source-backed entry decoder. Responses
+concatenates scores in text-block order; Chat refusal-token scores remain only
+in raw provider data. Chosen and alternative tokens use Python string/float
+coercion at the wire boundary, while canonical SDK record validation remains
+strict. Shared Python float-text parsing handles Unicode decimal digits,
+separators, signed zero and nonfinite spellings; ordinary ASCII decimal text
+allocates no conversion scratch. JSON repair reuses that parser rather than
+maintaining a second decimal grammar.
+
+Owning cloning, `ScriptedLM`, recording/replay, both transcript writers and
+in-memory/persisted `CachedLM` retain scores and completeness. Native JSON
+persistence uses a reserved `$dszig_f64` bit tag **only for nonfinite scores**;
+the canonical `lm.logprobs.toValue` view still returns float values. The native
+persistence reader alone decodes that tag. This is not Python diskcache or
+canonical SDK JSON-format interoperability.
+
+The new independent Source corpus has 51 canonical observations; Debug and
+ReleaseSafe compared **48** with zero mismatches, including genuine native
+IntEnum/Enum inputs. Three Python constructor/child-alias observations remain
+unconsumed, not passed. A separate **64-row** actual provider/configuration
+corpus exposed 38 native mismatches before score integration, then matched all
+42 response rows and 22 request rows in both modes. Actual cache dump/load
+additionally exposed four nonfinite-score failures before the lossless native
+encoding repaired them. A supplemental **24-row** actual Source probe covered
+previously unobserved float-text boundaries, including signed NaN, enormous
+exponents and a 5,000-digit string mantissa. Both modes matched all rows and
+the 14 accepted scores' exact binary64 bits; 12 ASCII cases also converted
+with a zero-byte allocator. Independently corrupted score and request-knob
+expectations each produced real nonzero comparator exits in both modes.
+These are finite observations, not full Python dataclass identity, arbitrary
+iterable or streaming-materialization parity.
+
+Actual localhost HTTP consumers in Debug and ReleaseSafe made eight
+score-configured requests with Source-matching request knobs and returned
+canonical scores. Both real `zig build live -- --smoke` dialects also returned
+answer `4`; the fixture served ten total requests and its worker joined.
+This is real HTTP/codec/CLI evidence, **not authenticated homelab inference**.
+At the token-logprob checkpoint, native gates passed **596/596 tests and
+38/38 build steps per mode**.
+
+### Ordered SDK artifacts and public call results
+
+`dszig.sdk_response` exposes a stable, reference-counted `Response` object,
+its typed `ResponseFields`, `Message` and twelve-variant `Part` records.
+`Response.fromFields(allocator, &fields)` copies immutable field storage,
+retains already-owned JSON views and snapshots borrowed JSON views.
+`fromValue`/`fromNativeValue` construct owning objects from wire projections.
+The returned `*const Response` exposes its immutable header through `.fields`;
+`retain` preserves object identity, `release` drops a reference, and `clone`
+makes an independent deep copy. The object's allocator must outlive all its
+references. Raw owning field records retain their `clone`/`free` methods.
+
+Tool-result content has its own presentational union, so nested tool
+calls/results, thinking and refusals cannot inhabit it. Owning readers validate
+roles, nonempty identifiers, JSON payloads, media addresses, probability
+distributions and adaptations. Partial constructors unwind on allocation
+failure. `toValue` is an arena projection; graph-backed JSON payloads are
+materialized into that arena. Native JSON persistence additionally retains
+empty score presence and nonfinite score bits.
+
+`DataPart.value`, `DataPart.probabilities`, `ResponseFields.provider_data` and
+`Completion.provider_data` use `sdk_response.JsonValue`. Its `root` is the
+existing `json_graph.Value`, not a flat container-header snapshot.
+`JsonValue.borrowed(root)` explicitly borrows a graph until an enclosing SDK
+clone; `fromValue(allocator, wire_value)` owns a converted wire value.
+`fromBorrowedValue(arena, wire_value)` imports parsed wire containers into the
+call arena and borrows their scalar leaves. Neither wire conversion can recover
+identity already erased by flat JSON headers. Construct shared graph nodes
+directly when aliases matter.
+
+SDK response and completion clones share one graph identity memo across data,
+probabilities and provider metadata. Their owned graph payloads use the same
+reference-counted arena storage as request-cache payloads. Free owning SDK
+records with their documented `free` method and response objects with `release`;
+do not independently free their payload fields. Convenience data text streams
+directly from graph nodes using
+the existing Python-compatible JSON scalar formatter, without a flattened
+temporary tree. Validation and both JSON writers use a fixed 64-frame traversal
+with u32 container indexes; depth overflow and cycles refuse rather than recurse.
+Null, bool, integer and float JSON round trips also passed with a zero-byte
+allocator in both modes; that is not a whole-runtime static-memory guarantee.
+
+`dszig.CallResult.native(allocator, response, options)` retains the supplied
+response object rather than copying its header. It provides the public
+string-or-dictionary output view, separate from the unchanged ordered artifact.
+`outputs` is now an owning `sdk_response.PayloadValue` whose `root.array` is the
+actual mutable list. Use `CallResult.init(allocator)` for an empty result, mutate
+through `outputs.root.array`, and use `outputs.retain()` when that same list must
+outlive the result while its allocator remains alive. `clone` instead owns an
+independent, memoized graph copy in the supplied allocator.
+`usage`, `cost`, and `cost_details` also use `sdk_response.PayloadValue`: inspect
+their `root` graph or call `toValue(arena)` for a flat borrowed projection.
+Each empty result has independent usage and detail dictionaries. These are
+Python-capable payloads, not JSON-only fields; even a nonnumeric mutable `cost`
+can be retained and cloned, although summing known costs still requires numbers.
+Retain an individual payload when it must outlive its result. When replacing a
+field, obtain the replacement lease first and free the previous lease.
+LM call methods use their documented arena for execution storage; clone results
+into longer-lived storage before destroying that arena. As with SDK objects,
+a retained payload's backing allocator must outlive every reference, including
+cache references. Releasing an original payload handle is safe; destroying its
+backing arena while a cache retains that opaque graph is not. Keep shared SDK
+payloads in startup-created or otherwise sufficiently long-lived storage.
+Options select `chat`, `auto`, `responses` or `text` and requested logprobs.
+Visible text concatenates text and JSON data parts; reasoning, tool calls and
+citations remain independent. Text mode preserves provider text-score offsets
+and unknown scores. `dump`/`load` preserve costs and SDK usage while a cache
+load exposes empty public usage. `call_result.combine` retains the original
+response objects in order, merges
+usage, promotes mixed outputs, preserves first response-bearing model selection
+and sums only fully known costs. Its new list retains the original dictionary
+rows and mutable wrapped values, not deep copies of them. Appending to an input
+list does not append to the combined list; mutating a shared row does remain
+visible. Shallow payload dependencies keep these rows alive after input results
+are freed, with allocation-free iterative final release rather than recursive
+destruction. Combined cost-detail candidates likewise retain the original
+metadata values, including repeated and empty dictionaries. Aggregate usage
+gets fresh dictionary headers while ordinary nested values remain shallow.
+Convenience outputs and native usage dictionaries are built directly into graph
+storage. `CallResult.clone` uses one object/graph memo across SDK responses and
+all four public payload fields: repeated objects remain repeated, and shared
+containers and mutable scalar boxes stay shared inside an independent copy.
+`CallResult.dump(allocator)` returns an owning canonical graph record
+(`sdk_response.PayloadValue`); free that record with `record.free()`.
+`CallResult.load(allocator, record)` retains an owning record's original cost
+and cost-detail roots. Its output conversion copies each dictionary/list
+occurrence independently, but leaves tuples and other objects unchanged; output
+values are not restricted to lists. Missing details and loaded public usage get
+fresh dictionaries. Explicitly borrowed records are snapshotted first, as at the
+SDK ownership boundary. Convert flat parsed input with
+`PayloadValue.fromPythonValue` before loading; that owning import cannot restore
+dictionary/list identity already erased by JSON or by-value runtime headers.
+
+Dump uses Source's distinct `plain` conversion: dictionary/list/tuple occurrences
+get fresh containers, tuples become lists, and mutable noncontainer leaves stay
+shared. Immutable text and dictionary-key bytes belong to the record; only
+untouched noncontainer leaves and non-scalar cost roots retain public payload
+owners. BaseModels follow dictionary construction through model iteration, not
+`model_dump`: empty `Reasoning` becomes `{}`, nonempty `Reasoning` in projected
+metadata refuses, and `Code` exposes its `code` field. Cost is deliberately not
+projected. Canonical SDK response records retain opaque payload roots and copy
+immutable headers, so a dump can outlive its result and SDK objects.
+`Response.toPayload` and `Response.fromPayload` provide the corresponding owning
+graph serde boundary; existing `toValue` projections still borrow their leaves.
+Invalid numeric combinations return `InvalidCost`, not a fabricated zero
+or unknown bill.
+
+Debug and ReleaseSafe each compared all **57** frozen actual Source result
+cases: 54 accepted and three refused combinations, without claiming Python
+exception identity. The SDK projection consumed the corresponding **45** raw
+response rows, not 45 additional independent cases. Before the response-object
+cutover, allocation-failure sweeps
+covered **331 SDK** and **2,741 result** sites per mode. Nine distinct shapes
+also survived actual scripted generation, recording, cache hits after the
+source arena was destroyed, cache dump/load and replay. The injected adaptation
+in that carrier check is a native lifecycle invariant, not a Source observation.
+
+`lm.Completion.message` and `.adaptations`, scripted/replay carriers and both
+live transcript codecs retain supplied artifacts. OpenAI Chat and Responses
+parsers construct ordered parts while reading the wire, retaining adjacent text,
+refusals, generated media, citation adjacency and part-local reasoning replay
+state. Nine newly observed actual Source messages matched in Debug and
+ReleaseSafe, including the previously failing missing-message path, owning
+clones and the completion codec. These are separate observations from the
+57-case standalone result corpus.
+
+Actual OpenAI HTTP calls additionally fold a single JSON-object text part into
+a canonical data part when the request schema declares any judgment. Mixed
+ordinary/judgment properties and scores above Jev's ceiling are allowed here;
+this is not TypeSafe's stricter request validation. Multiple text parts,
+non-object answers and malformed JSON remain text without repair. Other parts
+and the replaced text's continuation stay unchanged. Nonfinite object values
+fail SDK data construction rather than silently remaining text. Debug and
+ReleaseSafe each exercised **26 new frozen Source cases over localhost HTTP**:
+24 accepted responses and two refusals, comparing whole canonical SDK responses
+without claiming identical exception classes. The original message path produced
+12 mismatches; the request-aware path produced none. Extending comparison to
+whole responses exposed a separate canonical-serde bug: unknown `Usage` must be
+omitted, not serialized as `{}`. The fix preserves the actual nonnullable SDK
+`Usage` object and retains reported zeros. Six additional frozen Source cases
+(null, empty and zero-valued usage in both dialects) matched whole responses
+over HTTP in both modes. All request schemas were checked and server threads
+joined per mode.
+This proves scripted transport/codec behavior, not authenticated model inference.
+
+Responses also retain unknown output/content blocks in the ordered
+`provider_data._lm15_unmapped` index, with their original wire positions and
+Python-style type labels. The five recognized provider-executed tool item kinds
+are deliberately excluded. Newly observed unknown blocks replace an existing
+index; an existing index is retained when no unknown blocks occur. Reasoning
+continuation state stringifies truthy values and omits falsy values, rather than
+requiring the provider to send strings. **36 additional frozen Source cases**
+matched complete canonical SDK responses over localhost HTTP in both Debug and
+ReleaseSafe, including nested unknown blocks, index replacement/order, all five
+tool exclusions and seven reasoning-state shapes. All 36 request schemas were
+checked and server threads joined in each mode. These are value/codec
+observations, not shared SDK-object lifetime or authenticated-inference proof.
+
+After the graph-backed payload cutover, all those conserved provider
+observations were re-compared without re-executing Source. Whole SDK values,
+expected refusals and all request schemas still matched in both modes.
+
+The actual `live -- --smoke` CLI additionally completed four localhost requests:
+Chat Completions and Responses, each with and without native reasoning. Each
+returned `4` and wrote a real transcript. The production `live_suite.parseCalls`
+reader then replayed all four artifacts through both `LM.callResult` and typed
+ChainOfThought in Debug and ReleaseSafe, preserving complete SDK messages,
+provider data and canonical metadata and consuming every recorded request.
+Responses artifacts included the unmapped-block index and non-string reasoning
+continuation state. This is fixture-backed CLI/writer/reader proof, not a
+live-model result.
+
+TypeSafe also retains its canonical data part, including selected values,
+per-field distributions and classification method; opaque box edges retain their
+original numeric kinds. Both modes matched two accepted messages and one
+refusal from the conserved original TypeSafe Source receipt, without rerunning
+that oracle or counting these as additional independent Source cases.
+
+`LM.callResult(arena, request)` executes once and retains the actual canonical
+`Completion.response` object published by the engine. `LM.model_type` selects the client output
+mode independently of the HTTP wire dialect. Physical groups finalize before
+cache publication; invalid combined costs cannot publish through a fresh cache
+or an enclosing cache over a preexisting legacy entry. A cache hit has empty
+public usage but retains the original SDK usage and cost. Candidate groups combine their
+responses, outputs, costs and provenance in order. Custom engines using this API
+must supply their genuine canonical response object; joined text or an
+unpublished parser message is not silently reconstructed by the LM.
+
+Both modes compared the full results and dumps of **36 native and nine cached**
+rows from the conserved 57-case Source receipt through this public LM/cache path.
+These overlap the standalone corpus, not 45 new independent Source observations.
+The cached rows inject the receipt's prepriced cost/provenance at the engine
+boundary; actual catalogue pricing is exercised separately below. Public
+global/client/module response history and arbitrary Python class/path identity
+remain unfinished boundaries. The conserved Source history probe exposed a
+mutable-payload alias gap in the public LM path; graph-backed data/provider
+payloads now preserve that internal alias through actual `LM.callResult`.
+A new native consumer in Debug and ReleaseSafe matched two assertions from that
+saved Source mutation row: appending 100 values produced 101 items through both
+references, after the engine's source arena was destroyed. An independently
+owned result clone remained isolated. A permanent actual-LM/cache regression
+also covers probability/provider aliases, cache destruction, independent empty
+containers and the unchanged output-text snapshot; the allocation-failure
+completion regression now includes shared data/provider roots.
+
+Stable response objects now preserve identity through direct `CallResult.native`
+and `combine`, including repeated references. Native consumers in Debug and
+ReleaseSafe destroyed constructor storage, original response handles and input
+results before checking retained objects; an independent clone then outlived
+those objects while preserving cross-response payload aliases. Actual JSON
+serialization emitted the canonical response, not allocator/refcount internals.
+Permanent regressions cover these transitions and exhaustive clone-allocation
+failure cleanup. Both modes passed 609 tests; the same conserved 68 HTTP cases
+and four actual CLI artifacts were re-compared after this object cutover, not
+counted as new Source observations.
+
+OpenAI, TypeSafe, scripted and replay engines publish their canonical response
+before returning. `lm.publishResponse` explicitly distinguishes borrowed parser
+artifacts from owning clones: it snapshots borrowed artifacts without freeing
+static provider leaves, while releasing replaced owning fields. Canonical
+metadata, scores and provider data then belong to the class; the completion
+retains borrowed views of those fields. Parser-only calls can still expose an
+unpublished message without inventing a configured model.
+Recording reads the published message, cache clones own independent response
+objects, and native cache deserialization restores canonical objects from their
+recorded fields. The LM no longer fabricates a response during finalization.
+
+An earlier native-only Debug/ReleaseSafe consumer checked the engine object's
+identity through direct calls and cache misses, cache persistence without another
+engine call, shared payload mutation and independent clone lifetime. Its repeated
+cached-response identity check was not Source equivalence and has since been
+replaced by the canonical reconstruction behavior described below.
+Its general-purpose allocator reported no ownership leaks. The actual
+HTTP path re-compared the same conserved 68 Source cases per mode with no
+mismatches; all request schemas validated and serving threads joined. Four actual
+CLI runs and their production replay/typed-CoT readers also passed. These remain
+localhost transport and native lifetime proofs, not new Source observations or
+authenticated inference.
+
+`sdk_response.Request` now provides a stable, retained SDK request object,
+separate from `lm.Request`'s execution-adapter view. Its constructor owns message,
+system and tool headers while retaining owned JSON payload aliases across message
+data and configuration. An independent clone copies that whole graph together.
+Typed generation configuration includes reasoning budgets, cache intents, tool
+selection, exact integer knobs and opaque response schemas; contradictory options,
+duplicate tool names and selections outside the request's tools are refused.
+
+Actual Debug/ReleaseSafe consumers verified retained request identity, constructor
+payload sharing, an independent clone surviving the originals, exact wide negative
+seeds, budget grading, tool-schema preservation and serialization round trips with
+no allocator leaks. The request projection also matched the corresponding field
+of the conserved Source history case in both modes; this is **not** a match of
+that complete history case. Three permanent regressions cover ownership,
+contradictory options and exhaustive construction/clone allocation-failure cleanup.
+The native gates passed 627 tests in each mode, all 687 replay requests and the
+actual RAG, bootstrap and parallel examples.
+
+`Request.snapshot(allocator, io, maximum_file_bytes)` freezes local media before
+cache lookup or engine execution. With no paths it retains the **same** request;
+otherwise it returns a new request with path-backed media replaced by base64,
+including system parts and nested tool results. Existing owned JSON payloads
+remain shared. Each call reads current file bytes, while a completed snapshot
+remains unchanged if the file is overwritten or removed. The explicit per-file
+byte cap is a native safety bound, not Source's unbounded `read_bytes` behavior.
+Actual Debug/ReleaseSafe executables verified these transitions, retained payloads
+after the original request and caller references were freed, independent cloning,
+and oversized/missing/empty-file refusal with clean allocator shutdown. Three
+permanent regressions also cover inclusive byte limits, every media kind and
+exhaustive allocation-failure cleanup after partial replacement. These are native
+controls informed by static Source inspection, not additional Source observations.
+
+`Request.toPayload(allocator)` returns an owning canonical request record, using
+the same record projection as SDK responses. Each invocation creates fresh typed
+dictionary/list headers but retains the exact opaque roots stored in message
+data, function parameters, builtin configuration, response schemas and extensions.
+Mutations through those shared payloads remain visible. Call `record.free()` when
+finished; the record can outlive the original request and input handles, subject
+to the payload backing-allocator lifetime contract above. This is not a deep copy.
+
+One actual Source observation checks all five payload paths, fresh typed headers,
+shared nested mutation and the complete serialized record. Native Debug and
+ReleaseSafe consumers match that complete observation with clean allocator
+shutdown. A permanent exhaustive allocation-failure regression also releases both
+the request and input before mutating the retained record.
+
+`Request.fromPayload(allocator, record)` reconstructs an owning, validated SDK
+request from a canonical graph record. Each import owns fresh typed headers but
+retains the record's opaque payload roots, including aliases across messages,
+tools and configuration and between separate imports of the same owning record.
+Explicitly borrowed records are instead snapshotted once per import: aliases
+within each import survive, but separate imports do not share mutable storage.
+Release the returned request with `request.release()`; the payload backing
+allocator must still outlive all retained references.
+
+A separate actual Source `request_from_dict` observation checks all five opaque
+paths, fresh headers, aliases across two imports, nested mutation and the complete
+re-serialized record. Actual Debug and ReleaseSafe consumers match the whole
+observation with clean allocator shutdown. An exhaustive allocation-failure
+regression frees the input record and parse arena before mutating imported
+requests, and checks both retained owning records and isolated borrowed snapshots.
+These record operations do not by themselves integrate canonical requests into
+public LM calls or history. The TypeSafe and OpenAI physical SDK boundaries are
+described below; the public LM/history input-side cutover is still separate.
+
+Tool-call inputs now use the same `sdk_response.JsonValue` graph as data and
+provider payloads. Construct them with an owned payload or an explicit borrowed
+graph; the SDK reader requires the input object rather than inventing a default.
+Construction retains owned input identity, including sharing between multiple
+tool calls, data parts and provider data. Independent clones preserve that sharing
+within the clone without sharing mutable nodes with the original.
+An actual native executable first reproduced lost tool-input sharing, then passed
+in Debug and ReleaseSafe after the migration. It exercised mutation, independent
+cloning, original-input destruction, the actual `LM.callResult` response identity
+and Python-compatible ASCII tool-argument serialization, with clean allocator
+shutdown. Two permanent regressions cover container growth, escaped clone lifetime
+and exhaustive allocation-failure cleanup through public result construction.
+Both modes also re-compared the same 36 conserved HTTP cases with no mismatches;
+four current live-CLI localhost runs passed across Chat/Responses and plain/native
+reasoning, with serving threads joined. These are not new Source observations or
+authenticated inference.
+Continuation data now uses that same owned `JsonValue` graph. Owned constructor
+inputs remain shared across message/part continuations, tool inputs, data parts
+and provider data; independent clones preserve sharing within the copy.
+Standalone continuation cloning also uses one shared graph memo. Missing data
+in SDK and metadata readers creates a fresh object per continuation; explicit
+null or non-object data is refused at those decoding boundaries.
+Canonical JSON equality compares graph nodes directly with a bounded, nonrecursive
+stack rather than allocating flat projections. It keeps array order, ignores
+object insertion order and distinguishes boolean/integer/float kinds.
+An actual executable reproduced a lost continuation mutation before the repair.
+The repaired Debug/ReleaseSafe consumers passed eight lifecycle controls, including
+cache reuse, escaped result lifetime, shared list growth and independent defaults,
+with clean allocator shutdown. Three additional permanent regressions cover
+standalone clone lifetime, reader/allocation-failure cleanup and bounded equality.
+Both modes re-compared the same 36 conserved HTTP cases without mismatches.
+Four current localhost CLI runs passed; the existing transcript reader and typed
+CoT replay also consumed all four artifacts in both modes, comparing canonical
+message, provider-data and metadata values. These are native controls and frozen
+Source comparisons, not new Source observations or authenticated inference.
+Adaptation `asked` and `applied` now use `sdk_response.PayloadValue`, the same
+graph/owner representation without the JSON-field restriction.
+`PayloadValue.fromPythonValue` imports supported native Python values without
+projecting custom objects to JSON. Owned inputs retain shared containers across
+adaptations, data and provider fields; one clone memo preserves those aliases
+inside an independent copy. Tuple, bytes, mutable bytearray, Decimal, nonfinite
+float and cyclic-container payloads remain genuine graph values. Decoding these
+two fields uses the full Python protocol; JSON-only SDK fields remain strict.
+Cyclic payloads can be cloned but refuse flat wire projection. Neither this work
+nor the earlier controls establishes full Python class or garbage-collection
+equivalence.
+Four newly observed Source adaptation scenarios matched the native executable in
+Debug and ReleaseSafe: shared mutable data, genuine non-JSON kinds, cyclic copies
+and absent defaults. The executable also exercised actual LM/cache calls and
+escaped ownership. Its strict-data negative control exposed a missing nested
+constructor check; `Response.fromFields` now validates owned part/continuation
+headers and adaptation records before publication. Non-JSON data/provider inputs
+are refused while those same values remain valid adaptation payloads.
+Three new permanent regressions cover custom/mutable clones, owning readers with
+exhaustive allocation failures, and cyclic copies versus projection refusal;
+the existing public LM/cache alias regression also covers adaptation sharing.
+The final native gates passed 627 tests per mode and all 687 replay requests.
+Both modes re-compared the conserved 36-case HTTP subset without mismatches.
+Four fresh localhost CLI runs and both-mode artifact-reader/typed replay passed.
+Those HTTP/CLI runs are not new Source observations or authenticated inference.
+
+Five new actual Source output scenarios matched a native executable in Debug
+and ReleaseSafe: native/combined row identity and nested mutation, independent
+deepcopy with repeated-row identity, mixed mutable bytearray promotion, cycles,
+and independent default lists. The native before-proof failed on a lost combined
+row mutation. Additional native controls cover retained lists after result
+destruction, a 10,000-owner dependency chain, and actual LM/cache calls with
+caller mutation and escaped output ownership. Those controls are not additional
+Source observations. Permanent regressions cover shallow-row lifetime, cyclic
+copies, exhaustive allocation failures, and iterative dependency release.
+At the shared SDK/output memo checkpoint, native gates passed 627 tests per mode
+and all 687 replay requests. Both modes re-compared the conserved 57-result
+corpus with 2,184 exercised allocation-failure sites. The preceding output-list
+checkpoint also re-compared the conserved 36-case HTTP subset without mismatches;
+four localhost CLI runs and both-mode artifact replay passed there.
+These are overlapping native re-comparisons, not new Source executions or
+authenticated inference. Arbitrary class projection is outside this finite
+output-list proof; usage/cost metadata is covered separately below.
+
+Owning `CallResult.clone` now uses one graph memo across its SDK responses and
+public outputs, rather than independently copying those two views. A dictionary
+referenced by both an SDK provider field and repeated output rows remains one
+independent dictionary in the copy. One additional actual Source deepcopy
+scenario observed this cross-field alias and mutations in both directions.
+The unchanged native driver first failed with `LostSDKOutputAlias`, then passed
+in Debug and ReleaseSafe, including after the original owners were destroyed.
+Existing lifetime and exhaustive allocation-failure regressions also exercise
+that shared memo.
+
+Public usage, cost, and cost-details fields now retain mutable Python-capable
+graphs too. Three frozen actual Source metadata scenarios matched complete
+native observation rows in Debug and ReleaseSafe: independent default
+dictionaries, shallow combined candidates with repeated aliases and independent
+usage sums, and one deepcopy spanning repeated output rows, usage, details and a
+genuine mutable bytearray cost. The native before-proof failed on a lost
+candidate metadata mutation. A separate native control retained metadata after
+the source result and SDK response were destroyed. Existing SDK lifetime
+regressions now cover SDK/public-metadata sharing; one additional regression
+covers whole-result mutable-class copies and exhaustive allocation failures.
+A native loader control caught independent imports splitting a shared bytearray;
+one common import memo fixed that failure without changing the driver.
+Both modes re-compared all 57 conserved result rows with 1,537 exercised
+allocation-failure sites, the five conserved output rows, and the unchanged
+cross-SDK/output alias driver. These are not additional Source executions.
+That checkpoint passed 628 tests and all 687 replay requests per mode; the
+actual RAG, bootstrap and parallel examples also ran successfully.
+
+A subsequent actual Source SDK Adaptation/deepcopy probe observed repeated
+tuples, arbitrary-key dictionaries, sets and frozensets. All four complete rows
+matched native Debug and ReleaseSafe after the unchanged native driver first
+failed on a lost imported tuple alias. Genuine runtime containers now use a
+memoized graph importer. At that checkpoint the flat loader also shared its
+import context across fields. A native loader control retained a shared tuple
+across outputs, cost and details after the input storage was destroyed. These imports are owning snapshots, not
+preservation of the original caller's Python objects. Expanded SDK allocation
+fault coverage checks nested aliases, distinct equal containers and independent
+mutable leaves; result loading has its own cross-field lifetime/fault regression.
+Graph cloning looks up existing containers before reserving memo capacity, so
+alias hits do not attempt unnecessary allocations.
+The resulting Debug and ReleaseSafe gates each passed 629 tests, all 38 build
+steps and all 687 replay requests; actual RAG, bootstrap and parallel examples
+also ran successfully.
+
+The canonical graph-record cutover then compared **seven** actual Source rows
+in both native modes: original cost/details aliases, independently copied
+output dictionaries/lists, tuple-to-list dump projections, non-list outputs,
+BaseModel iteration and refusals, plus SDK owner escape and Code field
+iteration. The native before-proof failed when mutation of the original cost
+was invisible after loading. The owner-escape consumer now releases the
+original result, response and input owners, loads the surviving record, releases
+that record, and observes shared cost/tool-input and adaptation/bytearray
+mutations through the loaded result. Permanent regressions include exhaustive
+allocation-failure coverage for SDK serde ownership.
+Both modes again matched all **57** frozen result rows, now exercising **1,686**
+allocation-failure sites per mode with the new ownership paths. This count is
+not additive to earlier sweeps. At that checkpoint, Debug and ReleaseSafe gates
+each passed **632 tests**, all **38 build steps**, and all **687 replay requests**;
+actual RAG, bootstrap and parallel examples also ran successfully.
+
+Public `LM.callResult` calls through `CachedLM` now store the owning canonical record itself,
+rather than deep-copying SDK payloads during insertion and reconstructing outputs
+from them on a hit. Like Source's memory cache, lookup deep-copies the whole record
+once, then loads each response occurrence separately. A repeated engine response
+remains the same object on a miss but becomes distinct SDK headers on a hit;
+shared opaque payloads remain shared within the hit's independent copy.
+Mutations made to the original SDK payload between insertion and lookup remain
+visible in that copy, while the already-dumped convenience outputs stay at their
+insertion snapshot. Public usage is empty without clearing SDK usage.
+
+A new actual Source cached-group observation exposed both the former premature
+payload copy and the incorrect repeated SDK-header identity. The unchanged native
+consumer failed before repair, then matched the complete observation in Debug and
+ReleaseSafe with clean allocator shutdown. Both modes also re-compared the seven
+canonical rows and unchanged 57-row corpus above; those are overlapping
+re-comparisons, not additional Source executions. One new permanent regression
+covers mutation timing, shared payloads with separate SDK headers, independent
+successive hits, execution-arena teardown for private projected values, empty
+public usage, JSON persistence and exhaustive allocation-failure cleanup.
+Immutable projected strings/keys are now owned directly, so cache snapshots need
+not retain their former execution arena merely for those bytes.
+
+Native cache persistence now stores `{completions, record}` per key. Completion
+records preserve the existing native SDK codecs, including nonfinite score tags;
+the optional public record stores the output and metadata snapshots. Loading
+reconstitutes SDK records from those completion artifacts. The old array-only
+native cache shape is no longer accepted. This remains DSZig's JSON persistence,
+not DSPy's disk-cache format, arbitrary Python-value persistence or preservation
+of graph aliases through JSON. Native text-only calls without public results
+continue to cache their native completion carriers.
+
+Current Debug and ReleaseSafe qualification each passed **637 tests** and all
+**38 build steps**; both actual replay CLI runs consumed all **687 requests**.
+The eight new Source public-call observations also capture request/response
+identity, candidate seeds, local-media snapshots, refusal ordering and
+global/client/module history controls. They are research evidence for the next
+integration step, not eight implemented native parity cases.
+
+This does **not** implement response history. Passing the actual SDK Request
+through public calls and the remaining engines, binding returned lists into
+actual history entries, and module/global/client history ownership still require
+integration. TypeSafe and OpenAI now accept canonical requests at their physical
+boundaries; that alone is not the public LM/history cutover.
+Arbitrary third-party Python models and mutable fields outside those listed
+above—including constructor aliasing between owned and borrowed views—remain
+unfinished. Canonical records preserve owned graph identities; explicitly
+borrowed views and flat input still cross an owning snapshot boundary.
+These finite comparisons do not establish full Python class/garbage-collection
+equivalence or authenticated inference.
+
+### Advisory model pricing
+
+`model_prices.Catalogue.bundled(startup_arena)` loads the exact DSPy 3.5 bundled
+LiteLLM 1.108.3 catalogue into caller-owned startup storage. It does not fetch
+prices or read environment variables. The unmodified snapshot and its upstream
+licence ship together. `Catalogue.init(arena, json, source_info)` accepts an
+explicitly obtained catalogue; immutable lookups allocate no memory and keep
+namespace order, provider-matched bare entries and ordered aliases distinct.
+Capability-only rules affect whether a model is known, but never supply prices
+or inherit another entry's rates.
+
+`lm_cost.estimate(arena, &catalogue, &facts)` calculates advisory USD cost from
+validated canonical `lm.Usage`, actual response model/provider data, the pricing
+provider and any declared metadata namespaces. It preserves reported zero and
+other provider-reported JSON amounts; unknown pricing is null, not zero.
+Estimates separate seven token dimensions using exact integer subtraction,
+per-dimension/tier strict long-context thresholds and Source's float operation
+order. Served tiers override requested tiers. The direct facts API also carries
+hosted-tool, generated-media and long-cache-retention facts. Responses
+`output_image`/`output_audio` parts now supply the generated-media fact after
+the SDK's truthy payload fallback and shared base64-shape validation. Malformed
+payloads fail generation even if the response reports zero cost. Valid media
+counts toward synthetic tool IDs and does not fabricate an empty text part.
+The fact survives cloning, recording/replay and cache persistence; this is not
+a full generated-media SDK object API or general multimodal transport support.
+
+Enable pricing on the LM handle with **dedicated advisory storage**, disjoint
+from generation and recording arenas:
+
+```zig
+const prices = try dszig.model_prices.Catalogue.bundled(startup_arena);
+var priced_lm = model.lm();
+priced_lm.pricing = .{
+    .catalogue = &prices,
+    .arena = billing_arena,
+    .provider = "openai", // Explicit billing provider, not inferred from HTTP protocol.
+};
+var recording: dszig.lm.RecordingLM = .{
+    .inner = priced_lm,
+    .arena = recording_arena,
+};
+const measured_lm = recording.lm();
+```
+
+Each physical completion is priced once, before recording or cache publication.
+The configured model comes from the actual engine getter, and response facts
+come from the actual completion. Engine headers may be immutable: execution owns
+its headers rather than writing through an engine's const slice. Recording
+clones the already-known `cost` and `details` into `calls.items[i].billing`;
+it does not run another estimator. Cache persistence and replay retain those
+facts. A cache hit creates neither another physical recording nor another bill.
+Missing configured identity or exhausted advisory storage leaves billing absent
+without losing generation or required recording. Known billing, like other
+required response evidence, still requires ordinary storage when cloned.
+
+A native Debug/ReleaseSafe executable exercised single and grouped public
+results, immutable engine headers, destruction of original generation storage,
+cache hits after pricing storage exhaustion, dump/load, recorded replay and a
+fresh successful generation with unavailable advisory storage. It checked the
+previously Source-observed exact cost bits, preserved SDK usage and empty public
+usage on hits, with no cache-owner leaks. This does not implement Python's
+global/client/module response history or its mutable alias/lifetime semantics.
+
+Independent pinned Source pricing observations covered **4,420 cases**:
+3,469 estimates, 944 unknowns and seven reported bills. Debug and ReleaseSafe
+matched all **8,840 cost/provenance observations**, including every non-reserved
+bundled catalogue entry, namespace/alias precedence, zero/reporting, tier and
+threshold boundaries, exact wide counts and float-conversion overflow.
+Separate probes matched 55 model-rule truthiness/cost cases (165 observations),
+660 actual regular-expression matches, and three oversized threshold captures
+(six observations). The latter first exposed six native mismatches, then
+matched after preserving CPython's default 4,300-digit conversion guard.
+These probes overlap semantically; their counts are not a disjoint total.
+
+Actual typed Predict → cache → RecordingLM execution preserved the bill across
+a cache hit, and zero dedicated pricing capacity preserved the completed
+generation. Isolated cost/provenance observation controls produced 3,476/4,420
+real mismatches respectively in both modes. Ordinary Source-backed pricing
+used 2,552 caller-arena bytes before fixed-stack rate keys and borrowed ASCII
+thresholds, then 1,800 bytes with identical cost bits in both modes. That is one
+allocation probe, not whole-runtime static-memory or throughput evidence.
+A separate actual Responses parsing/pricing probe covered 21 new cases
+(17 accepted responses and four media-validation refusals). Before repair it
+exposed 37 native mismatches; afterward Debug and ReleaseSafe matched the
+Source acceptance, text, tool IDs and cost/provenance, with media facts retained
+through cloning, replay and cache dump/load. An earlier probe failed before
+emitting its accumulated successful rows; its complete failure receipt is
+retained, those lost observations are not counted, and it was not rerun.
+At that media checkpoint, native gates passed **592/592 tests and 38/38 build
+steps per mode**, actual examples and all **687 replay requests**; the later
+token-logprob extension is documented separately above.
+
+Only the bundled capability-pattern texts have bounded native matchers;
+other patterns are explicitly refused, not interpreted by a general regex
+engine. Remote refresh/shrink validation and full merged capability dictionaries
+are not provided. Native catalogue JSON also refuses NaN, Infinity and BOM
+accepted by Python's loader. Prices are pinned advisory metadata, not a promise
+of current provider billing.
+
+### LM accounting and per-call Predictions
+
+Set `Context.track_usage = .{ .storage = &storage, .limits = limits }` to enable
+automatic accounting on `dszig.call(&program, ctx, input)`, `Predict.call`,
+`ChainOfThought.call` or `Retrieve.call`. Retrieval's canonical result has a
+`passages` field; its low-level `forward` still returns the passage slice.
+A reflected field struct becomes a native
+`Prediction(Fields)`; an existing Prediction retains its instance identity.
+An optional keeps null, a tuple transforms only its first element, and other
+outputs remain bare. Read or mutate output fields through `fields()`, and use
+`getLMUsage()` / `setLMUsage()` for that instance's optional usage graph.
+Copying a Prediction handle shares its state; `clone(arena)` owns independent
+fields, completions and usage while preserving shared genuine custom objects
+across those projections.
+
+With tracking enabled and no active tracker, a canonical Module call opens
+one parentless scope, finishes it on success or failure, and attaches an owning
+totals snapshot only after success. An empty field struct receives no usage.
+Totals are still computed for unattachable outputs, so invalid merges and
+resource failures are not hidden. Any active `Context.usage_tracker`
+suppresses automatic scopes and attachment, regardless of how the caller
+configured it. This matches Source for both context-local and globally
+configured trackers; only explicit child `UsageScope`s roll up to a parent.
+Direct typed `forward` remains a low-level operation without a per-instance
+usage attachment.
+
+Prediction construction without completions has `completions() == null`.
+Predict's canonical call retains its parsed completion rows separately from
+the first output header. Evaluation preserves completion rows when the program
+provides `forwardPrediction`; a plain typed `forward` has no such metadata.
+The prepared record's first header is separate from its completion headers,
+and an owning clone retains both across scratch reset and prepared-state reuse.
+This is a typed row view, **not** Python's mutable column-based Completions
+class: dynamic extra columns, ragged column lists, empty-row indexing and
+Python shallow-copy behavior are not implemented. Native trace-step field
+projections do not carry per-step usage.
+
+At the LM boundary, usage is keyed by the configured model, not the response's
+wire-model name. Successful uncached public fanout combines candidate usage
+before adding one entry to the active tracker; a failed group accounts each
+retained successful candidate separately. The floating-point order matters.
+Cache hits retain SDK metadata but perform no physical accounting.
+`CachedLM` stores the whole public candidate group before successful final
+accounting: a tracker refusal can therefore leave cached responses, and a
+later hit returns without another charge. Physical recording/replay still
+uses the actual tagged `n=1` requests. Transient tracker, accounting-error,
+recording-chain and execution pointers never reach engines or persisted
+request records. A direct `LM.completeResponses` caller supplies its tracker
+through `Request.usage_tracker`.
+
+`Parallel.Program(P)` uses the canonical call result; choose the pool type
+with `parallel.ProgramResult(P)`. The utility itself creates no scope. Each
+task/attempt deep-forks an active tracker, including its seeded entries,
+without merging charges back into the original. `parallel.Evaluator` follows
+the same policy. Forks have stable, distinct headers, inherited capacities and
+independent mutable entry graphs, preserving aliases within each snapshot.
+They share Storage's lifetime and allocator lock, and remain allocated until
+that storage is reset. Without an active tracker, each tracking-enabled
+Module task gets its own automatic scope. An enclosing automatically scoped
+Module can consequently receive empty totals even while workers incur usage.
+SIMBA/GEPA `Rollouts.context` also forks per task and can fail when snapshot
+storage is exhausted. Raw Task callbacks receive no Context and do not
+implicitly fork one. Automatic-scope tracker headers, like forks, remain
+address-stable until their Storage is reset.
+
+Current parent-owned Debug and ReleaseSafe gates each passed **572/572 tests
+and 38/38 steps**, including actual RAG, bootstrap and joined Parallel
+examples; deterministic replay consumed all **687 requests, eight adapter
+cases and nine pipelines**. Both native modes consumed the frozen, disjoint
+15-row LM/cache and 19-row Module corpora: 2,602 and 3,647 Source-backed
+comparisons respectively, with zero mismatches. Their 30/22 native invariants
+and 15 LM Source-integrity checks are separate, not additional Source matches.
+The slices leave 630/668 observations unobserved, including client-only
+options, public Python history fields, exception representations and
+thread-local override-map details.
+
+Both native modes also consumed the separate **53-case, 212-request**
+threaded Source corpus with zero mismatches: **41,453 Source-backed checks**
+and 212 separately counted native invariants per mode. This covers the
+tracking/active-tracker/explicit-child matrix, direct and enclosing Module
+calls, evaluation metrics and two deliberate engine failures. Actual tracker
+alias relations include automatic scopes and retained per-task copies.
+Thread checks compare task-local affinity, caller separation, worker count
+and the barrier-forced first overlap; later worker assignments and request
+arrival order are scheduler-dependent and are not compared. Python exception
+representations and Source's `shutdown(wait=False)` followed by harness joins
+differ from native error names and the pool's joined `deinit`. Seven
+independently corrupted threaded outputs per mode were all refused.
+The eight frozen Prediction-edge Source cases remain a separate, unconsumed
+corpus; the row view above must not be reported as full column-class parity.
+These are finite proofs, not full DSPy, authenticated inference, current CI
+or whole-runtime static-memory qualification.
 
 The Responses parser follows the observed lm15 behavior: root/item statuses
 and message roles do not discard returned text, `output_text` and `text`
@@ -601,6 +1415,44 @@ establish full DSPy parity.
   and dictionaries. Class identity, not an annotation alone, controls this
   distinction.
 
+`boxed.custom.modelDump(arena)` is the separate default **Python-mode**
+BaseModel view. It uses an explicit class serializer rather than guessing from
+raw fields or reusing JSON mode: Reasoning/Code become strings, Citation omits
+null fields, evidence unwraps nested probability models, and unvalidated
+BoundingBox nonfinite fields remain floats. Nested containers are fresh
+snapshots; bytes, Enum, Decimal and other nonmodel leaves retain their native
+identities. The result borrows leaf storage from its source; use
+`value.cloneValue` for independent ownership. Ordinary objects, builtin boxes
+and stream namespaces are not implicitly BaseModels.
+
+Projection uses a fixed 64-frame stack, counts model serializers toward its
+depth limit, and refuses after 1,048,576 work steps. Storage comes only from the
+supplied arena, which can be backed by startup-provisioned memory. These native
+limits are not Python's serialization limits. An independent actual-source
+probe matched five complete outputs, including a nested tuple/list snapshot,
+invalid-UTF8 bytes, genuine Decimal/Enum values and an unvalidated NaN box. This is
+not by itself a proof of the automatic Module/Prediction integration above.
+
+`json_graph` also retains genuine scalar boxes, tuples, sets, frozen sets and
+arbitrary-key Python dictionaries without JSON coercion. Its pointer containers
+preserve mutable aliases across appends; memoized `clone` retains shared/cyclic
+containers while copying custom boxes and immutable dictionary keys into the
+destination arena. `fromValue` snapshots runtime container headers but borrows
+scalar leaves/keys: it is not a lease or a way to make later runtime-header
+mutations visible. Build and mutate graph containers directly for that behavior.
+`toValue` copies strings, borrows custom leaves/non-string keys, and refuses
+cycles or unhashable keys. Both conversion directions use explicit fixed stacks,
+at most 1,000 nested containers and 1,048,576 visited values; these are native
+resource bounds, not Python limits. Cloning remains iterative and preserves
+deeper graphs. Graphs are externally synchronized, arena-lifetime objects, not
+garbage-collected Python objects; custom clone protocols must support that arena
+lifetime. Low-level set/dictionary mutation must retain unique, hashable members
+or keys. Set materialization preserves the observed iteration order and hash
+seed rather than reinserting in iteration order, which can change collision
+layout. The startup-backed roundtrip consumer additionally clones and restores
+the five frozen Python-mode outputs described above; this is overlapping
+evidence, not five additional independent Source cases.
+
 #### File constructors
 
 `File` has three nullable UTF-8 fields: `file_data`, `file_id` and `filename`.
@@ -682,8 +1534,13 @@ Canonical documents require a media type and exactly one of `data`, `url`,
 The native OpenAI Responses transport translates supported non-assistant
 documents to `input_file` blocks using a file ID, URL, inline base64 data or a
 local path read at request construction. Assistant documents are rejected.
-Chat Completions rejects document content before HTTP, following the pinned
-source preflight rather than inventing an unsupported route. These implemented
+Chat Completions accepts canonical text parts: a lone part stays a string,
+multiple user parts stay ordered text blocks, assistant parts join with
+newlines, and tool-result text joins with newlines. Visible reasoning retains the
+default thinking-before-text policy. This generation policy is distinct from
+the SDK training/display projection below. Chat Completions still rejects
+document content before HTTP, following the pinned source preflight rather
+than inventing an unsupported route. These implemented
 paths do not establish full provider/media parity or a completed post-cutover
 provider rerun.
 
@@ -750,12 +1607,15 @@ unchanged. SIMBA and GEPA retain predictions, so those paths still materialize
 separate outer dictionaries rather than aliasing reusable storage.
 
 For explicit startup preparation, initialize `value.RecordStorage(field_count)`
-**in place and do not move it**, and reserve a stable `P.Output` slot. Call
-`optimize.runProgramInto(P, ctx, program, example, &output, &storage.record)`.
-The record must have capacity for every declared output field. Its backing
-must not alias program inputs or outputs. Both the typed output slot and its
-borrowed children must remain alive until the prediction is discarded or
-reused. Evaluation and bootstrap reserve their typed slots before their loops.
+**in place and do not move it**, and reserve a stable `P.Output` slot.
+Adopt its record once into a stable
+`optimize.RecordPrediction.State{ .output = storage.record }`, then call
+`optimize.runProgramInto(P, ctx, program, example, &output, &state)`.
+Use `state.output`, not the original record header, after adoption. The record
+must have capacity for every declared output field; its backing must not alias
+program inputs or outputs. The state, typed output slot and borrowed children
+must remain alive and unmoved until the prediction is discarded or reused.
+Evaluation and bootstrap reserve these slots before their loops.
 
 Prepared output records also borrow runtime boxes retained by scalar wrappers
 (including Decimal) and raw `Value` fields. Releasing those borrowed handles
@@ -772,14 +1632,18 @@ slot. Cloning still invokes the original class's owning clone protocol.
 
 Reuse invalidates the previous prediction. Any input, program or conversion
 failure leaves the prepared record empty, including a conversion failure
-after earlier fields were written. Metrics keep the ordinary `Record`
-interface, including mutation of existing values through `getPtr`.
+after earlier fields were written. The returned `RecordPrediction` borrows
+that state and exposes its ordinary record through `fields()`, including
+mutation of existing values through `getPtr`. Its optional `getLMUsage()`
+belongs to that invocation. Copies of the handle observe the next reuse;
+`prediction.clone(arena)` retains independent fields and usage across both
+state reuse and scratch reset.
 
-`optimize.runProgram` remains the materialization API for separately retained
-outer dictionaries; both execution paths share input decoding and field codecs.
-Use `value.cloneRecord` with an appropriate owning lifetime when retaining
-borrowed model or nested values beyond their source lifetime; copying only
-the outer dictionary does not extend a borrowed model's lifetime.
+`optimize.runProgram` materializes a separately retained `RecordPrediction`;
+both execution paths share input decoding and field codecs. Copying only a
+record header does not extend a borrowed model's lifetime. Use the
+Prediction's owning clone when retaining the whole result, or
+`value.cloneRecord` when deliberately retaining only its field projection.
 Nested container conversions, retained predictions, program execution and
 metrics can still allocate.
 This is not a whole-runtime allocator-free proof.
@@ -792,8 +1656,8 @@ when scoring fails, with a zero score. GEPA uses its configured failure score,
 with an empty prediction when trace capture is disabled versus no prediction
 or trajectory when capture is enabled. Reflective feedback failures propagate.
 Allocation failures remain fatal. `optimize.Metric` receives a nullable
-`?*const Record` prediction: SIMBA calls it with null after a program failure,
-rather than skipping scoring or supplying an empty record. A callback may
+`?*const optimize.RecordPrediction`: SIMBA calls it with null after a program
+failure, rather than skipping scoring or supplying an empty record. A callback may
 assign its own fallback score; callbacks that require an actual prediction
 must explicitly reject null.
 
@@ -1187,28 +2051,296 @@ locked owning snapshots before model decoding. Native SystemOne validates all
 BoundingBoxes first and records boxes before decisions; invalid geometry
 records neither.
 
+#### Canonical OpenAI physical requests
+
+`lm.OpenAI.requestBody(arena, request)` accepts an owning `sdk.Request` and
+returns wire bytes and adaptation records.
+`completeRequest(arena, request)` executes that same request and returns an
+owning `sdk.Response`; release it when finished. The SDK request's model and
+configuration take precedence over the provider's native prediction defaults.
+The native prediction entry point constructs a canonical request before entering
+the same codec and HTTP transport.
+
+Wire preparation selects fields before refreshing credentials, but retains
+references to the selected nested schemas, tool parameters and extension values.
+Serialization follows credential refresh: in-place mutations reach the wire,
+while replacing a selected top-level entry does not reselect it. Parsing reads
+the same current request again. This ordering is observable when credential
+callbacks mutate JSON payloads.
+
+Canonical Chat responses refuse multiple returned choices instead of silently
+discarding all but the first. An empty choice list becomes an empty text part;
+unknown content/tool blocks and finish reasons remain in `_lm15_unmapped`
+provider metadata. The explicit all-choice `parseCompletions` helper remains
+available separately.
+
+Responses client-side stops use an SSE consumer, not buffered text truncation.
+The `completeRequest` path authenticates and serializes the discarded nonstreaming
+request before preparing the streaming request. A matched stop closes the unread
+connection without waiting for terminal usage; absent usage remains unknown.
+Text across part indexes forms one stop stream, while materialized parts retain
+canonical index ordering. Final item copies complete fragments without repeating
+them, and conflicting copies refuse rather than choosing a version. Complete
+streams retain terminal usage and provider data; incomplete transport streams
+without a terminal event refuse. The existing response-byte limit also bounds
+SSE consumption and synthesized reasoning-summary separators.
+
+Frozen Source comparisons cover 116 whole request-body/refusal cases, actual
+HTTP execution, schema mutation and replacement clocks, canonical Chat choice
+boundaries, and Responses stop timing, final copies, scores, generated media,
+continuations and large part indexes. These are finite localhost protocol
+proofs, not authenticated inference.
+
+`OpenAI.streamRequest(backing, request, sink)` delivers typed SSE events for
+Responses and Chat Completions synchronously through `OpenAI.StreamSink`.
+The callback may return
+`.stop` to close the connection without another event. Event data is borrowed
+only for that invocation; copy anything that must outlive it. Delta part
+indexes are decimal strings so large provider indexes remain exact; a null
+index attaches continuation state to the message rather than a part.
+Provider error frames are events; an opening, transport, or decoding failure
+returns a Zig error. `.exhausted` means delivery finished, not necessarily
+that a terminal event arrived. Bare terminators carry neither usage nor a
+finish reason. Responses handles stops locally and emits one `.end` with
+`.stop` and no usage when cut; Chat forwards stop sequences to the server.
+Chat keeps the latest usage-bearing frame as end provider data, ahead of
+finish-only frames. Required vLLM candidate scoring is refused before
+credentials are fetched; `if_available` streams an unmeasured pick.
+
+This direct provider call prepares a streaming request without the discarded
+nonstreaming preflight used by `completeRequest`. It does not assemble a
+response, cache results, or publish history. It does not add streaming to
+other providers or the general LM interface. Localhost comparisons in Debug
+and ReleaseSafe matched eight frozen DSPy Responses and ten Chat event
+sequences, exact request bodies, paths, and authorization, plus one Chat
+pre-request refusal. Both modes delivered deltas with the tail withheld and
+closed the connection before the terminal frame on callback stops and
+Responses client-side stop matches.
+
+`lm.responseToEvents(backing, response, sink)` visits a completed SDK
+response through the same callback, without HTTP. It emits scores and
+their completeness on the first text delta, preserves image addresses and
+continuation scopes, and serializes tool arguments with Python JSON
+spelling. Unsupported parts and incomplete scores without a text carrier
+return explicit errors after the events already delivered; a callback stop
+does not inspect later parts. This does not assemble events into responses.
+
+Responses requests honor `config.extensions.openai_responses_compat`, its
+`openai_compat` alias and the nested `compat` forms. Null inherits; `"auto"`
+selects the dialect default. Direct empty objects win over aliases, whereas
+empty nested Responses policies fall back to the generic OpenAI policy.
+Invalid recognized policies refuse before credential refresh or HTTP; unknown
+fields are ignored as in Source. Fifteen fresh actual Source observations match
+in Debug and ReleaseSafe: eight complete SDK responses and ordered HTTP requests,
+seven refusals, and all request snapshots and credential counts.
+
+`lm.OpenAI.responses_compat` accepts a typed `lm.OpenAI.ResponsesCompat`, built
+with `.init(.{ ... })`. Its twelve optional fields preserve partial policy:
+null inherits, while `auto` explicitly resets to the Responses default. Bound
+policy is applied before request overrides, so a null routing override retains
+the bound object but an empty object replaces it. Routing and compatibility
+extensions borrow graph roots; owning LM clones copy both roots together and
+retain shared aliases. Native state save/restore owns its ordinary record
+projection. Compatibility `extensions` remain metadata, not request-body
+overrides, and the image-edit knob does not affect generation requests.
+
+Seventeen fresh actual Source cases matched thirteen complete SDK responses,
+four refusal outcomes, all thirteen ordered HTTP path/auth/body byte records,
+actual request snapshots and credential counts in Debug and ReleaseSafe.
+Ten of those frozen cases were also consumed through the native LM caller:
+seven whole SDK responses and HTTP records plus three refusal outcomes matched.
+Its unused input SDK record is not an executed SDK-request mutation clock.
+The corpus includes inherited/reset/replaced controls, empty routing, constructor
+versus request-policy errors, Source's nonfinite bound-routing serialization,
+genuine dictionaries with non-string keys, UTF-8 tuple values and a set that
+refuses during serialization after credential refresh. The allocation-free graph
+writer shares Python dictionary-key encoding without loosening finite-JSON
+admission. Permanent regressions check that distinction and build real request
+bodies after the source arena is destroyed, preserving independent state
+snapshots and shared aliases within an owning clone.
+
+`try provider.bindResponsesPreset("LM Studio", null)` selects the Responses
+dialect, binds the Ollama-compatible policy and uses LM Studio's separate root
+(`http://localhost:1234/v1`). Pass a non-default URL as the second argument to
+target a different deployment. Qwen, DeepSeek and Z.AI have no default Responses
+root: binding them without an override refuses without changing the provider.
+The exact OpenAI cloud default selects the preset's own default, as in DSPy;
+it is not a fallback for missing roots. `lm.OpenAI.ResponsesCompat.preset(name)`
+returns the shared partial policy without changing any endpoint.
+
+Both Debug and ReleaseSafe matched 19 frozen DSPy metadata cases for partial
+policies, available generation controls and default/explicit address handling.
+A separate actual localhost run matched 20 complete SDK responses and ordered
+HTTP path/auth/body byte records, two unknown-name refusals, and all request
+snapshots and credential counts. It covered every canonical Responses preset,
+aliases, Unicode case normalization and a request override of a bound preset.
+It did not contact the default server addresses or exercise endpoint profiles.
+
+`try provider.bindChatPreset("xai", null)` selects Chat Completions, its
+default root and xAI's separate reasoning-token accounting. Qwen, Bedrock and
+Bedrock Mantle require an explicit non-default root; a failed bind leaves the
+previous client settings intact. To bind a custom policy, set
+`lm.OpenAI.chat_compat` to a partial `lm.OpenAI.ChatCompat`. A matching
+case-sensitive model prefix applies only the first matching override, using
+the request's model rather than the client's fallback model. `auto` resets a
+knob to the Chat default. A bound Chat policy also replaces the standalone
+`chat_reasoning_usage` override. Native LM clones and state restore own the
+policy's borrowed inputs. Chat does not treat request compatibility extension
+keys as policy overrides.
+
+`completeRequest` uses MAP-14 candidate scoring on Chat policies that declare
+`logprob_token_ids` (including vLLM) when `probabilities` is `required` or
+`if_available` and a JSON schema declares measurable judgments. It tokenizes
+the conversation and candidate answers with the server’s chat template, then
+scores their shared prefixes in one Completions request. Ordinary properties
+and box judgments still come from structured generation. If the server omits
+requested token scores, `required` fails; `if_available` can fall back to
+strict structured generation when the adaptation policy permits it. Tool
+execution, stored-cache resources and unsupported privacy or billing controls
+are refused before credentials or HTTP are used. The explicit score-prompt
+array is capped at 16 MiB.
+
+A localhost comparison against 14 frozen DSPy scoring cases matched all three
+complete SDK responses, 11 refusal outcomes, 64 ordered HTTP path/auth/body
+records, and all 68 credential calls in both Debug and ReleaseSafe.
+
+Debug and ReleaseSafe matched 27 frozen DSPy preset cases, including 20
+model-specific resolutions. A separate localhost comparison matched 46
+complete SDK responses and byte-exact HTTP path/auth/body records, one
+unknown-name refusal, and all request snapshots and credential counts.
+This did not contact hosted servers or authenticate to the homelab.
+
+The canonical Chat wire builder also implements client-side tool exclusion and
+allowlists for servers that ignore forced choices, recorded JSON-schema
+dropping, whole-reasoning-dial dropping before subfield adaptations, nearest
+effort clamping with lower-level tie breaking, first-declared-level substitution
+for reasoning off, and Groq reasoning visibility. A separate 29-row actual
+Source corpus matched 20 complete wire bodies and ordered published adaptation
+lists, nine acceptance/refusal outcomes, and request-state outcomes in both
+native modes. This is a direct wire-builder comparison, not a whole-response or
+native HTTP execution proof for bound presets; those presets are not exposed
+yet. Canonical SDK request record import separately preserves legacy reasoning
+defaults, budget aliases and off normalization without weakening genuine typed
+constructor validation.
+
+The flattened native caller now replays multiple no-summary reasoning states
+as separate canonical thinking parts instead of silently sending only the first
+opaque state. A nonempty flattened summary with multiple states still refuses:
+the flattened representation cannot identify which state owns that summary.
+Three fresh two-turn Source comparisons matched both complete SDK responses and
+all six ordered HTTP requests in Debug and ReleaseSafe, including absent
+summaries, empty summaries and a single summarized state.
+
 `lm.TypeSafe` / `TypeSafe` uses the existing bounded native HTTP transport for
-`POST /v1/systemone`. Its LM advertises decision-request capability, retaining
-structured state, questions and response schema through recording/replay/cache
-wrappers. OpenAI refuses direct native decision requests rather than silently
-dropping them. The TypeSafe box route sends the experimental images header;
-this is **not** an Image/assets implementation or the complete provider SDK.
-Canonical response usage and the actual request-ID header are retained as
-described above. Scoped usage accounting, convenience views, Python exception
-identity, asynchronous execution and streaming remain outside this native
-decision implementation.
+`POST /v1/systemone`. Both physical entry points now take an actual canonical
+SDK request: `requestBody(arena, request)` returns wire bytes, header selection
+and adaptation records;
+`completeRequest(arena, request)` returns the actual owning SDK response.
+Release that response when finished; its allocator and any retained payload
+backing allocators must outlive it. The native prediction LM constructs its SDK
+request **before** entering the same codec/transport/parser, rather than
+reconstructing a request after legacy execution. Native decision state,
+questions and schema still survive recording/replay/cache wrappers, and decision
+calls forward the same explicit tracker and accounting-error capture. OpenAI
+still refuses direct native decision requests rather than silently dropping them.
+
+For a public call, `LM.callCanonicalResult(arena, io, request, options)` sends
+one SDK request through `CachedLM` and the normal usage and pricing finalizer.
+The configured model must match `request.fields.model`. Local media is frozen
+before cache lookup with an explicit file-size limit, and the engine uses the
+request's own config without applying prediction defaults. `use_cache = false`
+bypasses `CachedLM`; `rollout_id` separates otherwise identical calls. The
+existing backing-allocator rule applies to response payloads retained by the
+cache. OpenAI and TypeSafe support this entry point; custom engines can provide
+`LM.VTable.complete_canonical`. The legacy `RecordingLM` transcript does not
+encode SDK requests and rejects these calls before generation.
+
+Set `CanonicalCall.history` to a `lm.public_history.Capture` to record successful
+canonical calls, including cache hits, after usage accounting. Initialize the
+global owner with 10,000 pointer slots and supply client and module owners
+with enough slots for `owner_limit`. Each owner retains the same entry, with
+the base request, the ordered `Entry.responses`, and shared output and usage
+graphs. A zero owner limit skips the client and
+modules; a null capture disables recording altogether. Lowering a limit
+evicts one old entry per insertion, and repeated module owners are processed
+in order. Retain an entry before eviction if you need to use it afterward.
+Keep all backing allocators alive for as long as references survive and
+synchronize owner access and graph mutations externally. Timestamps use the
+injected real clock and display in UTC without a zone suffix; UUIDs use its
+secure randomness API. This option does not record legacy adapter calls.
+Use `Entry.setAnnotation`, `annotation`, and `removeAnnotation` to share
+caller-added fields across the same history entry. An entry supports up to
+64 annotation keys of at most 256 bytes each. Keys are copied; values with
+owned payloads are retained, and borrowed values are cloned. An annotation
+lookup borrows the value until replacement, removal, or entry release.
+Annotations do not replace typed history fields or populate Python `kwargs`.
+
+`LM.callPromptResult(arena, io, prompt, options)` takes UTF-8 text and a
+normalized SDK `Config`. It sends one user message per candidate, up to
+`LM.PromptCall.max_candidates`, adding the zero-based candidate index to a
+non-null seed. Cache entries distinguish candidate counts, and one history
+entry retains the original prompt and all ordered responses. The returned
+`CallResult.outputs` and the history entry share the same mutable output list.
+Supply the resolved generation config explicitly, or use
+`LM.callPromptOptionsResult(arena, io, prompt, &options, execution)` to merge
+`LM.PromptOptions.defaults` and `.overrides` JSON objects. This second API uses
+generic Chat generation spellings (and integer `logprobs` for `.text`), replaces
+aliases as a group, and treats null overrides as removing defaults. Connection
+settings belong on the LM; caching and rollout identity belong in `execution`.
+Provider-specific ingress dialects, Python model classes as schemas, and dynamic
+`kwargs` history are not supported by this API. For provider-specific options,
+pass a normalized SDK `Config` or `Request` instead.
+
+The canonical TypeSafe codec derives questions from judgment schemas, preserving
+instructions, choice descriptions and ordered-level fallback labels. State is
+one user text/data part, or an ordered mixture containing images. Inline/local
+PNG and JPEG images become named `assets`; image and box requests send the
+experimental header. Local reads have an inclusive, configurable `max_media_bytes`
+bound (16 MiB by default), unlike Source's unbounded reads. System prompts,
+conversation, unsupported media, tools and multiple-response extensions refuse.
+Extensions overwrite derived payload fields in order, and header selection uses
+the final payload, including Source's assets/box short-circuit behavior.
+
+Dropped configuration knobs and defaulted question descriptions produce canonical
+adaptation records. `adaptations = .note` exposes them, `.silent` preserves wire
+behavior while hiding them on responses, and `.refuse` rejects dropped controls
+before HTTP but allows defaults. Model fallback uses the canonical request model,
+not the native prediction binding; response usage, raw answers and the actual
+request-ID header are retained.
+
+Both native modes matched **32 frozen Source wire observations**: 15 complete
+successful bodies/header decisions/adaptation lists and 17 accept/refuse outcomes.
+Errors remain native `LMFailure`, not identical Python exception classes. Actual
+localhost HTTP also exercised both SDK and native prediction paths: five requests
+per mode matched the corresponding conserved/new Source bodies. Fresh Source
+image calls verify note/silent behavior and unchanged caller records; a separate
+complete call matches the full SDK record, including raw provider data and all
+15 adaptation records (14 dropped controls and one defaulted description).
+A further actual Source credential callback changes a boolean schema to a choice
+after the old questions have been serialized. Native execution first failed on
+the stale schema, then matched the complete Source response, mutated caller
+record, credential-call count and original wire bytes in both modes. Response
+parsing now rereads the actual SDK request rather than retaining a build-time
+schema snapshot; it recognizes the current judgments without repeating admission
+rules. Permanent regressions cover that parser/admission distinction and the
+inclusive local-image byte cap without changing the caller's request.
+These are finite protocol proofs, not authenticated
+TypeSafe inference or the complete provider SDK. Public LM/history integration,
+asynchronous execution and streaming remain unfinished.
 
 The frozen independent DSPy 3.5 source receipt contains **15,218 actual rows
-and 17 model definitions**. The model consumer was re-run natively after the
-immutable-scalar, mutable-field and Annotated metadata changes, without rerunning
-Source. The pipeline row remains its earlier historical run. These separate
-consumers report finite coverage; their entries/observations overlap and must
-not be added together:
+and 17 model definitions**. Both consumers were re-run in native Debug and
+ReleaseSafe after SDK metadata and canonical Prediction integration, without
+rerunning Source. The model consumer now observes singleton and genuine boxed
+builtin identity where the runtime exposes it. The pipeline consumer supplies
+metadata from the actual recorded SDK responses, not expected prediction usage.
+These separate consumers report finite coverage; their entries/observations
+must not be added together:
 
 | Independent consumer | Fully supported entries | Unsupported entries | Unconsumed entries | Compared observations | Mismatches |
 |---|---:|---:|---:|---:|---:|
-| Decision models and views | 9,095 | 0 | 6,140 | 94,174 | 0 |
-| Evidence/state/Predict pipeline | 2,045 | 335 | 12,838 | 17,037 | 0 |
+| Decision models and views | 9,114 | 0 | 6,121 | 95,462 | 0 |
+| Evidence/state/Predict pipeline | 2,095 | 285 | 12,838 | 18,154 | 0 |
 
 Both consumers deliberately **exit nonzero for incomplete coverage**.
 Partially compared unsupported rows contribute observations, not a claim that
@@ -1217,9 +2349,13 @@ are unobserved: the source engine receipt does not capture those client-only
 options. The native catalogue now includes all 17 declarations, including the
 three simple subclasses, and consumers reconstruct genuine Decimal and
 bytearray inputs rather than JSON lookalikes. Unvalidated model construction
-now preserves raw state without unsafe typed casts. The latest model runs in
-Debug and ReleaseSafe each compared 94,174 observations with zero mismatches and
-zero unsupported observations; 9,375 observations remain unconsumed. All 304
+now preserves raw state without unsafe typed casts. The current model ledger
+has zero unsupported observations and 8,087 unconsumed observations. Native
+identity checks include `None`/bool singletons, genuine Decimal/bytes/bytearray
+boxes, and independently observable copied evidence; erased int/string object
+identity is still not inferred from equality. The source oracle explicitly
+guards dictionary inputs before its value-identity check: parsing a raw JSON
+string does not turn that original input into a dictionary. All 304
 Annotated validation rows were exercised (322 acceptance/result observations),
 as were all 16 schema rows (26 comparisons). Six schema-error exception-identity
 observations remain unconsumed; native errors are not Python exception objects.
@@ -1228,7 +2364,75 @@ original member order because of Python's Annotated cache; the native regression
 separately verifies order-independent typed-set compatibility. The earlier
 unconsumed-row counter did not separately budget 17 newly compared
 acceptance/result observations, so historical observation totals are not a
-conservation ledger. All five frozen assignment/deletion scenarios exercised
+conservation ledger. The current model ledger retains all 103,549 budgeted
+observations, compared or explicitly unconsumed.
+
+The pipeline separately checks 42 native invariants; first-row value/class
+equality is **not** counted as Source's stronger object-identity observation.
+Canonical usage is read from the real Prediction, and SDK response ID, model,
+finish reason and sparse usage are checked through actual recording. Source
+history usage/model values can be compared to those retained SDK facts and the
+configured LM getter. `lm.sdk.Request.historyMessages(allocator)` provides the
+canonical display projection: text-only messages join with newlines, structured
+parts retain their mutable graph payloads, and local file paths are not read.
+The returned payload owns its display headers and must be freed by the caller.
+In Debug and ReleaseSafe it matched three frozen DSPy display records, including
+a mutation of a shared data part after the display was created.
+This does not implement Python's public history publication, owner retention, or
+cost/pricing/model-type entries. The separate advisory physical-request billing
+API does not turn those incomplete pipeline rows into matches.
+Dynamic Completions, Python Prediction class
+identity, private adapter entrypoints, warnings and async/streaming remain gaps.
+Isolated observation-corruption controls were compiled and executed in both
+modes: boxed identity, singleton identity, SDK usage loss and Prediction usage
+loss each produced actual mismatches and a nonzero mismatch exit, not merely
+the normal incomplete-coverage exit. Source bytes were unchanged.
+
+`adapter.formatFieldContent(arena, field, input)` implements the canonical
+`format_field_value(..., assume_text=False)` text block. It uses the existing
+field serializer, with both the returned dictionary and rendered text owned by
+the supplied arena. Pass the result directly to `adapter.Content.parts`; no
+second custom-value representation is introduced. All six frozen formatting
+rows now consume all 36 observations, including the text-block view and the
+distinction between a genuine model and a lookalike dictionary. Erasing the
+observed block text in an isolated consumer produced six real mismatches in
+each native mode. These replace six previously unconsumed observations, not
+additional Source execution or a larger observation budget.
+
+A separate Debug/ReleaseSafe native CLI exercised owned text after input
+mutation, content cloning, SDK projection, actual Chat/Responses request-body
+serialization for user and assistant roles, and rendering/container allocation
+refusal with fixed-capacity caller storage. It made no network requests.
+The role-policy regression and complete native gates passed: 574/574 tests
+and 38/38 build steps per mode, plus all 687 replay requests. Fixed-capacity
+smoke storage does not establish whole-runtime startup-only allocation.
+
+Scalar-only genuine decisions now stream through the existing JSON writer
+without allocating a temporary model dictionary. Eligibility inspects the
+actual decision fields; nested containers and custom values keep the
+materialized serializer, preserving whole-object string fallback rather than
+emitting partial JSON. Two newly observed Source formatting boundaries used
+genuine invalid-UTF-8 bytearrays directly and inside a list. Both native modes
+matched both results; bypassing materialization produced two actual mismatches
+in each mode. These are separate observations, not a rerun of the frozen
+15,218-row corpus.
+
+A ReleaseSafe native microbenchmark used runtime input `0.5`, seven alternating
+samples of 100,000 Score renders per path, fixed caller scratch storage and
+matching output checksums. The table reports median elapsed time and the
+scratch high-water mark **per render**, not total process memory:
+
+| Scalar Score rendering path | Scratch bytes per render | Time for 100,000 renders (ms) |
+|---|---:|---:|
+| Materialized projection | 608 | 29.72 |
+| Scalar streaming | 0 | 22.86 |
+
+This is one rendering boundary, not general DSPy throughput or whole-runtime
+allocation freedom. The independent frozen model and pipeline consumers were
+recompiled and executed in both modes after this change; their counters above
+were unchanged, including explicit nonzero incomplete-coverage exits.
+
+All five frozen assignment/deletion scenarios exercised
 real native mutable operations:
 110 observations matched, with five missing-argument views still unconsumed.
 Python type-object reflection, mutable runtime class construction, broader scalar
@@ -1348,6 +2552,20 @@ Python LM-state interchange**. API keys, HTTP clients, trust stores and header
 providers are never serialized. Custom engines must provide `LM.VTable.dump_state`
 and an application-owned `LM.StateLoader`; inference-only scripted, replay, cache
 and recording handles do not automatically gain persistence.
+
+The public handle's `model_type` is persisted separately from the provider's
+wire `api`: restoring text/chat output semantics must not switch a Responses
+endpoint. Four new frozen Source dump/reconstruction observations (`auto`,
+`chat`, `text`, `responses`) matched native program save/load in Debug and
+ReleaseSafe, with Responses request generation unchanged in every case. The
+Source BaseLM reconstruction used explicit custom-class trust; native loading
+does not import Source classes. The existing native lifetime regression also
+checks that a text-mode handle survives both trusted and sanitized restoration
+after the source arena is destroyed.
+
+Custom `LM.StateLoader` implementations provide `ptr` and `restore_engine`;
+call `loader.restore(arena, saved_state)` to restore the engine and apply the
+saved public mode. Program loading uses that same entry point.
 
 Loading has an explicit fourth argument:
 
@@ -2393,8 +3611,12 @@ The following prevent a claim that DSZig can do everything DSPy can:
   are implemented as described above. There is still no complete lm15 provider
   catalog/routing/auth/error taxonomy, full provider SDK, embedding providers
   beyond OpenAI/Azure, Image/Audio, general rich-media tool results, non-OpenAI
-  training providers or native streaming. Document support is not general
-  multimodal support, and Chat Completions does not accept document parts.
+  training providers or streaming beyond synchronous OpenAI Responses and
+  Chat Completions SSE. Completed SDK responses can be projected to events;
+  a general event-to-response assembler and DSPy program streaming are not
+  available.
+  Document support is not general multimodal support, and Chat Completions
+  does not accept document parts.
 - **File and DocumentPart boundaries:** the constructor smoke explicitly leaves
   606 successful source Python DocumentPart object/repr/bytes operations
   unimplemented; canonical document dictionaries do not replace those
@@ -2415,10 +3637,27 @@ The following prevent a claim that DSZig can do everything DSPy can:
   and nesting beyond 1,000 levels, while cache graph cloning preserves aliases
   and cycles. Native cache zero-capacity rejection occurs on insertion rather
   than Python's constructor.
+- **Logprob boundaries:** native SDK score records are not Python dataclass
+  object identity or arbitrary constructor/iterable equivalence. Canonical
+  scores and request knobs cover Chat/Responses, not every provider or streamed
+  text-edit/materialization policy. Native nonfinite-score persistence uses an
+  explicit bit tag, not Python cache/SDK JSON interchange. Public `LM.callResult`
+  and standalone convenience/combine APIs are available.
+- **Pricing/history boundaries:** canonical calls can record shared entries
+  in explicitly supplied global, client and module owners. This does not
+  implement automatic module discovery, legacy adapter-call history, or
+  Python's mutable history dictionaries and dynamic keyword records.
+  Custom engines lacking a canonical SDK response object cannot use
+  `LM.callResult`; their existing completion APIs remain available.
+  Catalogue loading is explicit and local; arbitrary
+  regex rules and automatic remote refresh/shrink validation remain unsupported.
 - **Dynamic Python APIs:** no general Python Module/BaseModule/Example/Prediction/
   Completions object model, dynamic signature syntax, arbitrary Pydantic custom
   models/validators, custom Type hierarchy, generic callbacks,
-  settings singleton, usage accounting, asyncify/syncify or streamify equivalents.
+  settings singleton, asyncify/syncify or streamify equivalents. Native
+  Prediction handles, explicit UsageTracker scopes and automatic LM/Module-call
+  accounting are available with the lifetime, synchronization and resource
+  contracts above; they are not the full dynamic Python object model.
 - **Type and parsing boundaries:** Unequal response-schema definitions with
   colliding names fail closed; equivalent definitions can share a name.
   Python's identity-dependent automatic renaming is not reproduced. Tagged

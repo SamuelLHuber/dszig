@@ -235,35 +235,35 @@ const TestProgram = struct {
     }
 };
 
-fn sourceMetric(_: Allocator, example: *const Example, maybe_prediction: ?*const Record, trace: ?*const predict.Trace) value.ParseError!f64 {
+fn sourceMetric(_: Allocator, example: *const Example, maybe_prediction: ?*const optimize.RecordPrediction, trace: ?*const predict.Trace) value.ParseError!f64 {
     if (trace != null) return 1;
     const target = std.fmt.parseInt(i64, example.record.get("question").?.string, 10) catch return 0;
     const prediction = maybe_prediction orelse return error.ParseValue;
     return if (@mod(2 * prediction.get("z").?.integer + prediction.get("a").?.integer, 5) == @mod(target, 5)) 1 else 0;
 }
 
-fn tiedMetric(_: Allocator, _: *const Example, _: ?*const Record, _: ?*const predict.Trace) value.ParseError!f64 {
+fn tiedMetric(_: Allocator, _: *const Example, _: ?*const optimize.RecordPrediction, _: ?*const predict.Trace) value.ParseError!f64 {
     return 1;
 }
 
-fn nanMetric(_: Allocator, _: *const Example, _: ?*const Record, trace: ?*const predict.Trace) value.ParseError!f64 {
+fn nanMetric(_: Allocator, _: *const Example, _: ?*const optimize.RecordPrediction, trace: ?*const predict.Trace) value.ParseError!f64 {
     return if (trace != null) 1 else std.math.nan(f64);
 }
 
-fn mixedNanMetric(_: Allocator, _: *const Example, maybe_prediction: ?*const Record, trace: ?*const predict.Trace) value.ParseError!f64 {
+fn mixedNanMetric(_: Allocator, _: *const Example, maybe_prediction: ?*const optimize.RecordPrediction, trace: ?*const predict.Trace) value.ParseError!f64 {
     if (trace != null) return 1;
     const prediction = maybe_prediction orelse return error.ParseValue;
     if (prediction.get("z").?.integer != 0) return 1;
     return std.math.nan(f64);
 }
 
-fn teacherMetric(_: Allocator, _: *const Example, maybe_prediction: ?*const Record, trace: ?*const predict.Trace) value.ParseError!f64 {
+fn teacherMetric(_: Allocator, _: *const Example, maybe_prediction: ?*const optimize.RecordPrediction, trace: ?*const predict.Trace) value.ParseError!f64 {
     if (trace == null) return 1;
     const prediction = maybe_prediction orelse return error.ParseValue;
     return if (prediction.get("z").?.integer == 88 and prediction.get("a").?.integer == 77) 1 else 0;
 }
 
-fn resetTeacherMetric(_: Allocator, _: *const Example, maybe_prediction: ?*const Record, trace: ?*const predict.Trace) value.ParseError!f64 {
+fn resetTeacherMetric(_: Allocator, _: *const Example, maybe_prediction: ?*const optimize.RecordPrediction, trace: ?*const predict.Trace) value.ParseError!f64 {
     if (trace == null) return 1;
     const prediction = maybe_prediction orelse return error.ParseValue;
     return if (prediction.get("z").?.integer == -1 and prediction.get("a").?.integer == -1) 1 else 0;

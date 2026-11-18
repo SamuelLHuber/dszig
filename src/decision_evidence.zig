@@ -383,6 +383,7 @@ fn Generated(comptime T: type, comptime probabilities: bool) type {
             .type_identity = runtime.typeIdentity(Self),
             .model_name = model_name,
             .raw_value = raw,
+            .model_dump = raw,
             .serialized = serialized,
             .write_str = writeStr,
             .write_repr = writeRepr,

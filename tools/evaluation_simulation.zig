@@ -103,7 +103,7 @@ const Program = struct {
     fn metric(
         _: Allocator,
         example: *const dszig.Example,
-        prediction: ?*const Record,
+        prediction: ?*const dszig.optimize.RecordPrediction,
         trace: ?*const dszig.Trace,
     ) dszig.value.ParseError!f64 {
         assert(trace == null);

@@ -305,7 +305,7 @@ test "shared typed Predict uses independent per-attempt LM and scratch state" {
         pub const Output = struct { answer: i64 };
     });
     const P = dszig.Predict(Sig);
-    const Predictions = dszig.Parallel(P.Output, .{
+    const Predictions = dszig.Parallel(parallel.ProgramResult(P), .{
         .workers = 4,
         .tasks = 4,
         .attempts = 4,
@@ -341,10 +341,254 @@ test "shared typed Predict uses independent per-attempt LM and scratch state" {
     }
     const report = try pool.forward(&tasks, .{ .straggler_timeout_ns = 0 });
     for (report.results, models, 0..) |slot, model, index| {
-        try testing.expectEqual(@as(i64, @intCast((index + 1) * 2)), slot.value.answer);
+        try testing.expectEqual(@as(i64, @intCast((index + 1) * 2)), slot.value.fields().answer);
         try testing.expectEqual(@as(usize, 1), model.index);
         try testing.expect(scratch[index].end_index <= buffers[index].len);
     }
+}
+
+fn usagePromptTokens(arena: std.mem.Allocator, usage: dszig.prediction.Graph.Value, model: []const u8) !?i64 {
+    const total = try dszig.prediction.Graph.toValue(arena, usage);
+    const entry = total.object.get(model) orelse return null;
+    return entry.object.get("prompt_tokens").?.integer;
+}
+
+test "canonical parallel programs attach per-call usage and charge per-task forks of an active tracker" {
+    const Sig = dszig.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: i64 };
+    });
+    const P = dszig.Predict(Sig);
+    const count = 4;
+    const limits: parallel.Limits = .{ .workers = 2, .tasks = count, .attempts = count, .failures = 0 };
+    const Direct = dszig.Parallel(parallel.ProgramResult(P), limits);
+    // Records the tracker each task actually runs under.
+    const Observed = struct {
+        inner: *const P,
+        seen: *[count]?*dszig.UsageTracker,
+        pub const Input = struct { index: usize, question: []const u8 };
+        pub const Output = P.Output;
+        pub fn forward(self: *const @This(), ctx: dszig.Context, input: Input) !Output {
+            self.seen[input.index] = ctx.usage_tracker;
+            return (try self.inner.call(ctx, .{ .question = input.question })).fields().*;
+        }
+    };
+    const Watched = dszig.Parallel(parallel.ProgramResult(Observed), limits);
+    // A Module whose forward fans out: only its own call opens a scope.
+    const Outer = struct {
+        pool: *Watched,
+        tasks: []const Watched.Task,
+        contexts: []dszig.Context,
+        pub const Input = struct {};
+        pub const Output = struct { total: i64 };
+        pub fn forward(self: *const @This(), ctx: dszig.Context, _: Input) !Output {
+            for (self.contexts) |*context| context.usage_tracker = ctx.usage_tracker;
+            const report = try self.pool.forward(self.tasks, .{ .straggler_timeout_ns = 0 });
+            var total: i64 = 0;
+            for (report.results) |slot| {
+                if (slot.value.getLMUsage() != null) return error.UnexpectedWorkerUsage;
+                total += slot.value.fields().answer;
+            }
+            return .{ .total = total };
+        }
+    };
+
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var storage_memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage_memory.deinit();
+    var storage: dszig.usage_tracker.Storage = .{ .arena = storage_memory.allocator(), .io = testing.io };
+
+    const tokens = [count]i64{ 3, 5, 7, 11 };
+    const answers = [count][]const u8{ "{\"answer\":3}", "{\"answer\":5}", "{\"answer\":7}", "{\"answer\":11}" };
+    var metadata: [count]dszig.lm.ResponseMetadata = undefined;
+    for (&metadata, tokens) |*item, prompt| item.* = .{ .usage = .{ .input_tokens = .{ .integer = prompt } } };
+    const buffers = try arena.create([count][1 << 16]u8);
+    var scratch: [count]std.heap.FixedBufferAllocator = undefined;
+    var models: [count]dszig.lm.ScriptedLM = undefined;
+    var contexts: [count]dszig.Context = undefined;
+    const program: P = .{};
+
+    // No active tracker: every canonical call owns one automatic scope.
+    for (0..count) |index| {
+        scratch[index] = .init(&buffers[index]);
+        models[index] = .{ .responses = answers[index .. index + 1], .model = "configured", .metadata = metadata[index .. index + 1] };
+        contexts[index] = .{
+            .arena = scratch[index].allocator(),
+            .lm = models[index].lm(),
+            .adapter = .json,
+            .track_usage = .{ .storage = &storage, .limits = .{ .models = 2, .entries = 2 } },
+        };
+    }
+    {
+        var pool: Direct = undefined;
+        try pool.init(testing.io, .{});
+        defer pool.deinit();
+        var calls: [count]Direct.Program(P) = undefined;
+        var tasks: [count]Direct.Task = undefined;
+        for (&calls, &tasks) |*call, *task| {
+            call.* = .{ .program = &program, .arguments = .{ .input = .{ .question = "Count." } }, .contexts = &contexts };
+            task.* = call.task();
+        }
+        const report = try pool.forward(&tasks, .{ .straggler_timeout_ns = 0 });
+        for (report.results) |slot| {
+            const prediction = slot.value.*;
+            try testing.expectEqual(@as(usize, 1), prediction.completions().?.len);
+            const usage = prediction.getLMUsage() orelse return error.MissingUsage;
+            try testing.expectEqual(@as(?i64, prediction.fields().answer), try usagePromptTokens(arena, usage, "configured"));
+        }
+        for (models) |model| try testing.expectEqual(@as(usize, 1), model.index);
+    }
+
+    var watched: Watched = undefined;
+    try watched.init(testing.io, .{});
+    defer watched.deinit();
+    var seen: [count]?*dszig.UsageTracker = undefined;
+    const observed: Observed = .{ .inner = &program, .seen = &seen };
+    var calls: [count]Watched.Program(Observed) = undefined;
+    var tasks: [count]Watched.Task = undefined;
+    for (&calls, &tasks, 0..) |*call, *task, index| {
+        call.* = .{ .program = &observed, .arguments = .{ .input = .{ .index = index, .question = "Count." } }, .contexts = &contexts };
+        task.* = call.task();
+    }
+
+    // An active seeded tracker: each task charges its own deep copy.
+    var tracker: dszig.UsageTracker = undefined;
+    try tracker.init(&storage, .{ .models = 2, .entries = 2 });
+    try tracker.addUsage("seed", try dszig.prediction.Graph.parse(arena, "{\"prompt_tokens\":100,\"completion_tokens\":200}"));
+    seen = @splat(null);
+    for (0..count) |index| {
+        scratch[index].reset();
+        models[index].index = 0;
+        contexts[index].usage_tracker = &tracker;
+    }
+    {
+        const report = try watched.forward(&tasks, .{ .straggler_timeout_ns = 0 });
+        for (report.results, 0..) |slot, index| {
+            try testing.expect(slot.value.getLMUsage() == null);
+            const fork = seen[index] orelse return error.MissingTracker;
+            try testing.expect(fork != &tracker);
+            for (seen[0..index]) |earlier| try testing.expect(earlier.? != fork);
+            const total = try fork.getTotalTokens(arena);
+            try testing.expectEqual(@as(?i64, 100), try usagePromptTokens(arena, total, "seed"));
+            try testing.expectEqual(@as(?i64, slot.value.fields().answer), try usagePromptTokens(arena, total, "configured"));
+        }
+        const original = try tracker.getTotalTokens(arena);
+        try testing.expectEqual(@as(?i64, 100), try usagePromptTokens(arena, original, "seed"));
+        try testing.expectEqual(@as(?i64, null), try usagePromptTokens(arena, original, "configured"));
+        try testing.expectEqual(@as(u32, 1), tracker.entry_count);
+    }
+
+    // An enclosing Module call: workers fork its empty tracker, so neither
+    // their results nor the outer Prediction receive the workers' usage.
+    seen = @splat(null);
+    for (0..count) |index| {
+        scratch[index].reset();
+        models[index].index = 0;
+        contexts[index].usage_tracker = null;
+    }
+    const outer: Outer = .{ .pool = &watched, .tasks = &tasks, .contexts = &contexts };
+    var unused: dszig.lm.ScriptedLM = .{ .responses = &.{} };
+    const result = try dszig.call(&outer, .{
+        .arena = arena,
+        .lm = unused.lm(),
+        .track_usage = .{ .storage = &storage, .limits = .{ .models = 2, .entries = 2 } },
+    }, .{});
+    try testing.expectEqual(@as(i64, 3 + 5 + 7 + 11), result.fields().total);
+    const outer_usage = try dszig.prediction.Graph.toValue(arena, result.getLMUsage() orelse return error.MissingUsage);
+    try testing.expectEqual(@as(usize, 0), outer_usage.object.count());
+    for (seen, 0..) |fork, index| {
+        try testing.expect(fork != null);
+        for (seen[0..index]) |earlier| try testing.expect(earlier.? != fork.?);
+        try testing.expectEqual(@as(?i64, tokens[index]), try usagePromptTokens(arena, try fork.?.getTotalTokens(arena), "configured"));
+    }
+}
+
+test "parallel Evaluate charges per-attempt forks of an active tracker and leaves the original unchanged" {
+    const Sig = dszig.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: i64 };
+    });
+    const P = dszig.Predict(Sig);
+    const count = 4;
+    const Observed = struct {
+        inner: P = .{},
+        seen: *[count]?*dszig.UsageTracker,
+        pub const Input = struct { index: i64, question: []const u8 };
+        pub const Output = P.Output;
+        pub fn forward(self: *const @This(), ctx: dszig.Context, input: Input) !Output {
+            self.seen[@intCast(input.index)] = ctx.usage_tracker;
+            return (try self.inner.call(ctx, .{ .question = input.question })).fields().*;
+        }
+
+        fn metric(_: std.mem.Allocator, _: *const dszig.Example, prediction: ?*const dszig.optimize.RecordPrediction, _: ?*const dszig.Trace) dszig.value.ParseError!f64 {
+            const run = prediction orelse return error.ParseValue;
+            // An active tracker suppresses the attachment for every attempt.
+            if (run.getLMUsage() != null) return error.ParseValue;
+            return @floatFromInt(run.get("answer").?.integer);
+        }
+    };
+    const Evaluator = parallel.Evaluator(Observed, .{ .workers = 2, .tasks = count, .attempts = count, .failures = 1 });
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var storage_memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage_memory.deinit();
+    var storage: dszig.usage_tracker.Storage = .{ .arena = storage_memory.allocator(), .io = testing.io };
+    var tracker: dszig.UsageTracker = undefined;
+    try tracker.init(&storage, .{ .models = 2, .entries = 2 });
+    try tracker.addUsage("seed", try dszig.prediction.Graph.parse(arena, "{\"prompt_tokens\":100,\"completion_tokens\":200}"));
+
+    const tokens = [count]i64{ 3, 5, 7, 11 };
+    const answers = [count][]const u8{ "{\"answer\":3}", "{\"answer\":5}", "{\"answer\":7}", "{\"answer\":11}" };
+    var metadata: [count]dszig.lm.ResponseMetadata = undefined;
+    for (&metadata, tokens) |*item, prompt| item.* = .{ .usage = .{ .input_tokens = .{ .integer = prompt } } };
+    const buffers = try arena.create([count][1 << 16]u8);
+    var backing: [count][]u8 = undefined;
+    var models: [count]dszig.lm.ScriptedLM = undefined;
+    var contexts: [count]dszig.Context = undefined;
+    for (0..count) |index| {
+        backing[index] = &buffers[index];
+        models[index] = .{ .responses = answers[index .. index + 1], .model = "configured", .metadata = metadata[index .. index + 1] };
+        contexts[index] = .{
+            .arena = undefined,
+            .lm = models[index].lm(),
+            .adapter = .json,
+            .usage_tracker = &tracker,
+            .track_usage = .{ .storage = &storage, .limits = .{ .models = 2, .entries = 2 } },
+        };
+    }
+    var evaluator: Evaluator = undefined;
+    try evaluator.init(testing.io, .{}, &backing);
+    defer evaluator.deinit();
+    const keys: []const []const u8 = &.{ "index", "question" };
+    const devset = [count]dszig.Example{
+        try dszig.Example.fromJson(arena, "{\"index\":0,\"question\":\"Count.\"}", keys),
+        try dszig.Example.fromJson(arena, "{\"index\":1,\"question\":\"Count.\"}", keys),
+        try dszig.Example.fromJson(arena, "{\"index\":2,\"question\":\"Count.\"}", keys),
+        try dszig.Example.fromJson(arena, "{\"index\":3,\"question\":\"Count.\"}", keys),
+    };
+    var seen: [count]?*dszig.UsageTracker = @splat(null);
+    const program: Observed = .{ .seen = &seen };
+    const evaluation = try evaluator.evaluate(&contexts, &program, &devset, Observed.metric, .{ .straggler_timeout_ns = 0 });
+    try testing.expectEqual(@as(f64, 3 + 5 + 7 + 11), evaluation.sum);
+    try testing.expectEqual(@as(usize, 0), evaluation.errors);
+    var charged: i64 = 0;
+    for (seen, 0..) |item, index| {
+        const fork = item orelse return error.MissingTracker;
+        try testing.expect(fork != &tracker);
+        for (seen[0..index]) |earlier| try testing.expect(earlier.? != fork);
+        const total = try fork.getTotalTokens(arena);
+        try testing.expectEqual(@as(?i64, 100), try usagePromptTokens(arena, total, "seed"));
+        charged += (try usagePromptTokens(arena, total, "configured")) orelse return error.MissingUsage;
+    }
+    // Each fork holds exactly one attempt's charge.
+    try testing.expectEqual(@as(i64, 3 + 5 + 7 + 11), charged);
+    const original = try tracker.getTotalTokens(arena);
+    try testing.expectEqual(@as(?i64, 100), try usagePromptTokens(arena, original, "seed"));
+    try testing.expectEqual(@as(?i64, null), try usagePromptTokens(arena, original, "configured"));
+    try testing.expectEqual(@as(u32, 1), tracker.entry_count);
 }
 
 const State = parallel.Scheduler(.{ .workers = 3, .tasks = 2, .attempts = 5, .failures = 5 });
@@ -457,7 +701,7 @@ fn ConfiguredProgram(comptime config: struct { factors: [100]i64 }) type {
             return .{ .y = input.x * config.factors[99] };
         }
 
-        fn metric(_: std.mem.Allocator, _: *const dszig.Example, prediction: ?*const dszig.value.Record, _: ?*const dszig.Trace) dszig.value.ParseError!f64 {
+        fn metric(_: std.mem.Allocator, _: *const dszig.Example, prediction: ?*const dszig.optimize.RecordPrediction, _: ?*const dszig.Trace) dszig.value.ParseError!f64 {
             return @floatFromInt(prediction.?.get("y").?.integer);
         }
     };
@@ -524,7 +768,7 @@ const Scored = struct {
         return .{ .label = label };
     }
 
-    fn metric(_: std.mem.Allocator, example: *const dszig.Example, prediction: ?*const dszig.value.Record, _: ?*const dszig.Trace) dszig.value.ParseError!f64 {
+    fn metric(_: std.mem.Allocator, example: *const dszig.Example, prediction: ?*const dszig.optimize.RecordPrediction, _: ?*const dszig.Trace) dszig.value.ParseError!f64 {
         const name = example.record.get("name").?.string;
         if (std.mem.eql(u8, name, "metric_fail")) return error.ParseValue;
         const label = prediction.?.get("label").?.string;

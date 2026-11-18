@@ -156,6 +156,33 @@ fn smokeTranscript(
         for (call.metadata) |entry| try metadata.append(try dszig.lm.responseMetadataValue(arena, entry));
         try row.put(arena, "metadata", .{ .array = metadata });
     }
+    if (call.generated_media.len != 0) {
+        var flags: dszig.Array = .init(arena);
+        for (call.generated_media) |flag| try flags.append(.{ .bool = flag });
+        try row.put(arena, "generated_media", .{ .array = flags });
+    }
+    if (call.logprobs.len != 0) {
+        var scores: dszig.Array = .init(arena);
+        for (call.logprobs) |parts| try scores.append(if (parts) |entries| try dszig.lm.logprobs.toNativeValue(arena, entries) else .null);
+        try row.put(arena, "logprobs", .{ .array = scores });
+    }
+    if (call.logprobs_complete.len != 0) {
+        var flags: dszig.Array = .init(arena);
+        for (call.logprobs_complete) |flag| try flags.append(.{ .bool = flag });
+        try row.put(arena, "logprobs_complete", .{ .array = flags });
+    }
+    if (call.response_messages.len != 0) {
+        var messages: dszig.Array = .init(arena);
+        for (call.response_messages) |message|
+            try messages.append(if (message) |entry| try entry.toValue(arena) else .null);
+        try row.put(arena, "response_messages", .{ .array = messages });
+    }
+    if (call.adaptations.len != 0) {
+        var adaptations: dszig.Array = .init(arena);
+        for (call.adaptations) |entries|
+            try adaptations.append(try dszig.sdk_response.adaptationsValue(arena, entries));
+        try row.put(arena, "adaptations", .{ .array = adaptations });
+    }
     var calls: dszig.Array = .init(arena);
     try calls.append(.{ .object = row });
 

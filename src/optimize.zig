@@ -13,6 +13,13 @@ const value = @import("value.zig");
 const Context = predict.Context;
 const Trace = predict.Trace;
 const Record = value.Record;
+const Graph = @import("prediction.zig").Graph;
+
+/// The Prediction a program run hands to metrics: `fields()` is the output
+/// record and `getLMUsage()` the usage of that one invocation. Usage is not
+/// part of the record, so demos, feedback, training data and traces built
+/// from `fields()` serialize output fields only.
+pub const RecordPrediction = predict.Prediction(Record);
 
 /// `dspy.Example(...).with_inputs(...)`.
 pub const Example = struct {
@@ -46,7 +53,10 @@ pub const Example = struct {
 /// SIMBA passes null after program failure, as Source passes None. Other
 /// scoring paths pass a successful prediction. Comparison failures enter the
 /// optimizer's existing error policy.
-pub const Metric = *const fn (arena: Allocator, example: *const Example, prediction: ?*const Record, trace: ?*const Trace) value.ParseError!f64;
+///
+/// The prediction may borrow per-attempt storage: a metric that keeps it
+/// beyond its own return must `clone` it.
+pub const Metric = *const fn (arena: Allocator, example: *const Example, prediction: ?*const RecordPrediction, trace: ?*const Trace) value.ParseError!f64;
 
 pub const Evaluation = struct {
     /// `round(100 * sum / n, 2)` as reported by `dspy.Evaluate`.
@@ -72,6 +82,7 @@ pub fn evaluate(
     // per-example backing budget. Retained optimizer runs use runProgram.
     var storage: value.RecordStorage(@typeInfo(P.Output).@"struct".field_names.len) = undefined;
     try storage.init();
+    var state: RecordPrediction.State = .{ .output = storage.record };
     var output: P.Output = undefined;
     var sum: f64 = 0;
     var errors: usize = 0;
@@ -81,8 +92,8 @@ pub fn evaluate(
         var c = ctx;
         c.arena = scratch.allocator();
         c.trace = null;
-        const score: anyerror!f64 = if (runProgramInto(P, c, program, example, &output, &storage.record))
-            metric(c.arena, example, &storage.record, null)
+        const score: anyerror!f64 = if (runProgramInto(P, c, program, example, &output, &state)) |prediction|
+            metric(c.arena, example, &prediction, null)
         else |err|
             err;
         sum += score catch |err| {
@@ -156,44 +167,113 @@ fn roundScore(score: f64) f64 {
     return if (negative) -rounded else rounded;
 }
 
-/// Materialize a prediction that can be retained for ctx.arena's lifetime.
-pub fn runProgram(comptime P: type, ctx: Context, program: *const P, example: *const Example) !Record {
-    return value.toRecord(ctx.arena, P.Output, try forwardProgram(P, ctx, program, example));
+/// A Source Prediction without fields is falsy and never receives usage.
+fn carriesUsage(comptime P: type) bool {
+    return @typeInfo(P.Output).@"struct".field_names.len != 0;
 }
 
-/// Execute into caller-provisioned outer storage. Values borrow program output
-/// or ctx.arena until its reset; callers must copy any result they retain across
-/// reuse. Input/program failure also clears stale predictions.
-/// output must remain alive and unmoved until prediction is discarded or reused.
+/// Run one Module call and materialize its Prediction, retainable for
+/// ctx.arena's lifetime: the instance, its record and its usage snapshot are
+/// all allocated there. Usage follows `predict.callProgram`: set after a
+/// successful automatic scope, null when tracking is off or a tracker is
+/// already active. A failed run returns no Prediction.
+pub fn runProgram(comptime P: type, ctx: Context, program: *const P, example: *const Example) !RecordPrediction {
+    if (comptime @hasDecl(P, "forwardPrediction")) {
+        const prediction = try predict.callProgram(program, ctx, try exampleInput(P, ctx.arena, example));
+        const result = try RecordPrediction.init(ctx.arena, try value.toRecord(ctx.arena, P.Output, prediction.fields().*));
+        result.state.outputs = try completionRecords(P, ctx.arena, prediction);
+        result.setLMUsage(prediction.getLMUsage());
+        return result;
+    }
+    var usage: ?Graph.Value = null;
+    const output = try forwardProgram(P, ctx, program, example, if (comptime carriesUsage(P)) &usage else null);
+    const prediction = try RecordPrediction.init(ctx.arena, try value.toRecord(ctx.arena, P.Output, output));
+    prediction.setLMUsage(usage);
+    return prediction;
+}
+
+/// Execute into caller-provisioned storage and return a Prediction borrowing
+/// it. Nothing is allocated for the instance or its outer record; with usage
+/// tracking off (or a tracker already active) the usage is null and costs
+/// nothing, otherwise its snapshot is allocated in ctx.arena.
+///
+/// `state.output` must already hold capacity for every output field, for
+/// example the record of an initialized `value.RecordStorage` adopted once
+/// (`.{ .output = storage.record }`) and addressed only through the state
+/// afterwards. `state` and `output` must stay alive and unmoved.
+///
+/// The returned Prediction and all its copies are valid until the next run
+/// into `state` or the reset of ctx.arena, whichever comes first: record
+/// values borrow `output` or ctx.arena, and the usage graph lives in
+/// ctx.arena. `clone` what must outlive that. Input or program failure
+/// returns no Prediction and clears the state's record and usage.
 pub fn runProgramInto(
     comptime P: type,
     ctx: Context,
     program: *const P,
     example: *const Example,
     output: *P.Output,
-    prediction: *Record,
-) !void {
-    assert(prediction.capacity() >= @typeInfo(P.Output).@"struct".field_names.len);
-    output.* = forwardProgram(P, ctx, program, example) catch |err| {
-        prediction.clearRetainingCapacity();
-        return err;
-    };
-    try value.toRecordInto(ctx.arena, P.Output, output, prediction);
+    state: *RecordPrediction.State,
+) !RecordPrediction {
+    assert(state.output.capacity() >= @typeInfo(P.Output).@"struct".field_names.len);
+    state.outputs = null;
+    state.usage = null;
+    errdefer state.output.clearRetainingCapacity();
+    if (comptime @hasDecl(P, "forwardPrediction")) {
+        const prediction = try predict.callProgram(program, ctx, try exampleInput(P, ctx.arena, example));
+        output.* = prediction.fields().*;
+        try value.toRecordInto(ctx.arena, P.Output, output, &state.output);
+        state.outputs = try completionRecords(P, ctx.arena, prediction);
+        state.usage = prediction.getLMUsage();
+        return RecordPrediction.borrowed(state);
+    }
+    var usage: ?Graph.Value = null;
+    output.* = try forwardProgram(P, ctx, program, example, if (comptime carriesUsage(P)) &usage else null);
+    try value.toRecordInto(ctx.arena, P.Output, output, &state.output);
+    state.usage = usage;
+    return RecordPrediction.borrowed(state);
+}
+
+/// Preserve a canonical predictor's completion metadata at the record boundary;
+/// plain typed forwards have no such metadata and keep the prepared fast path.
+fn completionRecords(
+    comptime P: type,
+    arena: Allocator,
+    prediction: predict.Prediction(P.Output),
+) !?[]Record {
+    const source = prediction.completions() orelse return null;
+    const records = try arena.alloc(Record, source.len);
+    for (source, records) |row, *record| record.* = try value.toRecord(arena, P.Output, row);
+    return records;
 }
 
 /// Execute a typed program directly from borrowed Example input roles, without
 /// materializing either an input dictionary or an outer prediction dictionary.
-pub fn forwardProgram(comptime P: type, ctx: Context, program: *const P, example: *const Example) !P.Output {
-    // Decode only declared input roles, directly from borrowed training storage.
+/// `usage` is the capture of `predict.forwardScoped`: null declares that the
+/// caller's result cannot carry it.
+pub fn forwardProgram(
+    comptime P: type,
+    ctx: Context,
+    program: *const P,
+    example: *const Example,
+    usage: ?*?Graph.Value,
+) !P.Output {
+    if (usage) |target| target.* = null;
+    return predict.forwardScoped(program, ctx, try exampleInput(P, ctx.arena, example), usage);
+}
+
+/// `example.inputs()` as the program's typed keyword arguments: only declared
+/// input roles are decoded, directly from borrowed training storage.
+pub fn exampleInput(comptime P: type, arena: Allocator, example: *const Example) !P.Input {
     // Interleave role checks and conversion to preserve declaration-order failures.
     var input: P.Input = undefined;
     const fields = @typeInfo(P.Input).@"struct";
     inline for (fields.field_names, fields.field_types) |name, T| {
         if (!example.isInput(name)) return error.MissingField;
         const item = example.record.get(name) orelse return error.MissingField;
-        @field(input, name) = try value.fromValue(ctx.arena, T, item);
+        @field(input, name) = try value.fromValue(arena, T, item);
     }
-    return program.forward(ctx, input);
+    return input;
 }
 
 /// `rng.sample(population, k)` over records.
@@ -339,6 +419,7 @@ pub const BootstrapFewShot = struct {
         var errors: usize = 0;
         var storage: value.RecordStorage(@typeInfo(P.Output).@"struct".field_names.len) = undefined;
         try storage.init();
+        var state: RecordPrediction.State = .{ .output = storage.record };
         var output: P.Output = undefined;
 
         for (trainset, 0..) |*example, example_idx| {
@@ -346,7 +427,7 @@ pub const BootstrapFewShot = struct {
             var round_idx: usize = 0;
             while (round_idx < self.max_rounds) : (round_idx += 1) {
                 attempts += 1;
-                const ok = try self.bootstrapOne(P, out, gpa, ctx, &teacher, teacher_preds, example, round_idx, name2traces, &errors, &output, &storage.record);
+                const ok = try self.bootstrapOne(P, out, gpa, ctx, &teacher, teacher_preds, example, round_idx, name2traces, &errors, &output, &state);
                 if (ok) {
                     bootstrapped[example_idx] = true;
                     n_bootstrapped += 1;
@@ -392,7 +473,7 @@ pub const BootstrapFewShot = struct {
         name2traces: []std.ArrayList(Record),
         errors: *usize,
         output: *P.Output,
-        prediction: *Record,
+        state: *RecordPrediction.State,
     ) !bool {
         var scratch: std.heap.ArenaAllocator = .init(gpa);
         defer scratch.deinit();
@@ -420,11 +501,13 @@ pub const BootstrapFewShot = struct {
                 }
                 p.param.predict.demos = kept.items;
             }
-            break :blk runProgramInto(P, c, teacher, example, output, prediction);
+            break :blk runProgramInto(P, c, teacher, example, output, state);
         };
-        const success: anyerror!bool = if (run) metric_result: {
+        // The Prediction borrows this attempt's scratch. Demos are built from
+        // trace steps, so only output fields are ever retained.
+        const success: anyerror!bool = if (run) |prediction| metric_result: {
             if (self.metric) |metric| {
-                const score = metric(arena, example, prediction, &trace) catch |err| break :metric_result err;
+                const score = metric(arena, example, &prediction, &trace) catch |err| break :metric_result err;
                 break :metric_result if (self.metric_threshold) |threshold| score >= threshold else score != 0;
             }
             break :metric_result true;

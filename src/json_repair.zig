@@ -55,6 +55,27 @@ pub fn parseJson(arena: Allocator, input: []const u8) Error!Value {
     return parser.wholeStrict();
 }
 
+/// Ordered lexical values from the same strict decoder. Object delimiters and
+/// duplicate keys survive, numeric spellings remain exact, and strings retain
+/// the decoder's existing lone-surrogate behavior.
+pub const Token = union(enum) {
+    object_begin,
+    object_end,
+    array_begin,
+    array_end,
+    scalar: Value,
+    number: []const u8,
+};
+
+pub fn parseJsonTokens(arena: Allocator, input: []const u8) Error![]const Token {
+    var parser: Parser = .{ .arena = arena, .text = try Text.init(arena, input) };
+    parser.strictWhitespace();
+    _ = try parser.strictValue(0, true);
+    parser.strictWhitespace();
+    if (parser.index != parser.text.len()) return error.ParseValue;
+    return parser.tokens.items;
+}
+
 /// json_repair.loads(input) with every option left at its default.
 pub fn loads(arena: Allocator, input: []const u8) Error!Value {
     var parser: Parser = .{ .arena = arena, .text = try Text.init(arena, input) };
@@ -393,6 +414,7 @@ const Parser = struct {
     deferred_count: usize = 0,
     calls: usize = 0,
     tried_suffix: bool = false,
+    tokens: std.ArrayList(Token) = .empty,
 
     fn char(self: *const Parser, offset: isize) ?u21 {
         return self.text.at(self.index + offset);
@@ -480,69 +502,26 @@ const Parser = struct {
     fn wholeStrict(self: *Parser) Error!Value {
         self.index = 0;
         self.strictWhitespace();
-        const value = try self.strictValue(0);
+        const value = try self.strictValue(0, false);
         self.strictWhitespace();
         if (self.index != self.text.len()) return error.ParseValue;
         return value;
     }
-    fn strictValue(self: *Parser, depth: usize) Error!Value {
+    fn strictValue(self: *Parser, depth: usize, comptime tokens: bool) Error!Value {
         if (depth >= max_depth) return error.JsonTooDeep;
         const c = self.char(0) orelse return error.ParseValue;
         switch (c) {
-            '"' => return .{ .string = try self.strictString() },
-            '{' => {
-                self.index += 1;
-                var object: runtime.ObjectMap = .empty;
-                self.strictWhitespace();
-                if (self.char(0) == '}') {
-                    self.index += 1;
-                    return .{ .object = object };
-                }
-                while (true) {
-                    if (self.char(0) != '"') return error.ParseValue;
-                    const key = try self.strictString();
-                    self.strictWhitespace();
-                    if (self.char(0) != ':') return error.ParseValue;
-                    self.index += 1;
-                    self.strictWhitespace();
-                    const value = try self.strictValue(depth + 1);
-                    try object.put(self.arena, key, value);
-                    self.strictWhitespace();
-                    if (self.char(0) == '}') break;
-                    if (self.char(0) != ',') return error.ParseValue;
-                    self.index += 1;
-                    self.strictWhitespace();
-                }
-                self.index += 1;
-                return .{ .object = object };
-            },
-            '[' => {
-                self.index += 1;
-                var array: runtime.Array = .init(self.arena);
-                self.strictWhitespace();
-                if (self.char(0) == ']') {
-                    self.index += 1;
-                    return .{ .array = array };
-                }
-                while (true) {
-                    try array.append(try self.strictValue(depth + 1));
-                    self.strictWhitespace();
-                    if (self.char(0) == ']') break;
-                    if (self.char(0) != ',') return error.ParseValue;
-                    self.index += 1;
-                    self.strictWhitespace();
-                }
-                self.index += 1;
-                return .{ .array = array };
-            },
+            '"' => return self.strictScalar(tokens, .{ .string = try self.strictString() }),
+            '{' => return self.strictObject(depth, tokens),
+            '[' => return self.strictArray(depth, tokens),
             else => {},
         }
-        if (self.starts(0, "null")) return self.takeLiteral(4, .null);
-        if (self.starts(0, "true")) return self.takeLiteral(4, .{ .bool = true });
-        if (self.starts(0, "false")) return self.takeLiteral(5, .{ .bool = false });
-        if (self.starts(0, "NaN")) return self.takeLiteral(3, .{ .float = std.math.nan(f64) });
-        if (self.starts(0, "Infinity")) return self.takeLiteral(8, .{ .float = std.math.inf(f64) });
-        if (self.starts(0, "-Infinity")) return self.takeLiteral(9, .{ .float = -std.math.inf(f64) });
+        if (self.starts(0, "null")) return self.strictScalar(tokens, self.takeLiteral(4, .null));
+        if (self.starts(0, "true")) return self.strictScalar(tokens, self.takeLiteral(4, .{ .bool = true }));
+        if (self.starts(0, "false")) return self.strictScalar(tokens, self.takeLiteral(5, .{ .bool = false }));
+        if (self.starts(0, "NaN")) return self.strictScalar(tokens, self.takeLiteral(3, .{ .float = std.math.nan(f64) }));
+        if (self.starts(0, "Infinity")) return self.strictScalar(tokens, self.takeLiteral(8, .{ .float = std.math.inf(f64) }));
+        if (self.starts(0, "-Infinity")) return self.strictScalar(tokens, self.takeLiteral(9, .{ .float = -std.math.inf(f64) }));
         // NUMBER_RE: (-?(?:0|[1-9]\d*))(\.\d+)?([eE][-+]?\d+)?
         const start = self.index;
         if (self.char(0) == '-') self.index += 1;
@@ -566,8 +545,66 @@ const Parser = struct {
             }
         }
         const number = try self.text.string(self.arena, start, self.index);
+        if (tokens) {
+            try self.tokens.append(self.arena, .{ .number = number });
+            return .null;
+        }
         if (floating) return .{ .float = std.fmt.parseFloat(f64, number) catch unreachable };
         return integer(self.arena, number);
+    }
+
+    fn strictScalar(self: *Parser, comptime tokens: bool, value: Value) Allocator.Error!Value {
+        if (tokens) try self.tokens.append(self.arena, .{ .scalar = value });
+        return value;
+    }
+
+    fn strictObject(self: *Parser, depth: usize, comptime tokens: bool) Error!Value {
+        self.index += 1;
+        var object: runtime.ObjectMap = .empty;
+        if (tokens) try self.tokens.append(self.arena, .object_begin);
+        self.strictWhitespace();
+        if (self.char(0) != '}') {
+            while (true) {
+                if (self.char(0) != '"') return error.ParseValue;
+                const key = try self.strictString();
+                if (tokens) try self.tokens.append(self.arena, .{ .scalar = .{ .string = key } });
+                self.strictWhitespace();
+                if (self.char(0) != ':') return error.ParseValue;
+                self.index += 1;
+                self.strictWhitespace();
+                const value = try self.strictValue(depth + 1, tokens);
+                if (!tokens) try object.put(self.arena, key, value);
+                self.strictWhitespace();
+                if (self.char(0) == '}') break;
+                if (self.char(0) != ',') return error.ParseValue;
+                self.index += 1;
+                self.strictWhitespace();
+            }
+        }
+        self.index += 1;
+        if (tokens) try self.tokens.append(self.arena, .object_end);
+        return .{ .object = object };
+    }
+
+    fn strictArray(self: *Parser, depth: usize, comptime tokens: bool) Error!Value {
+        self.index += 1;
+        var array: runtime.Array = .init(self.arena);
+        if (tokens) try self.tokens.append(self.arena, .array_begin);
+        self.strictWhitespace();
+        if (self.char(0) != ']') {
+            while (true) {
+                const value = try self.strictValue(depth + 1, tokens);
+                if (!tokens) try array.append(value);
+                self.strictWhitespace();
+                if (self.char(0) == ']') break;
+                if (self.char(0) != ',') return error.ParseValue;
+                self.index += 1;
+                self.strictWhitespace();
+            }
+        }
+        self.index += 1;
+        if (tokens) try self.tokens.append(self.arena, .array_end);
+        return .{ .array = array };
     }
     fn takeLiteral(self: *Parser, size: isize, value: Value) Value {
         self.index += size;
@@ -634,7 +671,7 @@ const Parser = struct {
     }
     /// JSONDecoder().raw_decode at the current index (no leading whitespace).
     fn rawDecode(self: *Parser) Error!Value {
-        return self.strictValue(0);
+        return self.strictValue(0, false);
     }
 
     // ---- json_parser.py ----
@@ -960,7 +997,11 @@ const Parser = struct {
         const text = number.items;
         if (std.mem.indexOfScalar(u8, text, ',') != null) return .{ .string = text };
         if (std.mem.indexOfAny(u8, text, ".eE") != null) {
-            return if (try pythonFloat(self.arena, text)) |f| .{ .float = f } else .{ .string = text };
+            const parsed_number = @import("value.zig").floatFromString(self.arena, text) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.InvalidNumber => .{ .string = text },
+            };
+            return .{ .float = parsed_number };
         }
         const digits_start: usize = @intFromBool(text.len != 0 and text[0] == '-');
         if (digits_start == text.len) return .{ .string = text };
@@ -1944,43 +1985,6 @@ fn stripComments(arena: Allocator, body: []const u21) Allocator.Error![]const u2
         i += 1;
     }
     return out.items;
-}
-/// Python float() for parse_number text (digits, '-', '+', '.', 'e', 'E',
-/// '/'): [+-](digits[.digits*]|.digits)[eE[+-]digits], else null. The text is
-/// validated first and rewritten with explicit zero digits around the point,
-/// so Zig's correctly rounded parser sees only one canonical syntax.
-fn pythonFloat(arena: Allocator, text: []const u8) Allocator.Error!?f64 {
-    var i: usize = 0;
-    if (i < text.len and (text[i] == '-' or text[i] == '+')) i += 1;
-    const integer_start = i;
-    while (i < text.len and std.ascii.isDigit(text[i])) i += 1;
-    const integer_end = i;
-    var fraction_start = i;
-    var fraction_end = i;
-    if (i < text.len and text[i] == '.') {
-        i += 1;
-        fraction_start = i;
-        while (i < text.len and std.ascii.isDigit(text[i])) i += 1;
-        fraction_end = i;
-    }
-    if (integer_end == integer_start and fraction_end == fraction_start) return null;
-    const exponent_start = i;
-    if (i < text.len and (text[i] == 'e' or text[i] == 'E')) {
-        i += 1;
-        if (i < text.len and (text[i] == '+' or text[i] == '-')) i += 1;
-        const digits_start = i;
-        while (i < text.len and std.ascii.isDigit(text[i])) i += 1;
-        if (i == digits_start) return null;
-    }
-    if (i != text.len) return null;
-    var canonical: std.ArrayList(u8) = .empty;
-    try canonical.ensureTotalCapacity(arena, text.len + 3);
-    canonical.appendSliceAssumeCapacity(text[0..integer_start]);
-    if (integer_end == integer_start) canonical.appendAssumeCapacity('0') else canonical.appendSliceAssumeCapacity(text[integer_start..integer_end]);
-    canonical.appendAssumeCapacity('.');
-    if (fraction_end == fraction_start) canonical.appendAssumeCapacity('0') else canonical.appendSliceAssumeCapacity(text[fraction_start..fraction_end]);
-    canonical.appendSliceAssumeCapacity(text[exponent_start..]);
-    return std.fmt.parseFloat(f64, canonical.items) catch unreachable;
 }
 
 // Generated by tool_argument_repair_oracle.py --zig-unicode-tables from CPython 3.11.17 (Unicode 14.0.0).

@@ -30,12 +30,24 @@ pub const adapter = @import("adapter.zig");
 pub const Adapter = adapter.Adapter;
 pub const XmlAdapter = @import("xml.zig");
 pub const inference = @import("inference.zig");
+pub const sdk_response = @import("sdk_response.zig");
+pub const call_result = @import("call_result.zig");
+pub const CallResult = call_result.CallResult;
 pub const http = @import("http.zig");
 pub const lm = @import("lm.zig");
+pub const model_prices = @import("model_prices.zig");
+pub const lm_cost = @import("lm_cost.zig");
 pub const training = @import("training.zig");
 pub const LM = lm.LM;
+pub const usage_tracker = @import("usage_tracker.zig");
+pub const UsageTracker = usage_tracker.UsageTracker;
+pub const UsageScope = usage_tracker.Scope;
 pub const TypeSafe = lm.TypeSafe;
 pub const predict = @import("predict.zig");
+pub const prediction = @import("prediction.zig");
+pub const Prediction = prediction.Prediction;
+/// Canonical `Module.__call__` for a native program pointer.
+pub const call = predict.callProgram;
 pub const Context = predict.Context;
 pub const TwoStepAdapter = predict.TwoStepAdapter;
 pub const Trace = predict.Trace;
@@ -133,4 +145,6 @@ test {
     _ = @import("avatar_optimizer.zig");
     _ = @import("generated_zig_source.zig");
     _ = @import("generated_zig_session.zig");
+    _ = @import("python_model_dump.zig");
+    _ = @import("sdk_json.zig");
 }

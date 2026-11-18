@@ -204,7 +204,7 @@ fn xmlField(text: []const u8, opening: []const u8, closing: []const u8) error{LM
     return std.mem.trim(u8, text[start..end], value.py_whitespace);
 }
 
-fn testMetric(_: Allocator, example: *const Example, maybe_prediction: ?*const Record, trace: ?*const predict.Trace) value.ParseError!f64 {
+fn testMetric(_: Allocator, example: *const Example, maybe_prediction: ?*const optimize.RecordPrediction, trace: ?*const predict.Trace) value.ParseError!f64 {
     const captured = trace orelse return 0;
     if (captured.steps.items.len != 1) return 0;
     const input = captured.steps.items[0].inputs.get("question") orelse return 0;

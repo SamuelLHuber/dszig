@@ -156,6 +156,7 @@ test "OpenAI program state restores owned configuration without saved credential
     };
     var program: predict.Predict(Sig) = .{};
     program.state.lm = model.lm();
+    program.state.lm.?.model_type = .text;
     const json = try saveAlloc(source, &program);
     try testing.expect(std.mem.indexOf(u8, json, "must-not-be-saved") == null);
     var loader: lm.OpenAI.StateLoader = .{
@@ -174,11 +175,12 @@ test "OpenAI program state restores owned configuration without saved credential
     try testing.expectEqualStrings("https://trusted.invalid/v1", safe_model.base_url);
     try testing.expectEqualStrings("https://saved.invalid/v1", trusted_model.base_url);
     try testing.expectEqualStrings("injected-credential", safe_model.api_key.?);
-    const body = try safe_model.requestBody(target, .{ .messages = &.{.{ .role = .user, .content = .{ .text = "q" } }} });
-    const decoded = try std.json.parseFromSliceLeaky(Value, target, body, .{});
-    try testing.expectEqualStrings("trained-model", decoded.object.get("model").?.string);
-    try testing.expectEqual(@as(i64, 73), decoded.object.get("max_output_tokens").?.integer);
+    try testing.expectEqualStrings("trained-model", safe_model.model);
+    try testing.expectEqual(@as(?u32, 73), safe_model.max_tokens);
     try testing.expect(safe.state.lm.?.supports_reasoning);
+    try testing.expectEqual(lm.OpenAI.Api.responses, safe_model.api);
+    try testing.expectEqual(@import("call_result.zig").ModelType.text, safe.state.lm.?.model_type);
+    try testing.expectEqual(@import("call_result.zig").ModelType.text, trusted.state.lm.?.model_type);
     try testing.expectEqual(@as(u8, 2), safe_model.max_retries);
     try testing.expectEqual(@as(?u64, 123456789), safe_model.timeout_ns);
 }
@@ -230,11 +232,11 @@ fn restoreLM(arena: Allocator, model: Value, options: LoadOptions) LoadError!?lm
     if (!truthy) return null;
     if (model != .object) return error.InvalidLMState;
     const loader = options.lm_loader orelse return error.MissingLMLoader;
-    if (options.allow_unsafe_lm_state) return try loader.restore(loader.ptr, arena, model);
+    if (options.allow_unsafe_lm_state) return try loader.restore(arena, model);
     var unsafe_count: u32 = 0;
     for ([_][]const u8{ "api_base", "base_url", "model_list" }) |key|
         unsafe_count += @intFromBool(model.object.contains(key));
-    if (unsafe_count == 0) return try loader.restore(loader.ptr, arena, model);
+    if (unsafe_count == 0) return try loader.restore(arena, model);
     var sanitized: Record = .empty;
     try sanitized.ensureTotalCapacity(arena, model.object.count() - unsafe_count);
     for (model.object.keys(), model.object.values()) |key, item| {
@@ -242,7 +244,7 @@ fn restoreLM(arena: Allocator, model: Value, options: LoadOptions) LoadError!?lm
             std.mem.eql(u8, key, "base_url") or std.mem.eql(u8, key, "model_list");
         if (!unsafe_key) sanitized.putAssumeCapacity(key, item);
     }
-    return try loader.restore(loader.ptr, arena, .{ .object = sanitized });
+    return try loader.restore(arena, .{ .object = sanitized });
 }
 
 fn loadPredict(arena: Allocator, s: *predict.PredictState, saved: *const Record, options: LoadOptions) LoadError!void {

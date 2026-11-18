@@ -54,6 +54,7 @@ const std = @import("std");
 const lm = @import("lm.zig");
 const value = @import("value.zig");
 const pyjson = @import("pyjson.zig");
+const python_base64 = @import("python_base64.zig");
 const Allocator = std.mem.Allocator;
 const Value = @import("runtime_value.zig").Value;
 const Record = value.Record;
@@ -855,83 +856,17 @@ fn responseEmbeddings(arena: Allocator, response: Value) !Value {
     for (data.array.items) |row| {
         var embedding = row.object.get("embedding").?;
         if (embedding == .string) {
-            const length = try decodeBase64(embedding.string, null);
+            const length = try python_base64.decode(embedding.string, .count, 0);
             if (length % @sizeOf(f32) != 0) return error.InvalidEmbeddingShape;
             var numbers: @import("runtime_value.zig").Array = .init(arena);
             try numbers.resize(length / @sizeOf(f32));
-            _ = try decodeBase64Output(embedding.string, .{ .numbers = numbers.items });
+            _ = try python_base64.decode(embedding.string, .{ .numbers = numbers.items }, 0);
             embedding = .{ .array = numbers };
         }
         if (embedding != .array) return error.InvalidEmbeddingResponse;
         output.appendAssumeCapacity(embedding);
     }
     return .{ .array = output };
-}
-
-/// CPython's default non-validating b64decode ignores nonalphabet ASCII and
-/// leading/excess padding, but still rejects incomplete final quartets.
-fn decodeBase64(text: []const u8, destination: ?[]u8) !usize {
-    return decodeBase64Output(text, if (destination) |bytes| .{ .bytes = bytes } else .count);
-}
-
-const Base64Output = union(enum) { count, bytes: []u8, numbers: []Value };
-
-fn decodeBase64Output(text: []const u8, destination: Base64Output) !usize {
-    // Python validates that the complete input string is ASCII before decoding,
-    // even if a padded quartet would otherwise terminate decoding early.
-    for (text) |c| if (c > 127) return error.InvalidBase64;
-    var chunk: [4]u8 = undefined;
-    var position: u3 = 0;
-    var previous: u8 = 0;
-    var pads: u3 = 0;
-    var length: usize = 0;
-    for (text) |c| {
-        if (c == '=') {
-            if (position >= 2) {
-                pads += 1;
-                if (@as(u4, position) + pads >= 4) return length;
-            }
-            continue;
-        }
-        const digit: u8 = switch (c) {
-            'A'...'Z' => c - 'A',
-            'a'...'z' => c - 'a' + 26,
-            '0'...'9' => c - '0' + 52,
-            '+' => 62,
-            '/' => 63,
-            else => continue,
-        };
-        pads = 0;
-        const byte: ?u8 = switch (position) {
-            0 => null,
-            1 => (previous << 2) | (digit >> 4),
-            2 => (previous << 4) | (digit >> 2),
-            3 => (previous << 6) | digit,
-            else => unreachable,
-        };
-        if (byte) |b| {
-            switch (destination) {
-                .count => {},
-                .bytes => |output| {
-                    if (length >= output.len) return error.InvalidBase64;
-                    output[length] = b;
-                },
-                .numbers => |output| {
-                    chunk[length % 4] = b;
-                    if (length % 4 == 3) {
-                        if (length / 4 >= output.len) return error.InvalidBase64;
-                        const number: f32 = @bitCast(std.mem.readInt(u32, &chunk, .little));
-                        output[length / 4] = .{ .float = number };
-                    }
-                },
-            }
-            length += 1;
-        }
-        previous = digit;
-        position = if (position == 3) 0 else position + 1;
-    }
-    if (position != 0) return error.InvalidBase64;
-    return length;
 }
 
 const testing = std.testing;
@@ -1388,10 +1323,10 @@ test "Embedder hosted responses sort indexes stably and decode explicit little-e
     try testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4.5, 5, 6 }, matrix.values);
     for ([_][]const u8{ "AACAPw==", "AA CA\nPw==", "?AACAPw==!", "====AACAPw======" }) |text| {
         var bytes: [4]u8 = undefined;
-        try testing.expectEqual(@as(usize, 4), try decodeBase64(text, &bytes));
+        try testing.expectEqual(@as(usize, 4), try python_base64.decode(text, .{ .bytes = &bytes }, 0));
         try testing.expectEqual(@as(f32, 1), @as(f32, @bitCast(std.mem.readInt(u32, &bytes, .little))));
     }
-    for ([_][]const u8{ "AACAPw", "AA=A", "A", "AACAPw==é" }) |text| try testing.expectError(error.InvalidBase64, decodeBase64(text, null));
+    for ([_][]const u8{ "AACAPw", "AA=A", "A", "AACAPw==é" }) |text| try testing.expectError(error.InvalidBase64, python_base64.decode(text, .count, 0));
     const invalid = try std.json.parseFromSliceLeaky(Value, arena, "{\"data\":[{\"index\":0,\"embedding\":\"AA==\"}]}", .{});
     try testing.expectError(error.InvalidEmbeddingShape, responseEmbeddings(arena, invalid));
     const missing = try std.json.parseFromSliceLeaky(Value, arena, "{\"data\":[{\"embedding\":[1]}]}", .{});

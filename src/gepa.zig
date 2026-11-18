@@ -39,10 +39,12 @@ pub const Feedback = struct { score: f64, feedback: ?[]const u8 = null };
 
 /// `metric(gold, pred, trace, pred_name, pred_trace)`. `pred_name` and
 /// `pred_step` are set only when GEPA asks for feedback on one predictor.
+/// `prediction` is the program's retained Prediction, with the usage of its
+/// invocation; a failed evaluation row passes an empty one, as Source does.
 pub const FeedbackMetric = *const fn (
     arena: Allocator,
     example: *const Example,
-    prediction: *const Record,
+    prediction: *const optimize.RecordPrediction,
     trace: ?*const Trace,
     pred_name: ?[]const u8,
     pred_step: ?*const Trace.Step,
@@ -115,7 +117,9 @@ pub const GEPA = struct {
     const merge_subsample = 5;
     const max_attempts = 10;
 
-    pub const Run = struct { prediction: ?Record, trace: *const Trace, score: f64 };
+    /// The reflective dataset serializes trace-step records and feedback
+    /// only, so a prediction's usage reaches the metric and nothing else.
+    pub const Run = struct { prediction: ?optimize.RecordPrediction, trace: *const Trace, score: f64 };
 
     const Desc = struct { id1: usize, id2: usize, picks: []const usize };
 
@@ -180,12 +184,12 @@ pub const GEPA = struct {
                 return copy;
             }
 
-            fn failedRun(e: *const Self, trace: *Trace, capture: bool) Run {
+            fn failedRun(e: *const Self, trace: *Trace, capture: bool) Allocator.Error!Run {
                 // Evaluate substitutes an empty Prediction, while bootstrap
                 // trace capture drops failed rows and their trajectories.
                 trace.steps.clearRetainingCapacity();
                 return .{
-                    .prediction = if (capture) null else Record.empty,
+                    .prediction = if (capture) null else try optimize.RecordPrediction.init(e.out, .empty),
                     .trace = trace,
                     .score = e.gepa.failure_score,
                 };
@@ -222,7 +226,7 @@ pub const GEPA = struct {
                             const call: *const @This() = @ptrCast(@alignCast(ptr));
                             try attempt.cancellation.check();
                             const en = call.engine;
-                            const c = en.gepa.rollouts.?.context(en.ctx, attempt, false);
+                            const c = try en.gepa.rollouts.?.context(en.ctx, attempt, false);
                             run.* = try en.runOne(c, call.program, call.example, call.capture);
                         }
                     };
@@ -778,16 +782,16 @@ test "GEPA scoring failures preserve capture-specific outputs while feedback err
     });
     const P = predict.Predict(Sig);
     const FailingMetric = struct {
-        fn failure(_: Allocator, _: *const Example, _: *const Record, _: ?*const Trace, _: ?[]const u8, _: ?*const Trace.Step) value.ParseError!Feedback {
+        fn failure(_: Allocator, _: *const Example, _: *const optimize.RecordPrediction, _: ?*const Trace, _: ?[]const u8, _: ?*const Trace.Step) value.ParseError!Feedback {
             return error.ParseValue;
         }
 
-        fn feedbackFailure(_: Allocator, _: *const Example, _: *const Record, _: ?*const Trace, pred_name: ?[]const u8, _: ?*const Trace.Step) value.ParseError!Feedback {
+        fn feedbackFailure(_: Allocator, _: *const Example, _: *const optimize.RecordPrediction, _: ?*const Trace, pred_name: ?[]const u8, _: ?*const Trace.Step) value.ParseError!Feedback {
             if (pred_name != null) return error.ParseValue;
             return .{ .score = 1 };
         }
 
-        fn allocationFailure(_: Allocator, _: *const Example, _: *const Record, _: ?*const Trace, _: ?[]const u8, _: ?*const Trace.Step) value.ParseError!Feedback {
+        fn allocationFailure(_: Allocator, _: *const Example, _: *const optimize.RecordPrediction, _: ?*const Trace, _: ?[]const u8, _: ?*const Trace.Step) value.ParseError!Feedback {
             return error.OutOfMemory;
         }
     };
@@ -826,7 +830,7 @@ test "GEPA scoring failures preserve capture-specific outputs while feedback err
         if (capture) {
             try std.testing.expect(run.prediction == null);
         } else {
-            try std.testing.expectEqual(@as(usize, 0), run.prediction.?.count());
+            try std.testing.expectEqual(@as(usize, 0), run.prediction.?.fields().count());
         }
         try std.testing.expectEqual(@as(usize, 0), run.trace.steps.items.len);
     }
@@ -840,7 +844,7 @@ test "GEPA scoring failures preserve capture-specific outputs while feedback err
         if (capture) {
             try std.testing.expect(run.prediction == null);
         } else {
-            try std.testing.expectEqual(@as(usize, 0), run.prediction.?.count());
+            try std.testing.expectEqual(@as(usize, 0), run.prediction.?.fields().count());
         }
         try std.testing.expectEqual(@as(usize, 0), run.trace.steps.items.len);
     }
@@ -868,7 +872,7 @@ test "GEPA empty validation evaluates the entire training set" {
         pub const Output = struct { answer: []const u8 };
     });
     const Metric = struct {
-        fn score(_: Allocator, example: *const Example, prediction: *const Record, _: ?*const Trace, _: ?[]const u8, _: ?*const Trace.Step) value.ParseError!Feedback {
+        fn score(_: Allocator, example: *const Example, prediction: *const optimize.RecordPrediction, _: ?*const Trace, _: ?[]const u8, _: ?*const Trace.Step) value.ParseError!Feedback {
             return .{ .score = @floatFromInt(@intFromBool(std.mem.eql(
                 u8,
                 example.record.get("answer").?.string,

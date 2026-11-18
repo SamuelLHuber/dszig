@@ -75,6 +75,7 @@ pub const Reasoning = struct {
         .bool_value = runtimeTruthy,
         .iterate = iterateRuntime,
         .raw_value = rawRuntimeValue,
+        .model_dump = modelDumpRuntimeValue,
         .serialized = serializedRuntimeValue,
         .write_str = writeRuntimeStr,
         .write_repr = writeRuntimeRepr,
@@ -109,6 +110,10 @@ pub const Reasoning = struct {
 
     fn rawRuntimeValue(allocator: Allocator, ptr: *const anyopaque) Allocator.Error!Value {
         return runtimeReasoning(ptr).toValue(allocator);
+    }
+
+    fn modelDumpRuntimeValue(_: Allocator, ptr: *const anyopaque) runtime.CustomError!Value {
+        return .{ .string = runtimeReasoning(ptr).format() };
     }
 
     fn serializedRuntimeValue(_: Allocator, ptr: *const anyopaque, _: u32) runtime.CustomError!Value {

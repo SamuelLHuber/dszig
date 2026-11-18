@@ -64,18 +64,21 @@ fn compact(arena: Allocator, v: Value) ![]const u8 {
 }
 
 fn expectMessages(arena: Allocator, expected: []const Value, actual: []const dszig.adapter.Message) !void {
-    // DSPy's fixture boundary is prompt_to_openai_messages, not just content.
-    // Use the production serializer to compare native calls and tool-result IDs
-    // as well, while keeping prompt text and argument strings byte-exact.
-    const provider: dszig.lm.OpenAI = .{ .client = undefined, .base_url = "http://unused", .model = "golden" };
-    const body = try provider.requestBody(arena, .{ .messages = actual });
-    const root = try std.json.parseFromSliceLeaky(Value, arena, body, .{});
-    const projected = root.object.get("messages").?.array.items;
-    try testing.expectEqual(expected.len, projected.len);
-    for (expected, projected) |want, got| {
-        try testing.expectEqualStrings(want.object.get("role").?.string, got.object.get("role").?.string);
-        try testing.expectEqualStrings(want.object.get("content").?.string, got.object.get("content").?.string);
-        try testing.expect(try dszig.value.recordEqual(&want.object, &got.object));
+    // This frozen boundary is prompt_to_openai_messages, not SDK build_request:
+    // prompt tool-argument strings retain spelling before the SDK parses JSON.
+    try testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |want, message| {
+        var projected: dszig.ObjectMap = .empty;
+        try projected.put(arena, "role", .{ .string = message.role.name() });
+        try projected.put(arena, "content", try message.content.toOpenAIChatValue(arena, testing.io));
+        if (message.tool_call_id) |id| try projected.put(arena, "tool_call_id", .{ .string = id });
+        if (message.tool_calls.len != 0) {
+            var calls: std.array_list.Managed(Value) = .init(arena);
+            for (message.tool_calls) |call|
+                try calls.append(try dszig.lm.OpenAI.toolCallValue(arena, .chat_completions, call));
+            try projected.put(arena, "tool_calls", .{ .array = calls });
+        }
+        try testing.expect(try dszig.value.recordEqual(&want.object, &projected));
     }
 }
 
@@ -782,7 +785,7 @@ const GepaMock = struct {
 fn gepaMetric(
     arena: Allocator,
     example: *const dszig.Example,
-    prediction: *const Record,
+    prediction: *const dszig.optimize.RecordPrediction,
     trace: ?*const dszig.Trace,
     pred_name: ?[]const u8,
     _: ?*const dszig.Trace.Step,
