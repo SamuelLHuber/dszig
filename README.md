@@ -3803,7 +3803,11 @@ The following prevent a claim that DSZig can do everything DSPy can:
   native custom classes, not arbitrary Python objects erased into ordinary
   `Value`/`Record` dictionaries; a nested dynamic model inside a History record
   therefore cannot retain its original Python class repr merely from its keys.
-- **Optimizer options:** GEPA returns the best candidate indices for each
+- **Optimizer options:** GEPA requires exactly one budget: `auto`,
+  `max_full_evals`, or `max_metric_calls`. Zero counts as a supplied budget;
+  GEPA still evaluates the seed program before checking whether to stop.
+  The native full-evaluation budget rejects overflow instead of wrapping.
+  GEPA returns the best candidate indices for each
   validation example, including ties. Set `track_best_outputs = true` to also
   retain their predictions in `best_outputs_valset`, in candidate discovery
   order. The results live in the compilation allocator and do not require

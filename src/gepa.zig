@@ -1710,6 +1710,11 @@ pub const GEPA = struct {
         trainset: []const Example,
         options: Options,
     ) !Result(P) {
+        const budget_count = @as(u2, @intFromBool(self.auto != null)) +
+            @as(u2, @intFromBool(self.max_full_evals != null)) +
+            @as(u2, @intFromBool(self.max_metric_calls != null));
+        if (budget_count == 0) return error.NoBudget;
+        if (budget_count != 1) return error.ConflictingBudgets;
         assert(trainset.len > 0);
         if (self.val_evaluation_policy) |policy| {
             if (policy.max_batch_size == 0) return error.InvalidValidationBatch;
@@ -1736,10 +1741,12 @@ pub const GEPA = struct {
                 .medium => 12,
                 .heavy => 18,
             }, if (options.valset) |set| set.len else trainset.len)
-        else if (self.max_full_evals) |k|
-            k * (trainset.len + if (options.valset) |v| v.len else 0)
-        else
-            self.max_metric_calls orelse return error.NoBudget;
+        else if (self.max_full_evals) |k| blk: {
+            const val_count = if (options.valset) |v| v.len else 0;
+            const total = std.math.add(usize, trainset.len, val_count) catch
+                return error.BudgetOverflow;
+            break :blk std.math.mul(usize, k, total) catch return error.BudgetOverflow;
+        } else self.max_metric_calls.?;
 
         const names = try out.alloc([]const u8, preds.len);
         const seed_candidate = try out.alloc([]const u8, preds.len);
@@ -2117,7 +2124,7 @@ test "GEPA objective batches require scores only for non-instance frontiers" {
     try std.testing.expectError(error.DuplicateObjective, state.update(arena, .instance, 4, &.{scored}, null));
 }
 
-test "GEPA empty validation evaluates the entire training set" {
+test "GEPA requires one budget and evaluates the seed even with a zero budget" {
     var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer memory.deinit();
     const arena = memory.allocator();
@@ -2141,13 +2148,38 @@ test "GEPA empty validation evaluates the entire training set" {
         try Example.fromJson(arena, "{\"question\":\"q\",\"answer\":\"ok\"}", &.{"question"}),
         try Example.fromJson(arena, "{\"question\":\"r\",\"answer\":\"ok\"}", &.{"question"}),
     };
-    const optimizer: GEPA = .{ .metric = Metric.score, .max_metric_calls = 1 };
-    const result = try optimizer.compile(predict.Predict(Sig), arena, .{ .arena = arena, .lm = script.lm() }, .{}, &examples, .{ .valset = &.{} });
+    const Program = predict.Predict(Sig);
+    const ctx: Context = .{ .arena = arena, .lm = script.lm() };
+    const options: GEPA.Options = .{ .valset = &.{} };
+    const invalid: []const GEPA = &.{
+        .{ .metric = Metric.score, .auto = .light, .max_full_evals = 0 },
+        .{ .metric = Metric.score, .auto = .light, .max_metric_calls = 0 },
+        .{ .metric = Metric.score, .max_full_evals = 0, .max_metric_calls = 0 },
+        .{ .metric = Metric.score, .auto = .light, .max_full_evals = 0, .max_metric_calls = 0 },
+    };
+    for (invalid) |optimizer| {
+        try std.testing.expectError(
+            error.ConflictingBudgets,
+            optimizer.compile(Program, arena, ctx, .{}, &examples, options),
+        );
+    }
+    const missing: GEPA = .{ .metric = Metric.score };
+    try std.testing.expectError(
+        error.NoBudget,
+        missing.compile(Program, arena, ctx, .{}, &examples, options),
+    );
+    const overflowing: GEPA = .{ .metric = Metric.score, .max_full_evals = std.math.maxInt(usize) };
+    try std.testing.expectError(
+        error.BudgetOverflow,
+        overflowing.compile(Program, arena, ctx, .{}, &examples, options),
+    );
+    const optimizer: GEPA = .{ .metric = Metric.score, .max_metric_calls = 0 };
+    const result = try optimizer.compile(Program, arena, ctx, .{}, &examples, options);
     try std.testing.expect(result.best_outputs_valset == null);
     try std.testing.expectEqualSlices(f64, &.{ 1, 0 }, result.val_subscores[0]);
     try std.testing.expectEqual(@as(f64, 0.5), result.val_aggregate_scores[0]);
     try std.testing.expectEqual(@as(usize, 2), result.total_metric_calls);
-    try std.testing.expectEqual(@as(usize, 1), result.max_metric_calls);
+    try std.testing.expectEqual(@as(usize, 0), result.max_metric_calls);
 }
 
 test "GEPA stops after seed evaluation before reflecting or calling later stoppers" {
