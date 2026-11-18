@@ -3724,9 +3724,13 @@ The following prevent a claim that DSZig can do everything DSPy can:
   cap, without NumPy or libsndfile. Other sample container formats are not
   supported. Live public OpenAI
   Chat Completions and Responses checks identified the dominant color of an
-  inline PNG through typed `Predict`. This does not verify hosted audio, media
-  fine-tuning, or rich-media tool results. Chat Completions does not accept
-  document parts.
+  inline PNG through typed `Predict`. When a Chat backend requires text-only
+  tool rows, the prediction path replaces each tool image with a placeholder
+  and sends the images together in a labeled user message after the tool
+  outputs. Public OpenAI Chat Completions identified a purple PNG sent this
+  way. Raw SDK tool rows are not rewritten. This does not verify hosted audio,
+  media fine-tuning, or other rich-media tool results. Chat Completions does
+  not accept document parts.
 - **File and DocumentPart boundaries:** the constructor smoke explicitly leaves
   606 successful source Python DocumentPart object/repr/bytes operations
   unimplemented; canonical document dictionaries do not replace those

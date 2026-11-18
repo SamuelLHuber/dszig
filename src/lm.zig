@@ -2193,8 +2193,14 @@ pub const OpenAI = struct {
         if (has_system) try fields.put(arena, "system", nativeContent(arena, request.messages[0].content));
         var messages: runtime.Array = .init(arena);
         try messages.ensureTotalCapacity(request.messages.len - @intFromBool(has_system));
-        for (request.messages[@intFromBool(has_system)..]) |*message|
-            try messages.append(try nativeMessage(arena, message));
+        const turns = request.messages[@intFromBool(has_system)..];
+        if (self.api == .chat_completions and hasToolImages(turns) and
+            (try self.chatCompatibility(self.model)).content_policy.tool_result_media == .reject)
+        {
+            try chatToolAttachments(arena, &messages, turns);
+        } else {
+            for (turns) |*message| try messages.append(try nativeMessage(arena, message));
+        }
         try fields.put(arena, "messages", .{ .array = messages });
         var tools: runtime.Array = .init(arena);
         for (request.tools) |tool| {
@@ -2254,6 +2260,96 @@ pub const OpenAI = struct {
         try self.nativeToolOverrides(arena, request.tools, &config);
         try fields.put(arena, "config", .{ .object = config });
         return sdk.Request.fromValue(arena, .{ .object = fields }) catch |err| return sdkCodecError(err);
+    }
+
+    fn isImagePart(part: @import("runtime_value.zig").Value) bool {
+        if (part != .object) return false;
+        const kind = part.object.get("type") orelse return false;
+        return kind == .string and std.mem.eql(u8, kind.string, "image");
+    }
+
+    fn hasToolImages(messages: []const Message) bool {
+        for (messages) |message| {
+            if (message.role != .tool or message.content != .parts) continue;
+            for (message.content.parts) |part| if (isImagePart(part)) return true;
+        }
+        return false;
+    }
+
+    fn chatToolAttachments(
+        arena: Allocator,
+        rows: *@import("runtime_value.zig").Array,
+        messages: []const Message,
+    ) Error!void {
+        const runtime = @import("runtime_value.zig");
+        var attachments: runtime.Array = .init(arena);
+        var calls: []const inference.ToolCall = &.{};
+        for (messages) |*message| {
+            if (message.role == .tool) {
+                try rows.append(try chatToolAttachment(arena, &attachments, message, calls));
+                continue;
+            }
+            try flushToolAttachments(arena, rows, &attachments);
+            calls = if (message.role == .assistant) message.tool_calls else &.{};
+            try rows.append(try nativeMessage(arena, message));
+        }
+        try flushToolAttachments(arena, rows, &attachments);
+    }
+
+    fn flushToolAttachments(
+        arena: Allocator,
+        rows: *@import("runtime_value.zig").Array,
+        attachments: *@import("runtime_value.zig").Array,
+    ) Error!void {
+        if (attachments.items.len == 0) return;
+        var row: @import("runtime_value.zig").ObjectMap = .empty;
+        try row.put(arena, "role", .{ .string = "user" });
+        try row.put(arena, "parts", .{ .array = attachments.* });
+        try rows.append(.{ .object = row });
+        attachments.* = .init(arena);
+    }
+
+    fn chatToolAttachment(
+        arena: Allocator,
+        attachments: *@import("runtime_value.zig").Array,
+        message: *const Message,
+        calls: []const inference.ToolCall,
+    ) Error!@import("runtime_value.zig").Value {
+        const runtime = @import("runtime_value.zig");
+        if (message.content != .parts) return nativeMessage(arena, message);
+        for (message.content.parts) |part| {
+            if (isImagePart(part)) break;
+        } else return nativeMessage(arena, message);
+        const id = message.tool_call_id orelse return error.LMFailure;
+        const name = for (calls) |call| {
+            if (std.mem.eql(u8, call.id, id)) break call.name;
+        } else "";
+        const label = if (name.len == 0)
+            try std.fmt.allocPrint(arena, "Attachments from tool call {s}:", .{id})
+        else
+            try std.fmt.allocPrint(arena, "Attachments from tool call {s} ({s}):", .{ id, name });
+        try attachments.append(try nativeTextPart(arena, label));
+        const placeholder = try nativeTextPart(arena, "[image attached in the next message]");
+        var result: runtime.Array = .init(arena);
+        try result.ensureTotalCapacity(message.content.parts.len);
+        for (message.content.parts) |part| {
+            if (isImagePart(part)) {
+                try attachments.append(part);
+                result.appendAssumeCapacity(placeholder);
+            } else {
+                result.appendAssumeCapacity(part);
+            }
+        }
+        var text_result = message.*;
+        text_result.content = .{ .parts = result.items };
+        return nativeMessage(arena, &text_result);
+    }
+
+    fn nativeTextPart(arena: Allocator, text: []const u8) Error!@import("runtime_value.zig").Value {
+        var fields: @import("runtime_value.zig").ObjectMap = .empty;
+        try fields.put(arena, "type", .{ .string = "text" });
+        try fields.put(arena, "text", .{ .string = text });
+        return .{ .object = fields };
     }
 
     fn nativeContent(arena: Allocator, input: adapter.Content) @import("runtime_value.zig").Value {
@@ -2324,11 +2420,8 @@ pub const OpenAI = struct {
 
     fn nativeContentParts(arena: Allocator, input: adapter.Content) Error!@import("runtime_value.zig").Value {
         if (input == .parts) return nativeContent(arena, input);
-        var fields: @import("runtime_value.zig").ObjectMap = .empty;
-        try fields.put(arena, "type", .{ .string = "text" });
-        try fields.put(arena, "text", .{ .string = input.text });
         var parts: @import("runtime_value.zig").Array = .init(arena);
-        try parts.append(.{ .object = fields });
+        try parts.append(try nativeTextPart(arena, input.text));
         return .{ .array = parts };
     }
 
@@ -4042,6 +4135,60 @@ test "public prompt ingress removes defaults under either max token alias" {
         error.InvalidPromptOptions,
         prompt_options.build(allocator, "mock", "prompt", &conflict, false, 8),
     );
+}
+
+test "Chat prediction puts tool images after all tool outputs in the turn" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var client: std.http.Client = .{ .allocator = testing.allocator, .io = testing.io };
+    defer client.deinit();
+    const model: OpenAI = .{
+        .client = &client,
+        .base_url = "https://example.invalid/v1",
+        .model = "gpt-4o-mini",
+    };
+    const url = "https://example.invalid/sample.png";
+    const image = try @import("image.zig").Image.fromString(arena, url);
+    const marker = try image.serialize(arena);
+    const messages: []const Message = &.{
+        .{ .role = .assistant, .content = .{ .text = "" }, .tool_calls = &.{
+            .{ .id = "visual", .name = "camera", .arguments = "{}" },
+            .{ .id = "plain", .name = "note", .arguments = "{}" },
+        } },
+        .{
+            .role = .tool,
+            .content = try adapter.renderedContent(arena, marker),
+            .tool_call_id = "visual",
+        },
+        .{ .role = .tool, .content = .{ .text = "unchanged" }, .tool_call_id = "plain" },
+        .{ .role = .user, .content = .{ .text = "finish" } },
+    };
+    const canonical = try model.predictionRequest(arena, .{ .messages = messages });
+    defer canonical.release();
+    const wire = try model.requestBody(arena, canonical);
+    const body = try OpenAI.parseJson(arena, wire.body);
+    const rows = body.object.get("messages").?.array.items;
+    try testing.expectEqual(@as(usize, 5), rows.len);
+    try testing.expectEqualStrings("visual", rows[1].object.get("tool_call_id").?.string);
+    try testing.expectEqualStrings(
+        "[image attached in the next message]",
+        rows[1].object.get("content").?.string,
+    );
+    try testing.expectEqualStrings("plain", rows[2].object.get("tool_call_id").?.string);
+    try testing.expectEqualStrings("unchanged", rows[2].object.get("content").?.string);
+    try testing.expectEqualStrings("user", rows[3].object.get("role").?.string);
+    const attachments = rows[3].object.get("content").?.array.items;
+    try testing.expectEqual(@as(usize, 2), attachments.len);
+    try testing.expectEqualStrings(
+        "Attachments from tool call visual (camera):",
+        attachments[0].object.get("text").?.string,
+    );
+    try testing.expectEqualStrings(
+        url,
+        attachments[1].object.get("image_url").?.object.get("url").?.string,
+    );
+    try testing.expectEqualStrings("finish", rows[4].object.get("content").?.string);
 }
 
 test "Chat canonical parts preserve text boundaries across roles" {
