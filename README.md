@@ -3817,6 +3817,10 @@ The following prevent a claim that DSZig can do everything DSPy can:
   GEPA warns at most once per compile if the predictor feedback score differs
   from the program score. `warn_on_score_mismatch = false` suppresses that
   diagnostic without changing feedback or selection. The result records the seed.
+  `stop_callbacks` can stop a compile after seed evaluation or between
+  complete iterations. Native callbacks see a borrowed, read-only state and
+  run in caller order until one returns true, before the metric-budget check.
+  They do not interrupt an in-flight evaluation or replace the metric budget.
   `proposal_options` configures the built-in reflection proposer: override its
   base instructions, supply additional guidance, select an adapter, or limit
   an instruction by Unicode character count. An oversized draft gets one

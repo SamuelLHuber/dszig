@@ -274,6 +274,8 @@ pub const GEPA = struct {
     auto: ?Auto = null,
     max_full_evals: ?usize = null,
     max_metric_calls: ?usize = null,
+    /// Checked in caller order after seed evaluation and between iterations.
+    stop_callbacks: []const StopCallback = &.{},
     reflection_minibatch_size: usize = 3,
     candidate_selection_strategy: Selection = .pareto,
     skip_perfect_score: bool = true,
@@ -328,6 +330,23 @@ pub const GEPA = struct {
             Context,
             *const ComponentSelection,
         ) anyerror![]const []const u8,
+    };
+
+    /// Read-only snapshot borrowed for the duration of a stop callback.
+    pub const StopState = struct {
+        last_iteration: ?usize,
+        total_metric_calls: usize,
+        num_full_val_evals: usize,
+        max_metric_calls: usize,
+        candidates: []const []const []const u8,
+        val_subscores: []const []const f64,
+        parents: []const []const ?usize,
+        discovery_eval_counts: []const usize,
+    };
+
+    pub const StopCallback = struct {
+        ptr: *anyopaque,
+        should_stop: *const fn (*anyopaque, *const StopState) anyerror!bool,
     };
 
     pub const Options = struct {
@@ -453,6 +472,25 @@ pub const GEPA = struct {
             last_iter_found_new_program: bool = false,
             triplets: std.ArrayList([3]usize) = .empty,
             descs: std.ArrayList(Desc) = .empty,
+
+            fn shouldStop(e: *const Self, last_iteration: ?usize, max_calls: usize) !bool {
+                if (e.gepa.stop_callbacks.len > 0) {
+                    const state: StopState = .{
+                        .last_iteration = last_iteration,
+                        .total_metric_calls = e.total_evals,
+                        .num_full_val_evals = e.full_evals,
+                        .max_metric_calls = max_calls,
+                        .candidates = e.candidates.items,
+                        .val_subscores = e.subscores.items,
+                        .parents = e.parents.items,
+                        .discovery_eval_counts = e.discovery.items,
+                    };
+                    for (e.gepa.stop_callbacks) |callback| {
+                        if (try callback.should_stop(callback.ptr, &state)) return true;
+                    }
+                }
+                return e.total_evals >= max_calls;
+            }
 
             fn average(e: *const Self, idx: usize) f64 {
                 const list = e.subscores.items[idx];
@@ -1312,7 +1350,7 @@ pub const GEPA = struct {
         }
         try e.addProgram(seed_candidate, &.{null});
         var started = false;
-        while (e.total_evals < max_calls) {
+        while (!(try e.shouldStop(if (started) e.i else null, max_calls))) {
             if (started) e.i += 1;
             started = true;
             if (self.use_merge) {
@@ -1556,6 +1594,58 @@ test "GEPA empty validation evaluates the entire training set" {
     try std.testing.expectEqual(@as(f64, 0.5), result.val_aggregate_scores[0]);
     try std.testing.expectEqual(@as(usize, 2), result.total_metric_calls);
     try std.testing.expectEqual(@as(usize, 1), result.max_metric_calls);
+}
+
+test "GEPA stops after seed evaluation before reflecting or calling later stoppers" {
+    const Sig = signature.Signature(struct {
+        pub const instructions = "Original.";
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: []const u8 };
+    });
+    const Callbacks = struct {
+        fn metric(
+            _: Allocator,
+            _: *const Example,
+            _: *const optimize.RecordPrediction,
+            _: ?*const Trace,
+            _: ?[]const u8,
+            _: ?*const Trace.Step,
+        ) value.ParseError!Feedback {
+            return .{ .score = 0 };
+        }
+
+        fn afterSeed(_: *anyopaque, state: *const GEPA.StopState) !bool {
+            try std.testing.expectEqual(@as(?usize, null), state.last_iteration);
+            try std.testing.expectEqual(@as(usize, 1), state.total_metric_calls);
+            return true;
+        }
+
+        fn unexpected(_: *anyopaque, _: *const GEPA.StopState) !bool {
+            return error.CallbackShouldHaveShortCircuited;
+        }
+    };
+    var storage: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    var script: @import("lm.zig").ScriptedLM = .{
+        .responses = &.{ "{\"answer\":\"seed\"}", "{\"answer\":\"would reflect\"}" },
+    };
+    const example = try Example.fromJson(arena, "{\"question\":\"q\"}", &.{"question"});
+    const optimizer: GEPA = .{
+        .metric = Callbacks.metric,
+        .max_metric_calls = 8,
+        .stop_callbacks = &.{
+            .{ .ptr = &script, .should_stop = Callbacks.afterSeed },
+            .{ .ptr = &script, .should_stop = Callbacks.unexpected },
+        },
+    };
+    const result = try optimizer.compile(predict.Predict(Sig), arena, .{
+        .arena = arena,
+        .lm = script.lm(),
+        .adapter = .json,
+    }, .{}, &.{example}, .{});
+    try std.testing.expectEqual(@as(usize, 1), script.index);
+    try std.testing.expectEqual(@as(usize, 1), result.total_metric_calls);
 }
 
 test "GEPA best outputs keep ties and replace an older frontier without extra evaluations" {
