@@ -116,10 +116,24 @@ pub const SIMBA = struct {
         prompt: ?Context = null,
     };
 
+    pub fn ScoredProgram(comptime P: type) type {
+        return struct {
+            program: *const P,
+            score: f64,
+
+            fn higher(_: void, a: @This(), b: @This()) bool {
+                return a.score > b.score;
+            }
+        };
+    }
+
     pub fn Result(comptime P: type) type {
         return struct {
             program: P,
-            /// `candidate_programs` scores on the full trainset, descending.
+            /// Final programs ranked by full-trainset score, with stable ties.
+            /// Program snapshots live in the compile allocator.
+            candidate_programs: []const ScoredProgram(P),
+            /// Scores in the same order as candidate_programs.
             scores: []const f64,
             /// `trial_logs[i]["train_score"]`, when set.
             train_scores: []const ?f64,
@@ -357,23 +371,31 @@ pub const SIMBA = struct {
             const idx: usize = if (m < 1) 0 else @intFromFloat(roundHalfEven(@as(f64, @floatFromInt(i * m)) / @as(f64, @floatFromInt(n - 1))));
             if (std.mem.indexOfScalar(usize, idxs.items, idx) == null) try idxs.append(out, idx);
         }
-        const scores = try out.alloc(f64, idxs.items.len);
+        const ranked = try out.alloc(ScoredProgram(P), idxs.items.len);
         const programs = try out.alloc(*P, idxs.items.len);
         var best_idx: usize = 0;
         for (idxs.items, programs) |w, *prog| prog.* = try clone(P, out, winning.items[w]);
         const all = try out.alloc(usize, trainset.len);
         for (all, 0..) |*index, i| index.* = i;
         const final_runs = try self.runPrograms(P, out, base, programs, trainset, all);
-        for (scores, 0..) |*s, i| {
+        for (ranked, programs, 0..) |*row, program, i| {
             const list = try out.alloc(f64, trainset.len);
             for (list, final_runs[i * trainset.len ..][0..trainset.len]) |*x, r| x.* = r.score.?;
-            s.* = mean(list);
-            if (i != 0) train_scores[i - 1] = s.*;
-            if (s.* > scores[best_idx]) best_idx = i;
+            const score = mean(list);
+            row.* = .{ .program = program, .score = score };
+            if (i != 0) train_scores[i - 1] = score;
+            if (score > ranked[best_idx].score) best_idx = i;
         }
-        const sorted = try out.dupe(f64, scores);
-        std.sort.insertion(f64, sorted, {}, std.sort.desc(f64));
-        return .{ .program = programs[best_idx].*, .scores = sorted, .train_scores = train_scores };
+        const best = programs[best_idx].*;
+        std.sort.insertion(ScoredProgram(P), ranked, {}, ScoredProgram(P).higher);
+        const scores = try out.alloc(f64, ranked.len);
+        for (scores, ranked) |*score, row| score.* = row.score;
+        return .{
+            .program = best,
+            .candidate_programs = ranked,
+            .scores = scores,
+            .train_scores = train_scores,
+        };
     }
 
     fn Job(comptime P: type) type {
