@@ -44,6 +44,7 @@ pub const UsageTracker = usage_tracker.UsageTracker;
 pub const UsageScope = usage_tracker.Scope;
 pub const TypeSafe = lm.TypeSafe;
 pub const Anthropic = lm.Anthropic;
+pub const Gemini = lm.Gemini;
 pub const predict = @import("predict.zig");
 pub const prediction = @import("prediction.zig");
 pub const Prediction = prediction.Prediction;
@@ -152,6 +153,7 @@ test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("bootstrap_finetune_data.zig");
     _ = @import("anthropic.zig");
+    _ = @import("gemini.zig");
     _ = @import("avatar.zig");
     _ = @import("avatar_optimizer.zig");
     _ = @import("generated_zig_source.zig");

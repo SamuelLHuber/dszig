@@ -38,6 +38,7 @@ pub const ToolChoice = inference.ToolChoice;
 /// TypeSafe System One decision backend (`POST /v1/systemone`).
 pub const TypeSafe = @import("typesafe.zig").TypeSafe;
 pub const Anthropic = @import("anthropic.zig").Anthropic;
+pub const Gemini = @import("gemini.zig").Gemini;
 
 pub const Options = struct {
     temperature: ?f64 = null,
