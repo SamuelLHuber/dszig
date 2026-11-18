@@ -3728,9 +3728,11 @@ The following prevent a claim that DSZig can do everything DSPy can:
   tool rows, the prediction path replaces each tool image with a placeholder
   and sends the images together in a labeled user message after the tool
   outputs. Public OpenAI Chat Completions identified a purple PNG sent this
-  way. Raw SDK tool rows are not rewritten. This does not verify hosted audio,
-  media fine-tuning, or other rich-media tool results. Chat Completions does
-  not accept document parts.
+  way. Responses prediction requests similarly move audio out of the tool
+  result into a user attachment, leaving native image and document results
+  in the tool row. Raw SDK tool rows are not rewritten. This does not verify
+  hosted audio, media fine-tuning, or other rich-media tool results.
+  Chat Completions does not accept document parts.
 - **File and DocumentPart boundaries:** the constructor smoke explicitly leaves
   606 successful source Python DocumentPart object/repr/bytes operations
   unimplemented; canonical document dictionaries do not replace those

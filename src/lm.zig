@@ -2194,10 +2194,16 @@ pub const OpenAI = struct {
         var messages: runtime.Array = .init(arena);
         try messages.ensureTotalCapacity(request.messages.len - @intFromBool(has_system));
         const turns = request.messages[@intFromBool(has_system)..];
-        if (self.api == .chat_completions and hasToolImages(turns) and
-            (try self.chatCompatibility(self.model)).content_policy.tool_result_media == .reject)
-        {
-            try chatToolAttachments(arena, &messages, turns);
+        const attachment: ?AttachmentKind = switch (self.api) {
+            .responses => if (hasToolAttachments(turns, .audio)) .audio else null,
+            .chat_completions => if (hasToolAttachments(turns, .image) and
+                (try self.chatCompatibility(self.model)).content_policy.tool_result_media == .reject)
+                .image
+            else
+                null,
+        };
+        if (attachment) |kind| {
+            try appendToolAttachments(arena, &messages, turns, kind);
         } else {
             for (turns) |*message| try messages.append(try nativeMessage(arena, message));
         }
@@ -2262,31 +2268,44 @@ pub const OpenAI = struct {
         return sdk.Request.fromValue(arena, .{ .object = fields }) catch |err| return sdkCodecError(err);
     }
 
-    fn isImagePart(part: @import("runtime_value.zig").Value) bool {
-        if (part != .object) return false;
-        const kind = part.object.get("type") orelse return false;
-        return kind == .string and std.mem.eql(u8, kind.string, "image");
-    }
+    const AttachmentKind = enum {
+        audio,
+        image,
 
-    fn hasToolImages(messages: []const Message) bool {
+        fn matches(kind: AttachmentKind, part: @import("runtime_value.zig").Value) bool {
+            if (part != .object) return false;
+            const tag = part.object.get("type") orelse return false;
+            return tag == .string and std.mem.eql(u8, tag.string, @tagName(kind));
+        }
+
+        fn placeholder(kind: AttachmentKind) []const u8 {
+            return switch (kind) {
+                .audio => "[audio attached in the next message]",
+                .image => "[image attached in the next message]",
+            };
+        }
+    };
+
+    fn hasToolAttachments(messages: []const Message, kind: AttachmentKind) bool {
         for (messages) |message| {
             if (message.role != .tool or message.content != .parts) continue;
-            for (message.content.parts) |part| if (isImagePart(part)) return true;
+            for (message.content.parts) |part| if (kind.matches(part)) return true;
         }
         return false;
     }
 
-    fn chatToolAttachments(
+    fn appendToolAttachments(
         arena: Allocator,
         rows: *@import("runtime_value.zig").Array,
         messages: []const Message,
+        kind: AttachmentKind,
     ) Error!void {
         const runtime = @import("runtime_value.zig");
         var attachments: runtime.Array = .init(arena);
         var calls: []const inference.ToolCall = &.{};
         for (messages) |*message| {
             if (message.role == .tool) {
-                try rows.append(try chatToolAttachment(arena, &attachments, message, calls));
+                try rows.append(try toolAttachment(arena, &attachments, message, calls, kind));
                 continue;
             }
             try flushToolAttachments(arena, rows, &attachments);
@@ -2309,16 +2328,17 @@ pub const OpenAI = struct {
         attachments.* = .init(arena);
     }
 
-    fn chatToolAttachment(
+    fn toolAttachment(
         arena: Allocator,
         attachments: *@import("runtime_value.zig").Array,
         message: *const Message,
         calls: []const inference.ToolCall,
+        kind: AttachmentKind,
     ) Error!@import("runtime_value.zig").Value {
         const runtime = @import("runtime_value.zig");
         if (message.content != .parts) return nativeMessage(arena, message);
         for (message.content.parts) |part| {
-            if (isImagePart(part)) break;
+            if (kind.matches(part)) break;
         } else return nativeMessage(arena, message);
         const id = message.tool_call_id orelse return error.LMFailure;
         const name = for (calls) |call| {
@@ -2329,11 +2349,11 @@ pub const OpenAI = struct {
         else
             try std.fmt.allocPrint(arena, "Attachments from tool call {s} ({s}):", .{ id, name });
         try attachments.append(try nativeTextPart(arena, label));
-        const placeholder = try nativeTextPart(arena, "[image attached in the next message]");
+        const placeholder = try nativeTextPart(arena, kind.placeholder());
         var result: runtime.Array = .init(arena);
         try result.ensureTotalCapacity(message.content.parts.len);
         for (message.content.parts) |part| {
-            if (isImagePart(part)) {
+            if (kind.matches(part)) {
                 try attachments.append(part);
                 result.appendAssumeCapacity(placeholder);
             } else {
@@ -4189,6 +4209,52 @@ test "Chat prediction puts tool images after all tool outputs in the turn" {
         attachments[1].object.get("image_url").?.object.get("url").?.string,
     );
     try testing.expectEqualStrings("finish", rows[4].object.get("content").?.string);
+}
+
+test "Responses moves tool audio into a user message without moving tool images" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var client: std.http.Client = .{ .allocator = testing.allocator, .io = testing.io };
+    defer client.deinit();
+    const model: OpenAI = .{
+        .client = &client,
+        .base_url = "https://example.invalid/v1",
+        .model = "gpt-4o-mini",
+        .api = .responses,
+    };
+    const media = [_]@import("runtime_value.zig").Value{
+        try OpenAI.parseJson(arena, "{\"type\":\"audio\",\"media_type\":\"audio/wav\",\"data\":\"UklGRg==\"}"),
+        try OpenAI.parseJson(arena, "{\"type\":\"image\",\"media_type\":\"image/png\",\"url\":\"https://example.invalid/image.png\"}"),
+    };
+    const messages: []const Message = &.{
+        .{ .role = .assistant, .content = .{ .text = "" }, .tool_calls = &.{
+            .{ .id = "media", .name = "capture", .arguments = "{}" },
+        } },
+        .{ .role = .tool, .tool_call_id = "media", .content = .{ .parts = &media } },
+        .{ .role = .user, .content = .{ .text = "summarize" } },
+    };
+    const canonical = try model.predictionRequest(arena, .{ .messages = messages });
+    defer canonical.release();
+    const wire = try model.requestBody(arena, canonical);
+    const body = try OpenAI.parseJson(arena, wire.body);
+    const rows = body.object.get("input").?.array.items;
+    try testing.expectEqual(@as(usize, 5), rows.len);
+    try testing.expectEqualStrings("media", rows[2].object.get("call_id").?.string);
+    const output = rows[2].object.get("output").?.array.items;
+    try testing.expectEqualStrings(
+        "[audio attached in the next message]",
+        output[0].object.get("text").?.string,
+    );
+    try testing.expectEqualStrings("input_image", output[1].object.get("type").?.string);
+    try testing.expectEqualStrings("user", rows[3].object.get("role").?.string);
+    const attachment = rows[3].object.get("content").?.array.items;
+    try testing.expectEqualStrings(
+        "Attachments from tool call media (capture):",
+        attachment[0].object.get("text").?.string,
+    );
+    try testing.expectEqualStrings("input_audio", attachment[1].object.get("type").?.string);
+    try testing.expectEqualStrings("UklGRg==", attachment[1].object.get("audio").?.string);
 }
 
 test "Chat canonical parts preserve text boundaries across roles" {
