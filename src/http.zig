@@ -33,6 +33,8 @@ pub const Response = struct {
     /// First nonempty `x-typesafe-request-id` response header, owned by the
     /// request arena; null when the server sent none.
     request_id: ?[]const u8 = null,
+    /// Request-arena-owned Content-Type, populated only when requested.
+    content_type: ?[]const u8 = null,
 };
 
 pub const Request = struct {
@@ -41,6 +43,7 @@ pub const Request = struct {
     body: ?[]const u8 = null,
     body_provider: ?BodyProvider = null,
     response_consumer: ?*ResponseConsumer = null,
+    capture_content_type: bool = false,
     content_type: ?[]const u8 = null,
     authorization: ?[]const u8 = null,
     headers: []const std.http.Header = &.{},
@@ -251,6 +254,10 @@ pub const Transport = struct {
             if (response.head.location) |text| if (text.len > 0) try arena.dupe(u8, text) else null else null
         else
             null;
+        const content_type = if (input.capture_content_type and location == null)
+            if (response.head.content_type) |text| try arena.dupe(u8, text) else null
+        else
+            null;
         const decompress_buffer: []u8 = switch (response.head.content_encoding) {
             .identity => &.{},
             .zstd => try self.client.allocator.alloc(u8, std.compress.zstd.default_window_len),
@@ -268,7 +275,15 @@ pub const Transport = struct {
                     consumer.failure = err;
                     return error.ResponseConsumerFailed;
                 };
-                return .{ .response = .{ .status = status, .body = &.{}, .request_id = request_id }, .location = null };
+                return .{
+                    .response = .{
+                        .status = status,
+                        .body = &.{},
+                        .request_id = request_id,
+                        .content_type = content_type,
+                    },
+                    .location = null,
+                };
             }
         }
         return .{
@@ -276,6 +291,7 @@ pub const Transport = struct {
                 .status = status,
                 .body = try reader.allocRemaining(self.client.allocator, .limited(self.max_response_bytes)),
                 .request_id = request_id,
+                .content_type = content_type,
             },
             .location = location,
         };

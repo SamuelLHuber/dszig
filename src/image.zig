@@ -1,8 +1,9 @@
-//! DSPy Image stores a URL reference or a data URI. Construction never fetches
-//! a URL or opens a path; inline media validation is deferred to formatting.
+//! DSPy Image stores a URL reference or a data URI. Only explicit I/O helpers
+//! fetch or open media; inline media validation is deferred to formatting.
 const std = @import("std");
 const file_module = @import("file.zig");
 const File = file_module.File;
+const media_download = @import("media_download.zig");
 const mime_types = @import("mime_types.zig");
 const pyjson = @import("pyjson.zig");
 const runtime = @import("runtime_value.zig");
@@ -16,6 +17,7 @@ pub const Image = struct {
 
     pub const model_name = "Image";
     pub const Error = error{ InvalidImage, InvalidImageDataUri, InvalidImageBase64 };
+    pub const UrlOptions = media_download.Options;
     pub const marker_start = File.marker_start;
     pub const marker_end = File.marker_end;
     const max_legacy_wrappers = 64;
@@ -74,6 +76,25 @@ pub const Image = struct {
                 else => error.InvalidImage,
             };
         return .{ .url = document.file_data.? };
+    }
+
+    /// Download caller-trusted HTTP(S) media. Redirect targets must also be
+    /// trusted. Prefer the response MIME, then guess from the original URL.
+    /// The resulting URI belongs to arena.
+    pub fn fromUrl(
+        arena: Allocator,
+        client: *std.http.Client,
+        url: []const u8,
+        options: UrlOptions,
+    ) !Image {
+        var scratch: std.heap.ArenaAllocator = .init(client.allocator);
+        defer scratch.deinit();
+        const response = try media_download.download(scratch.allocator(), client, url, options);
+        defer client.allocator.free(response.body);
+        const mime = response.content_type orelse "";
+        const media_type = if (mime.len != 0) mime else try guessMime(scratch.allocator(), url) orelse return error.UnknownImageMimeType;
+        const file = try File.fromBytes(arena, response.body, .{ .mime_type = media_type });
+        return .{ .url = file.file_data.? };
     }
 
     /// Explicitly read a caller-trusted regular file (symlinks are followed).

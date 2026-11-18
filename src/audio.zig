@@ -1,8 +1,8 @@
-//! DSPy 3.5 Audio for already encoded audio. Construction is in-memory unless
-//! fromPath is called explicitly. Neither construction nor formatting decodes
-//! audio samples, sniffs a container, or transcodes audio.
+//! DSPy 3.5 Audio for already encoded audio. Only explicit I/O constructors
+//! access files or URLs. No constructor decodes, sniffs, or transcodes audio.
 const std = @import("std");
 const file_model = @import("file.zig");
+const media_download = @import("media_download.zig");
 const mime_types = @import("mime_types.zig");
 const pyjson = @import("pyjson.zig");
 const python = @import("python_value.zig");
@@ -21,6 +21,7 @@ pub const Audio = struct {
     pub const Error = error{ InvalidAudio, InvalidAudioDataUri, InvalidAudioBase64 };
     pub const Options = struct { audio_format: []const u8 = "wav" };
     pub const PathOptions = struct { max_bytes: usize };
+    pub const UrlOptions = media_download.Options;
     pub const Fields = struct { data: []const u8, audio_format: []const u8 };
 
     pub const schema_description = "An audio input type for DSPy.\n\nConstruct from in-memory values only: a data URI string, raw ``bytes`` (with\n``audio_format=``), a numpy-like array, a ``{\"data\", \"audio_format\"}`` dict, or another\n``Audio``. Raw base64 is passed as ``Audio(data=..., audio_format=...)``. Construction and\nadapter parsing never access the filesystem or network; use :meth:`from_path` to read a local\nfile, :meth:`from_url` to download a remote resource, or :meth:`from_array` for array data.";
@@ -114,6 +115,24 @@ pub const Audio = struct {
         return .{ .data = rest[comma + 1 ..], .audio_format = normalizeFormat(header[0..semicolon]) };
     }
 
+    /// Download caller-trusted HTTP(S) media and require an audio MIME if
+    /// provided. Redirect targets must also be trusted. Both fields are owned.
+    pub fn fromUrl(
+        allocator: Allocator,
+        client: *std.http.Client,
+        url: []const u8,
+        options: UrlOptions,
+    ) !Audio {
+        var scratch: std.heap.ArenaAllocator = .init(client.allocator);
+        defer scratch.deinit();
+        const response = try media_download.download(scratch.allocator(), client, url, options);
+        defer client.allocator.free(response.body);
+        const format_name = try formatFromMime(response.content_type orelse "audio/wav");
+        const owned_format = try allocator.dupe(u8, format_name);
+        errdefer allocator.free(owned_format);
+        return fromEncodedBytes(allocator, response.body, owned_format);
+    }
+
     /// Explicit, caller-initiated read of a local regular file, following
     /// symlinks like Source. Both fields are allocated in allocator.
     /// Limit is inclusive and counts bytes before base64.
@@ -127,17 +146,11 @@ pub const Audio = struct {
             else => return error.FileNotFound,
         };
         if (initial.kind != .file) return error.FileNotFound;
-        const audio_prefix = "audio/";
         var scratch = std.heap.ArenaAllocator.init(allocator);
         defer scratch.deinit();
         const guessed = try mime_types.guessType(scratch.allocator(), path, true);
         const media_type = guessed.mime_type orelse return error.UnsupportedAudioMimeType;
-        if (!std.mem.startsWith(u8, media_type, audio_prefix)) return error.UnsupportedAudioMimeType;
-        // Python takes split('/')[1], not the entire suffix after audio/.
-        const subtype = media_type[audio_prefix.len..];
-        const end = std.mem.indexOfScalar(u8, subtype, '/') orelse subtype.len;
-        const audio_format = normalizeFormat(subtype[0..end]);
-        if (!std.unicode.utf8ValidateSlice(audio_format)) return error.InvalidAudio;
+        const audio_format = try formatFromMime(media_type);
         if (initial.size > options.max_bytes) return error.AudioTooLarge;
         const file = try directory.openFile(io, path, .{ .allow_directory = false });
         defer file.close(io);
@@ -173,7 +186,7 @@ pub const Audio = struct {
         return .{ .data = data, .audio_format = try allocator.dupe(u8, self.audio_format) };
     }
 
-    /// Free both fields of an owned Audio returned by clone or fromPath.
+    /// Free both fields of an owned Audio returned by clone, fromPath or fromUrl.
     /// Do not call this on views returned by other constructors.
     pub fn deinitOwned(self: Audio, allocator: Allocator) void {
         allocator.free(self.audio_format);
@@ -381,6 +394,17 @@ fn isTruthy(value: Value) error{ParseValue}!bool {
         .object => |object| object.count() != 0,
         .custom => |custom| try custom.truthy(),
     };
+}
+
+fn formatFromMime(media_type: []const u8) (Audio.Error || error{UnsupportedAudioMimeType})![]const u8 {
+    const prefix = "audio/";
+    if (!std.mem.startsWith(u8, media_type, prefix)) return error.UnsupportedAudioMimeType;
+    // Source takes split('/')[1], not the entire suffix after audio/.
+    const subtype = media_type[prefix.len..];
+    const end = std.mem.indexOfScalar(u8, subtype, '/') orelse subtype.len;
+    const format_name = normalizeFormat(subtype[0..end]);
+    if (!std.unicode.utf8ValidateSlice(format_name)) return error.InvalidAudio;
+    return format_name;
 }
 
 fn normalizeFormat(audio_format: []const u8) []const u8 {

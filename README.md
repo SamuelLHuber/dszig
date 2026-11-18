@@ -3714,8 +3714,12 @@ The following prevent a claim that DSZig can do everything DSPy can:
   status messages.
   Typed `Image` and `Audio` can produce canonical input parts from encoded media.
   `Image.fromEncodedBytes` and both `fromPath` helpers accept explicit byte
-  limits; path helpers require caller-trusted paths. The runtime does not fetch
-  remote media, transcode audio, or encode sample arrays. Live public OpenAI
+  limits; path helpers require caller-trusted paths. `Image.fromUrl` and
+  `Audio.fromUrl` explicitly download caller-trusted HTTP(S) media with a
+  required decompressed byte cap, configurable inactivity timeout and redirect
+  limit, and the caller's TLS trust. These helpers do not enforce an SSRF
+  allowlist; use only trusted URLs and redirects. The runtime never downloads
+  media implicitly, transcodes audio, or encodes sample arrays. Live public OpenAI
   Chat Completions and Responses checks identified the dominant color of an
   inline PNG through typed `Predict`. This does not verify hosted audio, media
   fine-tuning, or rich-media tool results. Chat Completions does not accept
