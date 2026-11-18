@@ -1,10 +1,8 @@
-//! `dspy.COPRO` (DSPy 3.4.1): coordinate ascent over each predictor's
+//! `dspy.COPRO` (DSPy 3.5.0): coordinate ascent over each predictor's
 //! instruction and output prefix. Depth 0 scores `breadth - 1` proposals plus
 //! the current instruction; every later depth asks for `breadth` more given
 //! the best attempts so far, in increasing score order. COPRO draws no random
 //! numbers, so the same LM answers give the same program.
-//!
-//! Not supported: `track_stats`.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -53,6 +51,7 @@ pub const COPRO = struct {
     breadth: u32 = 10,
     depth: usize = 3,
     init_temperature: f64 = 1.4,
+    track_stats: bool = false,
     max_errors: usize = 10,
     /// DSPy `eval_kwargs.num_threads`; null evaluates serially.
     concurrent_evaluation: ?optimize.ConcurrentEvaluation = null,
@@ -67,16 +66,81 @@ pub const COPRO = struct {
         depth: usize,
     };
 
+    pub const DepthStats = struct {
+        min: f64,
+        max: f64,
+        average: f64,
+        stddev: f64,
+    };
+
+    pub const PredictorStats = struct {
+        /// Indexed by zero-based depth, over up to ten retained prompt pairs.
+        best: []const DepthStats,
+        /// Indexed by zero-based depth. Includes the latest batches of earlier
+        /// predictors in the same depth, matching DSPy 3.5's shared accumulator.
+        latest: []const DepthStats,
+    };
+
     pub fn Result(comptime P: type) type {
         return struct {
             program: P,
             /// Sorted by score, descending, stable, duplicates dropped.
             candidates: []const Candidate,
             total_calls: usize,
+            /// Present only with `track_stats`, in named predictor order.
+            stats: ?[]const PredictorStats = null,
         };
     }
 
     const Proposed = struct { instruction: []const u8, prefix: []const u8 };
+
+    const ScoreStats = struct {
+        count: usize = 0,
+        min: f64 = std.math.inf(f64),
+        max: f64 = -std.math.inf(f64),
+        sum: f64 = 0,
+        mean: f128 = 0,
+        squared_deviations: f128 = 0,
+
+        fn add(self: *ScoreStats, score: f64) void {
+            self.count += 1;
+            self.min = @min(self.min, score);
+            self.max = @max(self.max, score);
+            self.sum += score;
+            const delta: f128 = @as(f128, score) - self.mean;
+            self.mean += delta / @as(f128, @floatFromInt(self.count));
+            self.squared_deviations += delta * (@as(f128, score) - self.mean);
+        }
+
+        fn finish(self: ScoreStats) DepthStats {
+            assert(self.count > 0);
+            const variance = self.squared_deviations / @as(f128, @floatFromInt(self.count));
+            return .{
+                .min = self.min,
+                .max = self.max,
+                .average = self.sum / @as(f64, @floatFromInt(self.count)),
+                .stddev = @floatCast(@sqrt(variance)),
+            };
+        }
+    };
+
+    fn bestStats(comptime P: type, evaluated: []const Evaluated(P)) DepthStats {
+        assert(evaluated.len > 0);
+        var top: [10]f64 = undefined;
+        var count: usize = 0;
+        for (evaluated) |candidate| {
+            const score = candidate.candidate.score;
+            var i = count;
+            while (i > 0 and score > top[i - 1]) : (i -= 1) {
+                if (i < top.len) top[i] = top[i - 1];
+            }
+            if (i < top.len) top[i] = score;
+            count = @min(count + 1, top.len);
+        }
+        var stats: ScoreStats = .{};
+        for (top[0..count]) |score| stats.add(score);
+        return stats.finish();
+    }
 
     fn Evaluated(comptime P: type) type {
         return struct {
@@ -122,16 +186,21 @@ pub const COPRO = struct {
             e.* = .empty;
         }
 
+        const best_stats = if (self.track_stats) try out.alloc(DepthStats, try std.math.mul(usize, preds.len, self.depth)) else null;
+        const latest_stats = if (best_stats) |best| try out.alloc(DepthStats, best.len) else null;
         var total_calls: usize = 0;
         for (0..self.depth) |d| {
+            var recent: ScoreStats = .{};
             for (preds, 0..) |p, p_i| {
                 const candidates = if (preds.len > 1) all[p_i].items else latest[p_i];
-                for (candidates) |c| {
+                const latest_start = candidates.len -| self.breadth;
+                for (candidates, 0..) |c, c_i| {
                     const instruction = value.pyStrip(std.mem.trim(u8, c.instruction, "\""));
                     const prefix = value.pyStrip(std.mem.trim(u8, c.prefix, "\""));
                     try setSignature(out, p.param.predict, instruction, prefix);
                     const score = (try optimize.evaluateWith(P, self.concurrent_evaluation, gpa, ctx, &clone, trainset, self.metric, self.max_errors)).score;
                     total_calls += 1;
+                    if (self.track_stats and c_i >= latest_start) recent.add(score);
                     const entry: E = .{
                         .candidate = .{ .predictor = p_i, .instruction = instruction, .prefix = prefix, .score = score, .depth = d },
                         .program = clone,
@@ -143,6 +212,8 @@ pub const COPRO = struct {
                         break;
                     } else try evaluated[p_i].append(out, entry);
                 }
+                if (latest_stats) |stats| stats[p_i * self.depth + d] = recent.finish();
+                if (best_stats) |stats| stats[p_i * self.depth + d] = bestStats(P, evaluated[p_i].items);
                 var best = &evaluated[p_i].items[0];
                 for (evaluated[p_i].items[1..]) |*e| {
                     if (e.candidate.score > best.candidate.score) best = e;
@@ -167,7 +238,18 @@ pub const COPRO = struct {
         const kept = try dropDuplicates(P, out, flat.items);
         const candidates = try out.alloc(Candidate, kept.len);
         for (candidates, kept) |*c, e| c.* = e.candidate;
-        return .{ .program = kept[0].program, .candidates = candidates, .total_calls = total_calls };
+        const stats = if (best_stats) |best| tracked: {
+            const items = try out.alloc(PredictorStats, preds.len);
+            for (items, 0..) |*item, i| {
+                const start = i * self.depth;
+                item.* = .{
+                    .best = best[start..][0..self.depth],
+                    .latest = latest_stats.?[start..][0..self.depth],
+                };
+            }
+            break :tracked items;
+        } else null;
+        return .{ .program = kept[0].program, .candidates = candidates, .total_calls = total_calls, .stats = stats };
     }
 
     /// `Predict(Sig, n=n, temperature=init_temperature)(**inputs).completions`.
@@ -316,4 +398,14 @@ test "COPRO climbs from the basic instruction to the best proposal" {
     try testing.expectEqual(@as(usize, 3), result.candidates.len);
     try testing.expectEqual(@as(f64, 100), result.candidates[0].score);
     try testing.expectEqual(@as(usize, 1), result.candidates[0].depth);
+    try testing.expect(result.stats == null);
+
+    var tracked_optimizer = optimizer;
+    tracked_optimizer.track_stats = true;
+    const tracked = try tracked_optimizer.compile(TestProgram, a, testing.allocator, ctx, null, .{}, &trainset);
+    try testing.expectEqual(result.total_calls, tracked.total_calls);
+    try testing.expectEqual(@as(f64, 100), tracked.stats.?[0].latest[1].average);
+    try testing.expectEqual(@as(f64, 0), tracked.stats.?[0].latest[1].stddev);
+    try testing.expectApproxEqAbs(@as(f64, 100.0 / 3.0), tracked.stats.?[0].best[1].average, 1e-12);
+    try testing.expectApproxEqAbs(@as(f64, 47.14045207910317), tracked.stats.?[0].best[1].stddev, 1e-12);
 }

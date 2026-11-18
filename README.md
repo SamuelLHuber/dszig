@@ -3796,7 +3796,13 @@ The following prevent a claim that DSZig can do everything DSPy can:
   order. The results live in the compilation allocator and do not require
   additional model calls. Unsupported GEPA options include custom code/instruction proposers,
   Flex components, objective-based frontiers, other selection policies, format-failure feedback,
-  logging integrations, and some MIPROv2/SIMBA/COPRO statistics/logging options.
+  and logging integrations. Python logging and runtime settings are not
+  mirrored across optimizers.
+  COPRO `track_stats` exposes per-predictor, per-depth score summaries in
+  `Result.stats`. `best` summarizes up to ten retained instruction/prefix
+  pairs; `latest` includes repeat evaluations and accumulates the newest
+  batches across predictors within the same depth, as in DSPy 3.5.
+  Tracking does not add evaluations.
   MIPROv2 `track_stats` retains native program values in trial order with
   stable score-ranked full and minibatch indices in `Result.tracked_programs`.
   Trial logs expose cumulative evaluation counts and distinguish minibatch
