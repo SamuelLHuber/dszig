@@ -3817,6 +3817,13 @@ The following prevent a claim that DSZig can do everything DSPy can:
   GEPA warns at most once per compile if the predictor feedback score differs
   from the program score. `warn_on_score_mismatch = false` suppresses that
   diagnostic without changing feedback or selection. The result records the seed.
+  `proposal_options` configures the built-in reflection proposer: override its
+  base instructions, supply additional guidance, select an adapter, or limit
+  an instruction by Unicode character count. An oversized draft gets one
+  compression call per proposal attempt; empty or still-oversized results
+  fail rather than being truncated. `gepa.ConfiguredInstructionProposer`
+  also runs standalone on reflection records. Skill loading and History
+  compaction are not implemented by this proposer.
   `add_format_failure_as_feedback = true` includes captured predictor response
   parse failures in the reflection dataset, with the completion text and the
   active adapter's output structure. Such rollouts keep the configured failure

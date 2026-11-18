@@ -61,9 +61,114 @@ pub const ProposeInstruction = signature.Signature(struct {
     };
 });
 
+const CompressInstruction = signature.Signature(struct {
+    pub const instructions =
+        \\Shorten the instruction to fit within the stated limit. Preserve every
+        \\strategy, rule, and constraint; cut redundancy and verbosity. Do not add
+        \\new content. Output only the shortened instruction.
+    ;
+    pub const Input = struct { instruction: []const u8, length_limit: []const u8 };
+    pub const Output = struct { shortened_instruction: []const u8 };
+    pub const descriptions = .{ .instruction = "", .length_limit = "", .shortened_instruction = "" };
+});
+
+const ProposalControls = signature.Signature(struct {
+    pub const Input = struct { additional_instructions: []const u8, length_limit: []const u8 };
+    pub const Output = struct { unused: []const u8 };
+    pub const descriptions = .{
+        .additional_instructions = "Additional requirements from the user for the new instruction. Follow them.",
+        .length_limit = "Hard limit on the length of the new instruction.",
+    };
+});
+
+/// Options for the built-in reflection LM proposer. The caller owns the strings.
+pub const ConfiguredInstructionProposer = struct {
+    base_instructions: []const u8 = "",
+    additional_instructions: []const u8 = "",
+    max_chars: ?u32 = null,
+    adapter: @import("adapter.zig").Adapter = .json,
+
+    pub fn propose(
+        options: ConfiguredInstructionProposer,
+        context: Context,
+        current_instruction: []const u8,
+        examples: []const Record,
+    ) (predict.Error || error{ InvalidInstructionLimit, InvalidInstruction })![]const u8 {
+        const max_chars = options.max_chars;
+        if (max_chars == 0) return error.InvalidInstructionLimit;
+        var ctx = context;
+        ctx.adapter = options.adapter;
+        ctx.trace = null;
+        const length_limit = if (max_chars) |max|
+            try std.fmt.allocPrint(ctx.arena, "The new instruction must be at most {d} characters.", .{max})
+        else
+            "";
+        const draft = try options.generateDraft(ctx, current_instruction, examples, length_limit);
+        if (draft.len == 0) return error.InvalidInstruction;
+        const max = max_chars orelse return draft;
+        if (try fitsInstruction(draft, max)) return draft;
+        const compressor: predict.Predict(CompressInstruction) = .{};
+        const output = try compressor.forward(ctx, .{ .instruction = draft, .length_limit = length_limit });
+        const shortened = value.pyStrip(output.shortened_instruction);
+        if (shortened.len == 0 or !(try fitsInstruction(shortened, max)))
+            return error.InvalidInstruction;
+        return shortened;
+    }
+
+    fn fitsInstruction(text: []const u8, max: u32) error{InvalidInstruction}!bool {
+        const count = std.unicode.utf8CountCodepoints(text) catch return error.InvalidInstruction;
+        return count <= max;
+    }
+
+    fn generateDraft(
+        options: ConfiguredInstructionProposer,
+        ctx: Context,
+        current_instruction: []const u8,
+        examples: []const Record,
+        length_limit: []const u8,
+    ) predict.Error![]const u8 {
+        var fields: [5]signature.Field = undefined;
+        var field_count: usize = 0;
+        var inputs: Record = .empty;
+        const additional = value.pyStrip(options.additional_instructions);
+        for (ProposalControls.fields[0..2], [2][]const u8{ additional, length_limit }) |field, text| {
+            if (text.len == 0) continue;
+            fields[field_count] = field;
+            field_count += 1;
+            try inputs.put(ctx.arena, field.name, .{ .string = text });
+        }
+        @memcpy(fields[field_count..][0..ProposeInstruction.fields.len], ProposeInstruction.fields);
+        field_count += ProposeInstruction.fields.len;
+        var descs: [5][]const u8 = undefined;
+        var prefixes: [5][]const u8 = undefined;
+        for (fields[0..field_count], descs[0..field_count], prefixes[0..field_count]) |field, *desc, *prefix| {
+            desc.* = field.desc;
+            prefix.* = field.prefix;
+        }
+        const rows = try ctx.arena.alloc(Value, examples.len);
+        for (examples, rows) |example, *row| row.* = .{ .object = example };
+        try inputs.put(ctx.arena, "current_instruction", .{ .string = current_instruction });
+        try inputs.put(ctx.arena, "examples_with_feedback", .{ .array = .fromOwnedSlice(ctx.arena, rows) });
+        const proposer: predict.Predict(ProposeInstruction) = .{};
+        var state = proposer.state;
+        state.fields = fields[0..field_count];
+        state.descs = descs[0..field_count];
+        state.prefixes = prefixes[0..field_count];
+        state.input_count = field_count - 1;
+        const base = value.pyStrip(options.base_instructions);
+        if (base.len > 0) state.instructions = base;
+        const output = try state.call(ctx, &inputs);
+        const text = output.get("new_instruction") orelse return error.AdapterParse;
+        if (text != .string) return error.AdapterParse;
+        return value.pyStrip(text.string);
+    }
+};
+
 pub const GEPA = struct {
     metric: FeedbackMetric,
     instruction_proposer: ?InstructionProposer = null,
+    /// Used when `instruction_proposer` is null.
+    proposal_options: ConfiguredInstructionProposer = .{},
     auto: ?Auto = null,
     max_full_evals: ?usize = null,
     max_metric_calls: ?usize = null,
@@ -827,20 +932,15 @@ pub const GEPA = struct {
                 datasets: []const ?[]const Record,
             ) Allocator.Error!?[]?[]const u8 {
                 const texts = try e.out.alloc(?[]const u8, components.len);
-                const proposer: predict.Predict(ProposeInstruction) = .{};
                 for (components, datasets, texts) |k, dataset, *t| {
                     t.* = null;
                     const examples = dataset orelse continue;
                     var c = e.reflection;
                     c.arena = e.out;
-                    c.trace = null;
-                    c.adapter = .json;
-                    const out = proposer.forward(c, .{ .current_instruction = candidate[k], .examples_with_feedback = examples }) catch |err| switch (err) {
+                    const draft = e.gepa.proposal_options.propose(c, candidate[k], examples) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
                         else => return null,
                     };
-                    const draft = value.pyStrip(out.new_instruction);
-                    if (draft.len == 0) return null;
                     t.* = draft;
                 }
                 return texts;
@@ -1057,6 +1157,8 @@ pub const GEPA = struct {
     ) !Result(P) {
         assert(trainset.len > 0);
         assert(self.reflection_minibatch_size > 0);
+        if (self.instruction_proposer == null and self.proposal_options.max_chars == 0)
+            return error.InvalidInstructionLimit;
         // Source computes its budget from the supplied set before applying
         // `valset or trainset`; an empty sampled holdout still evaluates trainset.
         const valset = if (options.valset) |set| if (set.len > 0) set else trainset else trainset;
