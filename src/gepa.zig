@@ -2,8 +2,8 @@
 //! Each iteration picks a parent with the configured selector, runs it
 //! on a minibatch with traces, asks a reflection LM (`ProposeInstruction`,
 //! JSONAdapter) for a better instruction from the metric's textual
-//! feedback, and keeps the child when its minibatch score sum strictly
-//! improves; kept children are scored on the full valset. Merge combines two
+//! feedback, and applies the configured acceptance criterion to the minibatch
+//! scores. Accepted children are scored on the full valset. Merge combines two
 //! Pareto programs that improved different predictors of a common ancestor.
 //! Python's `random.Random(seed)` is ported (one stream for the engine, one
 //! for the DSPy adapter), so the same LM answers give the same program.
@@ -287,6 +287,7 @@ pub const GEPA = struct {
     reflection_minibatch_size: usize = 3,
     candidate_selection_strategy: Selection = .pareto,
     frontier_type: Frontier = .instance,
+    acceptance_criterion: Acceptance = .strict_improvement,
     skip_perfect_score: bool = true,
     /// Use genuine predictor parse failures as reflection examples.
     add_format_failure_as_feedback: bool = false,
@@ -311,6 +312,7 @@ pub const GEPA = struct {
     pub const Auto = enum { light, medium, heavy };
     pub const Selection = enum { pareto, current_best, epsilon_greedy, top_k_pareto };
     pub const Frontier = enum { instance, objective, hybrid, cartesian };
+    pub const Acceptance = enum { strict_improvement, improvement_or_equal };
     pub const ComponentSelector = union(enum) {
         round_robin,
         all,
@@ -1028,7 +1030,13 @@ pub const GEPA = struct {
                     try e.proposeBuiltinChild(parent_candidate, components, datasets);
                 const child = proposed orelse return;
                 const after = try e.evalIds(child, e.trainset, ids, true);
-                if (sumScores(after) > sumScores(before)) {
+                const before_score = sumScores(before);
+                const after_score = sumScores(after);
+                const accepted = switch (e.gepa.acceptance_criterion) {
+                    .strict_improvement => after_score > before_score,
+                    .improvement_or_equal => after_score >= before_score,
+                };
+                if (accepted) {
                     const parent_ids = try e.out.alloc(?usize, 1);
                     parent_ids[0] = parent;
                     try e.addProgram(child, parent_ids);
