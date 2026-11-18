@@ -279,6 +279,7 @@ def request_metadata(request, rollout):
             "rollout_id": json.loads(json.dumps(rollout, ensure_ascii=False)),
             "n": 1,
             "reasoning_effort": request.config.reasoning.effort if request.config.reasoning is not None else None,
+            "logprobs": request.config.logprobs,
             # Predictor-only explicit-null intent is consumed before this
             # normalized engine Request; it is not a wire generation option.
             "reasoning_effort_present": False,
@@ -365,7 +366,9 @@ class ReplayLM(ref.ReferenceLM):
         for i, call in enumerate(self.calls):
             if call["messages"] != want or call.get("tools", []) != metadata["tools"]:
                 continue
-            if call["options"] != metadata["options"]:
+            # A missing logprobs key in an older transcript means disabled;
+            # zero and positive counts remain distinct request identities.
+            if {"logprobs": None, **call["options"]} != metadata["options"]:
                 continue
             if "request" in call:
                 recorded = {**call["request"], "model": request.model}

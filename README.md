@@ -3605,6 +3605,13 @@ live-model coverage, not proof of every optimizer option or full DSPy parity.
 The recorder preserves lm15's already-flat JSON-schema metadata and also
 normalizes nested Chat-wire schema dictionaries.
 
+A separate native Chat Completions run on public OpenAI used SecretSpec and
+`gpt-4o-mini` for 683 recorded calls. Pinned DSPy 3.5.0 strictly replayed that
+transcript and reproduced all eight adapter cases and nine pipeline scores
+and artifacts. COPRO and SIMBA completed but did not improve the date task.
+Separate native live checks exercised asynchronous field streaming on both
+Chat Completions and Responses. These runs do not qualify the homelab endpoint.
+
 ## Real inference
 
 The live executable reads `OPENAI_API_KEY`, or `CODEX_LB_API_KEY` for the local
