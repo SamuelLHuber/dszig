@@ -184,6 +184,12 @@ fn scanRequirements(node: Value, nullable: *bool, mapping: *bool, depth: usize) 
 }
 
 pub const XmlAdapter = struct {
+    pub fn fieldUsesNested(arena: Allocator, field: Field) Error!bool {
+        if (field.kind != .json) return usesNested(field, .null);
+        if (field.xml_literal) return false;
+        return usesNested(field, try fieldSchema(arena, field));
+    }
+
     pub fn fieldStructure(arena: Allocator, definitions: []const Field) Error![]const u8 {
         if (definitions.len == 0) return "";
         var out: Writer.Allocating = .init(arena);

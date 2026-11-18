@@ -2170,8 +2170,27 @@ Cache hits return their stored completion without emitting events. On a miss,
 each physical generation has its own event sequence. Returning `.stop` aborts
 the active generation with `error.StreamStopped` and does not cache a partial
 completion. Event payloads are borrowed only during the callback. This is
-synchronous raw delivery, not DSPy's asynchronous `streamify`, named field
-routing, status callbacks, or automatic field listener finalization.
+synchronous raw delivery; use `dszig.callStream` for named field routing.
+
+Bind `dszig.stream.Listener` descriptors with `dszig.stream.Session.init`
+before invoking `dszig.callStream`. An implicit binding must identify one
+predictor by its declared output field; to disambiguate, provide the
+predictor's state pointer. Only selected predictors request streaming.
+Listeners use the adapter's prepared output names, including text fallbacks
+for reasoning. Each listener needs disjoint fragment buffers, and XML also
+needs storage for the prepared output field table. Keep the program, binding
+arena and buffers alive throughout the session.
+
+Fragments are delivered synchronously and borrowed only during the callback.
+Returning `.stop` aborts the call. `allow_reuse` resets a listener for
+another invocation of its predictor in the same program call. Each new
+`callStream` starts with clean listener state. The returned typed prediction
+is always available; `emit_prediction` reports whether the streaming caller
+should also publish it, after all final fragments. A cache hit can therefore
+return a prediction without any fragments. A session cannot be shared across
+concurrent calls, and selected predictor generations cannot overlap. This
+does not implement asynchronous `streamify`, status messages, arbitrary
+custom streamable types, or routed TwoStep/native decision streaming.
 
 Responses requests honor `config.extensions.openai_responses_compat`, its
 `openai_compat` alias and the nested `compat` forms. Null inherits; `"auto"`
@@ -3663,8 +3682,8 @@ The following prevent a claim that DSZig can do everything DSPy can:
   Chat Completions SSE. Completed SDK responses can be projected to events,
   and bounded event sequences or synchronous sources can be assembled.
   Bounded Chat, JSON, and XML text field listeners are available separately.
-  Native programs can receive raw OpenAI events synchronously; automatic
-  field routing, status callbacks, and asynchronous streaming are not available.
+  Native programs can receive raw OpenAI events or routed field fragments
+  synchronously. Status callbacks and asynchronous streaming are not available.
   Document support is not general multimodal support, and Chat Completions
   does not accept document parts.
 - **File and DocumentPart boundaries:** the constructor smoke explicitly leaves

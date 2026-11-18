@@ -50,6 +50,10 @@ pub const ChatStreamListener = struct {
         };
     }
 
+    pub fn started(self: *const ChatStreamListener) bool {
+        return self.state.started;
+    }
+
     pub fn reset(self: *ChatStreamListener) void {
         self.state = .{};
     }

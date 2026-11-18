@@ -48,6 +48,8 @@ pub const prediction = @import("prediction.zig");
 pub const Prediction = prediction.Prediction;
 /// Canonical `Module.__call__` for a native program pointer.
 pub const call = predict.callProgram;
+pub const callStream = predict.callStream;
+pub const stream = @import("predict_stream.zig");
 pub const Context = predict.Context;
 pub const TwoStepAdapter = predict.TwoStepAdapter;
 pub const Trace = predict.Trace;

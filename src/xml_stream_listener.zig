@@ -60,6 +60,10 @@ pub const XmlStreamListener = struct {
         };
     }
 
+    pub fn started(self: *const XmlStreamListener) bool {
+        return self.state.started;
+    }
+
     pub fn reset(self: *XmlStreamListener) void {
         self.state = .{};
     }

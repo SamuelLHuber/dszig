@@ -21,10 +21,12 @@ const prediction_mod = @import("prediction.zig");
 const Graph = usage_mod.Graph;
 pub const Prediction = prediction_mod.Prediction;
 const Adapter = adapter_mod.Adapter;
+const stream = @import("predict_stream.zig");
 const Field = signature.Field;
 const Record = value.Record;
 
-pub const Error = adapter_mod.Error || lm_mod.Error || value.ConvertError || @import("decision_state.zig").Error || error{NoRetriever};
+pub const Error = adapter_mod.Error || lm_mod.Error || value.ConvertError ||
+    @import("decision_state.zig").Error || stream.Error || error{NoRetriever};
 
 /// The final failed completion parse of one predictor call, as DSPy's
 /// AdapterParseError exposes it. Contents borrow the call's arena.
@@ -69,6 +71,8 @@ pub const Context = struct {
     /// and non-streaming engines emit none. Concurrent calls need disjoint or
     /// synchronized sinks. A stop aborts the active prediction.
     stream_sink: ?lm_mod.OpenAI.StreamSink = null,
+    /// Scoped by callStream; callers normally leave this null.
+    stream_session: ?*stream.Session = null,
     /// ChatAdapter and XMLAdapter retry once with JSONAdapter on parse failure.
     json_fallback: bool = true,
     /// Implicit XML and JSON enable native History; explicit Chat opts in.
@@ -179,8 +183,8 @@ pub const TwoStepAdapter = struct {
         // Extraction failures are reported against the outer signature and the
         // main completion by the caller, so this context captures nothing.
         assert(ctx.parse_failure == null);
-        const parsed = runAdapterMany(ctx, null, .chat, extractor, &.{}, &inputs) catch |err| switch (err) {
-            error.AdapterParse => try runAdapterMany(ctx, null, .json, extractor, &.{}, &inputs),
+        const parsed = runAdapterMany(ctx, null, null, .chat, extractor, &.{}, &inputs) catch |err| switch (err) {
+            error.AdapterParse => try runAdapterMany(ctx, null, null, .json, extractor, &.{}, &inputs),
             else => return err,
         };
         if (parsed.len == 0) return error.AdapterParse;
@@ -366,10 +370,10 @@ pub const PredictState = struct {
     }
 };
 
-fn runWithFallback(ctx: Context, signature_class: *const anyopaque, view_: adapter_mod.View, demos: []const Record, inputs: *const Record) Error![]const Record {
-    return runAdapterMany(ctx, signature_class, ctx.adapter, view_, demos, inputs) catch |err| switch (err) {
+fn runWithFallback(ctx: Context, predictor: *const PredictState, signature_class: *const anyopaque, view_: adapter_mod.View, demos: []const Record, inputs: *const Record) Error![]const Record {
+    return runAdapterMany(ctx, predictor, signature_class, ctx.adapter, view_, demos, inputs) catch |err| switch (err) {
         error.AdapterParse => if ((ctx.adapter == .chat or ctx.adapter == .xml) and ctx.json_fallback)
-            try runAdapterMany(ctx, signature_class, .json, view_, demos, inputs)
+            try runAdapterMany(ctx, predictor, signature_class, .json, view_, demos, inputs)
         else
             return err,
         else => return err,
@@ -383,7 +387,10 @@ fn runPredict(predictor: *const PredictState, ctx: Context, prepared: PreparedCa
     for (prepared.view.outputs) |field| {
         if (field.decision) |binding| active = active or binding.automatic;
     }
-    if (!active) return runWithFallback(ctx, prepared.signature_class, prepared.view, predictor.demos, prepared.inputs);
+    if (!active) return runWithFallback(ctx, predictor, prepared.signature_class, prepared.view, predictor.demos, prepared.inputs);
+    if (native) if (ctx.stream_session) |session| {
+        if (session.selects(predictor)) return error.UnsupportedStreamField;
+    };
     const declared = if (predictor.decision_fields == .object and predictor.decision_fields.object.count() != 0)
         try predictor.view(ctx.arena)
     else
@@ -428,7 +435,7 @@ fn runPredict(predictor: *const PredictState, ctx: Context, prepared: PreparedCa
         }
         // with_updated_fields creates a new class whenever evidence is requested.
         const wire_class = if (snapshot.types.len != 0) ParseFailure.derived_signature else prepared.signature_class;
-        break :blk try runWithFallback(ctx, wire_class, wire, &.{}, prepared.inputs);
+        break :blk try runWithFallback(ctx, predictor, wire_class, wire, &.{}, prepared.inputs);
     };
     const outputs = try ctx.arena.alloc(Record, completions.len);
     for (completions, outputs) |completion, *output| {
@@ -643,8 +650,31 @@ fn runSystemOne(ctx: Context, prepared: PreparedCall, demos: []const Record, sna
     return result;
 }
 
+fn adapterCompletions(
+    ctx: Context,
+    predictor: ?*const PredictState,
+    kind: Adapter,
+    original: adapter_mod.View,
+    wire: []const Field,
+    native: stream.NativeFields,
+    request: lm_mod.Request,
+) Error![]const lm_mod.Completion {
+    const session = ctx.stream_session orelse return ctx.lm.completeResponses(ctx.arena, request);
+    const target = predictor orelse return ctx.lm.completeResponses(ctx.arena, request);
+    if (!session.selects(target)) return ctx.lm.completeResponses(ctx.arena, request);
+    if (session.in_flight.swap(true, .acquire)) return error.StreamSessionBusy;
+    defer session.in_flight.store(false, .release);
+    var attempt: stream.Attempt = .{ .session = session, .target = target };
+    try attempt.prepare(ctx.arena, kind, original.outputs, wire, native);
+    var routed = request;
+    routed.stream_sink = attempt.sink();
+    const result = ctx.lm.completeResponses(ctx.arena, routed);
+    if (attempt.failure) |err| return err;
+    return result;
+}
+
 /// `signature_class` identifies the prepared signature for `ctx.parse_failure`.
-fn runAdapterMany(ctx: Context, signature_class: ?*const anyopaque, adapter: Adapter, original: adapter_mod.View, demos: []const Record, inputs: *const Record) Error![]const Record {
+fn runAdapterMany(ctx: Context, predictor: ?*const PredictState, signature_class: ?*const anyopaque, adapter: Adapter, original: adapter_mod.View, demos: []const Record, inputs: *const Record) Error![]const Record {
     // An earlier attempt's failure must not outlive this attempt's outcome.
     if (ctx.parse_failure) |capture| capture.* = .{};
     if (adapter == .two_step and ctx.two_step == null) return error.AdapterParse;
@@ -735,14 +765,22 @@ fn runAdapterMany(ctx: Context, signature_class: ?*const anyopaque, adapter: Ada
     // Explicit-null intent has now been resolved into the effective signature.
     options.reasoning_effort_present = false;
     const messages = try adapter.format(ctx.arena, processed, processed_demos, inputs);
-    const completions = try ctx.lm.completeResponses(ctx.arena, .{
-        .messages = messages,
-        .options = options,
-        .tools = request_tools,
-        .stream_sink = ctx.stream_sink,
-        .usage_tracker = ctx.usage_tracker,
-        .usage_failure = ctx.usage_failure,
-    });
+    const completions = try adapterCompletions(
+        ctx,
+        predictor,
+        adapter,
+        original,
+        processed.outputs,
+        .{ .reasoning = native, .tools = use_native_tools },
+        .{
+            .messages = messages,
+            .options = options,
+            .tools = request_tools,
+            .stream_sink = ctx.stream_sink,
+            .usage_tracker = ctx.usage_tracker,
+            .usage_failure = ctx.usage_failure,
+        },
+    );
     const outputs = try ctx.arena.alloc(Record, completions.len);
     var has_citation_field = false;
     for (original.outputs) |field| has_citation_field = has_citation_field or field.native_citations;
@@ -1189,6 +1227,32 @@ pub fn callProgram(
     } else {
         return wrap(Output, ctx.arena, try invokeScoped(true, program, ctx, input, tracking, null));
     }
+}
+
+/// Run with synchronous field routing. The typed result stays available even
+/// when `emit_prediction` is false (the stream would omit the final result).
+pub fn callStream(
+    program: anytype,
+    ctx: Context,
+    input: InputOf(@TypeOf(program)),
+    session: *stream.Session,
+    include_prediction: bool,
+) (Failure(Forwarded(@TypeOf(program), true)) || usage_mod.Error || stream.Error)!struct {
+    prediction: CallResult(Payload(Forwarded(@TypeOf(program), true))),
+    emit_prediction: bool,
+} {
+    if (ctx.stream_session != null) return error.StreamSessionBusy;
+    if (session.bindings.len != 0 and ctx.stream_sink != null) return error.ConflictingStreamSinks;
+    if (session.active.swap(true, .acquire)) return error.StreamSessionBusy;
+    defer session.active.store(false, .release);
+    defer session.clear();
+    var scoped = ctx;
+    scoped.stream_session = session;
+    const result = try callProgram(program, scoped, input);
+    return .{
+        .prediction = result,
+        .emit_prediction = try session.finish(include_prediction),
+    };
 }
 
 /// Module-call scoping around the typed `forward`, for execution entry points

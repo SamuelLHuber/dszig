@@ -72,6 +72,10 @@ pub const JsonStreamListener = struct {
         };
     }
 
+    pub fn started(self: *const JsonStreamListener) bool {
+        return self.state.started;
+    }
+
     pub fn reset(self: *JsonStreamListener) void {
         self.state = .{};
     }
