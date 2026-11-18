@@ -90,7 +90,36 @@ pub const GEPA = struct {
 
     pub const Auto = enum { light, medium, heavy };
     pub const Selection = enum { pareto, current_best, epsilon_greedy, top_k_pareto };
-    pub const ComponentSelector = enum { round_robin, all };
+    pub const ComponentSelector = union(enum) {
+        round_robin,
+        all,
+        custom: CustomComponentSelector,
+    };
+
+    /// Candidate instructions follow `names`; runs follow `minibatch_ids`.
+    /// All slices and their contents are borrowed for the selector invocation.
+    pub const ComponentSelection = struct {
+        names: []const []const u8,
+        candidates: []const []const []const u8,
+        val_subscores: []const []const f64,
+        parents: []const []const ?usize,
+        parent_idx: usize,
+        total_metric_calls: usize,
+        trainset: []const Example,
+        minibatch_ids: []const usize,
+        runs: []const Run,
+    };
+
+    /// Return distinct predictor names in reflection order, using static
+    /// storage or the provided scratch arena. An empty slice skips reflection.
+    pub const CustomComponentSelector = struct {
+        ptr: *anyopaque,
+        select: *const fn (
+            *anyopaque,
+            Context,
+            *const ComponentSelection,
+        ) anyerror![]const []const u8,
+    };
 
     pub const Options = struct {
         /// Defaults to the trainset, as in DSPy.
@@ -99,7 +128,12 @@ pub const GEPA = struct {
         reflection: ?Context = null,
     };
 
-    pub const Error = error{ ZeroWeights, NoBudget, UnknownInstructionComponent };
+    pub const Error = error{
+        ZeroWeights,
+        NoBudget,
+        UnknownInstructionComponent,
+        InvalidComponentSelection,
+    };
 
     pub const Instruction = struct {
         name: []const u8,
@@ -529,6 +563,59 @@ pub const GEPA = struct {
                 }
             }
 
+            fn selectComponents(
+                e: *Self,
+                parent: usize,
+                ids: []const usize,
+                runs: []const Run,
+                single: *[1]usize,
+            ) ![]const usize {
+                assert(e.names.len > 0);
+                assert(ids.len == runs.len);
+                switch (e.gepa.component_selector) {
+                    .round_robin => {
+                        const index = e.next_pred.items[parent];
+                        e.next_pred.items[parent] = (index + 1) % e.names.len;
+                        single[0] = index;
+                        return single;
+                    },
+                    .all => {
+                        const selected = try e.out.alloc(usize, e.names.len);
+                        for (selected, 0..) |*index, i| index.* = i;
+                        return selected;
+                    },
+                    .custom => |selector| {
+                        var scratch = std.heap.ArenaAllocator.init(e.out);
+                        defer scratch.deinit();
+                        var ctx = e.ctx;
+                        ctx.arena = scratch.allocator();
+                        ctx.trace = null;
+                        const input: ComponentSelection = .{
+                            .names = e.names,
+                            .candidates = e.candidates.items,
+                            .val_subscores = e.subscores.items,
+                            .parents = e.parents.items,
+                            .parent_idx = parent,
+                            .total_metric_calls = e.total_evals,
+                            .trainset = e.trainset,
+                            .minibatch_ids = ids,
+                            .runs = runs,
+                        };
+                        const names = try selector.select(selector.ptr, ctx, &input);
+                        if (names.len > e.names.len) return error.InvalidComponentSelection;
+                        const selected = try e.out.alloc(usize, names.len);
+                        for (names, selected, 0..) |name, *slot, i| {
+                            slot.* = for (e.names, 0..) |known, index| {
+                                if (std.mem.eql(u8, known, name)) break index;
+                            } else return error.InvalidComponentSelection;
+                            if (std.mem.indexOfScalar(usize, selected[0..i], slot.*) != null)
+                                return error.InvalidComponentSelection;
+                        }
+                        return selected;
+                    },
+                }
+            }
+
             /// One `ReflectiveMutationProposer.propose` + acceptance.
             fn reflect(e: *Self) !void {
                 const parent = try e.selectParent();
@@ -541,28 +628,22 @@ pub const GEPA = struct {
                     } else true;
                     if (perfect) return;
                 }
-                var components: std.ArrayList(usize) = .empty;
-                switch (e.gepa.component_selector) {
-                    .round_robin => {
-                        const pid = e.next_pred.items[parent];
-                        e.next_pred.items[parent] = (pid + 1) % e.names.len;
-                        try components.append(e.out, pid);
-                    },
-                    .all => for (0..e.names.len) |k| try components.append(e.out, k),
-                }
+                var single: [1]usize = undefined;
+                const components = try e.selectComponents(parent, ids, before, &single);
+                if (components.len == 0) return;
                 const datasets = try e.reflectiveDataset(
                     parent_candidate,
                     before,
                     ids,
-                    components.items,
+                    components,
                 );
                 for (datasets) |dataset| {
                     if (dataset != null) break;
                 } else return;
                 const proposed = if (e.gepa.instruction_proposer) |proposer|
-                    try e.proposeCustomChild(proposer, parent_candidate, components.items, datasets)
+                    try e.proposeCustomChild(proposer, parent_candidate, components, datasets)
                 else
-                    try e.proposeBuiltinChild(parent_candidate, components.items, datasets);
+                    try e.proposeBuiltinChild(parent_candidate, components, datasets);
                 const child = proposed orelse return;
                 const after = try e.evalIds(child, e.trainset, ids, true);
                 if (sumScores(after) > sumScores(before)) {

@@ -3809,6 +3809,11 @@ The following prevent a claim that DSZig can do everything DSPy can:
   `epsilon_greedy` (epsilon 0.1), and `top_k_pareto` (top five). Top-five
   selection restricts the validation frontiers before removing dominated
   candidates and falls back to the best aggregate candidate if none remain.
+  A custom `component_selector` can inspect borrowed candidate instructions,
+  validation scores, and the current minibatch's traced rollouts before
+  returning predictor names in reflection order. An empty selection skips
+  reflection; unknown or repeated names raise `InvalidComponentSelection`.
+  The selector is not called when a perfect minibatch is skipped.
   `add_format_failure_as_feedback = true` includes captured predictor response
   parse failures in the reflection dataset, with the completion text and the
   active adapter's output structure. Such rollouts keep the configured failure
