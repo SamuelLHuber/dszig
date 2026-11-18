@@ -3805,7 +3805,12 @@ The following prevent a claim that DSZig can do everything DSPy can:
   The callback sees native trace representations, not Python objects; original
   model identity erased from untyped fields cannot be recovered. Custom code
   proposers, Flex components, objective-based frontiers, other selection
-  policies, format-failure feedback, and logging integrations remain unsupported.
+  policies, and logging integrations remain unsupported.
+  `add_format_failure_as_feedback = true` includes captured predictor response
+  parse failures in the reflection dataset, with the completion text and the
+  active adapter's output structure. Such rollouts keep the configured failure
+  score and do not call the application metric. Unattributed program errors are
+  not treated as predictor parse failures.
   COPRO `track_stats` exposes per-predictor, per-depth score summaries in
   `Result.stats`. `best` summarizes up to ten retained instruction/prefix
   pairs; `latest` includes repeat evaluations and accumulates the newest

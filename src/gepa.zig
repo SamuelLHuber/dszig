@@ -10,7 +10,7 @@
 //!
 //! Not supported: `dspy.Flex` code components, frontier types other than
 //! `"instance"`, `"epsilon_greedy"`/`"top_k_pareto"`,
-//! `add_format_failure_as_feedback`, `log_dir`. DSPy `num_threads` maps to
+//! `log_dir`. DSPy `num_threads` maps to
 //! `rollouts`: each minibatch/valset evaluation then runs on a native pool,
 //! results in example order. CPython iterates small-int sets in ascending
 //! order; DSZig assumes it always does.
@@ -71,6 +71,8 @@ pub const GEPA = struct {
     reflection_minibatch_size: usize = 3,
     candidate_selection_strategy: Selection = .pareto,
     skip_perfect_score: bool = true,
+    /// Use genuine predictor parse failures as reflection examples.
+    add_format_failure_as_feedback: bool = false,
     component_selector: ComponentSelector = .round_robin,
     use_merge: bool = true,
     max_merge_invocations: usize = 5,
@@ -157,7 +159,18 @@ pub const GEPA = struct {
 
     /// The reflective dataset serializes trace-step records and feedback
     /// only, so a prediction's usage reaches the metric and nothing else.
-    pub const Run = struct { prediction: ?optimize.RecordPrediction, trace: *const Trace, score: f64 };
+    pub const Run = struct {
+        prediction: ?optimize.RecordPrediction,
+        trace: *const Trace,
+        score: f64,
+        format_failure: ?FormatFailure = null,
+    };
+
+    pub const FormatFailure = struct {
+        predictor: *const predict.PredictState,
+        inputs: Record,
+        text: []const u8,
+    };
 
     const Desc = struct { id1: usize, id2: usize, picks: []const usize };
 
@@ -211,7 +224,9 @@ pub const GEPA = struct {
                 return list;
             }
 
-            fn build(e: *const Self, candidate: []const []const u8) Allocator.Error!*P {
+            const Built = struct { program: *P, predictors: []const predict.NamedParam };
+
+            fn build(e: *const Self, candidate: []const []const u8) Allocator.Error!Built {
                 const copy = try e.out.create(P);
                 copy.* = e.student.*;
                 const preds = try predict.namedPredictors(e.out, copy);
@@ -220,7 +235,7 @@ pub const GEPA = struct {
                     try p.param.predict.forkSignatureClass(e.out);
                     p.param.predict.instructions = text;
                 }
-                return copy;
+                return .{ .program = copy, .predictors = preds };
             }
 
             fn failedRun(e: *const Self, trace: *Trace, capture: bool) Allocator.Error!Run {
@@ -234,15 +249,28 @@ pub const GEPA = struct {
                 };
             }
 
-            fn runOne(e: *const Self, ctx: Context, program: *const P, example: *const Example, capture: bool) Allocator.Error!Run {
+            fn runOne(
+                e: *const Self,
+                ctx: Context,
+                built: *const Built,
+                example: *const Example,
+                capture: bool,
+            ) Allocator.Error!Run {
                 const trace = try e.out.create(Trace);
                 trace.* = .{ .arena = e.out };
                 var c = ctx;
                 c.arena = e.out;
                 c.trace = if (capture) trace else null;
-                const prediction = optimize.runProgram(P, c, program, example) catch |err| {
+                var failure: predict.ParseFailure = .{};
+                const reflect_failure = capture and e.gepa.add_format_failure_as_feedback;
+                if (reflect_failure) c.parse_failure = &failure;
+                const prediction = optimize.runProgram(P, c, built.program, example) catch |err| {
                     if (err == error.OutOfMemory) return error.OutOfMemory;
-                    return e.failedRun(trace, capture);
+                    var run = try e.failedRun(trace, capture);
+                    if (reflect_failure and err == error.AdapterParse) {
+                        run.format_failure = try e.formatFailure(built.predictors, example, &failure);
+                    }
+                    return run;
                 };
                 const feedback = e.gepa.metric(e.out, example, &prediction, if (capture) trace else null, null, null) catch |err| {
                     if (err == error.OutOfMemory) return error.OutOfMemory;
@@ -251,13 +279,32 @@ pub const GEPA = struct {
                 return .{ .prediction = prediction, .trace = trace, .score = feedback.score };
             }
 
+            fn formatFailure(
+                e: *const Self,
+                predictors: []const predict.NamedParam,
+                example: *const Example,
+                failure: *const predict.ParseFailure,
+            ) Allocator.Error!?FormatFailure {
+                const class = failure.signature_class orelse return null;
+                for (predictors) |named| {
+                    const predictor = named.param.predict;
+                    if (predictor.signature_class != class) continue;
+                    return .{
+                        .predictor = predictor,
+                        .inputs = try example.inputs(e.out),
+                        .text = failure.failure.completion_text,
+                    };
+                }
+                return null;
+            }
+
             fn evalIds(e: *Self, candidate: []const []const u8, set: []const Example, ids: []const usize, capture: bool) ![]Run {
-                const program = try e.build(candidate);
+                const built = try e.build(candidate);
                 const runs = try e.out.alloc(Run, ids.len);
                 if (e.gepa.rollouts) |rollouts| {
                     const Call = struct {
                         engine: *const Self,
-                        program: *const P,
+                        built: *const Built,
                         example: *const Example,
                         capture: bool,
 
@@ -266,18 +313,18 @@ pub const GEPA = struct {
                             try attempt.cancellation.check();
                             const en = call.engine;
                             const c = try en.gepa.rollouts.?.context(en.ctx, attempt, false);
-                            run.* = try en.runOne(c, call.program, call.example, call.capture);
+                            run.* = try en.runOne(c, call.built, call.example, call.capture);
                         }
                     };
                     const calls = try e.out.alloc(Call, ids.len);
                     const tasks = try e.out.alloc(parallel.TaskFor(Run), ids.len);
                     for (calls, tasks, ids) |*call, *task, id| {
-                        call.* = .{ .engine = e, .program = program, .example = &set[id], .capture = capture };
+                        call.* = .{ .engine = e, .built = &built, .example = &set[id], .capture = capture };
                         task.* = .{ .ptr = call, .invoke = Call.invoke };
                     }
                     try rollouts.run(tasks, runs);
                 } else {
-                    for (runs, ids) |*r, id| r.* = try e.runOne(e.ctx, program, &set[id], capture);
+                    for (runs, ids) |*r, id| r.* = try e.runOne(e.ctx, &built, &set[id], capture);
                 }
                 e.total_evals += ids.len;
                 return runs;
@@ -463,6 +510,9 @@ pub const GEPA = struct {
                     ids,
                     components.items,
                 );
+                for (datasets) |dataset| {
+                    if (dataset != null) break;
+                } else return;
                 const proposed = if (e.gepa.instruction_proposer) |proposer|
                     try e.proposeCustomChild(proposer, parent_candidate, components.items, datasets)
                 else
@@ -488,15 +538,20 @@ pub const GEPA = struct {
                 runs: []const Run,
                 ids: []const usize,
                 components: []const usize,
-            ) value.ParseError![]?[]const Record {
+            ) @import("adapter.zig").Error![]?[]const Record {
                 assert(runs.len == ids.len);
-                const program = try e.build(candidate);
-                const preds = try predict.namedPredictors(e.out, program);
+                const preds = (try e.build(candidate)).predictors;
                 const result = try e.out.alloc(?[]const Record, components.len);
                 for (components, result) |k, *slot| {
                     const module = preds[k].param.predict;
                     var items: std.ArrayList(Record) = .empty;
                     for (runs, ids) |run, id| {
+                        if (run.format_failure) |failure| {
+                            if (predict.sameSignature(failure.predictor, module)) {
+                                try items.append(e.out, try e.failedReflectionExample(failure, module));
+                            }
+                            continue;
+                        }
                         const prediction = run.prediction orelse continue;
                         var matching: std.ArrayList(*const Trace.Step) = .empty;
                         for (run.trace.steps.items) |*step| if (predict.sameSignature(step.predictor, module)) try matching.append(e.out, step);
@@ -519,6 +574,45 @@ pub const GEPA = struct {
                     slot.* = if (items.items.len == 0) null else items.items;
                 }
                 return result;
+            }
+
+            fn failedReflectionExample(
+                e: *const Self,
+                failure: FormatFailure,
+                module: *const predict.PredictState,
+            ) @import("adapter.zig").Error!Record {
+                const step: Trace.Step = .{
+                    .predictor = failure.predictor,
+                    .inputs = failure.inputs,
+                    .outputs = .empty,
+                };
+                const inputs = if (e.gepa.instruction_proposer != null)
+                    try customInputs(e.out, &step)
+                else
+                    failure.inputs;
+                const text = try std.fmt.allocPrint(
+                    e.out,
+                    "Couldn't parse the output as per the expected output format. " ++
+                        "The model's raw response was:\n```\n{s}\n```\n\n",
+                    .{failure.text},
+                );
+                const view = try module.view(e.out);
+                const messages = try e.ctx.adapter.format(e.out, view, &.{}, &.empty);
+                var feedback: Writer.Allocating = .init(e.out);
+                defer feedback.deinit();
+                const w = &feedback.writer;
+                w.writeAll("Your output failed to parse. Follow this structure:\n") catch
+                    return error.OutOfMemory;
+                for (messages) |message| {
+                    if (message.content != .text) return error.AdapterParse;
+                    w.print("{s}: {s}\n", .{ @tagName(message.role), message.content.text }) catch
+                        return error.OutOfMemory;
+                }
+                var item: Record = .empty;
+                try item.put(e.out, "Inputs", .{ .object = inputs });
+                try item.put(e.out, "Generated Outputs", .{ .string = text });
+                try item.put(e.out, "Feedback", .{ .string = try feedback.toOwnedSlice() });
+                return item;
             }
 
             fn proposeCustomChild(
@@ -574,9 +668,6 @@ pub const GEPA = struct {
                 components: []const usize,
                 datasets: []const ?[]const Record,
             ) Allocator.Error!?[]const []const u8 {
-                for (datasets) |dataset| {
-                    if (dataset != null) break;
-                } else return null;
                 const texts = (try e.proposeTexts(candidate, components, datasets)) orelse
                     (try e.proposeTexts(candidate, components, datasets)) orelse return null;
                 const child = try e.out.dupe([]const u8, candidate);
@@ -891,7 +982,7 @@ pub const GEPA = struct {
         for (0..e.candidates.items.len) |idx| {
             if (e.average(idx) > e.average(best)) best = idx;
         }
-        const program = try e.build(e.candidates.items[best]);
+        const program = (try e.build(e.candidates.items[best])).program;
         const per_instance = try out.alloc([]const usize, e.fronts.len);
         for (per_instance, e.fronts) |*row, front| row.* = front.items;
         const best_outputs: ?[]const []const BestOutput = if (e.best_outputs) |outputs| rows: {
@@ -965,8 +1056,9 @@ test "GEPA scoring failures preserve capture-specific outputs while feedback err
         .fronts = &fronts,
     };
 
+    const built: GEPA.Engine(P).Built = .{ .program = &program, .predictors = &.{} };
     for ([_]bool{ false, true }) |capture| {
-        const run = try engine.runOne(engine.ctx, &program, &examples[0], capture);
+        const run = try engine.runOne(engine.ctx, &built, &examples[0], capture);
         try std.testing.expectEqual(@as(f64, 0.125), run.score);
         if (capture) {
             try std.testing.expect(run.prediction == null);
@@ -980,7 +1072,7 @@ test "GEPA scoring failures preserve capture-specific outputs while feedback err
     var program_failure: @import("lm.zig").ScriptedLM = .{ .responses = &.{} };
     engine.ctx.lm = program_failure.lm();
     for ([_]bool{ false, true }) |capture| {
-        const run = try engine.runOne(engine.ctx, &program, &examples[0], capture);
+        const run = try engine.runOne(engine.ctx, &built, &examples[0], capture);
         try std.testing.expectEqual(@as(f64, 0.125), run.score);
         if (capture) {
             try std.testing.expect(run.prediction == null);
@@ -992,14 +1084,14 @@ test "GEPA scoring failures preserve capture-specific outputs while feedback err
 
     engine.ctx = ctx;
     engine.gepa.metric = FailingMetric.feedbackFailure;
-    const successful = try engine.runOne(engine.ctx, &program, &examples[0], true);
+    const successful = try engine.runOne(engine.ctx, &built, &examples[0], true);
     try std.testing.expectEqualStrings("ok", successful.prediction.?.get("answer").?.string);
     try std.testing.expectEqual(@as(usize, 1), successful.trace.steps.items.len);
     try std.testing.expectError(error.ParseValue, engine.reflectiveDataset(&.{program.state.instructions}, &.{successful}, &.{0}, &.{0}));
 
     engine.gepa.metric = FailingMetric.allocationFailure;
     for ([_]bool{ false, true }) |capture| {
-        try std.testing.expectError(error.OutOfMemory, engine.runOne(engine.ctx, &program, &examples[0], capture));
+        try std.testing.expectError(error.OutOfMemory, engine.runOne(engine.ctx, &built, &examples[0], capture));
     }
     try std.testing.expectEqual(@as(usize, 5), script.index);
 }
