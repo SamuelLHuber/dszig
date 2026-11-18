@@ -75,7 +75,7 @@ pub fn systemPresent(system: sdk.SystemContent) bool {
 pub fn systemText(arena: Allocator, system: sdk.SystemContent) Error![]const u8 {
     return switch (system) {
         .text => |text| text,
-        .parts => |parts| partsText(arena, parts),
+        .parts => |parts| partsText(arena, parts, null),
     };
 }
 
@@ -292,7 +292,7 @@ const Codec = struct {
             else => {},
         };
         if (!has_media) {
-            const text = try partsText(self.arena, tool.content);
+            const text = try partsText(self.arena, tool.content, null);
             return .{ .string = if (tool.is_error)
                 try std.fmt.allocPrint(self.arena, "[error] {s}", .{text})
             else
@@ -426,8 +426,10 @@ const Codec = struct {
     }
 };
 
-fn partsText(arena: Allocator, parts: anytype) Error![]const u8 {
+/// A leading line, when present, is emitted with its newline even for empty content.
+pub fn partsText(arena: Allocator, parts: anytype, leading_line: ?[]const u8) Error![]const u8 {
     var bits: std.ArrayList([]const u8) = .empty;
+    if (leading_line) |line| try bits.append(arena, line);
     for (parts) |part| {
         var canonical: sdk.Part = switch (part) {
             inline else => |value, tag| @unionInit(sdk.Part, @tagName(tag), value),
@@ -438,6 +440,7 @@ fn partsText(arena: Allocator, parts: anytype) Error![]const u8 {
             else => if (text.len != 0) try bits.append(arena, text),
         }
     }
+    if (leading_line != null and bits.items.len == 1) try bits.append(arena, "");
     return std.mem.join(arena, "\n", bits.items);
 }
 
@@ -460,7 +463,7 @@ fn partText(arena: Allocator, part: *const sdk.Part) Error![]const u8 {
     };
 }
 
-fn dataText(arena: Allocator, data: sdk.JsonValue) Error![]const u8 {
+pub fn dataText(arena: Allocator, data: sdk.JsonValue) Error![]const u8 {
     const value = data.toValue(arena) catch |err| return mapError(err);
     var encoded: std.Io.Writer.Allocating = .init(arena);
     pyjson.writeJson(&encoded.writer, value, .minified) catch |err| return mapError(err);

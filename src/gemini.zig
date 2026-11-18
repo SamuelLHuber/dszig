@@ -3,6 +3,7 @@ const std = @import("std");
 const lm_mod = @import("lm.zig");
 const http = @import("http.zig");
 const runtime = @import("runtime_value.zig");
+const content = @import("openai_content.zig");
 const sdk = lm_mod.sdk;
 const Allocator = std.mem.Allocator;
 const Error = lm_mod.Error;
@@ -419,8 +420,11 @@ fn requestBody(
     records: *std.ArrayList(sdk.Adaptation),
 ) Error![]const u8 {
     const config = &fields.config;
-    if (config.user_id != null or config.extensions != null)
-        return error.LMFailure;
+    const extensions = if (config.extensions) |value|
+        value.toValue(arena) catch |err| return codecError(err)
+    else
+        Value{ .object = .empty };
+    if (extensions != .object) return error.LMFailure;
     var names: std.StringHashMapUnmanaged([]const u8) = .empty;
     defer names.deinit(arena);
     for (fields.messages) |message| for (message.parts) |part| {
@@ -434,7 +438,7 @@ fn requestBody(
         var row: Object = .empty;
         try row.put(arena, "role", str(if (message.role == .assistant) "model" else "user"));
         const parts = if (message.role == .developer)
-            try joinedParts(arena, "[developer]\n", message.parts)
+            try joinedParts(arena, "[developer]", message.parts)
         else blk: {
             var values: runtime.Array = .init(arena);
             try values.ensureTotalCapacity(message.parts.len);
@@ -452,7 +456,7 @@ fn requestBody(
         var row: Object = .empty;
         const parts = switch (system) {
             .text => |bytes| try singleton(arena, try textPart(arena, bytes)),
-            .parts => |parts| try joinedParts(arena, "", parts),
+            .parts => |parts| try joinedParts(arena, null, parts),
         };
         try row.put(arena, "parts", parts);
         try body.put(arena, "systemInstruction", .{ .object = row });
@@ -504,14 +508,51 @@ fn requestBody(
         const thinking = try thinkingConfig(arena, fields.model, &effective, policy, records);
         try generation.put(arena, "thinkingConfig", thinking);
     }
+    const output = text(get(extensions, "output"));
+    const requested_modality: ?[]const u8 = if (std.mem.eql(u8, output, "image"))
+        "IMAGE"
+    else if (std.mem.eql(u8, output, "audio"))
+        "AUDIO"
+    else
+        null;
+    if (requested_modality) |name| {
+        try generation.put(arena, "responseModalities", try singleton(arena, str(name)));
+    }
     if (generation.count() != 0) try body.put(arena, "generationConfig", .{ .object = generation });
     if (cache.resource == null) try addTools(arena, &body, fields, policy, records);
-    if (config.store) |store| try body.put(arena, "store", .{ .bool = store });
-    if (config.service_tier) |tier| try body.put(arena, "serviceTier", str(tier));
+    try applyExtensions(arena, &body, config, &extensions.object, policy, records);
     var writer: std.Io.Writer.Allocating = .init(arena);
     @import("pyjson.zig").writeJson(&writer.writer, .{ .object = body }, .minified) catch |err|
         return if (err == error.WriteFailed) error.OutOfMemory else error.LMFailure;
     return writer.written();
+}
+
+fn applyExtensions(
+    arena: Allocator,
+    body: *Object,
+    config: *const sdk.Config,
+    extensions: *const Object,
+    policy: @FieldType(Gemini, "adaptations"),
+    records: *std.ArrayList(sdk.Adaptation),
+) Error!void {
+    if (config.store) |store| try body.put(arena, "store", .{ .bool = store });
+    if (config.service_tier) |tier| try body.put(arena, "serviceTier", str(tier));
+    if (config.user_id) |user| try adaptString(
+        arena,
+        policy,
+        records,
+        "config.user_id",
+        .dropped,
+        "GenerateContent has no end-user attribution field (OpenAI and Anthropic carry it)",
+        user,
+        null,
+    );
+    var entries = extensions.iterator();
+    while (entries.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (contains(&.{ "prompt_caching", "output" }, key)) continue;
+        try body.put(arena, key, entry.value_ptr.*);
+    }
 }
 
 const CachePrefix = struct {
@@ -763,6 +804,7 @@ fn parseSignature(arena: Allocator, value: Value) Error![]const sdk.Continuation
 
 fn encodePart(arena: Allocator, part: sdk.Part, names: *const std.StringHashMapUnmanaged([]const u8)) Error!Value {
     switch (part) {
+        .data => |value| return textPart(arena, try content.dataText(arena, value.value)),
         .text => |value| {
             var row = try textPart(arena, value.text);
             try encodeSignature(arena, &row, value.continuation, false);
@@ -1203,19 +1245,9 @@ fn modality(arena: Allocator, details: Value) Error!Value {
     return total;
 }
 
-fn joinedParts(arena: Allocator, prefix: []const u8, parts: anytype) Error!Value {
-    return singleton(arena, try textPart(arena, try joinText(arena, prefix, parts)));
-}
-
-fn joinText(arena: Allocator, prefix: []const u8, parts: anytype) Error![]const u8 {
-    var writer: std.Io.Writer.Allocating = .init(arena);
-    writer.writer.writeAll(prefix) catch return error.OutOfMemory;
-    for (parts, 0..) |part, index| {
-        if (part != .text or part.text.continuation.len != 0) return error.LMFailure;
-        if (index != 0) writer.writer.writeByte('\n') catch return error.OutOfMemory;
-        writer.writer.writeAll(part.text.text) catch return error.OutOfMemory;
-    }
-    return writer.written();
+fn joinedParts(arena: Allocator, leading_line: ?[]const u8, parts: anytype) Error!Value {
+    const rendered = try content.partsText(arena, parts, leading_line);
+    return singleton(arena, try textPart(arena, rendered));
 }
 
 fn singleton(arena: Allocator, part: Value) Error!Value {
@@ -1283,6 +1315,32 @@ test "Gemini judgment enum takes precedence over non-const branches" {
     try std.testing.expectEqualStrings("string", text(get(grade, "type")));
     try std.testing.expect(get(grade, "anyOf") == .null);
     try std.testing.expectEqualStrings("ok", text(elems(get(grade, "enum"))[0]));
+}
+
+test "Gemini extensions override top-level wire fields without leaking control keys" {
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    const parse = @import("json_repair.zig").parseJson;
+    const request = try sdk.Request.fromValue(arena, try parse(arena,
+        \\{"model":"fixture","messages":[{"role":"user","parts":[{"type":"text","text":"Answer"}]}],
+        \\"config":{"user_id":"actor","max_tokens":24,"extensions":{"output":"audio",
+        \\"prompt_caching":true,"generationConfig":{"responseModalities":["TEXT"]}}}}
+    ));
+    defer request.release();
+
+    var records: std.ArrayList(sdk.Adaptation) = .empty;
+    const body = try parse(arena, try requestBody(arena, &request.fields, .canonical, .note, &records));
+    const generation = get(body, "generationConfig");
+    try std.testing.expectEqualStrings("TEXT", text(elems(get(generation, "responseModalities"))[0]));
+    try std.testing.expectEqual(@as(usize, 1), generation.object.count());
+    try std.testing.expect(!body.object.contains("output"));
+    try std.testing.expect(!body.object.contains("prompt_caching"));
+    try std.testing.expectEqualStrings("config.user_id", records.items[0].field);
+    try std.testing.expectError(
+        error.LMFailure,
+        requestBody(arena, &request.fields, .canonical, .refuse, &records),
+    );
 }
 
 test "Gemini retains tool call position in mixed responses" {

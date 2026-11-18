@@ -3751,8 +3751,12 @@ The following prevent a claim that DSZig can do everything DSPy can:
   with one JSON-object text part becomes a canonical data part. Gemini
   returns the pick, not a distribution over judgment keys: `if_available`
   records that limitation and `required` refuses measurable judgments.
-  The Gemini codec maps requested token logprobs
-  in buffered and streamed responses when a model serves them. Buffered
+  Canonical data parts can be sent back as compact JSON text, including in
+  system instructions and developer turns. `extensions.output` can request
+  image or audio output; other wire extensions override top-level request
+  fields. Gemini has no end-user attribution field, so `user_id` is recorded
+  as dropped or rejected under the refusal policy. The codec maps requested
+  token logprobs in buffered and streamed responses when a model serves them. Buffered
   generation maps grounding sources to citations and preserves hosted code
   execution output in raw provider data. Nonstreaming reasoning supports
   Gemini 2.5 budgets and Gemini 3 effort levels, with thought-signature replay
