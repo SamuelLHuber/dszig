@@ -432,8 +432,8 @@ fn borrowedFieldValue(arena: Allocator, comptime T: type, input: *const T) Alloc
             .null;
     }
     if (comptime code.isCode(T) or decision.isDecision(T) or citation.isCitation(T) or
-        T == @import("file.zig").File or T == @import("bounding_box.zig").BoundingBox or
-        T == signature.Reasoning)
+        T == @import("file.zig").File or T == @import("image.zig").Image or T == @import("audio.zig").Audio or
+        T == @import("bounding_box.zig").BoundingBox or T == signature.Reasoning)
     {
         return input.borrowedRuntime();
     }
@@ -447,7 +447,9 @@ fn borrowedFieldValue(arena: Allocator, comptime T: type, input: *const T) Alloc
 
 pub fn toValue(arena: Allocator, comptime T: type, v: T) Allocator.Error!Value {
     if (comptime code.isCode(T) or @import("enum.zig").isEnum(T) or @import("literal.zig").isLiteral(T) or T == @import("integer.zig").Integer or @import("decimal_type.zig").isDecimal(T)) return v.toRuntime(arena);
-    if (comptime decision.isDecision(T) or citation.isCitation(T) or T == @import("file.zig").File or T == @import("bounding_box.zig").BoundingBox or T == signature.Reasoning)
+    if (comptime decision.isDecision(T) or citation.isCitation(T) or T == @import("file.zig").File or
+        T == @import("image.zig").Image or T == @import("audio.zig").Audio or
+        T == @import("bounding_box.zig").BoundingBox or T == signature.Reasoning)
         return v.toRuntime(arena);
     if (T == @import("tool.zig").ToolCalls) return v.toValue(arena);
     if (T == Value) return v;
@@ -514,7 +516,7 @@ pub fn fromValue(arena: Allocator, comptime T: type, v: Value) ConvertError!T {
     };
     if (comptime code.isCode(T)) return T.fromValue(v) catch error.TypeMismatch;
     if (T == @import("bounding_box.zig").BoundingBox) return T.fromValue(v) catch error.TypeMismatch;
-    if (T == @import("file.zig").File) return T.fromValue(arena, v) catch |err| switch (err) {
+    if (T == @import("file.zig").File or T == @import("image.zig").Image or T == @import("audio.zig").Audio) return T.fromValue(arena, v) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.TypeMismatch,
     };

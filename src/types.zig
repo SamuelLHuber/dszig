@@ -12,6 +12,8 @@ const Value = @import("runtime_value.zig").Value;
 const code = @import("code.zig");
 const BoundingBox = @import("bounding_box.zig").BoundingBox;
 const File = @import("file.zig").File;
+const Image = @import("image.zig").Image;
+const Audio = @import("audio.zig").Audio;
 const citation = @import("citation.zig");
 const decision = @import("decision.zig");
 const Integer = @import("integer.zig").Integer;
@@ -355,7 +357,7 @@ fn modelEntries(comptime S: type, comptime ordered_properties: bool) []const Ent
             .{ .key = "properties", .val = if (ordered_properties) renderOrdered(&final) else render(&final) },
         } ++ (if (n_required != 0) &[_]Entry{.{ .key = "required", .val = required ++ "]" }} else &[_]Entry{}) ++ &[_]Entry{
             .{ .key = "title", .val = quote(modelName(S)) },
-        } ++ description ++ (if (S == BoundingBox or S == File) &[_]Entry{.{ .key = "additionalProperties", .val = "false" }} else &[_]Entry{});
+        } ++ description ++ (if (S == BoundingBox or S == File or S == Image or S == Audio) &[_]Entry{.{ .key = "additionalProperties", .val = "false" }} else &[_]Entry{});
     }
 }
 
@@ -509,12 +511,12 @@ fn validateMode(comptime T: type, arena: Allocator, input: Value, comptime xml_l
     if (comptime decimal_type.isDecimal(T)) return T.validate(arena, v);
     if (comptime citation.isCitation(T)) return T.validate(arena, v);
     if (comptime decision.isDecision(T)) return if (xml_lax) T.validateLax(arena, v) else T.validate(arena, v);
-    if (T == File) {
-        const file = File.fromValue(arena, v) catch |err| return switch (err) {
+    if (T == File or T == Image or T == Audio) {
+        const media = T.fromValue(arena, v) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.ParseValue,
         };
-        return if (v == .custom and v.custom.get(File) != null) v else file.toRuntime(arena);
+        return if (v == .custom and v.custom.get(T) != null) v else media.toRuntime(arena);
     }
     if (T == BoundingBox) {
         const box = (if (xml_lax) BoundingBox.fromXmlValue(v) else BoundingBox.fromValue(v)) catch return error.ParseValue;

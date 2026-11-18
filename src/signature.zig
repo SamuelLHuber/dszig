@@ -21,6 +21,8 @@ const History = @import("history.zig").History;
 const ToolCalls = @import("tool.zig").ToolCalls;
 const BoundingBox = @import("bounding_box.zig").BoundingBox;
 const File = @import("file.zig").File;
+const Image = @import("image.zig").Image;
+const Audio = @import("audio.zig").Audio;
 const citation = @import("citation.zig");
 const decision = @import("decision.zig");
 const code = @import("code.zig");
@@ -243,7 +245,7 @@ fn customXmlLiteral(comptime T: type) bool {
 /// Source keeps BaseModels owned by a `dspy.*` module as literal JSON leaves.
 /// Module metadata also covers native models that are not rich DSPy Types.
 fn dspyXmlModel(comptime T: type) bool {
-    if (code.isCode(T) or T == BoundingBox or T == File or citation.isCitation(T)) return true;
+    if (code.isCode(T) or T == BoundingBox or T == File or T == Image or T == Audio or citation.isCitation(T)) return true;
     return switch (@typeInfo(T)) {
         .@"struct" => @hasDecl(T, "model_module") and
             @hasDecl(T, "model_name") and std.mem.startsWith(u8, T.model_module, "dspy."),
@@ -287,7 +289,7 @@ fn fieldsOf(comptime T: type, comptime role: []const u8, comptime descriptions: 
                 .type_description = if (code.annotationType(FT)) |C| C.description else if (citation.annotationType(FT)) |C| C.description else if (decision_description) |C| C.description else if (FT == ToolCalls) ToolCalls.description else "",
                 .type_description_name = if (code.annotationType(FT)) |C| C.model_name else if (citation.annotationType(FT)) |C| C.model_name else if (decision_description) |C| C.model_name else "",
                 .code_type = code.isCode(FT),
-                .dspy_type = code.isCode(FT) or citation.isCitation(FT) or decision.isDecision(FT) or FT == Reasoning or FT == BoundingBox or FT == File or FT == History or FT == ToolCalls,
+                .dspy_type = code.isCode(FT) or citation.isCitation(FT) or decision.isDecision(FT) or FT == Reasoning or FT == BoundingBox or FT == File or FT == Image or FT == Audio or FT == History or FT == ToolCalls,
                 .parse_value = if (@import("enum.zig").isEnum(FT) or @import("literal.zig").isLiteral(FT)) FT.parseValue else null,
                 .schema_definition_name = if (code.isCode(FT) or decision.isDecision(FT)) FT.schema_name else "",
                 .nullable = @typeInfo(FT) == .optional,

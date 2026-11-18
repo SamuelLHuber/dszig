@@ -3690,8 +3690,8 @@ The following prevent a claim that DSZig can do everything DSPy can:
   class identity; Refine shares this boundary. Mid-bootstrap mutation of a
   borrowed teacher-settings object is not reflected after Bootstrap's entry
   snapshot.
-- **Runtime model identity:** Code, File, Reasoning, BoundingBox, Citations,
-  Noul/Score/Choice and generated decision evidence have genuine boxed classes,
+- **Runtime model identity:** Code, File, Image, Audio, Reasoning, BoundingBox,
+  Citations, Noul/Score/Choice and generated decision evidence have genuine boxed classes,
   not a complete Python object runtime. Other model
   families still use their existing representations. A clone scope preserves
   shared custom-box aliases, but generic arrays/maps do not preserve shared
@@ -3705,16 +3705,21 @@ The following prevent a claim that DSZig can do everything DSPy can:
   handling, File tool-result markers and bounded Responses document translation
   are implemented as described above. There is still no complete lm15 provider
   catalog/routing/auth/error taxonomy, full provider SDK, embedding providers
-  beyond OpenAI/Azure, Image/Audio, general rich-media tool results, non-OpenAI
-  training providers or streaming beyond synchronous OpenAI Responses and
-  Chat Completions SSE. Completed SDK responses can be projected to events,
+  beyond OpenAI/Azure, general rich-media tool results, non-OpenAI training
+  providers, or other providers' streaming protocols. Completed SDK responses
+  can be projected to events,
   and bounded event sequences or synchronous sources can be assembled.
   Bounded Chat, JSON, and XML text field listeners are available separately.
   Native programs can receive raw OpenAI events or routed field fragments
   synchronously or through a bounded Zig `Io` iterator, with optional program
   status messages.
-  Document support is not general multimodal support, and Chat Completions
-  does not accept document parts.
+  Typed `Image` and `Audio` can produce canonical input parts from encoded media.
+  `Image.fromEncodedBytes` and both `fromPath` helpers accept explicit byte
+  limits; path helpers require caller-trusted paths. The runtime does not fetch
+  remote media, transcode audio, or encode sample arrays. A live public OpenAI
+  Responses check identified the dominant color of an inline PNG through typed
+  `Predict`. This does not verify hosted audio, media fine-tuning, or rich-media
+  tool results. Chat Completions does not accept document parts.
 - **File and DocumentPart boundaries:** the constructor smoke explicitly leaves
   606 successful source Python DocumentPart object/repr/bytes operations
   unimplemented; canonical document dictionaries do not replace those

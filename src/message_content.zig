@@ -317,7 +317,9 @@ const Builder = struct {
             if (text != .string) return error.InvalidContent;
             if (continuation == null) return self.appendText(text.string);
             try canonical.put(self.arena, "text", text);
-        } else if (std.mem.eql(u8, kind.string, "document")) {
+        } else if (std.mem.eql(u8, kind.string, "document") or
+            std.mem.eql(u8, kind.string, "image") or std.mem.eql(u8, kind.string, "audio"))
+        {
             const media_type = part.object.get("media_type") orelse return error.InvalidContent;
             if (media_type != .string or media_type.string.len == 0) return error.InvalidContent;
             try canonical.put(self.arena, "media_type", media_type);
@@ -332,6 +334,15 @@ const Builder = struct {
                 count += 1;
             }
             if (count != 1) return error.InvalidContent;
+            if (std.mem.eql(u8, kind.string, "image")) {
+                if (part.object.get("detail")) |detail| {
+                    if (detail != .null) {
+                        if (detail != .string) return error.InvalidContent;
+                        _ = std.meta.stringToEnum(@import("sdk_response.zig").ImageDetail, detail.string) orelse return error.InvalidContent;
+                        try canonical.put(self.arena, "detail", detail);
+                    }
+                }
+            }
         } else return error.InvalidContent;
         if (continuation) |states| try canonical.put(self.arena, "continuation", states);
         try self.flushText();
