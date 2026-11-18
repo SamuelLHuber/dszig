@@ -3740,8 +3740,11 @@ The following prevent a claim that DSZig can do everything DSPy can:
   JSON/schema-constrained generation, and function calls with text results
   on the Gemini Developer API, with `x-goog-api-key` authentication and
   canonical token accounting. Builtin declarations can be sent, but hosted
-  tool outputs and grounding are not supported. Gemini reasoning, media,
-  streaming, and Vertex AI are not supported.
+  tool outputs and grounding are not supported. Nonstreaming reasoning supports
+  Gemini 2.5 budgets and Gemini 3 effort levels, with thought-signature replay
+  for reasoning, text, and function calls. Set `Gemini.supports_reasoning` when
+  the configured model supports native reasoning for typed prediction. Gemini
+  media, streaming, and Vertex AI are not supported.
   Native File construction, adapter/typed prediction
   handling, File tool-result markers and bounded Responses document translation
   are implemented as described above. There is still no complete lm15 provider

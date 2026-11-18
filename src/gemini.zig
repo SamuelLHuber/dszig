@@ -22,6 +22,7 @@ pub const Gemini = struct {
     connect_timeout_ns: ?u64 = null,
     header_provider: ?http.HeaderProvider = null,
     adaptations: enum { note, silent, refuse } = .note,
+    supports_reasoning: bool = false,
 
     pub fn lm(self: *Gemini) lm_mod.LM {
         return .{
@@ -30,6 +31,7 @@ pub const Gemini = struct {
             .supports_response_format = true,
             .supports_response_schema = true,
             .supports_function_calling = true,
+            .supports_reasoning = self.supports_reasoning,
         };
     }
 
@@ -57,7 +59,7 @@ pub const Gemini = struct {
         const native = try lm_mod.OpenAI.canonicalPredictionRequest(arena, request, self.model, self.max_tokens, null);
         defer native.release();
         const result = try arena.alloc(lm_mod.Completion, 1);
-        result[0] = try canonical(ptr, arena, native);
+        result[0] = try self.completeFields(arena, &native.fields, .prediction);
         return result;
     }
 
@@ -67,9 +69,18 @@ pub const Gemini = struct {
 
     fn canonical(ptr: *anyopaque, arena: Allocator, request: *const sdk.Request) Error!lm_mod.Completion {
         const self: *Gemini = @ptrCast(@alignCast(ptr));
+        return self.completeFields(arena, &request.fields, .canonical);
+    }
+
+    fn completeFields(
+        self: *const Gemini,
+        arena: Allocator,
+        fields: *const sdk.RequestFields,
+        mode: RequestMode,
+    ) Error!lm_mod.Completion {
         var records: std.ArrayList(sdk.Adaptation) = .empty;
-        const body = try requestBody(arena, &request.fields, self.adaptations, &records);
-        const url = try endpoint(arena, self.base_url, request.fields.model);
+        const body = try requestBody(arena, fields, mode, self.adaptations, &records);
+        const url = try endpoint(arena, self.base_url, fields.model);
         var headers: [1]std.http.Header = undefined;
         var headers_len: usize = 0;
         if (self.api_key) |key| {
@@ -98,7 +109,7 @@ pub const Gemini = struct {
         }) catch |err| return codecError(err);
         defer self.client.allocator.free(reply.body);
         const raw = @import("json_repair.zig").parseJson(arena, reply.body) catch |err| return codecError(err);
-        return parseResponse(arena, request.fields.model, raw, records.items);
+        return parseResponse(arena, fields.model, raw, records.items);
     }
 };
 
@@ -121,9 +132,17 @@ fn endpoint(arena: Allocator, base_url: []const u8, model: []const u8) Error![]c
     return writer.written();
 }
 
-fn requestBody(arena: Allocator, fields: *const sdk.RequestFields, policy: @FieldType(Gemini, "adaptations"), records: *std.ArrayList(sdk.Adaptation)) Error![]const u8 {
+const RequestMode = enum { canonical, prediction };
+
+fn requestBody(
+    arena: Allocator,
+    fields: *const sdk.RequestFields,
+    mode: RequestMode,
+    policy: @FieldType(Gemini, "adaptations"),
+    records: *std.ArrayList(sdk.Adaptation),
+) Error![]const u8 {
     const config = &fields.config;
-    if (config.reasoning != null or config.cache != null or config.logprobs != .null or
+    if (config.cache != null or config.logprobs != .null or
         config.probabilities != null or config.user_id != null or config.extensions != null)
         return error.LMFailure;
     var names: std.StringHashMapUnmanaged([]const u8) = .empty;
@@ -187,6 +206,14 @@ fn requestBody(arena: Allocator, fields: *const sdk.RequestFields, policy: @Fiel
             try generation.put(arena, if (try openApi(arena, schema)) "responseSchema" else "responseJsonSchema", schema);
         } else if (!std.mem.eql(u8, kind, "json_object")) return error.LMFailure;
     }
+    if (config.reasoning) |reasoning| {
+        var effective = reasoning;
+        // Typed DSPy prediction consumes the provider's visible thought summary.
+        if (mode == .prediction and reasoning.effort != .off and reasoning.summary == null)
+            effective.summary = .auto;
+        const thinking = try thinkingConfig(arena, fields.model, &effective, policy, records);
+        try generation.put(arena, "thinkingConfig", thinking);
+    }
     if (generation.count() != 0) try body.put(arena, "generationConfig", .{ .object = generation });
     try addTools(arena, &body, fields, policy, records);
     if (config.store) |store| try body.put(arena, "store", .{ .bool = store });
@@ -197,19 +224,138 @@ fn requestBody(arena: Allocator, fields: *const sdk.RequestFields, policy: @Fiel
     return writer.written();
 }
 
+fn thinkingConfig(
+    arena: Allocator,
+    model: []const u8,
+    reasoning: *const sdk.Reasoning,
+    policy: @FieldType(Gemini, "adaptations"),
+    records: *std.ArrayList(sdk.Adaptation),
+) Error!Value {
+    const level = startsIgnoreCase(model, "gemini-3") or startsIgnoreCase(model, "models/gemini-3");
+    var effort = reasoning.effort;
+    if (effort == .off) {
+        if (!level) return wrapped(arena, "thinkingBudget", .{ .integer = 0 });
+        const reason = try std.fmt.allocPrint(arena, "{s} cannot disable thinking " ++
+            "(the Gemini 3 class honours no off switch); the lowest level was sent and " ++
+            "the thinking spend is visible in usage", .{model});
+        try reasoningAdapt(arena, policy, records, "config.reasoning.effort", .substituted, reason, "off", "minimal");
+        effort = .minimal;
+    }
+
+    var thinking: Object = .empty;
+    if (reasoning.summary) |summary| {
+        if (summary != .auto) {
+            try reasoningAdapt(arena, policy, records, "config.reasoning.summary", .substituted, "GenerateContent has includeThoughts only, no detail levels; 'auto' shows the thoughts", @tagName(summary), "auto");
+        }
+        try thinking.put(arena, "includeThoughts", .{ .bool = true });
+    }
+    if (reasoning.thinking_budget != .null) {
+        try thinking.put(arena, "thinkingBudget", reasoning.thinking_budget);
+    } else {
+        var selected = effort orelse return error.LMFailure;
+        if (level) {
+            if (selected == .xhigh or selected == .max) {
+                try reasoningAdapt(arena, policy, records, "config.reasoning.effort", .clamped, "the Gemini 3 class has thinkingLevel minimal|low|medium|high; 'high' is the ceiling", @tagName(selected), "high");
+                selected = .high;
+            }
+            try thinking.put(arena, "thinkingLevel", str(@tagName(selected)));
+        } else {
+            const budget: i64 = switch (selected) {
+                .off => unreachable,
+                .minimal => 1024,
+                .low => 2048,
+                .medium => 8192,
+                .high => 16384,
+                .xhigh => 24576,
+                .max => 32768,
+            };
+            try thinking.put(arena, "thinkingBudget", .{ .integer = budget });
+        }
+    }
+    return .{ .object = thinking };
+}
+
+fn startsIgnoreCase(value: []const u8, prefix: []const u8) bool {
+    return value.len >= prefix.len and std.ascii.eqlIgnoreCase(value[0..prefix.len], prefix);
+}
+
+fn reasoningAdapt(
+    arena: Allocator,
+    policy: @FieldType(Gemini, "adaptations"),
+    records: *std.ArrayList(sdk.Adaptation),
+    field: []const u8,
+    action: sdk.AdaptationAction,
+    reason: []const u8,
+    asked: []const u8,
+    applied: []const u8,
+) Error!void {
+    switch (policy) {
+        .silent => {},
+        .refuse => return error.LMFailure,
+        .note => try records.append(arena, .{
+            .field = field,
+            .action = action,
+            .reason = reason,
+            .asked = sdk.PayloadValue.fromBorrowedValue(arena, str(asked)) catch |err|
+                return codecError(err),
+            .applied = sdk.PayloadValue.fromBorrowedValue(arena, str(applied)) catch |err|
+                return codecError(err),
+        }),
+    }
+}
+
+fn encodeSignature(
+    arena: Allocator,
+    row: *Value,
+    states: []const sdk.Continuation,
+    thinking: bool,
+) Error!void {
+    for (states) |state| {
+        if (!std.mem.eql(u8, state.provider, "gemini")) continue;
+        if (!std.mem.eql(u8, state.kind, "thought_signature")) continue;
+        const data = state.data.toValue(arena) catch |err| return codecError(err);
+        const signature = text(get(data, "value"));
+        if (signature.len != 0) {
+            if (thinking) try row.object.put(arena, "thought", .{ .bool = true });
+            try row.object.put(arena, "thoughtSignature", str(signature));
+        }
+        return;
+    }
+}
+
+fn parseSignature(arena: Allocator, value: Value) Error![]const sdk.Continuation {
+    if (value == .null) return &.{};
+    if (value != .string) return error.LMFailure;
+    const data = try wrapped(arena, "value", value);
+    const states = try arena.alloc(sdk.Continuation, 1);
+    states[0] = .{
+        .provider = "gemini",
+        .kind = "thought_signature",
+        .data = sdk.PayloadValue.fromBorrowedValue(arena, data) catch |err| return codecError(err),
+    };
+    return states;
+}
+
 fn encodePart(arena: Allocator, part: sdk.Part, names: *const std.StringHashMapUnmanaged([]const u8)) Error!Value {
     switch (part) {
         .text => |value| {
-            if (value.continuation.len != 0) return error.LMFailure;
-            return textPart(arena, value.text);
+            var row = try textPart(arena, value.text);
+            try encodeSignature(arena, &row, value.continuation, false);
+            return row;
+        },
+        .thinking => |value| {
+            var row = try textPart(arena, value.text);
+            try encodeSignature(arena, &row, value.continuation, true);
+            return row;
         },
         .tool_call => |call| {
-            if (call.continuation.len != 0) return error.LMFailure;
             var row: Object = .empty;
             try row.put(arena, "name", str(call.name));
             try row.put(arena, "args", call.input.toValue(arena) catch |err| return codecError(err));
             try row.put(arena, "id", str(call.id));
-            return wrapped(arena, "functionCall", .{ .object = row });
+            var encoded = try wrapped(arena, "functionCall", .{ .object = row });
+            try encodeSignature(arena, &encoded, call.continuation, false);
+            return encoded;
         },
         .tool_result => |result| {
             if (result.continuation.len != 0) return error.LMFailure;
@@ -328,20 +474,30 @@ fn parseResponse(arena: Allocator, model: []const u8, raw: Value, records: []con
     const wire_parts = elems(get(get(candidate, "content"), "parts"));
     const parts = try arena.alloc(sdk.Part, @max(wire_parts.len, 1));
     var visible: std.Io.Writer.Allocating = .init(arena);
+    var reasoning: std.Io.Writer.Allocating = .init(arena);
     var calls: std.ArrayList(lm_mod.ToolCall) = .empty;
     for (wire_parts, parts[0..wire_parts.len], 0..) |part, *dest, index| {
-        if (get(part, "thoughtSignature") != .null) return error.LMFailure;
+        const signature = get(part, "thoughtSignature");
         const value = get(part, "text");
         const thought = get(part, "thought");
-        if (thought == .bool and thought.bool) return error.LMFailure;
         if (value == .string) {
-            dest.* = .{ .text = .{ .text = value.string } };
-            visible.writer.writeAll(value.string) catch return error.OutOfMemory;
+            const states = try parseSignature(arena, signature);
+            if (thought == .bool and thought.bool) {
+                dest.* = .{ .thinking = .{ .text = value.string, .continuation = states } };
+                reasoning.writer.writeAll(value.string) catch return error.OutOfMemory;
+            } else {
+                dest.* = .{ .text = .{ .text = value.string, .continuation = states } };
+                visible.writer.writeAll(value.string) catch return error.OutOfMemory;
+            }
             continue;
         }
         const call = get(part, "functionCall");
         const name = text(get(call, "name"));
-        if (name.len == 0 or get(call, "thoughtSignature") != .null) return error.LMFailure;
+        if (name.len == 0) return error.LMFailure;
+        const states = try parseSignature(arena, if (text(signature).len != 0)
+            signature
+        else
+            get(call, "thoughtSignature"));
         const wire_id = text(get(call, "id"));
         const call_id = if (wire_id.len != 0) wire_id else try std.fmt.allocPrint(arena, "tool_call_{d}", .{index});
         const args = get(call, "args");
@@ -350,13 +506,24 @@ fn parseResponse(arena: Allocator, model: []const u8, raw: Value, records: []con
         var json: std.Io.Writer.Allocating = .init(arena);
         @import("pyjson.zig").writeJson(&json.writer, input, .minified) catch |err|
             return if (err == error.WriteFailed) error.OutOfMemory else error.LMFailure;
-        dest.* = .{ .tool_call = .{ .name = name, .id = call_id, .input = parsed } };
-        try calls.append(arena, .{ .name = name, .id = call_id, .arguments = json.written() });
+        dest.* = .{ .tool_call = .{
+            .name = name,
+            .id = call_id,
+            .input = parsed,
+            .continuation = states,
+        } };
+        try calls.append(arena, .{
+            .name = name,
+            .id = call_id,
+            .arguments = json.written(),
+            .continuation = states,
+        });
     }
     if (wire_parts.len == 0) parts[0] = .{ .text = .{} };
     const id = text(get(raw, "responseId"));
     var result: lm_mod.Completion = .{
         .text = if (visible.written().len == 0 and calls.items.len != 0) null else visible.written(),
+        .reasoning = if (reasoning.written().len != 0) reasoning.written() else null,
         .tool_calls = calls.items,
         .adaptations = records,
         .message = .{ .role = .assistant, .parts = parts },
@@ -483,4 +650,30 @@ test "Gemini retains tool call position in mixed responses" {
     try std.testing.expectEqual(sdk.FinishReason.tool_call, result.metadata.finish_reason.?);
     try std.testing.expectEqualStrings("tool_call_1", result.response.?.fields.message.parts[1].tool_call.id);
     try std.testing.expectEqualStrings("tool_call_1", result.tool_calls[0].id);
+}
+
+test "Gemini separates answer text from signed and unsigned thought summaries" {
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    const raw = try @import("json_repair.zig").parseJson(arena,
+        \\{"candidates":[{"content":{"parts":[
+        \\ {"thought":true,"text":"","thoughtSignature":"opaque"},
+        \\ {"thought":true,"text":"Check "},{"thought":true,"text":"the answer"},
+        \\ {"text":"Paris","thoughtSignature":"answer-state"}
+        \\]}}]}
+    );
+    const result = try parseResponse(arena, "gemini-3-flash", raw, &.{});
+    try std.testing.expectEqualStrings("Check the answer", result.reasoning.?);
+    try std.testing.expectEqualStrings("Paris", result.text.?);
+
+    const parts = result.response.?.fields.message.parts;
+    const names: std.StringHashMapUnmanaged([]const u8) = .empty;
+    const signed = try encodePart(arena, parts[0], &names);
+    const unsigned = try encodePart(arena, parts[1], &names);
+    const answer = try encodePart(arena, parts[3], &names);
+    try std.testing.expect(get(signed, "thought").bool);
+    try std.testing.expectEqualStrings("opaque", text(get(signed, "thoughtSignature")));
+    try std.testing.expect(get(unsigned, "thought") == .null);
+    try std.testing.expectEqualStrings("answer-state", text(get(answer, "thoughtSignature")));
 }
