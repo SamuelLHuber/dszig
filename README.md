@@ -3724,6 +3724,8 @@ The following prevent a claim that DSZig can do everything DSPy can:
   that limitation and `required` refuses measurable judgments before sending.
   Supply an existing `std.http.Client` and an API key or a
   per-attempt `header_provider`; use a trusted `base_url` ending in `/v1`.
+  Set `system_prefix` to prepend application instructions before the caller's
+  system blocks, preserving any cache markers on those blocks.
   For compatible Claude models, set `supports_reasoning = true` to advertise
   native reasoning to typed predictors. Canonical requests support manual
   budgets and adaptive effort; `max_tokens` is the visible budget on manual

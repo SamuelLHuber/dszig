@@ -26,6 +26,8 @@ pub const Anthropic = struct {
     timeout_ns: ?u64 = null,
     connect_timeout_ns: ?u64 = null,
     header_provider: ?http.HeaderProvider = null,
+    /// Borrowed application instructions sent before the caller's system blocks.
+    system_prefix: []const u8 = "",
     supports_reasoning: bool = false,
     supports_response_schema: bool = false,
     adaptations: enum { note, silent, refuse } = .note,
@@ -58,10 +60,13 @@ pub const Anthropic = struct {
         errdefer arena.free(model);
         const base_url = try arena.dupe(u8, self.base_url);
         errdefer arena.free(base_url);
+        const system_prefix = try arena.dupe(u8, self.system_prefix);
+        errdefer arena.free(system_prefix);
         const copy = try arena.create(Anthropic);
         copy.* = self.*;
         copy.model = model;
         copy.base_url = base_url;
+        copy.system_prefix = system_prefix;
         return copy.lm();
     }
 
@@ -283,11 +288,32 @@ pub const Anthropic = struct {
         try self.addSampling(arena, &body, config, records);
         try self.addTools(arena, &body, fields, records);
         try self.addOutput(arena, &body, config, records);
+        // Extensions can replace system; the application prefix still comes first.
+        if (self.system_prefix.len != 0) {
+            try prependSystem(arena, &body, self.system_prefix);
+        }
         var writer: std.Io.Writer.Allocating = .init(arena);
         @import("pyjson.zig").writeJson(&writer.writer, .{ .object = body }, .minified) catch |err|
             return if (err == error.WriteFailed) error.OutOfMemory else error.LMFailure;
         if (!std.unicode.utf8ValidateSlice(writer.written())) return error.LMFailure;
         return writer.written();
+    }
+
+    fn prependSystem(arena: Allocator, body: *Object, prefix: []const u8) Error!void {
+        const existing = body.get("system") orelse .null;
+        var blocks: runtime.Array = if (existing == .array) existing.array else .init(arena);
+        try blocks.insert(0, try textBlock(arena, prefix));
+        switch (existing) {
+            .null, .array => {},
+            .string => |rendered| try blocks.append(try textBlock(arena, rendered)),
+            else => {
+                var writer: std.Io.Writer.Allocating = .init(arena);
+                @import("pyjson.zig").writeStr(&writer.writer, existing) catch |err|
+                    return if (err == error.WriteFailed) error.OutOfMemory else error.LMFailure;
+                try blocks.append(try textBlock(arena, writer.written()));
+            },
+        }
+        try body.put(arena, "system", .{ .array = blocks });
     }
 
     fn cacheMarker(
@@ -1128,6 +1154,32 @@ test "Anthropic hosted blocks do not shift client calls, but citations do" {
     try std.testing.expectEqualStrings("Paris", parts[0].text.text);
     try std.testing.expectEqualStrings("https://example.org", parts[1].citation.url.?);
     try std.testing.expectEqualStrings("tool_2", parts[2].tool_call.id);
+}
+
+test "Anthropic system prefix leaves the cache marker on the caller's block" {
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const parse = @import("json_repair.zig").parseJson;
+    const request = try sdk.Request.fromValue(arena, try parse(arena,
+        \\{"model":"fixture","system":"Caller instructions",
+        \\"messages":[{"role":"user","parts":[{"type":"text","text":"Pick"}]}],
+        \\"config":{"max_tokens":16,"cache":{"prefix":"stable","retention":"long"}}}
+    ));
+    defer request.release();
+    const provider: Anthropic = .{
+        .client = undefined,
+        .model = "fixture",
+        .system_prefix = "Application policy",
+    };
+    var records: std.ArrayList(sdk.Adaptation) = .empty;
+    const body = try parse(arena, try provider.requestBody(arena, request, &records, true));
+    const blocks = get(body, "system").array.items;
+    try std.testing.expectEqual(@as(usize, 2), blocks.len);
+    try std.testing.expectEqualStrings("Application policy", text(get(blocks[0], "text")));
+    try std.testing.expect(get(blocks[0], "cache_control") == .null);
+    try std.testing.expectEqualStrings("Caller instructions", text(get(blocks[1], "text")));
+    try std.testing.expectEqualStrings("1h", text(get(get(blocks[1], "cache_control"), "ttl")));
 }
 
 test "Anthropic judgment encoding does not change the caller schema" {
