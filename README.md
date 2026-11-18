@@ -3822,8 +3822,11 @@ The following prevent a claim that DSZig can do everything DSPy can:
   an instruction by Unicode character count. An oversized draft gets one
   compression call per proposal attempt; empty or still-oversized results
   fail rather than being truncated. `gepa.ConfiguredInstructionProposer`
-  also runs standalone on reflection records. Skill loading and History
-  compaction are not implemented by this proposer.
+  also runs standalone on reflection records. Pass already-loaded
+  `gepa.ReflectionSkill` records as `proposal_options.skills` to include
+  trusted reference material in caller order (up to 64 skills and 256 KiB
+  of input text). The proposer does not read files or parse YAML; resolve
+  those at application startup. History compaction is not implemented.
   `add_format_failure_as_feedback = true` includes captured predictor response
   parse failures in the reflection dataset, with the completion text and the
   active adapter's output structure. Such rollouts keep the configured failure

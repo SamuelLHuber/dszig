@@ -73,18 +73,31 @@ const CompressInstruction = signature.Signature(struct {
 });
 
 const ProposalControls = signature.Signature(struct {
-    pub const Input = struct { additional_instructions: []const u8, length_limit: []const u8 };
+    pub const Input = struct {
+        reference_skills: []const u8,
+        additional_instructions: []const u8,
+        length_limit: []const u8,
+    };
     pub const Output = struct { unused: []const u8 };
     pub const descriptions = .{
+        .reference_skills = "Trusted reference material chosen by the user. Draw on it when writing the new instruction.",
         .additional_instructions = "Additional requirements from the user for the new instruction. Follow them.",
         .length_limit = "Hard limit on the length of the new instruction.",
     };
 });
 
+/// Loaded reference material. Applications resolve files and metadata at startup.
+pub const ReflectionSkill = struct {
+    name: []const u8,
+    content: []const u8,
+    description: []const u8 = "",
+};
+
 /// Options for the built-in reflection LM proposer. The caller owns the strings.
 pub const ConfiguredInstructionProposer = struct {
     base_instructions: []const u8 = "",
     additional_instructions: []const u8 = "",
+    skills: []const ReflectionSkill = &.{},
     max_chars: ?u32 = null,
     adapter: @import("adapter.zig").Adapter = .json,
 
@@ -93,7 +106,7 @@ pub const ConfiguredInstructionProposer = struct {
         context: Context,
         current_instruction: []const u8,
         examples: []const Record,
-    ) (predict.Error || error{ InvalidInstructionLimit, InvalidInstruction })![]const u8 {
+    ) (predict.Error || error{ InvalidInstructionLimit, InvalidInstruction, InvalidReflectionSkill })![]const u8 {
         const max_chars = options.max_chars;
         if (max_chars == 0) return error.InvalidInstructionLimit;
         var ctx = context;
@@ -120,18 +133,63 @@ pub const ConfiguredInstructionProposer = struct {
         return count <= max;
     }
 
+    fn renderSkills(
+        skills: []const ReflectionSkill,
+        arena: Allocator,
+    ) (Allocator.Error || error{InvalidReflectionSkill})![]const u8 {
+        if (skills.len == 0) return "";
+        if (skills.len > 64) return error.InvalidReflectionSkill;
+        var bytes_left: usize = 256 * 1024;
+        var output: std.Io.Writer.Allocating = .init(arena);
+        defer output.deinit();
+        for (skills, 0..) |skill, index| {
+            for ([_][]const u8{ skill.name, skill.description, skill.content }) |text| {
+                if (text.len > bytes_left) return error.InvalidReflectionSkill;
+                bytes_left -= text.len;
+                if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidReflectionSkill;
+            }
+            const content = value.pyStrip(skill.content);
+            if (skill.name.len == 0 or content.len == 0) return error.InvalidReflectionSkill;
+            writeSkill(&output.writer, skill, content, index != 0) catch return error.OutOfMemory;
+        }
+        return output.toOwnedSlice();
+    }
+
+    fn writeSkill(
+        writer: *std.Io.Writer,
+        skill: ReflectionSkill,
+        content: []const u8,
+        separator: bool,
+    ) std.Io.Writer.Error!void {
+        const repr = @import("pyjson.zig").writeReprString;
+        if (separator) try writer.writeAll("\n\n");
+        try writer.writeAll("<skill name=");
+        try repr(writer, skill.name);
+        if (skill.description.len > 0) {
+            try writer.writeAll(" description=");
+            try repr(writer, skill.description);
+        }
+        try writer.writeAll(">\n");
+        try writer.writeAll(content);
+        try writer.writeAll("\n</skill>");
+    }
+
     fn generateDraft(
         options: ConfiguredInstructionProposer,
         ctx: Context,
         current_instruction: []const u8,
         examples: []const Record,
         length_limit: []const u8,
-    ) predict.Error![]const u8 {
-        var fields: [5]signature.Field = undefined;
+    ) (predict.Error || error{InvalidReflectionSkill})![]const u8 {
+        const controls_count = ProposalControls.fields.len - 1;
+        const capacity = controls_count + ProposeInstruction.fields.len;
+        var fields: [capacity]signature.Field = undefined;
         var field_count: usize = 0;
         var inputs: Record = .empty;
+        const skills = try renderSkills(options.skills, ctx.arena);
         const additional = value.pyStrip(options.additional_instructions);
-        for (ProposalControls.fields[0..2], [2][]const u8{ additional, length_limit }) |field, text| {
+        const controls = [controls_count][]const u8{ skills, additional, length_limit };
+        for (ProposalControls.fields[0..controls_count], controls) |field, text| {
             if (text.len == 0) continue;
             fields[field_count] = field;
             field_count += 1;
@@ -139,8 +197,8 @@ pub const ConfiguredInstructionProposer = struct {
         }
         @memcpy(fields[field_count..][0..ProposeInstruction.fields.len], ProposeInstruction.fields);
         field_count += ProposeInstruction.fields.len;
-        var descs: [5][]const u8 = undefined;
-        var prefixes: [5][]const u8 = undefined;
+        var descs: [capacity][]const u8 = undefined;
+        var prefixes: [capacity][]const u8 = undefined;
         for (fields[0..field_count], descs[0..field_count], prefixes[0..field_count]) |field, *desc, *prefix| {
             desc.* = field.desc;
             prefix.* = field.prefix;
@@ -163,6 +221,23 @@ pub const ConfiguredInstructionProposer = struct {
         return value.pyStrip(text.string);
     }
 };
+
+test "blank reflection skills are refused before a model request" {
+    var model: @import("lm.zig").ScriptedLM = .{
+        .responses = &.{"{\"new_instruction\":\"should not be requested\"}"},
+    };
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const options: ConfiguredInstructionProposer = .{
+        .skills = &.{.{ .name = "Blank", .content = "\u{2003}\n" }},
+    };
+    try std.testing.expectError(error.InvalidReflectionSkill, options.propose(
+        .{ .arena = arena_state.allocator(), .lm = model.lm() },
+        "Original.",
+        &.{},
+    ));
+    try std.testing.expectEqual(@as(usize, 0), model.index);
+}
 
 pub const GEPA = struct {
     metric: FeedbackMetric,
