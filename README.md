@@ -3814,7 +3814,10 @@ The following prevent a claim that DSZig can do everything DSPy can:
   batch. The winning program is still chosen by mean validation score.
   `acceptance_criterion` defaults to `.strict_improvement`; set
   `.improvement_or_equal` to validate reflective mutations whose minibatch
-  scores tie their parent's. Merge acceptance is unchanged.
+  scores tie their parent's. `.custom` supplies a callback that sees both
+  minibatch evaluations and the current search state before child validation.
+  It runs once per evaluated reflective mutation; errors abort compilation.
+  Merge acceptance is unchanged.
   Candidate selection supports `pareto`, `current_best`,
   `epsilon_greedy` (epsilon 0.1), and `top_k_pareto` (top five). Top-five
   selection restricts the validation frontiers before removing dominated

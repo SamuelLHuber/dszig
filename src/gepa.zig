@@ -312,7 +312,33 @@ pub const GEPA = struct {
     pub const Auto = enum { light, medium, heavy };
     pub const Selection = enum { pareto, current_best, epsilon_greedy, top_k_pareto };
     pub const Frontier = enum { instance, objective, hybrid, cartesian };
-    pub const Acceptance = enum { strict_improvement, improvement_or_equal };
+    pub const Acceptance = union(enum) {
+        strict_improvement,
+        improvement_or_equal,
+        custom: CustomAcceptance,
+    };
+
+    pub const CustomAcceptance = struct {
+        ptr: *anyopaque,
+        should_accept: *const fn (*anyopaque, *const AcceptanceInput) anyerror!bool,
+    };
+
+    /// Borrowed for one callback after both minibatch runs and before validation.
+    /// Candidate instructions follow `names`; run entries follow `minibatch_ids`.
+    pub const AcceptanceInput = struct {
+        names: []const []const u8,
+        child: []const []const u8,
+        parent_idx: usize,
+        iteration: usize,
+        total_metric_calls: usize,
+        candidates: []const []const []const u8,
+        val_subscores: []const []const f64,
+        parents: []const []const ?usize,
+        trainset: []const Example,
+        minibatch_ids: []const usize,
+        before: []const Run,
+        after: []const Run,
+    };
     pub const ComponentSelector = union(enum) {
         round_robin,
         all,
@@ -668,7 +694,7 @@ pub const GEPA = struct {
                     .prediction = prediction,
                     .trace = trace,
                     .score = feedback.score,
-                    .objective_scores = if (capture) &.{} else feedback.objective_scores,
+                    .objective_scores = feedback.objective_scores,
                 };
             }
 
@@ -1030,11 +1056,23 @@ pub const GEPA = struct {
                     try e.proposeBuiltinChild(parent_candidate, components, datasets);
                 const child = proposed orelse return;
                 const after = try e.evalIds(child, e.trainset, ids, true);
-                const before_score = sumScores(before);
-                const after_score = sumScores(after);
                 const accepted = switch (e.gepa.acceptance_criterion) {
-                    .strict_improvement => after_score > before_score,
-                    .improvement_or_equal => after_score >= before_score,
+                    .strict_improvement => sumScores(after) > sumScores(before),
+                    .improvement_or_equal => sumScores(after) >= sumScores(before),
+                    .custom => |callback| try callback.should_accept(callback.ptr, &.{
+                        .names = e.names,
+                        .child = child,
+                        .parent_idx = parent,
+                        .iteration = e.i,
+                        .total_metric_calls = e.total_evals,
+                        .candidates = e.candidates.items,
+                        .val_subscores = e.subscores.items,
+                        .parents = e.parents.items,
+                        .trainset = e.trainset,
+                        .minibatch_ids = ids,
+                        .before = before,
+                        .after = after,
+                    }),
                 };
                 if (accepted) {
                     const parent_ids = try e.out.alloc(?usize, 1);
