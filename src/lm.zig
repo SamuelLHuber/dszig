@@ -1794,6 +1794,20 @@ pub fn materializeStream(
     return OpenAI.OpenAIStream.materialize(backing, request, events);
 }
 
+pub const StreamSource = @import("openai_stream.zig").Source;
+pub const StreamSourceResult = @import("openai_stream.zig").SourceResult;
+
+/// Assemble a synchronous event source and call close exactly once.
+/// An observer may stop before the end without pulling another event.
+pub fn materializeStreamSource(
+    backing: Allocator,
+    request: *const sdk.Request,
+    source: StreamSource,
+    observer: ?OpenAI.StreamSink,
+) StreamSourceResult {
+    return OpenAI.OpenAIStream.materializeSource(backing, request, source, observer);
+}
+
 /// OpenAI-compatible Chat Completions and Responses clients on `std.http`.
 pub const OpenAI = struct {
     client: *std.http.Client,

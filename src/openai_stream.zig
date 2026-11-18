@@ -70,6 +70,52 @@ pub const Materialized = union(enum) {
     }
 };
 
+/// A synchronous event source. Event payloads remain valid until close
+/// returns; close may release all source storage, even on error.
+pub const Source = struct {
+    context: *anyopaque,
+    next: *const fn (*anyopaque) anyerror!?Event,
+    close: *const fn (*anyopaque) anyerror!void,
+};
+
+/// Preserve the primary outcome and any secondary failure separately.
+pub const SourceResult = struct {
+    outcome: anyerror!Materialized,
+    stopped: bool = false,
+    read_after_end: ?anyerror = null,
+    close_error: ?anyerror = null,
+    diagnostic_bytes: ?[]u8 = null,
+
+    /// Use the allocator originally supplied to materializeStreamSource.
+    pub fn release(self: SourceResult, backing: Allocator) void {
+        if (self.outcome) |result| result.release() else |_| {}
+        if (self.diagnostic_bytes) |bytes| backing.free(bytes);
+    }
+
+    fn ownDiagnostic(self: *SourceResult, backing: Allocator, result: Materialized) !Materialized {
+        var owned = result;
+        switch (owned) {
+            .unnamed_tool => |*failure| {
+                const bytes = try backing.dupe(u8, failure.part_index);
+                self.diagnostic_bytes = bytes;
+                failure.part_index = bytes;
+            },
+            .provider_error => |*detail| {
+                const size = std.math.add(usize, detail.provider_code.len, detail.message.len) catch return error.OutOfMemory;
+                const bytes = try backing.alloc(u8, size);
+                const split = detail.provider_code.len;
+                @memcpy(bytes[0..split], detail.provider_code);
+                @memcpy(bytes[split..], detail.message);
+                self.diagnostic_bytes = bytes;
+                detail.provider_code = bytes[0..split];
+                detail.message = bytes[split..];
+            },
+            else => {},
+        }
+        return owned;
+    }
+};
+
 pub const ReplayError = std.mem.Allocator.Error ||
     error{ UnsupportedPart, IncompleteLogprobs, InvalidToolInput };
 
@@ -341,7 +387,86 @@ pub fn Reader(comptime codec: anytype) type {
             defer scratch.deinit();
             const arena = scratch.allocator();
             var self: Self = .{ .arena = arena, .model = request.fields.model, .stop = &.{} };
-            for (events, 0..) |event, i| switch (event) {
+            for (events, 0..) |event, i| {
+                if (try self.foldEvent(backing, request, event)) |result| {
+                    return if (result == .complete and i + 1 != events.len)
+                        .{ .after_end = result.complete }
+                    else
+                        result;
+                }
+            }
+            return self.missingEnd(backing, request);
+        }
+
+        pub fn materializeSource(
+            backing: Allocator,
+            request: *const sdk.Request,
+            source: Source,
+            observer: ?Sink,
+        ) SourceResult {
+            var scratch: std.heap.ArenaAllocator = .init(backing);
+            defer scratch.deinit();
+            var self: Self = .{
+                .arena = scratch.allocator(),
+                .model = request.fields.model,
+                .stop = &.{},
+            };
+            var report: SourceResult = .{ .outcome = error.LMFailure };
+            report.outcome = self.driveSource(backing, request, source, observer, &report);
+            if (report.outcome) |result| {
+                report.outcome = report.ownDiagnostic(backing, result) catch |err| blk: {
+                    result.release();
+                    break :blk err;
+                };
+            } else |_| {}
+            source.close(source.context) catch |err| {
+                report.close_error = err;
+            };
+            return report;
+        }
+
+        fn driveSource(
+            self: *Self,
+            backing: Allocator,
+            request: *const sdk.Request,
+            source: Source,
+            observer: ?Sink,
+            report: *SourceResult,
+        ) anyerror!Materialized {
+            for (0..65_536) |_| {
+                const event = try source.next(source.context) orelse
+                    return self.missingEnd(backing, request);
+                const folded = try self.foldEvent(backing, request, event);
+                const stop = if (observer) |sink|
+                    sink.on_event(sink.context, event) == .stop
+                else
+                    false;
+                if (folded) |result| {
+                    if (result != .complete) return result;
+                    // The end is final. Check one more pull even if the observer
+                    // asked to stop on the end notification.
+                    const trailing = source.next(source.context) catch |err| {
+                        report.read_after_end = err;
+                        return result;
+                    };
+                    return if (trailing == null) result else .{ .after_end = result.complete };
+                }
+                if (stop) {
+                    report.stopped = true;
+                    return self.missingEnd(backing, request);
+                }
+            }
+            if (try source.next(source.context) == null) return self.missingEnd(backing, request);
+            return error.LMFailure;
+        }
+
+        fn foldEvent(
+            self: *Self,
+            backing: Allocator,
+            request: *const sdk.Request,
+            event: Event,
+        ) lm.Error!?Materialized {
+            switch (event) {
                 .start => |start_event| {
                     if (start_event.id) |id| {
                         if (id.len != 0) self.metadata.id = id;
@@ -362,11 +487,17 @@ pub fn Reader(comptime codec: anytype) type {
                         .part_index = part_index,
                         .partial = response,
                     } };
-                    return if (i == events.len - 1) .{ .complete = response } else .{
-                        .after_end = response,
-                    };
+                    return .{ .complete = response };
                 },
-            };
+            }
+            return null;
+        }
+
+        fn missingEnd(
+            self: *Self,
+            backing: Allocator,
+            request: *const sdk.Request,
+        ) lm.Error!Materialized {
             const partial = self.materializedResponse(backing, request) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => null,

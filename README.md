@@ -2134,6 +2134,17 @@ with `.release()`. Diagnostic strings borrow the input; the response is owned.
 This API does not read from a transport, manage a source iterator, or run a
 DSPy program.
 
+`lm.materializeStreamSource` applies the same rules to a synchronous source.
+It closes the source exactly once, even when reading, folding, or copying
+diagnostics fails. An optional observer can stop before the end without
+another read, returning the partial result with `stopped = true`. After an
+end, one more read distinguishes a trailing event from source exhaustion.
+Read failures after completion and close failures are reported separately
+from the primary outcome. Keep event payloads valid until close; the returned
+response and diagnostic strings no longer depend on source storage. Release
+the report with `.release(backing)`. This API does not turn an HTTP push
+stream into a pull iterator or run a DSPy program.
+
 Responses requests honor `config.extensions.openai_responses_compat`, its
 `openai_compat` alias and the nested `compat` forms. Null inherits; `"auto"`
 selects the dialect default. Direct empty objects win over aliases, whereas
@@ -3622,8 +3633,8 @@ The following prevent a claim that DSZig can do everything DSPy can:
   beyond OpenAI/Azure, Image/Audio, general rich-media tool results, non-OpenAI
   training providers or streaming beyond synchronous OpenAI Responses and
   Chat Completions SSE. Completed SDK responses can be projected to events,
-  and bounded event sequences can be assembled offline. Iterator lifecycle,
-  asynchronous streaming, and DSPy program streaming are not available.
+  and bounded event sequences or synchronous sources can be assembled.
+  Asynchronous streaming and DSPy program streaming are not available.
   Document support is not general multimodal support, and Chat Completions
   does not accept document parts.
 - **File and DocumentPart boundaries:** the constructor smoke explicitly leaves
