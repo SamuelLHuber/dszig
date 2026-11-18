@@ -4002,6 +4002,8 @@ The following prevent a claim that DSZig can do everything DSPy can:
   logging mode from a batch that covered the whole validation set. Tracking
   makes no extra evaluations. This is not Python object deepcopy or LM-call
   counter parity; opaque program state can still be borrowed.
+  `view_data_batch_size = 0` summarizes an empty initial view without
+  refinement, matching DSPy rather than disabling the data-aware proposer.
   SIMBA `Result.candidate_programs` retains the final native program values
   alongside their full-trainset scores, descending and stable across ties.
   It reuses the final evaluations and does not deep-copy opaque program state.

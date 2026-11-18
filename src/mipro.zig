@@ -290,7 +290,6 @@ fn stringLess(_: void, a: []const u8, b: []const u8) bool {
 
 /// `create_dataset_summary(trainset, view_data_batch_size, prompt_model)`.
 pub fn datasetSummary(out: Allocator, prompt: Context, trainset: []const Example, batch_size: usize) predict.Error![]const u8 {
-    assert(batch_size > 0);
     var ctx = prompt;
     ctx.lm_options.temperature = 1.0;
     const first = try (predict.Predict(DatasetDescriptor){}).forward(ctx, .{
@@ -299,18 +298,19 @@ pub fn datasetSummary(out: Allocator, prompt: Context, trainset: []const Example
     var observations: std.ArrayList(u8) = .empty;
     try observations.appendSlice(out, first.observations);
     var skips: usize = 0;
-    var calls: usize = 0;
-    var b = batch_size;
-    while (b < trainset.len) : (b += batch_size) {
-        calls += 1;
-        if (calls >= 10) break;
+    // A zero Python range step skips refinement, not the first or final call.
+    var start = batch_size;
+    for (0..9) |_| {
+        if (batch_size == 0 or start >= trainset.len) break;
+        const end = start + @min(batch_size, trainset.len - start);
         const more = (predict.Predict(DatasetDescriptorWithPriorObservations){}).forward(ctx, .{
-            .examples = try examplesRepr(ctx.arena, trainset[b..@min(trainset.len, b + batch_size)]),
+            .examples = try examplesRepr(ctx.arena, trainset[start..end]),
             .prior_observations = observations.items,
         }) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => break, // DSPy keeps the observations gathered so far.
         };
+        start = end;
         const o = more.observations;
         if (o.len >= 8 and std.ascii.eqlIgnoreCase(o[0..8], "COMPLETE")) {
             skips += 1;
@@ -960,6 +960,28 @@ fn zeros(out: Allocator, n: usize) Allocator.Error![]usize {
 }
 
 const testing = std.testing;
+
+test "MIPRO zero-size dataset summary skips refinement but uses the initial observations" {
+    var backing: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer backing.deinit();
+    const arena = backing.allocator();
+    const lm_mod = @import("lm.zig");
+    var history: lm_mod.History = .{ .arena = arena };
+    var model: lm_mod.ScriptedLM = .{ .history = &history, .responses = &.{
+        "{\"observations\":\"Initial.\"}",
+        "{\"summary\":\"Facts.\"}",
+    } };
+    const sample = try Example.fromJson(arena, "{\"q\":\"unseen row\"}", &.{"q"});
+    const ctx: Context = .{ .arena = arena, .lm = model.lm(), .adapter = .json };
+    try testing.expectEqualStrings("Facts.", try datasetSummary(arena, ctx, &.{sample}, 0));
+
+    const requests = history.requests.items;
+    try testing.expectEqual(@as(usize, 2), requests.len);
+    const initial = requests[0].messages;
+    const final = requests[1].messages;
+    try testing.expect(std.mem.indexOf(u8, initial[initial.len - 1].content.text, "[]") != null);
+    try testing.expect(std.mem.indexOf(u8, final[final.len - 1].content.text, "Initial.") != null);
+}
 
 test "MIPRO ranks full-set minibatch trials as full candidates and preserves ties" {
     var backing: std.heap.ArenaAllocator = .init(testing.allocator);
