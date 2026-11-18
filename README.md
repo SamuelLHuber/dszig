@@ -3744,7 +3744,10 @@ The following prevent a claim that DSZig can do everything DSPy can:
   Gemini 2.5 budgets and Gemini 3 effort levels, with thought-signature replay
   for reasoning, text, and function calls. Set `Gemini.supports_reasoning` when
   the configured model supports native reasoning for typed prediction. Gemini
-  media, streaming, and Vertex AI are not supported.
+  accepts inline bytes, URIs, and file IDs for media, including image and
+  document attachments in function results. It decodes returned image, audio,
+  and document parts. Provider-side file uploads, local path reads, streaming,
+  and Vertex AI are not supported.
   Native File construction, adapter/typed prediction
   handling, File tool-result markers and bounded Responses document translation
   are implemented as described above. There is still no complete lm15 provider

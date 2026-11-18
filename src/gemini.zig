@@ -357,18 +357,57 @@ fn encodePart(arena: Allocator, part: sdk.Part, names: *const std.StringHashMapU
             try encodeSignature(arena, &encoded, call.continuation, false);
             return encoded;
         },
-        .tool_result => |result| {
-            if (result.continuation.len != 0) return error.LMFailure;
-            const name = result.name orelse names.get(result.id) orelse return error.LMFailure;
-            const bytes = try joinText(arena, "", result.content);
-            var row: Object = .empty;
-            try row.put(arena, "name", str(name));
-            try row.put(arena, "response", try wrapped(arena, if (result.is_error) "error" else "result", str(bytes)));
-            try row.put(arena, "id", str(result.id));
-            return wrapped(arena, "functionResponse", .{ .object = row });
-        },
+        .image, .audio, .video, .document, .binary => |media| return encodeMedia(arena, &media),
+        .tool_result => |result| return encodeToolResult(arena, &result, names),
         else => return error.LMFailure,
     }
+}
+
+fn encodeMedia(arena: Allocator, media: *const sdk.MediaPart) Error!Value {
+    if (media.path != null or media.continuation.len != 0) return error.LMFailure;
+    const mime = if (media.media_type.len != 0) media.media_type else "application/octet-stream";
+    var row: Object = .empty;
+    try row.put(arena, "mimeType", str(mime));
+    if (media.url orelse media.file_id) |uri| {
+        try row.put(arena, "fileUri", str(uri));
+        return wrapped(arena, "fileData", .{ .object = row });
+    }
+    try row.put(arena, "data", str(media.data orelse return error.LMFailure));
+    return wrapped(arena, "inlineData", .{ .object = row });
+}
+
+fn encodeToolResult(
+    arena: Allocator,
+    result: *const sdk.ToolResultPart,
+    names: *const std.StringHashMapUnmanaged([]const u8),
+) Error!Value {
+    if (result.continuation.len != 0) return error.LMFailure;
+    const name = result.name orelse names.get(result.id) orelse return error.LMFailure;
+    var attachments: runtime.Array = .init(arena);
+    var body: std.Io.Writer.Allocating = .init(arena);
+    var has_text = false;
+    for (result.content) |part| switch (part) {
+        .image, .document => |media| try attachments.append(try encodeMedia(arena, &media)),
+        .text => |value| {
+            if (value.continuation.len != 0) return error.LMFailure;
+            if (has_text) body.writer.writeByte('\n') catch return error.OutOfMemory;
+            body.writer.writeAll(value.text) catch return error.OutOfMemory;
+            has_text = true;
+        },
+        else => return error.LMFailure,
+    };
+    const response = if (result.is_error)
+        try wrapped(arena, "error", str(body.written()))
+    else if (has_text or attachments.items.len == 0)
+        try wrapped(arena, "result", str(body.written()))
+    else
+        Value{ .object = .empty };
+    var row: Object = .empty;
+    try row.put(arena, "name", str(name));
+    try row.put(arena, "response", response);
+    if (result.id.len != 0) try row.put(arena, "id", str(result.id));
+    if (attachments.items.len != 0) try row.put(arena, "parts", .{ .array = attachments });
+    return wrapped(arena, "functionResponse", .{ .object = row });
 }
 
 fn addTools(arena: Allocator, body: *Object, fields: *const sdk.RequestFields, policy: @FieldType(Gemini, "adaptations"), records: *std.ArrayList(sdk.Adaptation)) Error!void {
@@ -476,7 +515,9 @@ fn parseResponse(arena: Allocator, model: []const u8, raw: Value, records: []con
     var visible: std.Io.Writer.Allocating = .init(arena);
     var reasoning: std.Io.Writer.Allocating = .init(arena);
     var calls: std.ArrayList(lm_mod.ToolCall) = .empty;
-    for (wire_parts, parts[0..wire_parts.len], 0..) |part, *dest, index| {
+    var parts_len: usize = 0;
+    for (wire_parts) |part| {
+        const dest = &parts[parts_len];
         const signature = get(part, "thoughtSignature");
         const value = get(part, "text");
         const thought = get(part, "thought");
@@ -489,6 +530,20 @@ fn parseResponse(arena: Allocator, model: []const u8, raw: Value, records: []con
                 dest.* = .{ .text = .{ .text = value.string, .continuation = states } };
                 visible.writer.writeAll(value.string) catch return error.OutOfMemory;
             }
+            parts_len += 1;
+            continue;
+        }
+        const inline_data = get(part, "inlineData");
+        const file_data = get(part, "fileData");
+        if (inline_data == .object or file_data == .object) {
+            const media = if (inline_data == .object)
+                parseMedia(inline_data, .inline_bytes)
+            else
+                parseMedia(file_data, .uri);
+            if (media) |value_part| {
+                dest.* = value_part;
+                parts_len += 1;
+            }
             continue;
         }
         const call = get(part, "functionCall");
@@ -499,7 +554,7 @@ fn parseResponse(arena: Allocator, model: []const u8, raw: Value, records: []con
         else
             get(call, "thoughtSignature"));
         const wire_id = text(get(call, "id"));
-        const call_id = if (wire_id.len != 0) wire_id else try std.fmt.allocPrint(arena, "tool_call_{d}", .{index});
+        const call_id = if (wire_id.len != 0) wire_id else try std.fmt.allocPrint(arena, "tool_call_{d}", .{parts_len});
         const args = get(call, "args");
         const input: Value = if (args == .object) args else .{ .object = .empty };
         const parsed = sdk.JsonValue.fromBorrowedValue(arena, input) catch |err| return codecError(err);
@@ -518,15 +573,19 @@ fn parseResponse(arena: Allocator, model: []const u8, raw: Value, records: []con
             .arguments = json.written(),
             .continuation = states,
         });
+        parts_len += 1;
     }
-    if (wire_parts.len == 0) parts[0] = .{ .text = .{} };
+    if (parts_len == 0) {
+        parts[0] = .{ .text = .{} };
+        parts_len = 1;
+    }
     const id = text(get(raw, "responseId"));
     var result: lm_mod.Completion = .{
         .text = if (visible.written().len == 0 and calls.items.len != 0) null else visible.written(),
         .reasoning = if (reasoning.written().len != 0) reasoning.written() else null,
         .tool_calls = calls.items,
         .adaptations = records,
-        .message = .{ .role = .assistant, .parts = parts },
+        .message = .{ .role = .assistant, .parts = parts[0..parts_len] },
         .provider_data = sdk.PayloadValue.fromBorrowedValue(arena, raw) catch |err| return codecError(err),
         .metadata = .{
             .id = if (id.len != 0) id else null,
@@ -537,6 +596,20 @@ fn parseResponse(arena: Allocator, model: []const u8, raw: Value, records: []con
     };
     try lm_mod.publishResponse(arena, &result, model, .borrowed);
     return result;
+}
+
+fn parseMedia(value: Value, mode: enum { inline_bytes, uri }) ?sdk.Part {
+    const address = text(get(value, if (mode == .inline_bytes) "data" else "fileUri"));
+    if (address.len == 0) return null;
+    const mime = text(get(value, "mimeType"));
+    const media: sdk.MediaPart = .{
+        .media_type = if (mime.len == 0) "application/octet-stream" else mime,
+        .data = if (mode == .inline_bytes) address else null,
+        .url = if (mode == .uri) address else null,
+    };
+    if (std.mem.startsWith(u8, mime, "image/")) return .{ .image = media };
+    if (std.mem.startsWith(u8, mime, "audio/")) return .{ .audio = media };
+    return .{ .document = media };
 }
 
 fn readUsage(arena: Allocator, usage: Value) Error!sdk.Usage {
@@ -676,4 +749,21 @@ test "Gemini separates answer text from signed and unsigned thought summaries" {
     try std.testing.expectEqualStrings("opaque", text(get(signed, "thoughtSignature")));
     try std.testing.expect(get(unsigned, "thought") == .null);
     try std.testing.expectEqualStrings("answer-state", text(get(answer, "thoughtSignature")));
+}
+
+test "Gemini ignores empty media before assigning a synthetic tool ID" {
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    const raw = try @import("json_repair.zig").parseJson(arena,
+        \\{"candidates":[{"content":{"parts":[
+        \\ {"inlineData":{"mimeType":"image/png","data":""}},
+        \\ {"fileData":{"mimeType":"audio/wav","fileUri":"gs://bucket/audio"}},
+        \\ {"functionCall":{"name":"lookup","args":{}}}
+        \\]}}]}
+    );
+    const result = try parseResponse(arena, "fixture", raw, &.{});
+    const parts = result.response.?.fields.message.parts;
+    try std.testing.expectEqualStrings("gs://bucket/audio", parts[0].audio.url.?);
+    try std.testing.expectEqualStrings("tool_call_1", parts[1].tool_call.id);
 }
