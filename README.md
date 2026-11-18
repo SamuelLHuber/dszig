@@ -3778,8 +3778,12 @@ The following prevent a claim that DSZig can do everything DSPy can:
   native custom classes, not arbitrary Python objects erased into ordinary
   `Value`/`Record` dictionaries; a nested dynamic model inside a History record
   therefore cannot retain its original Python class repr merely from its keys.
-- **Optimizer options:** unsupported GEPA custom code/instruction proposers,
-  Flex components, other frontier/selection policies, format-failure feedback,
+- **Optimizer options:** GEPA returns the best candidate indices for each
+  validation example, including ties. Set `track_best_outputs = true` to also
+  retain their predictions in `best_outputs_valset`, in candidate discovery
+  order. The results live in the compilation allocator and do not require
+  additional model calls. Unsupported GEPA options include custom code/instruction proposers,
+  Flex components, objective-based frontiers, other selection policies, format-failure feedback,
   logging integrations, and some MIPROv2/SIMBA/COPRO statistics/logging options.
   Concurrent evaluation and SIMBA/GEPA rollouts use explicit startup-created
   native pools; Python ambient settings and general async execution are not

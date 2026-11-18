@@ -75,6 +75,8 @@ pub const GEPA = struct {
     failure_score: f64 = 0.0,
     perfect_score: f64 = 1.0,
     seed: u32 = 0,
+    /// Retain the predictions attaining the best score for each validation row.
+    track_best_outputs: bool = false,
     /// DSPy `num_threads`: a `parallel.Parallel(GEPA.Run, limits).runner()`
     /// plus per-attempt contexts. Program and metric must be thread-safe, and
     /// `out`, which retains predictions and traces, must then be thread-safe
@@ -96,6 +98,11 @@ pub const GEPA = struct {
 
     pub const Error = error{ ZeroWeights, NoBudget };
 
+    pub const BestOutput = struct {
+        candidate_idx: usize,
+        prediction: optimize.RecordPrediction,
+    };
+
     /// `DspyGEPAResult` (`track_stats=True`) plus the optimized program.
     pub fn Result(comptime P: type) type {
         return struct {
@@ -105,6 +112,10 @@ pub const GEPA = struct {
             parents: []const []const ?usize,
             val_aggregate_scores: []const f64,
             val_subscores: []const []const f64,
+            /// Indexed by validation row; tied candidates are in discovery order.
+            per_val_instance_best_candidates: []const []const usize,
+            /// Indexed by validation row, in candidate discovery order.
+            best_outputs_valset: ?[]const []const BestOutput,
             discovery_eval_counts: []const usize,
             best_idx: usize,
             total_metric_calls: usize,
@@ -143,6 +154,7 @@ pub const GEPA = struct {
             next_pred: std.ArrayList(usize) = .empty,
             front_score: []f64,
             fronts: []std.ArrayList(usize),
+            best_outputs: ?[]std.ArrayList(BestOutput) = null,
             total_evals: usize = 0,
             full_evals: usize = 0,
             i: usize = 0,
@@ -262,13 +274,19 @@ pub const GEPA = struct {
                 try e.parents.append(e.out, parent_ids);
                 try e.discovery.append(e.out, discovered);
                 try e.next_pred.append(e.out, next);
-                for (scores, 0..) |s, k| {
-                    if (idx == 0 or s > e.front_score[k]) {
-                        e.front_score[k] = s;
+                for (runs, 0..) |run, k| {
+                    const improves = idx == 0 or run.score > e.front_score[k];
+                    if (!improves and run.score != e.front_score[k]) continue;
+                    if (improves) {
+                        e.front_score[k] = run.score;
                         e.fronts[k].clearRetainingCapacity();
-                        try e.fronts[k].append(e.out, idx);
-                    } else if (s == e.front_score[k]) {
-                        try e.fronts[k].append(e.out, idx);
+                    }
+                    try e.fronts[k].append(e.out, idx);
+                    if (e.best_outputs) |outputs| {
+                        // Full evaluation substitutes an empty prediction on failure.
+                        const prediction = run.prediction.?;
+                        if (improves) outputs[k].clearRetainingCapacity();
+                        try outputs[k].append(e.out, .{ .candidate_idx = idx, .prediction = prediction });
                     }
                 }
             }
@@ -739,6 +757,11 @@ pub const GEPA = struct {
             .front_score = try out.alloc(f64, valset.len),
             .fronts = fronts,
         };
+        if (self.track_best_outputs) {
+            const outputs = try out.alloc(std.ArrayList(BestOutput), valset.len);
+            @memset(outputs, .empty);
+            e.best_outputs = outputs;
+        }
         try e.addProgram(seed_candidate, &.{null});
         var started = false;
         while (e.total_evals < max_calls) {
@@ -760,12 +783,21 @@ pub const GEPA = struct {
             if (e.average(idx) > e.average(best)) best = idx;
         }
         const program = try e.build(e.candidates.items[best]);
+        const per_instance = try out.alloc([]const usize, e.fronts.len);
+        for (per_instance, e.fronts) |*row, front| row.* = front.items;
+        const best_outputs: ?[]const []const BestOutput = if (e.best_outputs) |outputs| rows: {
+            const rows = try out.alloc([]const BestOutput, outputs.len);
+            for (rows, outputs) |*row, outputs_for_row| row.* = outputs_for_row.items;
+            break :rows rows;
+        } else null;
         return .{
             .program = program.*,
             .candidates = e.candidates.items,
             .parents = e.parents.items,
             .val_aggregate_scores = try e.averages(),
             .val_subscores = e.subscores.items,
+            .per_val_instance_best_candidates = per_instance,
+            .best_outputs_valset = best_outputs,
             .discovery_eval_counts = e.discovery.items,
             .best_idx = best,
             .total_metric_calls = e.total_evals,
@@ -889,10 +921,69 @@ test "GEPA empty validation evaluates the entire training set" {
     };
     const optimizer: GEPA = .{ .metric = Metric.score, .max_metric_calls = 1 };
     const result = try optimizer.compile(predict.Predict(Sig), arena, .{ .arena = arena, .lm = script.lm() }, .{}, &examples, .{ .valset = &.{} });
+    try std.testing.expect(result.best_outputs_valset == null);
     try std.testing.expectEqualSlices(f64, &.{ 1, 0 }, result.val_subscores[0]);
     try std.testing.expectEqual(@as(f64, 0.5), result.val_aggregate_scores[0]);
     try std.testing.expectEqual(@as(usize, 2), result.total_metric_calls);
     try std.testing.expectEqual(@as(usize, 1), result.max_metric_calls);
+}
+
+test "GEPA best outputs keep ties and replace an older frontier without extra evaluations" {
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const P = predict.Predict(signature.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: []const u8 };
+    }));
+    const Metric = struct {
+        fn score(_: Allocator, _: *const Example, pred: *const optimize.RecordPrediction, _: ?*const Trace, _: ?[]const u8, _: ?*const Trace.Step) value.ParseError!Feedback {
+            return .{ .score = if (pred.get("answer").?.string[0] == 'h') 1 else 0 };
+        }
+    };
+    var script: @import("lm.zig").ScriptedLM = .{ .responses = &.{
+        "<answer>low0</answer>",  "<answer>high0</answer>",
+        "<answer>high1</answer>", "<answer>high1</answer>",
+        "<answer>high2</answer>", "<answer>low2</answer>",
+    } };
+    const ctx: Context = .{ .arena = arena, .lm = script.lm(), .json_fallback = false };
+    const examples = [_]Example{
+        try Example.fromJson(arena, "{\"question\":\"q\"}", &.{"question"}),
+        try Example.fromJson(arena, "{\"question\":\"r\"}", &.{"question"}),
+    };
+    const program: P = .{};
+    var front_scores: [2]f64 = undefined;
+    var fronts: [2]std.ArrayList(usize) = @splat(.empty);
+    var outputs: [2]std.ArrayList(GEPA.BestOutput) = @splat(.empty);
+    var engine: GEPA.Engine(P) = .{
+        .gepa = .{ .metric = Metric.score, .track_best_outputs = true },
+        .out = arena,
+        .ctx = ctx,
+        .reflection = ctx,
+        .student = &program,
+        .names = &.{"self"},
+        .trainset = &examples,
+        .valset = &examples,
+        .rng = .init(0),
+        .adapter_rng = .init(0),
+        .front_score = &front_scores,
+        .fronts = &fronts,
+        .best_outputs = &outputs,
+    };
+    try engine.addProgram(&.{"first"}, &.{null});
+    try engine.addProgram(&.{"second"}, &.{0});
+    try engine.addProgram(&.{"third"}, &.{1});
+    const expected = [_][]const usize{ &.{ 1, 2 }, &.{ 0, 1 } };
+    const answers = [_][]const []const u8{ &.{ "high1", "high2" }, &.{ "high0", "high1" } };
+    for (fronts, outputs, expected, answers) |front, row, ids, texts| {
+        try std.testing.expectEqualSlices(usize, ids, front.items);
+        try std.testing.expectEqual(ids.len, row.items.len);
+        for (row.items, ids, texts) |entry, id, text| {
+            try std.testing.expectEqual(id, entry.candidate_idx);
+            try std.testing.expectEqualStrings(text, entry.prediction.get("answer").?.string);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 6), script.index);
 }
 
 fn sumScores(runs: []const GEPA.Run) f64 {
