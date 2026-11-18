@@ -2275,6 +2275,20 @@ knob to the Chat default. A bound Chat policy also replaces the standalone
 policy's borrowed inputs. Chat does not treat request compatibility extension
 keys as policy overrides.
 
+For Azure OpenAI **v1** generation, use `lm.OpenAI.initAzure(arena, &client,
+options)` with `.endpoint`, `.deployment`, and `.credential`. The endpoint
+can be the Azure resource root, a gateway prefix, or the full `/openai/v1`
+base. It defaults to Responses, like DSPy's Azure `model_type="auto"`.
+Set `.api = .chat_completions` for Chat Completions.
+The deployment name goes in the request's `model`; no legacy `api-version`
+parameter or `/deployments/` path is added. Use `.credential =
+.{ .api_key = key }` for Azure's `api-key` header, or `.credential =
+.{ .entra = provider }` with a caller-supplied header provider that sets
+`Authorization: Bearer …` on each attempt. Keep the startup arena and borrowed
+credentials alive while the LM is in use. Do not rebind a credential-bearing
+LM to another host. Entra credential discovery and Azure management endpoints
+are not included.
+
 `completeRequest` uses MAP-14 candidate scoring on Chat policies that declare
 `logprob_token_ids` (including vLLM) when `probabilities` is `required` or
 `if_available` and a JSON schema declares measurable judgments. It tokenizes

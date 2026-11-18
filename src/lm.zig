@@ -1832,6 +1832,29 @@ pub fn materializeStreamSource(
     return OpenAI.OpenAIStream.materializeSource(backing, request, source, observer);
 }
 
+test "Azure OpenAI v1 keeps gateway prefixes and refuses ambiguous endpoint URLs" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cases = [_]struct { endpoint: []const u8, base: []const u8 }{
+        .{ .endpoint = "https://account.services.ai.azure.com", .base = "https://account.services.ai.azure.com/openai/v1" },
+        .{ .endpoint = " http://localhost:1234/gateway//openai/ ", .base = "http://localhost:1234/gateway/openai/v1" },
+        .{ .endpoint = "https://account.openai.azure.com/openai/v1/", .base = "https://account.openai.azure.com/openai/v1" },
+    };
+    for (cases) |case| {
+        try testing.expectEqualStrings(case.base, try OpenAI.azureBaseUrl(arena, case.endpoint));
+    }
+    for ([_][]const u8{
+        "ftp://azure.invalid",
+        "https:///path",
+        "https://user@azure.invalid",
+        "https://azure.invalid?api-version=2024",
+        "https://azure.invalid/#fragment",
+    }) |endpoint| {
+        try testing.expectError(error.InvalidAzureEndpoint, OpenAI.azureBaseUrl(arena, endpoint));
+    }
+}
+
 /// OpenAI-compatible Chat Completions and Responses clients on `std.http`.
 pub const OpenAI = struct {
     client: *std.http.Client,
@@ -1878,6 +1901,115 @@ pub const OpenAI = struct {
     pub const Api = enum { chat_completions, responses };
     pub const ResponsesCompat = @import("openai_request.zig").ResponsesCompat;
     pub const ChatCompat = @import("openai_request.zig").ChatCompat;
+
+    pub const AzureOptions = struct {
+        endpoint: []const u8,
+        deployment: []const u8,
+        api: Api = .responses,
+        credential: union(enum) {
+            api_key: []const u8,
+            /// Supplies Authorization per attempt. Token acquisition is caller-owned.
+            entra: http.HeaderProvider,
+        },
+    };
+
+    /// Bind the Azure OpenAI v1 generation endpoint. The arena and borrowed
+    /// deployment/credentials must outlive the provider, including LM copies.
+    pub fn initAzure(
+        arena: Allocator,
+        client: *std.http.Client,
+        options: AzureOptions,
+    ) (Allocator.Error || error{ InvalidAzureEndpoint, InvalidAzureCredential, EmptyDeployment })!OpenAI {
+        if (options.deployment.len == 0) return error.EmptyDeployment;
+        if (options.credential == .api_key) {
+            const key = options.credential.api_key;
+            if (key.len == 0 or std.mem.indexOfAny(u8, key, "\r\n") != null)
+                return error.InvalidAzureCredential;
+        }
+        const base_url = try azureBaseUrl(arena, options.endpoint);
+        errdefer arena.free(base_url);
+        const provider: http.HeaderProvider = switch (options.credential) {
+            .entra => |provider| provider,
+            .api_key => |key| blk: {
+                const header = try arena.create(std.http.Header);
+                header.* = .{ .name = "api-key", .value = key };
+                break :blk .{ .context = header, .prepare = azureKeyHeader };
+            },
+        };
+        return .{
+            .client = client,
+            .base_url = base_url,
+            .model = options.deployment,
+            .api = options.api,
+            .header_provider = provider,
+        };
+    }
+
+    fn azureBaseUrl(arena: Allocator, endpoint: []const u8) ![]const u8 {
+        const trimmed = std.mem.trim(u8, endpoint, " \t\r\n");
+        const uri = std.Uri.parse(trimmed) catch return error.InvalidAzureEndpoint;
+        const scheme_end = std.mem.indexOf(u8, trimmed, "://") orelse
+            return error.InvalidAzureEndpoint;
+        if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and
+            !std.ascii.eqlIgnoreCase(uri.scheme, "https")) return error.InvalidAzureEndpoint;
+        if (uri.host == null or uri.host.?.isEmpty() or uri.user != null or uri.password != null or
+            uri.query != null or uri.fragment != null) return error.InvalidAzureEndpoint;
+        for (trimmed) |byte| {
+            if (byte <= ' ' or byte == 0x7f or byte == '\\') return error.InvalidAzureEndpoint;
+        }
+        const authority_start = scheme_end + 3;
+        const authority_end = std.mem.indexOfScalarPos(u8, trimmed, authority_start, '/') orelse
+            trimmed.len;
+        const path = trimmed[authority_end..];
+        // Find the longest overlap with the two-segment Azure door, ignoring
+        // redundant slashes without decoding the caller's path segments.
+        var segments = std.mem.tokenizeScalar(u8, path, '/');
+        var previous: []const u8 = "";
+        var last: []const u8 = "";
+        var path_len: usize = 0;
+        while (segments.next()) |segment| {
+            path_len += 1 + segment.len;
+            previous = last;
+            last = segment;
+        }
+        const suffix: []const u8 = if (std.mem.eql(u8, last, "openai"))
+            "/v1"
+        else if (std.mem.eql(u8, previous, "openai") and std.mem.eql(u8, last, "v1"))
+            ""
+        else
+            "/openai/v1";
+
+        const len = std.math.add(usize, authority_end + path_len, suffix.len) catch
+            return error.InvalidAzureEndpoint;
+        const output = try arena.alloc(u8, len);
+        var writer: Writer = .fixed(output);
+        writer.writeAll(if (uri.scheme.len == 5) "https://" else "http://") catch unreachable;
+        writer.writeAll(trimmed[authority_start..authority_end]) catch unreachable;
+        segments.reset();
+        while (segments.next()) |segment| {
+            writer.writeByte('/') catch unreachable;
+            writer.writeAll(segment) catch unreachable;
+        }
+        writer.writeAll(suffix) catch unreachable;
+        assert(writer.end == len);
+        return output;
+    }
+
+    fn azureKeyHeader(
+        context: *anyopaque,
+        arena: Allocator,
+        headers: []const std.http.Header,
+    ) Allocator.Error![]const std.http.Header {
+        const header: *const std.http.Header = @ptrCast(@alignCast(context));
+        if (headers.len == 0) return @as(*const [1]std.http.Header, @ptrCast(header));
+        for (headers) |extra| {
+            if (std.ascii.eqlIgnoreCase(extra.name, header.name)) return headers;
+        }
+        const combined = try arena.alloc(std.http.Header, headers.len + 1);
+        @memcpy(combined[0..headers.len], headers);
+        combined[headers.len] = header.*;
+        return combined;
+    }
 
     /// Bind the Chat preset and its root atomically, never reusing a root
     /// previously selected for a different provider.
