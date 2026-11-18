@@ -80,7 +80,52 @@ pub const Gemini = struct {
     ) Error!lm_mod.Completion {
         var records: std.ArrayList(sdk.Adaptation) = .empty;
         const body = try requestBody(arena, fields, mode, self.adaptations, &records);
-        const url = try endpoint(arena, self.base_url, fields.model);
+        const reply = try self.send(arena, fields.model, body, null);
+        defer self.client.allocator.free(reply.body);
+        const raw = @import("json_repair.zig").parseJson(arena, reply.body) catch |err|
+            return codecError(err);
+        return parseResponse(arena, fields.model, raw, records.items);
+    }
+
+    pub const StreamEvent = lm_mod.OpenAI.StreamEvent;
+    pub const StreamSink = lm_mod.OpenAI.StreamSink;
+    pub const StreamOutcome = lm_mod.OpenAI.StreamOutcome;
+
+    /// Event payloads borrow frame storage during the callback. `.stop` closes the stream.
+    pub fn streamRequest(
+        self: *Gemini,
+        backing: Allocator,
+        request: *const sdk.Request,
+        sink: StreamSink,
+    ) Error!StreamOutcome {
+        var scratch: std.heap.ArenaAllocator = .init(backing);
+        defer scratch.deinit();
+        const arena = scratch.allocator();
+        var records: std.ArrayList(sdk.Adaptation) = .empty;
+        const fields = &request.fields;
+        const body = try requestBody(arena, fields, .canonical, self.adaptations, &records);
+        var state: GenerateStream = .{
+            .model = fields.model,
+            .adaptations = records.items,
+            .sink = sink,
+        };
+        var consumer: http.ResponseConsumer = .{
+            .context = &state,
+            .consume = GenerateStream.consume,
+        };
+        const reply = try self.send(arena, fields.model, body, &consumer);
+        defer self.client.allocator.free(reply.body);
+        return state.outcome;
+    }
+
+    fn send(
+        self: *const Gemini,
+        arena: Allocator,
+        model: []const u8,
+        body: []const u8,
+        consumer: ?*http.ResponseConsumer,
+    ) Error!http.Response {
+        const url = try endpoint(arena, self.base_url, model, consumer != null);
         var headers: [1]std.http.Header = undefined;
         var headers_len: usize = 0;
         if (self.api_key) |key| {
@@ -100,20 +145,18 @@ pub const Gemini = struct {
             .failure_error = error.LMFailure,
             .response_limit_error = error.LMFailure,
         };
-        const reply = transport.send(arena, .{
+        return transport.send(arena, .{
             .url = url,
             .method = .POST,
             .body = body,
             .content_type = "application/json",
             .headers = headers[0..headers_len],
+            .response_consumer = consumer,
         }) catch |err| return codecError(err);
-        defer self.client.allocator.free(reply.body);
-        const raw = @import("json_repair.zig").parseJson(arena, reply.body) catch |err| return codecError(err);
-        return parseResponse(arena, fields.model, raw, records.items);
     }
 };
 
-fn endpoint(arena: Allocator, base_url: []const u8, model: []const u8) Error![]const u8 {
+fn endpoint(arena: Allocator, base_url: []const u8, model: []const u8, stream: bool) Error![]const u8 {
     // Match urllib.quote(safe="/:@") on the model, not on the configured origin.
     var writer: std.Io.Writer.Allocating = .init(arena);
     const out = &writer.writer;
@@ -128,8 +171,186 @@ fn endpoint(arena: Allocator, base_url: []const u8, model: []const u8) Error![]c
             out.writeAll(&.{ '%', hex[byte >> 4], hex[byte & 15] }) catch return error.OutOfMemory;
         }
     }
-    out.writeAll(":generateContent") catch return error.OutOfMemory;
+    out.writeAll(if (stream) ":streamGenerateContent?alt=sse" else ":generateContent") catch
+        return error.OutOfMemory;
     return writer.written();
+}
+
+const GenerateStream = struct {
+    model: []const u8,
+    adaptations: []const sdk.Adaptation,
+    sink: Gemini.StreamSink,
+    outcome: Gemini.StreamOutcome = .exhausted,
+    started: bool = false,
+    previous: ?Slot = null,
+    next_index: usize = 0,
+
+    const Kind = enum { text, thinking, tool_call, audio, image };
+    const Slot = struct { index: usize, kind: Kind };
+    const stream = @import("openai_stream.zig");
+
+    fn consume(context: *anyopaque, arena: Allocator, reader: *std.Io.Reader, limit: usize) !void {
+        const self: *GenerateStream = @ptrCast(@alignCast(context));
+        var events = @import("sse.zig").Iterator.init(arena, reader, limit);
+        defer events.deinit();
+        var frame: std.heap.ArenaAllocator = .init(arena);
+        defer frame.deinit();
+        while (try events.next()) |bytes| {
+            if (bytes.len == 0) continue;
+            const temp = frame.allocator();
+            const value = try @import("json_repair.zig").parseJson(temp, bytes);
+            if (value != .object) continue;
+            if (try self.dispatch(temp, value)) return;
+            if (self.outcome == .stopped) return;
+            _ = frame.reset(.retain_capacity);
+        }
+    }
+
+    fn emit(self: *GenerateStream, event: Gemini.StreamEvent) void {
+        if (self.outcome == .stopped) return;
+        if (self.sink.on_event(self.sink.context, event) == .stop) self.outcome = .stopped;
+    }
+
+    fn start(self: *GenerateStream) void {
+        if (self.started) return;
+        self.started = true;
+        self.emit(.{ .start = .{ .id = null, .model = self.model, .adaptations = self.adaptations } });
+    }
+
+    fn slot(self: *GenerateStream, index: usize, kind: Kind) usize {
+        if (index == 0 and (kind == .text or kind == .thinking)) {
+            if (self.previous) |previous| if (previous.kind == kind) return previous.index;
+        }
+        const result = self.next_index;
+        self.next_index += 1;
+        self.previous = .{ .index = result, .kind = kind };
+        return result;
+    }
+
+    fn dispatch(self: *GenerateStream, arena: Allocator, value: Value) Error!bool {
+        const candidates = elems(get(value, "candidates"));
+        const candidate = if (candidates.len == 0) .null else candidates[0];
+        const finish = text(get(candidate, "finishReason"));
+        const block = text(get(get(value, "promptFeedback"), "blockReason"));
+        if (get(value, "error") != .null) {
+            const detail = get(value, "error");
+            const status = nonempty(get(detail, "status")) orelse "provider";
+            self.emit(.{ .provider_error = .{
+                .code = providerError(status),
+                .provider_code = status,
+                .message = nonempty(get(detail, "message")) orelse status,
+            } });
+            return true;
+        }
+        if (invalidFinish(finish) or (block.len != 0 and
+            !std.mem.eql(u8, block, "BLOCK_REASON_UNSPECIFIED")))
+        {
+            self.emit(.{ .provider_error = .{
+                .code = .invalid_request,
+                .provider_code = "inband_finish_reason",
+                .message = if (block.len != 0) block else finish,
+            } });
+            return true;
+        }
+        var saw_tool = false;
+        var saw_delta = false;
+        for (elems(get(get(candidate, "content"), "parts")), 0..) |part, index| {
+            const decoded = (try decodePart(arena, part)) orelse continue;
+            self.start();
+            const position = self.slot(index, decoded.kind);
+            var buffer: [24]u8 = undefined;
+            const key = std.fmt.bufPrint(&buffer, "{d}", .{position}) catch unreachable;
+            self.emit(.{ .delta = .{ .part_index = key, .data = decoded.data } });
+            if (self.outcome == .stopped) return true;
+            const continuation = try parseSignature(arena, decoded.signature);
+            if (continuation.len != 0) {
+                self.emit(.{ .delta = .{
+                    .part_index = key,
+                    .data = .{ .continuation = continuation[0] },
+                } });
+                if (self.outcome == .stopped) return true;
+            }
+            saw_delta = true;
+            saw_tool = saw_tool or decoded.kind == .tool_call;
+        }
+        const usage = get(value, "usageMetadata");
+        if (finish.len != 0 or (!saw_delta and usage != .null)) {
+            self.start();
+            self.emit(.{ .end = .{
+                .finish_reason = finishReason(finish, saw_tool),
+                .usage = if (usage != .null) try readUsage(arena, usage) else null,
+                .provider_data = sdk.PayloadValue.fromBorrowedValue(arena, value) catch |err|
+                    return codecError(err),
+            } });
+        }
+        return false;
+    }
+
+    const Decoded = struct { kind: Kind, data: stream.DeltaData, signature: Value = .null };
+
+    fn decodePart(arena: Allocator, part: Value) Error!?Decoded {
+        const signature = get(part, "thoughtSignature");
+        const bytes = get(part, "text");
+        const thought = get(part, "thought");
+        if (bytes == .string) {
+            if (thought == .bool and thought.bool)
+                return .{ .kind = .thinking, .data = .{ .thinking = bytes.string }, .signature = signature };
+            return .{ .kind = .text, .data = .{ .text = .{ .text = bytes.string } }, .signature = signature };
+        }
+        const call = get(part, "functionCall");
+        if (call == .object) {
+            const args = call.object.get("args") orelse Value{ .object = .empty };
+            var writer: std.Io.Writer.Allocating = .init(arena);
+            @import("pyjson.zig").writeJson(&writer.writer, args, .minified) catch |err|
+                return if (err == error.WriteFailed) error.OutOfMemory else error.LMFailure;
+            return .{
+                .kind = .tool_call,
+                .data = .{ .tool_call = .{
+                    .input = writer.written(),
+                    .id = nonempty(get(call, "id")),
+                    .name = nonempty(get(call, "name")),
+                } },
+                .signature = if (nonempty(signature) != null) signature else get(call, "thoughtSignature"),
+            };
+        }
+        const inline_data = get(part, "inlineData");
+        if (inline_data != .object) return null;
+        const mime = text(get(inline_data, "mimeType"));
+        const media: stream.Media = .{ .media_type = mime, .data = text(get(inline_data, "data")) };
+        if (std.mem.startsWith(u8, mime, "image/")) return .{ .kind = .image, .data = .{ .image = media } };
+        if (std.mem.startsWith(u8, mime, "audio/")) return .{ .kind = .audio, .data = .{ .audio = media } };
+        return null;
+    }
+};
+
+fn providerError(code: []const u8) @FieldType(@import("openai_stream.zig").ErrorDetail, "code") {
+    if (contains(&.{ "INVALID_ARGUMENT", "NOT_FOUND" }, code)) return .invalid_request;
+    if (contains(&.{ "PERMISSION_DENIED", "UNAUTHENTICATED" }, code)) return .auth;
+    if (contains(&.{ "INTERNAL", "UNAVAILABLE" }, code)) return .server;
+    if (std.mem.eql(u8, code, "FAILED_PRECONDITION")) return .billing;
+    if (std.mem.eql(u8, code, "RESOURCE_EXHAUSTED")) return .rate_limit;
+    if (std.mem.eql(u8, code, "DEADLINE_EXCEEDED")) return .timeout;
+    return .provider;
+}
+
+fn nonempty(value: Value) ?[]const u8 {
+    const bytes = text(value);
+    return if (bytes.len == 0) null else bytes;
+}
+
+fn finishReason(reason: []const u8, saw_tool: bool) sdk.FinishReason {
+    if (saw_tool) return .tool_call;
+    if (std.ascii.eqlIgnoreCase(reason, "MAX_TOKENS")) return .length;
+    return .stop;
+}
+
+fn invalidFinish(reason: []const u8) bool {
+    return contains(&.{
+        "SAFETY",             "RECITATION",              "LANGUAGE",             "BLOCKLIST",                "PROHIBITED_CONTENT",
+        "SPII",               "MALFORMED_FUNCTION_CALL", "IMAGE_SAFETY",         "IMAGE_PROHIBITED_CONTENT", "IMAGE_OTHER",
+        "NO_IMAGE",           "IMAGE_RECITATION",        "UNEXPECTED_TOOL_CALL", "TOO_MANY_TOOL_CALLS",      "MISSING_THOUGHT_SIGNATURE",
+        "MALFORMED_RESPONSE",
+    }, reason);
 }
 
 const RequestMode = enum { canonical, prediction };
@@ -508,7 +729,7 @@ fn parseResponse(arena: Allocator, model: []const u8, raw: Value, records: []con
     const candidates = elems(get(raw, "candidates"));
     const candidate = if (candidates.len == 0) .null else candidates[0];
     const reason = text(get(candidate, "finishReason"));
-    if (contains(&.{ "SAFETY", "RECITATION", "LANGUAGE", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "MALFORMED_FUNCTION_CALL", "IMAGE_SAFETY", "IMAGE_PROHIBITED_CONTENT", "IMAGE_OTHER", "NO_IMAGE", "IMAGE_RECITATION", "UNEXPECTED_TOOL_CALL", "TOO_MANY_TOOL_CALLS", "MISSING_THOUGHT_SIGNATURE", "MALFORMED_RESPONSE" }, reason)) return error.LMFailure;
+    if (invalidFinish(reason)) return error.LMFailure;
     if (get(candidate, "groundingMetadata") != .null or get(candidate, "logprobsResult") != .null) return error.LMFailure;
     const wire_parts = elems(get(get(candidate, "content"), "parts"));
     const parts = try arena.alloc(sdk.Part, @max(wire_parts.len, 1));
@@ -590,7 +811,7 @@ fn parseResponse(arena: Allocator, model: []const u8, raw: Value, records: []con
         .metadata = .{
             .id = if (id.len != 0) id else null,
             .model = model,
-            .finish_reason = if (calls.items.len != 0) .tool_call else if (std.ascii.eqlIgnoreCase(reason, "MAX_TOKENS")) .length else .stop,
+            .finish_reason = finishReason(reason, calls.items.len != 0),
             .usage = try readUsage(arena, get(raw, "usageMetadata")),
         },
     };
@@ -766,4 +987,45 @@ test "Gemini ignores empty media before assigning a synthetic tool ID" {
     const parts = result.response.?.fields.message.parts;
     try std.testing.expectEqualStrings("gs://bucket/audio", parts[0].audio.url.?);
     try std.testing.expectEqualStrings("tool_call_1", parts[1].tool_call.id);
+}
+
+test "Gemini SSE joins split text without merging parallel tool calls" {
+    const Capture = struct {
+        indexes: [4]u8 = undefined,
+        used: usize = 0,
+
+        fn onEvent(context: *anyopaque, event: Gemini.StreamEvent) Gemini.StreamSink.Action {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (event == .delta) {
+                const index = event.delta.part_index.?;
+                if (self.used == self.indexes.len or index.len != 1) return .stop;
+                self.indexes[self.used] = index[0];
+                self.used += 1;
+            }
+            return .proceed;
+        }
+    };
+    var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch.deinit();
+    var capture: Capture = .{};
+    var state: GenerateStream = .{
+        .model = "gemini-3-flash",
+        .adaptations = &.{},
+        .sink = .{ .context = &capture, .on_event = Capture.onEvent },
+    };
+    const frames =
+        \\data: {"candidates":[{"content":{"parts":[{"text":"Pa"}]}}]}
+        \\
+        \\data: {"candidates":[{"content":{"parts":[{"text":"ris"}]}}]}
+        \\
+        \\data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"a"}}]}}]}
+        \\
+        \\data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"b"}}]}}]}
+        \\
+        \\
+    ;
+    var reader = std.Io.Reader.fixed(frames);
+    try GenerateStream.consume(&state, scratch.allocator(), &reader, frames.len);
+    try std.testing.expectEqualStrings("0012", capture.indexes[0..capture.used]);
+    try std.testing.expectEqual(Gemini.StreamOutcome.exhausted, state.outcome);
 }
