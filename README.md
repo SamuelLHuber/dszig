@@ -3730,8 +3730,10 @@ The following prevent a claim that DSZig can do everything DSPy can:
   tool fragments and reasoning continuation. Use `Anthropic.lm()` with the
   regular program streaming APIs to route typed fields and get a final
   prediction; cache hits return the prediction without replaying live fields.
-  Third-party reasoning dialects, multimodal blocks, prompt caching and
-  hosted tools are not implemented.
+  Messages accepts image and document blocks, including in tool results,
+  from inline base64, URLs or existing provider file IDs. The transport does
+  not read local paths implicitly. Other media kinds, third-party reasoning
+  dialects, prompt caching and hosted tools are not implemented.
   Native File construction, adapter/typed prediction
   handling, File tool-result markers and bounded Responses document translation
   are implemented as described above. There is still no complete lm15 provider

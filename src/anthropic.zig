@@ -645,6 +645,8 @@ fn encodeBlock(arena: Allocator, part: sdk.Part) Error!Value {
     var block: Object = .empty;
     switch (part) {
         .text => |item| return textBlock(arena, item.text),
+        .image => |item| return encodeMedia(arena, "image", &item),
+        .document => |item| return encodeMedia(arena, "document", &item),
         .thinking => |item| return encodeThinking(arena, &item),
         .tool_call => |item| {
             try block.put(arena, "type", str("tool_use"));
@@ -660,8 +662,13 @@ fn encodeBlock(arena: Allocator, part: sdk.Part) Error!Value {
             } else if (item.content.len != 0) {
                 var blocks: runtime.Array = .init(arena);
                 for (item.content) |child| {
-                    if (child != .text) return error.LMFailure;
-                    try blocks.append(try textBlock(arena, child.text.text));
+                    const content = switch (child) {
+                        .text => |text_part| try textBlock(arena, text_part.text),
+                        .image => |media| try encodeMedia(arena, "image", &media),
+                        .document => |media| try encodeMedia(arena, "document", &media),
+                        else => return error.LMFailure,
+                    };
+                    try blocks.append(content);
                 }
                 try block.put(arena, "content", .{ .array = blocks });
             }
@@ -669,6 +676,28 @@ fn encodeBlock(arena: Allocator, part: sdk.Part) Error!Value {
         },
         else => return error.LMFailure,
     }
+    return .{ .object = block };
+}
+
+fn encodeMedia(arena: Allocator, kind: []const u8, media: *const sdk.MediaPart) Error!Value {
+    var source: Object = .empty;
+    if (media.url) |url| {
+        try source.put(arena, "type", str("url"));
+        try source.put(arena, "url", str(url));
+    } else if (media.file_id) |file_id| {
+        try source.put(arena, "type", str("file"));
+        try source.put(arena, "file_id", str(file_id));
+    } else if (media.data) |data| {
+        try source.put(arena, "type", str("base64"));
+        try source.put(arena, "media_type", str(media.media_type));
+        try source.put(arena, "data", str(data));
+    } else {
+        // Reading a local path must remain an explicit caller operation.
+        return error.LMFailure;
+    }
+    var block: Object = .empty;
+    try block.put(arena, "type", str(kind));
+    try block.put(arena, "source", .{ .object = source });
     return .{ .object = block };
 }
 
