@@ -3022,7 +3022,7 @@ pub const OpenAI = struct {
 
     /// Request-aware SDK adaptation, not JSON repair or answer validation.
     /// Preserve every other part and the replaced text's opaque continuation.
-    fn foldJudgments(arena: Allocator, completion: *Completion, request: *const sdk.Request) Error!void {
+    pub fn foldJudgments(arena: Allocator, completion: *Completion, request: *const sdk.Request) Error!void {
         // Transport and credential callbacks may have changed opaque schemas.
         // Read the same SDK request again, never its stale wire projection.
         const configured = request.fields.config.response_format orelse return;

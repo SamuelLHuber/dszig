@@ -164,7 +164,11 @@ pub const Anthropic = struct {
         defer self.client.allocator.free(response.body);
         const input = @import("json_repair.zig").parseJson(arena, response.body) catch |err|
             return codecError(err);
-        return parseResponse(arena, request.fields.model, input, records.items);
+        const model = request.fields.model;
+        var result = try parseResponse(arena, model, input, records.items);
+        try lm_mod.OpenAI.foldJudgments(arena, &result, request);
+        try lm_mod.publishResponse(arena, &result, model, .borrowed);
+        return result;
     }
 
     fn send(
@@ -225,7 +229,6 @@ pub const Anthropic = struct {
     ) Error![]const u8 {
         const fields = &request.fields;
         const config = &fields.config;
-        if (config.probabilities != null) return error.LMFailure;
         var body: Object = .empty;
         var messages = try encodeMessages(arena, fields.messages);
         const system_text = if (fields.system) |system| switch (system) {
@@ -438,8 +441,27 @@ pub const Anthropic = struct {
         if (config.response_format) |format| {
             const value = try project(arena, format);
             if (!std.mem.eql(u8, text(get(value, "type")), "json_schema")) return error.LMFailure;
-            const schema = get(value, "schema");
+            var schema = get(value, "schema");
             if (schema != .object) return error.LMFailure;
+            const found = try @import("typesafe.zig").responseJudgments(arena, schema);
+            for (found) |judgment| {
+                if (judgment.kind == .box) continue;
+                switch (config.probabilities orelse .off) {
+                    .off => {},
+                    .required => return error.LMFailure,
+                    .if_available => try self.adapt(
+                        arena,
+                        records,
+                        "config.probabilities",
+                        .dropped,
+                        "this wire cannot measure a distribution over the declared keys; the answer carries the pick only",
+                        str("if_available"),
+                        .null,
+                    ),
+                }
+                break;
+            }
+            try encodeJudgmentSchema(arena, &schema, found);
             var wire_format: Object = .empty;
             try wire_format.put(arena, "type", str("json_schema"));
             try wire_format.put(arena, "schema", schema);
@@ -846,6 +868,28 @@ fn citationField(arena: Allocator, item: Value, comptime keys: []const []const u
     return null;
 }
 
+fn encodeJudgmentSchema(
+    arena: Allocator,
+    schema: *Value,
+    found: []const @import("typesafe.zig").Judgment,
+) Error!void {
+    if (found.len == 0) return;
+    const properties = &schema.object.getPtr("properties").?.object;
+    for (found) |judgment| {
+        const property = &properties.getPtr(judgment.name).?.object;
+        const kind = property.get("type") orelse continue;
+        const branches = property.getPtr("anyOf") orelse continue;
+        if (branches.* != .array) continue;
+        for (branches.array.items) |*branch| {
+            if (branch.* != .object) return error.LMFailure;
+            if (!branch.object.contains("type")) try branch.object.put(arena, "type", kind);
+        }
+        // The wire rejects sibling type + anyOf on judgment properties.
+        std.debug.assert(property.contains("type"));
+        _ = property.orderedRemove("type");
+    }
+}
+
 fn appendCitations(
     arena: Allocator,
     parts: *std.ArrayList(sdk.Part),
@@ -910,7 +954,7 @@ fn parseResponse(arena: Allocator, model: []const u8, input: Value, records: []c
     if (parts.items.len == 0) try parts.append(arena, .{ .text = .{} });
     const id = text(get(input, "id"));
     const model_id = text(get(input, "model"));
-    var result: lm_mod.Completion = .{
+    return .{
         .text = if (visible.written().len == 0 and calls.items.len != 0) null else visible.written(),
         .reasoning = if (reasoning.written().len == 0) null else reasoning.written(),
         .tool_calls = calls.items,
@@ -925,8 +969,6 @@ fn parseResponse(arena: Allocator, model: []const u8, input: Value, records: []c
             .finish_reason = finishReason(text(get(input, "stop_reason")), calls.items.len != 0),
         },
     };
-    try lm_mod.publishResponse(arena, &result, model, .borrowed);
-    return result;
 }
 
 fn finishReason(reason: []const u8, tool: bool) sdk.FinishReason {
@@ -1052,10 +1094,9 @@ test "Anthropic reasoning replays signed and redacted blocks without showing eit
         \\{"type":"redacted_thinking","data":"hidden"},{"type":"text","text":"Paris"}]}
     );
     const result = try parseResponse(arena, "claude-opus-4-7", input, &.{});
-    defer result.response.?.release();
     try std.testing.expectEqualStrings("Paris", result.text.?);
     try std.testing.expectEqualStrings("private summary", result.reasoning.?);
-    const message = result.response.?.fields.message;
+    const message = result.message.?;
     const signed = try encodeBlock(arena, message.parts[0]);
     try std.testing.expectEqualStrings("thinking", text(get(signed, "type")));
     try std.testing.expectEqualStrings("opaque", text(get(signed, "signature")));
@@ -1080,11 +1121,36 @@ test "Anthropic hosted blocks do not shift client calls, but citations do" {
         try @import("json_repair.zig").parseJson(arena, raw),
         &.{},
     );
-    defer result.response.?.release();
-    const parts = result.response.?.fields.message.parts;
+    const parts = result.message.?.parts;
     try std.testing.expectEqualStrings("Paris", parts[0].text.text);
     try std.testing.expectEqualStrings("https://example.org", parts[1].citation.url.?);
     try std.testing.expectEqualStrings("tool_2", parts[2].tool_call.id);
+}
+
+test "Anthropic judgment encoding does not change the caller schema" {
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const raw =
+        \\{"model":"fixture","messages":[{"role":"user","parts":[{"type":"text","text":"Pick"}]}],
+        \\"config":{"max_tokens":16,"probabilities":"if_available","response_format":{
+        \\"type":"json_schema","schema":{"type":"object","properties":{"pick":{
+        \\"type":"string","anyOf":[{"const":"a"},{"const":"b"}]}}}}}}
+    ;
+    const parse = @import("json_repair.zig").parseJson;
+    const request = try sdk.Request.fromValue(arena, try parse(arena, raw));
+    defer request.release();
+    const provider: Anthropic = .{ .client = undefined, .model = "fixture" };
+    var records: std.ArrayList(sdk.Adaptation) = .empty;
+    const body = try parse(arena, try provider.requestBody(arena, request, &records, false));
+    const wire = get(get(get(body, "output_config"), "format"), "schema");
+    const own_format = try project(arena, request.fields.config.response_format.?);
+    const wire_pick = get(get(wire, "properties"), "pick");
+    const own_pick = get(get(get(own_format, "schema"), "properties"), "pick");
+    try std.testing.expect(get(wire_pick, "type") == .null);
+    try std.testing.expectEqualStrings("string", text(get(get(wire_pick, "anyOf").array.items[0], "type")));
+    try std.testing.expectEqualStrings("string", text(get(own_pick, "type")));
+    try std.testing.expect(get(get(own_pick, "anyOf").array.items[0], "type") == .null);
 }
 
 test "Anthropic forcing one function preserves the other declarations" {
