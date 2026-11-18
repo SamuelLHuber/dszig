@@ -3835,6 +3835,19 @@ The following prevent a claim that DSZig can do everything DSPy can:
   minibatch evaluations and the current search state before child validation.
   It runs once per evaluated reflective mutation; errors abort compilation.
   Merge acceptance is unchanged.
+  `sampling_strategy` defaults to `.single`; use `.{ .same_parent = n }` for
+  several minibatches from one parent, `.{ .independent = n }` to select a
+  parent for each task, or `.{ .pxn = .{ .parents = p, .mutations = n } }`
+  to sample `n` minibatches per parent. Batches must contain 1–32 tasks.
+  `selection_strategy` defaults to `.all`; `.best` and `.{ .top_k = k }`
+  rank accepted proposals by their minibatch improvement, preserving task
+  order on ties. Identical selected children are validated once per iteration.
+  The validation policy sees the same search state for every selected child;
+  the evaluated children are then added in selection order. The metric
+  budget is checked between iterations, so a whole batch can cross it.
+  Tasks run in order within each phase; the optional rollout runner can
+  parallelize examples within a task, not across tasks. Custom proposal
+  sampling/selection strategies and batched reflection backends are not supported.
   Candidate selection supports `pareto`, `current_best`,
   `epsilon_greedy` (epsilon 0.1), and `top_k_pareto` (top five). Top-five
   selection restricts the validation frontiers before removing dominated

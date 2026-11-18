@@ -292,6 +292,8 @@ pub const GEPA = struct {
     candidate_selection_strategy: Selection = .pareto,
     frontier_type: Frontier = .instance,
     acceptance_criterion: Acceptance = .strict_improvement,
+    sampling_strategy: ProposalSampling = .single,
+    selection_strategy: ProposalSelection = .all,
     skip_perfect_score: bool = true,
     /// Use genuine predictor parse failures as reflection examples.
     add_format_failure_as_feedback: bool = false,
@@ -460,6 +462,8 @@ pub const GEPA = struct {
         InvalidCandidateSelection,
         InvalidBatchSamplerConfiguration,
         InvalidBatchSample,
+        EmptyProposalBatch,
+        ProposalTaskLimitExceeded,
     };
 
     pub const Instruction = struct {
@@ -490,6 +494,30 @@ pub const GEPA = struct {
     pub const BestOutput = struct {
         candidate_idx: usize,
         prediction: optimize.RecordPrediction,
+    };
+
+    pub const max_proposal_tasks = 32;
+
+    pub const ProposalSampling = union(enum) {
+        single,
+        same_parent: usize,
+        independent: usize,
+        pxn: struct { parents: usize, mutations: usize },
+
+        fn shape(sampling: ProposalSampling) struct { parents: usize, mutations: usize } {
+            return switch (sampling) {
+                .single => .{ .parents = 1, .mutations = 1 },
+                .same_parent => |n| .{ .parents = 1, .mutations = n },
+                .independent => |n| .{ .parents = n, .mutations = 1 },
+                .pxn => |pn| .{ .parents = pn.parents, .mutations = pn.mutations },
+            };
+        }
+    };
+
+    pub const ProposalSelection = union(enum) {
+        all,
+        best,
+        top_k: isize,
     };
 
     /// `DspyGEPAResult` (`track_stats=True`) plus the optimized program.
@@ -813,6 +841,12 @@ pub const GEPA = struct {
             }
 
             fn evalIds(e: *Self, candidate: []const []const u8, set: []const Example, ids: []const usize, capture: bool) ![]Run {
+                const runs = try e.rolloutIds(candidate, set, ids, capture);
+                e.total_evals += ids.len;
+                return runs;
+            }
+
+            fn rolloutIds(e: *const Self, candidate: []const []const u8, set: []const Example, ids: []const usize, capture: bool) ![]Run {
                 const built = try e.build(candidate);
                 const runs = try e.out.alloc(Run, ids.len);
                 if (e.gepa.rollouts) |rollouts| {
@@ -840,7 +874,6 @@ pub const GEPA = struct {
                 } else {
                     for (runs, ids) |*r, id| r.* = try e.runOne(e.ctx, &built, &set[id], capture);
                 }
-                e.total_evals += ids.len;
                 return runs;
             }
 
@@ -922,8 +955,21 @@ pub const GEPA = struct {
 
             fn addProgram(e: *Self, candidate: []const []const u8, parent_ids: []const ?usize) !void {
                 const requested = try e.validationBatch();
+                const runs = try e.rolloutIds(candidate, e.valset, requested, false);
+                try e.commitProgram(candidate, parent_ids, requested, runs);
+            }
+
+            fn commitProgram(
+                e: *Self,
+                candidate: []const []const u8,
+                parent_ids: []const ?usize,
+                requested: []const usize,
+                evaluated: []Run,
+            ) !void {
+                assert(requested.len == evaluated.len);
                 const discovered = e.total_evals;
-                var runs = try e.evalIds(candidate, e.valset, requested, false);
+                e.total_evals += requested.len;
+                var runs = evaluated;
                 const sparse = e.gepa.val_evaluation_policy != null;
                 const ids = if (sparse) try e.retainValidationRows(requested, &runs) else requested;
                 const idx = e.candidates.items.len;
@@ -1283,37 +1329,73 @@ pub const GEPA = struct {
                 const ids = try e.nextMinibatch(parent);
                 const parent_candidate = e.candidates.items[parent];
                 const before = try e.evalIds(parent_candidate, e.trainset, ids, true);
+                var task: ReflectionTask = .{ .parent = parent, .ids = ids, .before = before };
+                try e.prepareReflection(&task);
+                const child = (try e.proposeChild(&task)) orelse return;
+                const after = try e.evalIds(child, e.trainset, ids, true);
+                if (try e.accepts(&task, child, after)) {
+                    const parent_ids = try e.out.dupe(?usize, &.{parent});
+                    try e.addProgram(child, parent_ids);
+                    e.scheduleMerge();
+                }
+            }
+
+            const ReflectionTask = struct {
+                parent: usize,
+                ids: []const usize,
+                before: []const Run = &.{},
+                single: [1]usize = undefined,
+                components: []const usize = &.{},
+                datasets: []const ?[]const Record = &.{},
+                child: ?[]const []const u8 = null,
+                after: []const Run = &.{},
+                margin: f64 = 0,
+                val_ids: []const usize = &.{},
+                validation: []Run = &.{},
+            };
+
+            fn prepareReflection(e: *Self, task: *ReflectionTask) !void {
                 if (e.gepa.skip_perfect_score) {
-                    const perfect = for (before) |r| {
-                        if (r.score < e.gepa.perfect_score) break false;
+                    const perfect = for (task.before) |r| {
+                        if (!(r.score >= e.gepa.perfect_score)) break false;
                     } else true;
                     if (perfect) return;
                 }
-                var single: [1]usize = undefined;
-                const components = try e.selectComponents(parent, ids, before, &single);
-                if (components.len == 0) return;
-                const datasets = try e.reflectiveDataset(
-                    parent_candidate,
-                    before,
-                    ids,
-                    components,
+                task.components = try e.selectComponents(
+                    task.parent,
+                    task.ids,
+                    task.before,
+                    &task.single,
                 );
-                for (datasets) |dataset| {
+                if (task.components.len == 0) return;
+                task.datasets = try e.reflectiveDataset(
+                    e.candidates.items[task.parent],
+                    task.before,
+                    task.ids,
+                    task.components,
+                );
+            }
+
+            fn proposeChild(e: *Self, task: *const ReflectionTask) !?[]const []const u8 {
+                for (task.datasets) |dataset| {
                     if (dataset != null) break;
-                } else return;
-                const proposed = if (e.gepa.instruction_proposer) |proposer|
-                    try e.proposeCustomChild(proposer, parent_candidate, components, datasets)
+                } else return null;
+                const parent = e.candidates.items[task.parent];
+                return if (e.gepa.instruction_proposer) |proposer|
+                    e.proposeCustomChild(proposer, parent, task.components, task.datasets)
                 else
-                    try e.proposeBuiltinChild(parent_candidate, components, datasets);
-                const child = proposed orelse return;
-                const after = try e.evalIds(child, e.trainset, ids, true);
-                const accepted = switch (e.gepa.acceptance_criterion) {
+                    e.proposeBuiltinChild(parent, task.components, task.datasets);
+            }
+
+            fn accepts(e: *Self, task: *const ReflectionTask, child: []const []const u8, after: []const Run) !bool {
+                const before = task.before;
+                return switch (e.gepa.acceptance_criterion) {
                     .strict_improvement => sumScores(after) > sumScores(before),
                     .improvement_or_equal => sumScores(after) >= sumScores(before),
                     .custom => |callback| try callback.should_accept(callback.ptr, &.{
                         .names = e.names,
                         .child = child,
-                        .parent_idx = parent,
+                        .parent_idx = task.parent,
                         .iteration = e.i,
                         .total_metric_calls = e.total_evals,
                         .candidates = e.candidates.items,
@@ -1321,20 +1403,119 @@ pub const GEPA = struct {
                         .val_ids = e.validationIds(),
                         .parents = e.parents.items,
                         .trainset = e.trainset,
-                        .minibatch_ids = ids,
+                        .minibatch_ids = task.ids,
                         .before = before,
                         .after = after,
                     }),
                 };
-                if (accepted) {
-                    const parent_ids = try e.out.alloc(?usize, 1);
-                    parent_ids[0] = parent;
-                    try e.addProgram(child, parent_ids);
-                    if (e.gepa.use_merge) {
-                        e.last_iter_found_new_program = true;
-                        if (e.merges_tested < e.gepa.max_merge_invocations) e.merges_due += 1;
+            }
+
+            fn scheduleMerge(e: *Self) void {
+                if (!e.gepa.use_merge) return;
+                e.last_iter_found_new_program = true;
+                if (e.merges_tested < e.gepa.max_merge_invocations) e.merges_due += 1;
+            }
+
+            fn sameCandidate(a: []const []const u8, b: []const []const u8) bool {
+                assert(a.len == b.len);
+                if (a.ptr == b.ptr) return true;
+                for (a, b) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+                return true;
+            }
+
+            fn reflectBatch(e: *Self) !void {
+                var scratch = std.heap.ArenaAllocator.init(e.out);
+                defer scratch.deinit();
+                const tmp = scratch.allocator();
+                const shape = e.gepa.sampling_strategy.shape();
+                var storage: [max_proposal_tasks]ReflectionTask = undefined;
+                const tasks = storage[0 .. shape.parents * shape.mutations];
+                for (0..shape.parents) |p| {
+                    const parent = try e.selectParent();
+                    for (tasks[p * shape.mutations ..][0..shape.mutations]) |*task| {
+                        const ids = try e.nextMinibatch(parent);
+                        task.* = .{
+                            .parent = parent,
+                            .ids = if (e.gepa.batch_sampler != null) try tmp.dupe(usize, ids) else ids,
+                        };
                     }
                 }
+
+                for (tasks, 0..) |*task, i| {
+                    const candidate = e.candidates.items[task.parent];
+                    task.before = for (tasks[0..i]) |*prior| {
+                        if (!std.mem.eql(usize, task.ids, prior.ids)) continue;
+                        if (sameCandidate(candidate, e.candidates.items[prior.parent]))
+                            break prior.before;
+                    } else try e.evalIds(candidate, e.trainset, task.ids, true);
+                }
+                for (tasks) |*task| try e.prepareReflection(task);
+                for (tasks) |*task| task.child = try e.proposeChild(task);
+                for (tasks) |*task| {
+                    const child = task.child orelse continue;
+                    task.after = try e.evalIds(child, e.trainset, task.ids, true);
+                }
+
+                var selected: [max_proposal_tasks]*ReflectionTask = undefined;
+                const retained = try e.selectProposals(tasks, &selected);
+                // Every policy request sees the same pre-commit pool and budget.
+                for (retained) |task| {
+                    const ids = try e.validationBatch();
+                    task.val_ids = if (e.gepa.val_evaluation_policy != null)
+                        try tmp.dupe(usize, ids)
+                    else
+                        ids;
+                }
+                for (retained) |task|
+                    task.validation = try e.rolloutIds(task.child.?, e.valset, task.val_ids, false);
+                for (retained) |task| {
+                    const parents = try e.out.dupe(?usize, &.{task.parent});
+                    try e.commitProgram(task.child.?, parents, task.val_ids, task.validation);
+                    e.scheduleMerge();
+                }
+            }
+
+            fn selectProposals(
+                e: *Self,
+                tasks: []ReflectionTask,
+                selected: *[max_proposal_tasks]*ReflectionTask,
+            ) ![]*ReflectionTask {
+                assert(tasks.len <= max_proposal_tasks);
+                const strategy = e.gepa.selection_strategy;
+                var count: usize = 0;
+                for (tasks) |*task| {
+                    const child = task.child orelse continue;
+                    if (!try e.accepts(task, child, task.after)) continue;
+                    task.margin = sumScores(task.after) - sumScores(task.before);
+                    // Source's BestImprovement compares against negative infinity initially.
+                    if (strategy == .best and !(task.margin > -std.math.inf(f64))) continue;
+                    var i = count;
+                    if (strategy != .all) while (i > 0) {
+                        if (!(task.margin > selected[i - 1].margin)) break;
+                        selected[i] = selected[i - 1];
+                        i -= 1;
+                    };
+                    selected[i] = task;
+                    count += 1;
+                }
+                const limit = switch (strategy) {
+                    .all => count,
+                    .best => @min(count, 1),
+                    .top_k => |k| if (k < 0)
+                        count -| @abs(k)
+                    else
+                        @min(count, @as(usize, @intCast(k))),
+                };
+                var unique: usize = 0;
+                for (selected[0..limit]) |task| {
+                    for (selected[0..unique]) |prior| {
+                        if (sameCandidate(prior.child.?, task.child.?)) break;
+                    } else {
+                        selected[unique] = task;
+                        unique += 1;
+                    }
+                }
+                return selected[0..unique];
             }
 
             /// `DspyAdapter.make_reflective_dataset`; `null` where no example
@@ -1773,6 +1954,11 @@ pub const GEPA = struct {
             @as(u2, @intFromBool(self.max_metric_calls != null));
         if (budget_count == 0) return error.NoBudget;
         if (budget_count != 1) return error.ConflictingBudgets;
+        const shape = self.sampling_strategy.shape();
+        if (shape.parents == 0 or shape.mutations == 0) return error.EmptyProposalBatch;
+        if (shape.parents > max_proposal_tasks or shape.mutations > max_proposal_tasks or
+            shape.parents * shape.mutations > max_proposal_tasks)
+            return error.ProposalTaskLimitExceeded;
         assert(trainset.len > 0);
         if (self.val_evaluation_policy) |policy| {
             if (policy.max_batch_size == 0) return error.InvalidValidationBatch;
@@ -1849,7 +2035,10 @@ pub const GEPA = struct {
                 }
                 e.last_iter_found_new_program = false;
             }
-            try e.reflect();
+            if (self.sampling_strategy == .single and self.selection_strategy == .all)
+                try e.reflect()
+            else
+                try e.reflectBatch();
         }
         try e.validationDiagnostics(null, if (started) e.i else null);
 
@@ -2239,6 +2428,86 @@ test "GEPA requires one budget and evaluates the seed even with a zero budget" {
     try std.testing.expectEqual(@as(f64, 0.5), result.val_aggregate_scores[0]);
     try std.testing.expectEqual(@as(usize, 2), result.total_metric_calls);
     try std.testing.expectEqual(@as(usize, 0), result.max_metric_calls);
+}
+
+test "GEPA ranks before deduplicating and snapshots all validation batches before commit" {
+    const P = predict.Predict(signature.Signature(struct {
+        pub const instructions = "Seed.";
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: i64 };
+    }));
+    const Script = struct {
+        next: usize = 0,
+        batch_count: usize = 0,
+        ids: [1]usize = undefined,
+
+        fn metric(
+            _: Allocator,
+            _: *const Example,
+            p: *const optimize.RecordPrediction,
+            _: ?*const Trace,
+            _: ?[]const u8,
+            _: ?*const Trace.Step,
+        ) @import("value.zig").ParseError!Feedback {
+            return .{ .score = @floatFromInt(p.get("answer").?.integer), .feedback = "Improve." };
+        }
+
+        fn propose(ptr: *anyopaque, ctx: Context, input: *const GEPA.InstructionProposal) ![]const GEPA.Instruction {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const texts = [_][]const u8{ "A", "B", "B", "C" };
+            const text = texts[self.next];
+            self.next += 1;
+            return ctx.arena.dupe(GEPA.Instruction, &.{.{
+                .name = input.components_to_update[0],
+                .text = text,
+            }});
+        }
+
+        fn batch(ptr: *anyopaque, state: *const GEPA.ValidationState) ![]const usize {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(1, state.candidates.len);
+            try std.testing.expectEqual(8, state.total_metric_calls);
+            self.ids[0] = self.batch_count;
+            self.batch_count += 1;
+            return &self.ids;
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const example = try Example.fromJson(arena, "{\"question\":\"q\"}", &.{"question"});
+    var script: Script = .{};
+    var model: @import("lm.zig").ScriptedLM = .{ .responses = &.{
+        "{\"answer\":0}", "{\"answer\":0}", "{\"answer\":1}", "{\"answer\":1}",
+        "{\"answer\":3}", "{\"answer\":5}", "{\"answer\":5}", "{\"answer\":3}",
+        "{\"answer\":4}", "{\"answer\":6}",
+    } };
+    const optimizer: GEPA = .{
+        .metric = Script.metric,
+        .max_metric_calls = 3,
+        .reflection_minibatch_size = 1,
+        .instruction_proposer = .{ .ptr = &script, .propose = Script.propose },
+        .candidate_selection_strategy = .current_best,
+        .sampling_strategy = .{ .pxn = .{ .parents = 2, .mutations = 2 } },
+        .selection_strategy = .{ .top_k = 3 },
+        .skip_perfect_score = false,
+        .use_merge = false,
+        .val_evaluation_policy = .{ .ptr = &script, .next_batch = Script.batch, .max_batch_size = 1 },
+    };
+    const examples = [_]Example{ example, example };
+    const ctx: Context = .{ .arena = arena, .lm = model.lm(), .adapter = .json };
+    var invalid = optimizer;
+    invalid.sampling_strategy = .{ .same_parent = 0 };
+    try std.testing.expectError(error.EmptyProposalBatch, invalid.compile(P, arena, ctx, .{}, &examples, .{}));
+    invalid.sampling_strategy = .{ .pxn = .{ .parents = 2, .mutations = 17 } };
+    try std.testing.expectError(error.ProposalTaskLimitExceeded, invalid.compile(P, arena, ctx, .{}, &examples, .{}));
+    const fit = try optimizer.compile(P, arena, ctx, .{}, &examples, .{});
+    try std.testing.expectEqualStrings("B", fit.candidates[1][0]);
+    try std.testing.expectEqualStrings("A", fit.candidates[2][0]);
+    try std.testing.expectEqualSlices(usize, &.{0}, fit.val_ids.?[1]);
+    try std.testing.expectEqualSlices(usize, &.{1}, fit.val_ids.?[2]);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 8, 9 }, fit.discovery_eval_counts);
+    try std.testing.expectEqual(10, fit.total_metric_calls);
 }
 
 test "GEPA stops after seed evaluation before reflecting or calling later stoppers" {
