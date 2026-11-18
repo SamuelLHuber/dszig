@@ -215,11 +215,23 @@ pub const Anthropic = struct {
     ) Error![]const u8 {
         const fields = &request.fields;
         const config = &fields.config;
-        if (config.cache != null or config.probabilities != null) return error.LMFailure;
+        if (config.probabilities != null) return error.LMFailure;
         var body: Object = .empty;
+        var messages = try encodeMessages(arena, fields.messages);
+        const system_text = if (fields.system) |system| switch (system) {
+            .text => |value| value,
+            else => return error.LMFailure,
+        } else "";
+        const marker = try self.cacheMarker(
+            arena,
+            config.cache,
+            &messages.array,
+            system_text.len != 0,
+            records,
+        );
         const budget = try self.addReasoning(arena, &body, fields, records);
         try body.put(arena, "model", str(fields.model));
-        try body.put(arena, "messages", try encodeMessages(arena, fields.messages));
+        try body.put(arena, "messages", messages);
         try body.put(arena, "stream", .{ .bool = stream });
         var max_tokens = config.max_tokens;
         if (max_tokens == .null) {
@@ -240,9 +252,16 @@ pub const Anthropic = struct {
                 "the Messages API requires max_tokens and none was set; 16384 was used (this server's ceiling is its own)", .null, max_tokens);
         }
         try body.put(arena, "max_tokens", if (budget == .null) max_tokens else try lm_mod.OpenAI.countSum(arena, budget, max_tokens));
-        if (fields.system) |system| {
-            if (system != .text) return error.LMFailure;
-            if (system.text.len != 0) try body.put(arena, "system", str(system.text));
+        if (system_text.len != 0) {
+            if (marker) |cache_control| {
+                var block = try textBlock(arena, system_text);
+                try block.object.put(arena, "cache_control", cache_control);
+                var blocks: runtime.Array = .init(arena);
+                try blocks.append(block);
+                try body.put(arena, "system", .{ .array = blocks });
+            } else {
+                try body.put(arena, "system", str(system_text));
+            }
         }
         try self.addSampling(arena, &body, config, records);
         try self.addTools(arena, &body, fields, records);
@@ -252,6 +271,45 @@ pub const Anthropic = struct {
             return if (err == error.WriteFailed) error.OutOfMemory else error.LMFailure;
         if (!std.unicode.utf8ValidateSlice(writer.written())) return error.LMFailure;
         return writer.written();
+    }
+
+    fn cacheMarker(
+        self: *const Anthropic,
+        arena: Allocator,
+        configured: ?sdk.CacheConfig,
+        messages: *runtime.Array,
+        has_system: bool,
+        records: *std.ArrayList(sdk.Adaptation),
+    ) Error!?Value {
+        const cache = configured orelse return null;
+        if (cache.resource != null) return error.LMFailure;
+        if (cache.mode == .off) return null;
+        if (cache.key) |key| {
+            try self.adapt(arena, records, "config.cache.key", .dropped, "the Messages API has no cache affinity key (OpenAI's prompt_cache_key); " ++
+                "marks on blocks are its mechanism", str(key), .null);
+        }
+        var last_block: ?*Object = null;
+        if (messages.items.len != 0 and
+            (cache.prefix == .history or cache.prefix_until_index != .null))
+        {
+            const last = messages.items.len - 1;
+            const index = switch (cache.prefix_until_index) {
+                .integer => |requested| @min(last, std.math.cast(usize, requested) orelse last),
+                .null, .number_string => last,
+                else => unreachable,
+            };
+            const blocks = &messages.items[index].object.getPtr("content").?.array;
+            if (blocks.items.len != 0) {
+                last_block = &blocks.items[blocks.items.len - 1].object;
+            }
+        }
+        if (!has_system and last_block == null) return null;
+        var object: Object = .empty;
+        try object.put(arena, "type", str("ephemeral"));
+        if (cache.retention == .long) try object.put(arena, "ttl", str("1h"));
+        const marker: Value = .{ .object = object };
+        if (last_block) |block| try block.put(arena, "cache_control", marker);
+        return marker;
     }
 
     fn addReasoning(
