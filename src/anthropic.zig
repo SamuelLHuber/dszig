@@ -25,6 +25,7 @@ pub const Anthropic = struct {
     timeout_ns: ?u64 = null,
     connect_timeout_ns: ?u64 = null,
     header_provider: ?http.HeaderProvider = null,
+    supports_reasoning: bool = false,
     supports_response_schema: bool = false,
     adaptations: enum { note, silent, refuse } = .note,
 
@@ -37,6 +38,7 @@ pub const Anthropic = struct {
                 .model_name = modelName,
                 .clone = clone,
             },
+            .supports_reasoning = self.supports_reasoning,
             .supports_response_format = self.supports_response_schema,
             .supports_response_schema = self.supports_response_schema,
             .supports_function_calling = true,
@@ -130,8 +132,8 @@ pub const Anthropic = struct {
         const fields = &request.fields;
         const config = &fields.config;
         if (config.cache != null or config.probabilities != null) return error.LMFailure;
-        if (config.reasoning) |reasoning| if (reasoning.effort != .off) return error.LMFailure;
         var body: Object = .empty;
+        const budget = try self.addReasoning(arena, &body, fields, records);
         try body.put(arena, "model", str(fields.model));
         try body.put(arena, "messages", try encodeMessages(arena, fields.messages));
         try body.put(arena, "stream", .{ .bool = false });
@@ -139,12 +141,21 @@ pub const Anthropic = struct {
         if (max_tokens == .null) {
             const ceiling = outputCeiling(fields.model);
             max_tokens = .{ .integer = ceiling orelse 16384 };
+            if (ceiling != null and budget != .null) {
+                const math = @import("value.zig");
+                const order = math.numericOrder(budget, max_tokens) catch return error.LMFailure;
+                max_tokens = if (order == .lt)
+                    math.numericDifference(arena, max_tokens, budget) catch |err|
+                        return codecError(err)
+                else
+                    .{ .integer = 16384 };
+            }
             try self.adapt(arena, records, "config.max_tokens", .defaulted, if (ceiling != null)
                 "the Messages API requires max_tokens and none was set; the model's output ceiling was used"
             else
                 "the Messages API requires max_tokens and none was set; 16384 was used (this server's ceiling is its own)", .null, max_tokens);
         }
-        try body.put(arena, "max_tokens", max_tokens);
+        try body.put(arena, "max_tokens", if (budget == .null) max_tokens else try lm_mod.OpenAI.countSum(arena, budget, max_tokens));
         if (fields.system) |system| {
             if (system != .text) return error.LMFailure;
             if (system.text.len != 0) try body.put(arena, "system", str(system.text));
@@ -157,6 +168,57 @@ pub const Anthropic = struct {
             return if (err == error.WriteFailed) error.OutOfMemory else error.LMFailure;
         if (!std.unicode.utf8ValidateSlice(writer.written())) return error.LMFailure;
         return writer.written();
+    }
+
+    fn addReasoning(
+        self: *const Anthropic,
+        arena: Allocator,
+        body: *Object,
+        fields: *const sdk.RequestFields,
+        records: *std.ArrayList(sdk.Adaptation),
+    ) Error!Value {
+        const reasoning = fields.config.reasoning orelse return .null;
+        const effort = reasoning.effort orelse return error.LMFailure;
+        if (effort == .off) return .null;
+        if (reasoning.summary) |summary| if (summary != .auto) {
+            try self.adapt(arena, records, "config.reasoning.summary", .substituted, "the Messages API has no summary detail levels; it returns one summary of the " ++
+                "thinking, which is 'auto'", str(@tagName(summary)), str("auto"));
+        };
+        var thinking: Object = .empty;
+        const adaptive = adaptiveModel(fields.model);
+        try thinking.put(arena, "type", str(if (adaptive) "adaptive" else "enabled"));
+        if (reasoning.summary != null) try thinking.put(arena, "display", str("summarized"));
+        var budget = reasoning.thinking_budget;
+        if (adaptive) {
+            if (budget != .null) {
+                const reason = try std.fmt.allocPrint(arena, "{s} takes thinking.type 'adaptive' with output_config.effort; " ++
+                    "budget_tokens is rejected by the API (live 2026-09-02). Thinking is bounded only " ++
+                    "by max_tokens, which covers thinking and answer together: lower the effort or " ++
+                    "raise max_tokens", .{fields.model});
+                try self.adapt(arena, records, "config.reasoning.thinking_budget", .dropped, reason, budget, .null);
+                budget = .null;
+            }
+            if (effort == .minimal) {
+                try self.adapt(arena, records, "config.reasoning.effort", .clamped, "this model class has no 'minimal' level (output_config.effort is " ++
+                    "low|medium|high|xhigh|max); 'low' is the floor", str("minimal"), str("low"));
+            }
+            var output: Object = .empty;
+            try output.put(arena, "effort", str(if (effort == .minimal) "low" else @tagName(effort)));
+            try body.put(arena, "output_config", .{ .object = output });
+        } else {
+            if (budget == .null) budget = .{ .integer = switch (effort) {
+                .off => unreachable,
+                .minimal => 1024,
+                .low => 2048,
+                .medium => 8192,
+                .high => 16384,
+                .xhigh => 24576,
+                .max => 32768,
+            } };
+            try thinking.put(arena, "budget_tokens", budget);
+        }
+        try body.put(arena, "thinking", .{ .object = thinking });
+        return budget;
     }
 
     fn addSampling(self: *const Anthropic, arena: Allocator, body: *Object, config: *const sdk.Config, records: *std.ArrayList(sdk.Adaptation)) Error!void {
@@ -230,7 +292,8 @@ pub const Anthropic = struct {
             var wire_format: Object = .empty;
             try wire_format.put(arena, "type", str("json_schema"));
             try wire_format.put(arena, "schema", schema);
-            var output: Object = .empty;
+            const existing = body.get("output_config");
+            var output: Object = if (existing) |item| item.object else .empty;
             try output.put(arena, "format", .{ .object = wire_format });
             try body.put(arena, "output_config", .{ .object = output });
         }
@@ -287,6 +350,16 @@ fn outputCeiling(model: []const u8) ?i64 {
     return null;
 }
 
+fn adaptiveModel(model: []const u8) bool {
+    for ([_][]const u8{
+        "sonnet-5", "opus-5", "sonnet-4-6", "opus-4-6", "opus-4-7",
+        "opus-4-8", "fable",  "mythos",     "haiku-5",
+    }) |marker| {
+        if (std.ascii.findIgnoreCase(model, marker) != null) return true;
+    }
+    return false;
+}
+
 fn encodeMessages(arena: Allocator, messages: []const sdk.Message) Error!Value {
     var rows: runtime.Array = .init(arena);
     for (messages) |message| {
@@ -316,6 +389,7 @@ fn encodeBlock(arena: Allocator, part: sdk.Part) Error!Value {
     var block: Object = .empty;
     switch (part) {
         .text => |item| return textBlock(arena, item.text),
+        .thinking => |item| return encodeThinking(arena, &item),
         .tool_call => |item| {
             try block.put(arena, "type", str("tool_use"));
             try block.put(arena, "id", str(item.id));
@@ -342,11 +416,56 @@ fn encodeBlock(arena: Allocator, part: sdk.Part) Error!Value {
     return .{ .object = block };
 }
 
+fn encodeThinking(arena: Allocator, item: *const sdk.ThinkingPart) Error!Value {
+    var block: Object = .empty;
+    for (item.continuation) |state| {
+        if (!std.mem.eql(u8, state.provider, "anthropic")) continue;
+        if (!std.mem.eql(u8, state.kind, "redacted_thinking")) continue;
+        const data = try project(arena, state.data);
+        if (data != .object) return error.LMFailure;
+        block = data.object;
+        try block.put(arena, "type", str("redacted_thinking"));
+        return .{ .object = block };
+    }
+    for (item.continuation) |state| {
+        if (!std.mem.eql(u8, state.provider, "anthropic")) continue;
+        if (!std.mem.eql(u8, state.kind, "thinking_signature")) continue;
+        const signature = text(get(try project(arena, state.data), "signature"));
+        if (signature.len == 0) break;
+        try block.put(arena, "type", str("thinking"));
+        try block.put(arena, "thinking", str(item.text));
+        try block.put(arena, "signature", str(signature));
+        return .{ .object = block };
+    }
+    return textBlock(arena, item.text);
+}
+
+fn parseThinking(arena: Allocator, block: Value, redacted: bool) Error!sdk.ThinkingPart {
+    const key = if (redacted) "data" else "signature";
+    const value = get(block, key);
+    var thinking = text(get(block, "thinking"));
+    if (thinking.len == 0) thinking = text(get(block, "text"));
+    var result: sdk.ThinkingPart = .{ .text = if (redacted) "" else thinking };
+    if (if (redacted) value != .null else text(value).len != 0) {
+        var data: Object = .empty;
+        try data.put(arena, key, value);
+        const state = try arena.alloc(sdk.Continuation, 1);
+        state[0] = .{
+            .provider = "anthropic",
+            .kind = if (redacted) "redacted_thinking" else "thinking_signature",
+            .data = try payload(arena, .{ .object = data }),
+        };
+        result.continuation = state;
+    }
+    return result;
+}
+
 fn parseResponse(arena: Allocator, model: []const u8, input: Value, records: []const sdk.Adaptation) Error!lm_mod.Completion {
     if (input != .object) return error.LMFailure;
     var parts: std.ArrayList(sdk.Part) = .empty;
     var calls: std.ArrayList(lm_mod.ToolCall) = .empty;
     var visible: std.Io.Writer.Allocating = .init(arena);
+    var reasoning: std.Io.Writer.Allocating = .init(arena);
     const content = get(input, "content");
     if (content != .null and content != .array) return error.LMFailure;
     for (if (content == .array) content.array.items else &.{}) |block| {
@@ -370,6 +489,12 @@ fn parseResponse(arena: Allocator, model: []const u8, input: Value, records: []c
                 return if (err == error.WriteFailed) error.OutOfMemory else error.LMFailure;
             try parts.append(arena, .{ .tool_call = .{ .id = id, .name = name, .input = encoded } });
             try calls.append(arena, .{ .id = id, .name = name, .arguments = json.written() });
+        } else if (std.mem.eql(u8, kind, "thinking") or
+            std.mem.eql(u8, kind, "redacted_thinking"))
+        {
+            const item = try parseThinking(arena, block, std.mem.eql(u8, kind, "redacted_thinking"));
+            reasoning.writer.writeAll(item.text) catch return error.OutOfMemory;
+            try parts.append(arena, .{ .thinking = item });
         } else return error.LMFailure;
     }
     if (parts.items.len == 0) try parts.append(arena, .{ .text = .{} });
@@ -377,6 +502,7 @@ fn parseResponse(arena: Allocator, model: []const u8, input: Value, records: []c
     const model_id = text(get(input, "model"));
     var result: lm_mod.Completion = .{
         .text = if (visible.written().len == 0 and calls.items.len != 0) null else visible.written(),
+        .reasoning = if (reasoning.written().len == 0) null else reasoning.written(),
         .tool_calls = calls.items,
         .message = .{ .role = .assistant, .parts = parts.items },
         .provider_data = try payload(arena, input),
@@ -457,6 +583,28 @@ fn payload(arena: Allocator, value: Value) Error!sdk.PayloadValue {
 
 fn codecError(err: anyerror) Error {
     return if (err == error.OutOfMemory) error.OutOfMemory else error.LMFailure;
+}
+
+test "Anthropic reasoning replays signed and redacted blocks without showing either as the answer" {
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const parse = @import("json_repair.zig").parseJson;
+    const input = try parse(arena,
+        \\{"content":[{"type":"thinking","thinking":"private summary","signature":"opaque"},
+        \\{"type":"redacted_thinking","data":"hidden"},{"type":"text","text":"Paris"}]}
+    );
+    const result = try parseResponse(arena, "claude-opus-4-7", input, &.{});
+    defer result.response.?.release();
+    try std.testing.expectEqualStrings("Paris", result.text.?);
+    try std.testing.expectEqualStrings("private summary", result.reasoning.?);
+    const message = result.response.?.fields.message;
+    const signed = try encodeBlock(arena, message.parts[0]);
+    try std.testing.expectEqualStrings("thinking", text(get(signed, "type")));
+    try std.testing.expectEqualStrings("opaque", text(get(signed, "signature")));
+    const hidden = try encodeBlock(arena, message.parts[1]);
+    try std.testing.expectEqualStrings("redacted_thinking", text(get(hidden, "type")));
+    try std.testing.expectEqualStrings("hidden", text(get(hidden, "data")));
 }
 
 test "Anthropic forcing one function preserves the other declarations" {

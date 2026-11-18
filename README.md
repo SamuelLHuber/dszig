@@ -3719,10 +3719,15 @@ The following prevent a claim that DSZig can do everything DSPy can:
   explicit JSON schemas (`supports_response_schema = true` for a compatible
   model). Supply an existing `std.http.Client` and an API key or a
   per-attempt `header_provider`; use a trusted `base_url` ending in `/v1`.
-  Set `max_tokens` explicitly to control the output budget. The Messages
-  implementation has been compared against DSPy over loopback, not against a
-  hosted Claude model. Messages streaming, reasoning, multimodal blocks,
-  prompt caching and hosted tools are not implemented.
+  For compatible Claude models, set `supports_reasoning = true` to advertise
+  native reasoning to typed predictors. Canonical requests support manual
+  budgets and adaptive effort; `max_tokens` is the visible budget on manual
+  models and the total budget on adaptive models. Canonical assistant
+  messages preserve signed and redacted thinking for subsequent requests.
+  The Messages implementation has been compared against DSPy over loopback,
+  not against a hosted Claude model. Messages streaming, third-party
+  reasoning dialects, multimodal blocks, prompt caching and hosted tools are
+  not implemented.
   Native File construction, adapter/typed prediction
   handling, File tool-result markers and bounded Responses document translation
   are implemented as described above. There is still no complete lm15 provider
