@@ -90,6 +90,12 @@ pub const Context = struct {
     /// When set, every predictor call is appended (deep-copied).
     trace: ?*Trace = null,
     retriever: ?Retriever = null,
+    /// Original sampling options when an optimizer refreshes the settings LM.
+    /// An explicitly selected LM does not inherit that refresh.
+    before_settings_rollout: ?struct {
+        temperature: ?f64,
+        rollout_id: ?@import("runtime_value.zig").Value,
+    } = null,
     lm_options: lm_mod.Options = .{},
     /// Borrowed overrides for a predictor invocation, after its stored config.
     predict_config: ?*const PredictConfig = null,
@@ -355,11 +361,15 @@ pub const PredictState = struct {
 
     fn resolveContext(state: *const PredictState, base: Context) Error!Context {
         var ctx = base;
-        if (base.lm_override_present or base.lm_override != null) {
-            ctx.lm = base.lm_override orelse base.lm;
-        } else {
-            ctx.lm = state.lm orelse base.lm;
+        const explicit_lm = if (base.lm_override_present or base.lm_override != null) base.lm_override else state.lm;
+        ctx.lm = explicit_lm orelse base.lm;
+        if (explicit_lm != null) {
+            if (base.before_settings_rollout) |before| {
+                ctx.lm_options.temperature = before.temperature;
+                ctx.lm_options.rollout_id = before.rollout_id;
+            }
         }
+        ctx.before_settings_rollout = null;
         if (ctx.lm.sameInstance(lm_mod.LM.unconfigured)) return error.NoLM;
         return ctx;
     }
@@ -388,12 +398,13 @@ pub const PredictState = struct {
     fn callConfigured(state: *const PredictState, ctx_in: Context, inputs: *const Record, count: ?u32) Error![]const Record {
         if (ctx_in.parse_failure) |capture| capture.* = .{};
         var ctx = try state.resolveContext(ctx_in);
+        const base_temperature = ctx.lm_options.temperature orelse 0;
         if (state.config) |config| config.apply(&ctx.lm_options);
         if (ctx.predict_config) |config| config.apply(&ctx.lm_options);
         if (count) |n| ctx.lm_options.n = n;
         if (ctx.lm_options.n == 0) return error.InvalidCompletionCount;
         const temperature = ctx.lm_options.temperature orelse 0;
-        const sampling_temperature = if (temperature == 0) ctx_in.lm_options.temperature orelse 0 else temperature;
+        const sampling_temperature = if (temperature == 0) base_temperature else temperature;
         if (ctx.lm_options.n > 1 and sampling_temperature <= 0.15) ctx.lm_options.temperature = 0.7;
         var defaulted_inputs: Record = undefined;
         const prepared = try state.prepare(&ctx, inputs, &defaulted_inputs);

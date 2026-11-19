@@ -1459,6 +1459,69 @@ test "BootstrapFewShot zero threshold accepts a zero score while null rejects it
     try testing.expectEqual(@as(usize, 0), rejected.program.generate_answer.predict.state.demos.len);
 }
 
+test "BootstrapFewShot retries the settings model without retuning a bound model" {
+    const Sig = dszig.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: []const u8 };
+    });
+    const Program = struct {
+        pub const Input = Sig.Input;
+        pub const Output = Sig.Output;
+        compiled: bool = false,
+        fallback: dszig.Predict(Sig) = .{},
+        bound: dszig.Predict(Sig) = .{},
+
+        pub fn forward(self: *const @This(), ctx: dszig.Context, input: Input) !Output {
+            _ = try self.fallback.forward(ctx, input);
+            return self.bound.forward(ctx, input);
+        }
+    };
+    const Metric = struct {
+        threadlocal var calls: usize = 0;
+
+        fn score(
+            _: Allocator,
+            _: *const dszig.Example,
+            _: ?*const dszig.optimize.RecordPrediction,
+            _: ?*const dszig.Trace,
+        ) dszig.value.ParseError!f64 {
+            calls += 1;
+            return if (calls == 2) 1 else 0;
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var fallback: dszig.lm.ScriptedLM = .{ .responses = &.{ "<answer>fallback</answer>", "<answer>fallback</answer>" } };
+    var bound: dszig.lm.ScriptedLM = .{ .responses = &.{ "<answer>bound</answer>", "<answer>bound</answer>" } };
+    var fallback_tape: dszig.lm.RecordingLM = .{ .inner = fallback.lm(), .arena = arena };
+    var bound_tape: dszig.lm.RecordingLM = .{ .inner = bound.lm(), .arena = arena };
+    var teacher: Program = .{};
+    teacher.bound.state.lm = bound_tape.lm();
+    const train = [_]dszig.Example{
+        try .fromJson(arena, "{\"question\":\"q\",\"answer\":\"label\"}", &.{"question"}),
+    };
+    var optimizer: dszig.BootstrapFewShot = .{ .metric = Metric.score, .max_rounds = 2, .max_labeled_demos = 0 };
+    Metric.calls = 0;
+    const result = try optimizer.compile(Program, arena, testing.allocator, .{
+        .arena = arena,
+        .lm = fallback_tape.lm(),
+        .lm_options = .{ .temperature = 0 },
+    }, .{}, teacher, &train);
+    try testing.expectEqual(@as(usize, 2), result.report.attempts);
+    try testing.expectEqual(@as(usize, 2), fallback_tape.calls.items.len);
+    try testing.expectEqual(@as(usize, 2), bound_tape.calls.items.len);
+    const retry = fallback_tape.calls.items[1].options.?;
+    try testing.expectEqual(@as(?f64, 1), retry.temperature);
+    try testing.expectEqual(@as(i64, 1), retry.rollout_id.?.integer);
+    for (bound_tape.calls.items) |call| {
+        try testing.expectEqual(@as(?f64, 0), call.options.?.temperature);
+        try testing.expect(call.options.?.rollout_id == null);
+    }
+    try testing.expectEqualStrings("fallback", result.program.fallback.state.demos[0].get("answer").?.string);
+    try testing.expectEqualStrings("bound", result.program.bound.state.demos[0].get("answer").?.string);
+}
+
 test "BootstrapFewShot reads borrowed settings for retries and later examples" {
     const Sig = dszig.Signature(struct {
         pub const Input = struct { question: []const u8 };

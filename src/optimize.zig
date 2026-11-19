@@ -706,6 +706,12 @@ pub const BootstrapFewShot = struct {
         const settings = if (self.teacher_settings_ref) |bound| bound.* else self.teacher_settings;
         settings.apply(&c);
         if (round_idx > 0) {
+            if (c.before_settings_rollout == null) {
+                c.before_settings_rollout = .{
+                    .temperature = c.lm_options.temperature,
+                    .rollout_id = c.lm_options.rollout_id,
+                };
+            }
             c.lm_options.temperature = 1.0;
             c.lm_options.rollout_id = .{ .integer = @intCast(round_idx) };
         }

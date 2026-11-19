@@ -4262,6 +4262,9 @@ The following prevent a claim that DSZig can do everything DSPy can:
   `error.NoCandidates`. With an empty training set at positive depth it
   generates initial proposals, then the first evaluation returns `error.EmptyDevset`.
   Tracking does not add evaluations.
+  Bootstrap retries refresh the settings LM with temperature `1.0` and the
+  round's rollout ID. Predictors with an explicitly selected LM do not inherit
+  that refresh.
   `BootstrapFewShotWithRandomSearch.Result.candidates` retains runnable
   programs and their per-validation-example scores in original example order.
   Candidates are sorted by aggregate score, with ties preserving seed order.
