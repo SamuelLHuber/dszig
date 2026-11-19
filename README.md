@@ -3815,8 +3815,9 @@ The following prevent a claim that DSZig can do everything DSPy can:
   observations; runtime failures propagate. `forwardWithHistory` continues the
   conversation, not the runtime state. Variable previews count Unicode code
   points, group the displayed count with commas, and show the first and last
-  500 code points when the rendered value exceeds 1,000. An optional
-  `history_processor` runs before each action and can edit or trim a private
+  500 code points when the rendered value exceeds 1,000. List and dictionary
+  previews use `list` and `dict` rather than their parameterized annotations.
+  An optional `history_processor` runs before each action and can edit or trim a private
   draft, or supply a replacement history that DSZig copies. `forwardWithOptions`
   can override the processor or the `interpreter_factory` for a single call.
   The factory override

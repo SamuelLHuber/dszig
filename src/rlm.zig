@@ -8,7 +8,9 @@ const lm = @import("lm.zig");
 const value = @import("value.zig");
 const runtime_value = @import("runtime_value.zig");
 const pyjson = @import("pyjson.zig");
-const Field = @import("signature.zig").Field;
+const signature = @import("signature.zig");
+const types = @import("types.zig");
+const Field = signature.Field;
 const Allocator = std.mem.Allocator;
 const Record = value.Record;
 const Value = runtime_value.Value;
@@ -403,7 +405,7 @@ pub fn CustomRLM(comptime Sig: type) type {
             const arena = ctx.arena;
             if (self.max_iters > iterations_max) return error.TooManyIterations;
             const variables = try value.toRecord(arena, Input, input);
-            const info = try variableInfo(arena, Sig.input_fields_list, &variables);
+            const info = try variableInfo(Sig, arena, &variables);
             const entries = try arena.alloc(Entry, self.max_iters);
             var history = try TurnHistory.clone(arena, options.history, entries.len + 1);
             const processor = options.history_processor orelse self.history_processor;
@@ -492,11 +494,26 @@ fn reasoningText(reason: Value) ![]const u8 {
     return (try @import("signature.zig").Reasoning.fromValue(reason)).content;
 }
 
-fn variableInfo(arena: Allocator, fields: []const Field, variables: *const Record) !Value {
+fn variableInfo(comptime Sig: type, arena: Allocator, variables: *const Record) !Value {
+    const fields = Sig.input_fields_list;
+    const dict_fields = comptime blk: {
+        var flags: [fields.len]bool = undefined;
+        for (fields, 0..) |field, index| {
+            const T = @FieldType(Sig.Input, field.name);
+            const Base = if (@typeInfo(T) == .optional) @typeInfo(T).optional.child else T;
+            flags[index] = Base == signature.StrDict or Base == runtime_value.ObjectMap or types.isDict(Base);
+        }
+        break :blk flags;
+    };
     var items = runtime_value.Array.init(arena);
     try items.ensureTotalCapacity(fields.len);
-    for (fields) |field| {
+    for (fields, dict_fields) |field, is_dict| {
         const val = variables.get(field.name) orelse return error.MissingField;
+        const type_name = switch (val) {
+            .array => "list",
+            .object => if (is_dict) "dict" else field.type_name,
+            else => field.type_name,
+        };
         const rendered = try variableText(arena, val);
         const length = try std.unicode.utf8CountCodepoints(rendered);
         const preview = try variablePreview(arena, rendered, length);
@@ -508,7 +525,7 @@ fn variableInfo(arena: Allocator, fields: []const Field, variables: *const Recor
         items.appendAssumeCapacity(text(try std.fmt.allocPrint(
             arena,
             "Variable: `{s}` (access it in your code)\nType: {s}\n{s}Total length: {s} characters\nPreview:\n```\n{s}\n```",
-            .{ field.name, field.type_name, description, pyjson.groupedDecimal(&length_buffer, length), preview },
+            .{ field.name, type_name, description, pyjson.groupedDecimal(&length_buffer, length), preview },
         )));
     }
     return .{ .array = items };
@@ -528,7 +545,7 @@ test "RLM variable previews group Unicode counts and cut only beyond one thousan
     var vars: Record = .empty;
     for ([_][]const u8{ &input, longer }, [_][]const u8{ "1,000", "1,001" }) |raw, count| {
         try vars.put(arena, "note", text(raw));
-        const data = try variableInfo(arena, Sig.input_fields_list, &vars);
+        const data = try variableInfo(Sig, arena, &vars);
         const expected = try std.mem.concat(arena, u8, &.{
             "Variable: `note` (access it in your code)\nType: str\nTotal length: ",
             count,
@@ -540,6 +557,24 @@ test "RLM variable previews group Unicode counts and cut only beyond one thousan
         });
         try std.testing.expectEqualStrings(expected, data.array.items[0].string);
     }
+}
+
+test "RLM distinguishes dictionary values from model records in variable previews" {
+    var storage: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    const Count = struct { value: i64 };
+    const Sig = signature.Signature(struct {
+        pub const Input = struct { counts: signature.Dict(i64), model: Count };
+        pub const Output = struct { answer: i64 };
+    });
+    const vars = try value.toRecord(arena, Sig.Input, .{
+        .counts = .{ .keys = &.{"value"}, .values = &.{2} },
+        .model = .{ .value = 2 },
+    });
+    const info = try variableInfo(Sig, arena, &vars);
+    try std.testing.expect(std.mem.indexOf(u8, info.array.items[0].string, "\nType: dict\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, info.array.items[1].string, "\nType: Count\n") != null);
 }
 
 fn variableText(arena: Allocator, input: Value) ![]const u8 {
