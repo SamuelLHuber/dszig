@@ -8,8 +8,8 @@
 //! byte-order metadata too when replacing a loaded array with a different kind.
 //! Result slices belong to the caller's output arena; passage strings borrow
 //! the current corpus and must not outlive it (including a subsequent load).
-//! Calls require external synchronization; batchForward explicitly embeds the
-//! whole query list, without Python Unbatchify's background thread/scheduler.
+//! Direct calls require external synchronization. `batchForward` embeds the
+//! whole query list; `Batcher` coalesces concurrent single-query calls.
 //!
 //! Constructor/query vectors use the existing Embedder's contiguous float32
 //! boundary. Arbitrary Python callables retaining float64/object/complex arrays
@@ -62,10 +62,164 @@ pub const ArrayRank = enum { scalar, vector, matrix };
 pub const Embeddings = Retriever(false);
 pub const EmbeddingsWithScores = Retriever(true);
 
+fn QueryBatcher(comptime RetrieverType: type) type {
+    return struct {
+        const Self = @This();
+        const Io = std.Io;
+        const assert = std.debug.assert;
+        const batch_size_max = 32;
+
+        pub const Options = struct {
+            batch_size: u8 = batch_size_max,
+            wait_ms: u32 = 100,
+        };
+
+        const Request = struct {
+            query: []const u8,
+            ready: Io.Condition = .init,
+            result: ?anyerror!BatchPrediction = null,
+        };
+
+        io: Io,
+        retriever: *RetrieverType,
+        config: Self.Options,
+        worker: std.Thread,
+        mutex: Io.Mutex = .init,
+        changed: Io.Condition = .init,
+        queued: [batch_size_max]*Request = undefined,
+        queued_count: u8 = 0,
+        leases: u8 = 0,
+        closing: bool = false,
+
+        /// Initialize in place. The worker exclusively uses the borrowed
+        /// retriever, embedder and their allocator until close joins it.
+        /// The embedder callback must not reenter this batcher.
+        pub fn init(self: *Self, io: Io, retriever: *RetrieverType, config: Self.Options) !void {
+            if (config.batch_size == 0 or config.batch_size > batch_size_max)
+                return error.InvalidBatchSize;
+            self.* = .{
+                .io = io,
+                .retriever = retriever,
+                .config = config,
+                .worker = undefined,
+            };
+            self.worker = try std.Thread.spawn(.{}, run, .{self});
+        }
+
+        /// Single-owner shutdown. Finish active results, reject queued work,
+        /// and join the worker. Join callers before freeing the batcher.
+        pub fn close(self: *Self) void {
+            self.mutex.lockUncancelable(self.io);
+            assert(!self.closing);
+            self.closing = true;
+            self.changed.signal(self.io);
+            self.mutex.unlock(self.io);
+            self.worker.join();
+        }
+
+        /// Caller memory is only used on the calling thread. Once admitted,
+        /// wait until the worker has released its reference to this request.
+        pub fn forward(self: *Self, out: Allocator, query: []const u8) anyerror!RetrieverType.Output {
+            var request: Request = .{ .query = query };
+            self.mutex.lockUncancelable(self.io);
+            const result = self.enqueue(&request);
+            self.mutex.unlock(self.io);
+            const row = try result;
+            defer self.release();
+            const passages = try out.dupe([]const u8, row.passages);
+            errdefer out.free(passages);
+            const indices = try out.dupe(usize, row.indices);
+            errdefer out.free(indices);
+            if (RetrieverType.Output == ScoredPrediction)
+                return .{ .passages = passages, .indices = indices, .scores = try out.dupe(f64, row.scores) };
+            return .{ .passages = passages, .indices = indices };
+        }
+
+        fn enqueue(self: *Self, request: *Request) anyerror!BatchPrediction {
+            if (self.closing) return error.BatcherClosed;
+            if (self.queued_count == self.config.batch_size) return error.BatchQueueFull;
+            assert(self.queued_count < self.queued.len);
+            self.queued[self.queued_count] = request;
+            self.queued_count += 1;
+            self.changed.signal(self.io);
+            while (request.result == null) request.ready.waitUncancelable(self.io, &self.mutex);
+            return request.result.?;
+        }
+
+        fn release(self: *Self) void {
+            self.mutex.lockUncancelable(self.io);
+            assert(self.leases > 0);
+            self.leases -= 1;
+            if (self.leases == 0) self.changed.signal(self.io);
+            self.mutex.unlock(self.io);
+        }
+
+        fn run(self: *Self) void {
+            var memory: std.heap.ArenaAllocator = .init(self.retriever.allocator);
+            defer memory.deinit();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            while (true) {
+                while (self.queued_count == 0 and !self.closing)
+                    self.changed.waitUncancelable(self.io, &self.mutex);
+                if (self.closing) break;
+                self.collect();
+                if (self.closing) break;
+                self.execute(memory.allocator());
+                _ = memory.reset(.free_all);
+            }
+            for (self.queued[0..self.queued_count]) |request| {
+                request.result = error.BatcherClosed;
+                request.ready.signal(self.io);
+            }
+            self.queued_count = 0;
+        }
+
+        fn collect(self: *Self) void {
+            const timeout: Io.Timeout = .{ .duration = .{
+                .clock = .awake,
+                .raw = .fromMilliseconds(self.config.wait_ms),
+            } };
+            const deadline = timeout.toDeadline(self.io);
+            while (self.queued_count < self.config.batch_size and !self.closing) {
+                self.changed.waitTimeout(self.io, &self.mutex, deadline) catch |err| switch (err) {
+                    error.Timeout => break,
+                    error.Canceled => unreachable, // Dedicated thread, never canceled.
+                };
+            }
+        }
+
+        fn execute(self: *Self, scratch: Allocator) void {
+            const count = self.queued_count;
+            assert(count > 0);
+            assert(count <= self.config.batch_size);
+            assert(self.leases == 0);
+            var requests: [batch_size_max]*Request = undefined;
+            var queries: [batch_size_max][]const u8 = undefined;
+            @memcpy(requests[0..count], self.queued[0..count]);
+            for (requests[0..count], queries[0..count]) |request, *query| query.* = request.query;
+            self.queued_count = 0;
+            self.mutex.unlock(self.io);
+            const rows = self.retriever.batchForward(scratch, queries[0..count]);
+            self.mutex.lockUncancelable(self.io);
+            for (requests[0..count], 0..) |request, index| {
+                request.result = if (rows) |batch| row: {
+                    if (index >= batch.len) break :row error.MissingQueryEmbedding;
+                    self.leases += 1;
+                    break :row batch[index];
+                } else |err| err;
+                request.ready.signal(self.io);
+            }
+            while (self.leases != 0) self.changed.waitUncancelable(self.io, &self.mutex);
+        }
+    };
+}
+
 fn Retriever(comptime with_scores: bool) type {
     return struct {
         const Self = @This();
         pub const Output = if (with_scores) ScoredPrediction else Prediction;
+        pub const Batcher = QueryBatcher(Self);
 
         allocator: Allocator,
         configuration_memory: std.heap.ArenaAllocator,
@@ -642,6 +796,37 @@ test "Embeddings embeds its corpus once and batches query text together" {
     try testing.expectEqualStrings("diagonal", backend.calls.items[1][0]);
     try testing.expectEqualStrings("origin", backend.calls.items[1][1]);
     try testing.expectEqualStrings("again", backend.calls.items[2][0]);
+}
+
+test "Embeddings batcher releases worker storage when a caller cannot allocate output" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    var backend: TestBackend = .{
+        .arena = memory.allocator(),
+        .corpus = .{ .values = &.{ 1, 0, 0, 1 }, .rows = 2, .columns = 2 },
+        .query = .{ .values = &.{ 0, 2 }, .rows = 1, .columns = 2 },
+    };
+    var model = backend.model();
+    defer model.deinit();
+    var retriever = try EmbeddingsWithScores.init(
+        testing.allocator,
+        &.{ "east", "north" },
+        &model,
+        .{ .k = 1, .normalize = false },
+    );
+    defer retriever.deinit();
+
+    var batcher: EmbeddingsWithScores.Batcher = undefined;
+    {
+        try batcher.init(testing.io, &retriever, .{ .batch_size = 1 });
+        defer batcher.close();
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 1 });
+        try testing.expectError(error.OutOfMemory, batcher.forward(failing.allocator(), "oom"));
+        const next = try batcher.forward(memory.allocator(), "recovered");
+        try testing.expectEqualSlices(usize, &.{1}, next.indices);
+        try testing.expectEqualSlices(f64, &.{2}, next.scores);
+    }
+    try testing.expectError(error.BatcherClosed, batcher.forward(memory.allocator(), "closed"));
 }
 
 test "EmbeddingsWithScores observes runtime k normalization corpus and vector changes" {

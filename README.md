@@ -1780,6 +1780,17 @@ preserving comparisons such as `0.800000011920929 > 0.8`. `save`, `load` and
 float32 arrays include NPY versions 1–3, both byte orders and C/Fortran storage.
 The embedder and initial corpus are borrowed; initialized retrievers own their
 vectors and loaded configuration and require `deinit`.
+
+For concurrent single-query retrieval, initialize an `Embeddings.Batcher` or
+`EmbeddingsWithScores.Batcher` in place and call its `forward` from client
+threads. One worker batches up to 32 queries, waiting up to 100 ms from the
+start of collection by default. Pending work is bounded to one additional
+batch; full queues return `BatchQueueFull`. `close` finishes active work,
+rejects queued requests and joins the worker. Join client threads before
+reclaiming the batcher, and do not use the borrowed retriever or embedder
+directly while the batcher owns access. Output allocations use each caller's
+own allocator; returned passages still borrow the corpus.
+
 An actual native executable loaded six independently generated Python saves
 without recomputing the corpus and matched their retrieval results. Real DSPy
 then loaded both normalized and raw native saves and reproduced the same indices,
@@ -4124,8 +4135,10 @@ The following prevent a claim that DSZig can do everything DSPy can:
   that limit.
 - **Dense retrieval boundaries:** FAISS construction/indexed saves are unsupported;
   the default threshold of 20,000 corpus items therefore fails explicitly rather
-  than silently changing index algorithms. Retrieval caching and Python
-  Unbatchify's background scheduler are not implemented. Persistence accepts
+  than silently changing index algorithms. Like DSPy, dense retrieval rejects
+  retrieval-level caching. Background batching is explicit and bounded in Zig;
+  it does not reproduce Python Unbatchify's idle polling or unbounded queue.
+  Persistence accepts
   float32 arrays, not arbitrary NumPy dtypes/ranks. Scalar sorting and the observed
   NEON einsum arithmetic are not all-platform NumPy CPU-dispatch equivalence.
 - **Embedding numerical portability:** KNN ports NumPy 2.4.6's scalar quicksort,
