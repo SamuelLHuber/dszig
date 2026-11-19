@@ -1415,6 +1415,7 @@ test "random search with concurrent evaluation ranks the same candidates as seri
     for (serial.candidates, concurrent.candidates) |expected, actual| {
         try testing.expectEqual(expected.seed, actual.seed);
         try testing.expectEqual(expected.score, actual.score);
+        try testing.expectEqualSlices(f64, expected.subscores, actual.subscores);
     }
     const Other = struct {
         pub const Input = struct { question: []const u8 };
@@ -1546,9 +1547,9 @@ fn expectFewShotDemos(program: *const FewShotOptionsProgram, z: []const []const 
     for (a, program.a.state.demos) |expected, demo| try testing.expectEqualStrings(expected, demo.get("answer").?.string);
 }
 
-const FewShotCandidate = dszig.BootstrapFewShotWithRandomSearch.Candidate;
+const FewShotCandidate = struct { seed: i64, score: f64 };
 
-fn expectFewShotCandidates(expected: []const FewShotCandidate, actual: []const FewShotCandidate) !void {
+fn expectFewShotCandidates(expected: []const FewShotCandidate, actual: anytype) !void {
     try testing.expectEqual(expected.len, actual.len);
     for (expected, actual) |want, got| {
         try testing.expectEqual(want.seed, got.seed);

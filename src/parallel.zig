@@ -438,12 +438,13 @@ pub fn Evaluator(comptime P: type, comptime limits: Limits) type {
             devset: []const optimize.Example,
             metric: optimize.Metric,
             max_errors: usize,
+            subscores: ?[]f64,
         ) anyerror!optimize.Evaluation {
             const self: *Self = @ptrCast(@alignCast(ptr));
             var options = self.bound_options;
             options.max_errors = std.math.cast(u32, max_errors) orelse std.math.maxInt(u32);
             const typed: *const P = @ptrCast(@alignCast(program));
-            return self.evaluate(self.bound_contexts, typed, devset, metric, options);
+            return self.evaluateScores(self.bound_contexts, typed, devset, metric, options, subscores);
         }
 
         /// contexts supply independent per-attempt LM/retriever pointees; their
@@ -461,7 +462,20 @@ pub fn Evaluator(comptime P: type, comptime limits: Limits) type {
             metric: optimize.Metric,
             options: Options,
         ) !optimize.Evaluation {
+            return self.evaluateScores(contexts, program, devset, metric, options, null);
+        }
+
+        fn evaluateScores(
+            self: *Self,
+            contexts: []const Context,
+            program: *const P,
+            devset: []const optimize.Example,
+            metric: optimize.Metric,
+            options: Options,
+            subscores: ?[]f64,
+        ) !optimize.Evaluation {
             assert(devset.len > 0);
+            if (subscores) |scores| assert(scores.len == devset.len);
             assert(contexts.len >= limits.attempts);
             assert(!options.return_failed_tasks);
             if (devset.len > limits.tasks) return error.TaskCapacity;
@@ -481,13 +495,17 @@ pub fn Evaluator(comptime P: type, comptime limits: Limits) type {
             // Sum after the join in devset order, not completion order, as DSPy does.
             var sum: f64 = 0;
             var errors: usize = 0;
-            for (report.results) |slot| switch (slot) {
-                .failed => {
-                    errors += 1;
-                    sum += self.failure_score;
-                },
-                .value => |score| sum += score.*,
-            };
+            for (report.results, 0..) |slot, index| {
+                const score = switch (slot) {
+                    .failed => blk: {
+                        errors += 1;
+                        break :blk self.failure_score;
+                    },
+                    .value => |score| score.*,
+                };
+                sum += score;
+                if (subscores) |scores| scores[index] = score;
+            }
             return optimize.summarize(sum, devset.len, errors);
         }
 

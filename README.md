@@ -4100,6 +4100,11 @@ The following prevent a claim that DSZig can do everything DSPy can:
   program snapshot. Equal-scoring candidates with identical prompt text can
   remain separate, as in DSPy; native custom pointers retain Zig copy semantics.
   Tracking does not add evaluations.
+  `BootstrapFewShotWithRandomSearch.Result.candidates` retains runnable
+  programs and their per-validation-example scores in original example order.
+  Candidates are sorted by aggregate score, with ties preserving seed order.
+  The candidate programs and scores use the caller's output allocator and
+  do not trigger extra evaluations.
   MIPROv2 `track_stats` retains native program values in trial order with
   stable score-ranked full and minibatch indices in `Result.tracked_programs`.
   Trial logs expose cumulative evaluation counts and distinguish minibatch

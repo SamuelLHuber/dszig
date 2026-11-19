@@ -77,7 +77,21 @@ pub fn evaluate(
     metric: Metric,
     max_errors: usize,
 ) !Evaluation {
+    return evaluateScores(P, gpa, ctx, program, devset, metric, max_errors, null);
+}
+
+fn evaluateScores(
+    comptime P: type,
+    gpa: Allocator,
+    ctx: Context,
+    program: *const P,
+    devset: []const Example,
+    metric: Metric,
+    max_errors: usize,
+    subscores: ?[]f64,
+) !Evaluation {
     assert(devset.len > 0);
+    if (subscores) |scores| assert(scores.len == devset.len);
     // Static outer storage survives each scratch reset without consuming the
     // per-example backing budget. Retained optimizer runs use runProgram.
     var storage: value.RecordStorage(@typeInfo(P.Output).@"struct".field_names.len) = undefined;
@@ -86,7 +100,7 @@ pub fn evaluate(
     var output: P.Output = undefined;
     var sum: f64 = 0;
     var errors: usize = 0;
-    for (devset) |*example| {
+    for (devset, 0..) |*example, index| {
         var scratch: std.heap.ArenaAllocator = .init(gpa);
         defer scratch.deinit();
         var c = ctx;
@@ -96,12 +110,17 @@ pub fn evaluate(
             metric(c.arena, example, &prediction, null)
         else |err|
             err;
-        sum += score catch |err| {
+        const scored = score catch |err| blk: {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             errors += 1;
             if (errors >= max_errors) return err;
-            continue;
+            if (subscores) |scores| scores[index] = 0;
+            break :blk null;
         };
+        if (scored) |s| {
+            sum += s;
+            if (subscores) |scores| scores[index] = s;
+        }
     }
     return summarize(sum, devset.len, errors);
 }
@@ -118,6 +137,7 @@ pub const ConcurrentEvaluation = struct {
         devset: []const Example,
         metric: Metric,
         max_errors: usize,
+        subscores: ?[]f64,
     ) anyerror!Evaluation,
 };
 
@@ -133,9 +153,25 @@ pub fn evaluateWith(
     metric: Metric,
     max_errors: usize,
 ) !Evaluation {
-    const bound = concurrent orelse return evaluate(P, gpa, ctx, program, devset, metric, max_errors);
-    if (bound.program_type != @import("runtime_value.zig").typeIdentity(P)) return error.ProgramTypeMismatch;
-    return bound.run(bound.ptr, program, devset, metric, max_errors);
+    return evaluateWithScores(P, concurrent, gpa, ctx, program, devset, metric, max_errors, null);
+}
+
+fn evaluateWithScores(
+    comptime P: type,
+    concurrent: ?ConcurrentEvaluation,
+    gpa: Allocator,
+    ctx: Context,
+    program: *const P,
+    devset: []const Example,
+    metric: Metric,
+    max_errors: usize,
+    subscores: ?[]f64,
+) !Evaluation {
+    const bound = concurrent orelse
+        return evaluateScores(P, gpa, ctx, program, devset, metric, max_errors, subscores);
+    if (bound.program_type != @import("runtime_value.zig").typeIdentity(P))
+        return error.ProgramTypeMismatch;
+    return bound.run(bound.ptr, program, devset, metric, max_errors, subscores);
 }
 
 /// Report an ordered devset score sum as `dspy.Evaluate` does.
@@ -589,16 +625,25 @@ pub const BootstrapFewShotWithRandomSearch = struct {
         labeled_sample: bool = true,
     };
 
-    pub const Candidate = struct { seed: i64, score: f64 };
+    pub fn Candidate(comptime P: type) type {
+        return struct {
+            seed: i64,
+            score: f64,
+            subscores: []const f64,
+            program: P,
 
-    /// `candidates` is `best_program.candidate_programs` without the
-    /// programs: sorted by score, descending, stable.
-    pub fn Result(comptime P: type) type {
-        return struct { program: P, candidates: []Candidate };
+            fn higher(_: void, left: @This(), right: @This()) bool {
+                return left.score > right.score;
+            }
+        };
     }
 
-    /// `valset` defaults to `trainset`, as in DSPy. Result demos live in
-    /// `out`; every candidate is built in its own arena from `gpa`.
+    /// Candidates are runnable programs in stable descending score order.
+    pub fn Result(comptime P: type) type {
+        return struct { program: P, candidates: []const Candidate(P) };
+    }
+
+    /// `valset` defaults to `trainset`. Candidate state and scores live in `out`.
     pub fn compile(
         self: BootstrapFewShotWithRandomSearch,
         comptime P: type,
@@ -622,42 +667,51 @@ pub const BootstrapFewShotWithRandomSearch = struct {
         } else range_count;
         assert(candidate_count_max > 0);
         const val = if (valset) |set| if (set.len > 0) set else trainset else trainset;
-        const candidates = try out.alloc(Candidate, candidate_count_max);
+        const candidates = try out.alloc(Candidate(P), candidate_count_max);
         var count: usize = 0;
-        var best: P = undefined;
-        var best_score: f64 = 0;
-        var best_arena: ?std.heap.ArenaAllocator = null;
-        defer if (best_arena) |*a| a.deinit();
+        var best: usize = 0;
 
         var seed: i64 = -3;
         while (seed < end) : (seed += 1) {
             if (!selected(seed, options.restrict)) continue;
-            var arena_state: std.heap.ArenaAllocator = .init(gpa);
-            var kept = false;
-            defer if (!kept) arena_state.deinit();
-            const program = try self.candidate(P, arena_state.allocator(), gpa, ctx, student, teacher, trainset, seed, options.labeled_sample);
-            const result = try evaluateWith(P, self.concurrent_evaluation, gpa, ctx, &program, val, self.metric, self.max_errors);
-            if (count == 0 or result.score > best_score) {
-                best_score = result.score;
-                if (best_arena) |*a| a.deinit();
-                best_arena = arena_state;
-                kept = true;
-                best = program;
-            }
+            const program = try self.candidate(
+                P,
+                out,
+                gpa,
+                ctx,
+                student,
+                teacher,
+                trainset,
+                seed,
+                options.labeled_sample,
+            );
+            const subscores = try out.alloc(f64, val.len);
+            const result = try evaluateWithScores(
+                P,
+                self.concurrent_evaluation,
+                gpa,
+                ctx,
+                &program,
+                val,
+                self.metric,
+                self.max_errors,
+                subscores,
+            );
             assert(count < candidates.len);
-            candidates[count] = .{ .seed = seed, .score = result.score };
+            if (count == 0 or result.score > candidates[best].score) best = count;
+            candidates[count] = .{
+                .seed = seed,
+                .score = result.score,
+                .program = program,
+                .subscores = subscores,
+            };
             count += 1;
             if (self.stop_at_score) |stop| if (result.score >= stop) break;
         }
         assert(count > 0);
 
-        var program = best;
-        for (try predict.namedPredictors(out, &program)) |p| {
-            const demos = try out.alloc(Record, p.param.predict.demos.len);
-            for (demos, p.param.predict.demos) |*d, *src| d.* = try value.cloneRecord(out, src);
-            p.param.predict.demos = demos;
-        }
-        std.sort.insertion(Candidate, candidates[0..count], {}, scoreGreater);
+        const program = candidates[best].program;
+        std.sort.insertion(Candidate(P), candidates[0..count], {}, Candidate(P).higher);
         return .{ .program = program, .candidates = candidates[0..count] };
     }
 
@@ -675,10 +729,6 @@ pub const BootstrapFewShotWithRandomSearch = struct {
             }
         }
         return false;
-    }
-
-    fn scoreGreater(_: void, a: Candidate, b: Candidate) bool {
-        return a.score > b.score;
     }
 
     fn candidate(
@@ -700,14 +750,15 @@ pub const BootstrapFewShotWithRandomSearch = struct {
             return program;
         }
         if (seed == -2) return (LabeledFewShot{ .k = self.max_labeled_demos }).compile(P, arena, student, trainset, .{ .sample = labeled_sample });
-        const shuffled = try arena.dupe(Example, trainset);
+        const shuffled = if (seed >= 0) try gpa.dupe(Example, trainset) else null;
+        defer if (shuffled) |rows| gpa.free(rows);
         var size = self.max_bootstrapped_demos;
         if (seed >= 0) {
             // Fixed seeds permit zero bootstrapping; only a shuffled seed
             // consumes randint(1, max_bootstrapped_demos).
             if (self.max_bootstrapped_demos == 0) return error.InvalidBootstrapRange;
             var shuffle_rng = pyrandom.Random.init(@intCast(seed));
-            shuffle_rng.shuffle(Example, shuffled);
+            shuffle_rng.shuffle(Example, shuffled.?);
             var size_rng = pyrandom.Random.init(@intCast(seed));
             size = 1 + size_rng.randbelow(self.max_bootstrapped_demos);
         }
@@ -722,6 +773,6 @@ pub const BootstrapFewShotWithRandomSearch = struct {
         };
         // Only bootstrap consumes the teacher. Earlier reset/labeled candidates
         // may satisfy stop_at_score before an invalid Source list is encountered.
-        return (try optimizer.compile(P, arena, gpa, ctx, student, teacher, shuffled)).program;
+        return (try optimizer.compile(P, arena, gpa, ctx, student, teacher, shuffled orelse trainset)).program;
     }
 };

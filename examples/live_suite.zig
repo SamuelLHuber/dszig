@@ -106,7 +106,7 @@ pub const Pipeline = struct {
     /// Compiled program in `program.save()` format.
     artifact: []const u8,
     /// Random-search candidates (`candidate_programs`); empty otherwise.
-    candidates: []const dszig.optimize.BootstrapFewShotWithRandomSearch.Candidate = &.{},
+    candidates: []const CandidateSummary = &.{},
     /// MIPROv2 only: instruction candidates, `trial_logs` and the scores of
     /// `candidate_programs`.
     instructions: []const []const []const u8 = &.{},
@@ -319,13 +319,22 @@ fn pipeline(
     else
         try optimizer.compile(P, arena, gpa, ctx, student, null, trainset);
     const optimized = try dszig.optimize.evaluate(P, gpa, ctx, &compiled.program, devset, metric, 10);
+    const candidates = if (search) summaries: {
+        const rows = try arena.alloc(CandidateSummary, compiled.candidates.len);
+        for (compiled.candidates, rows) |candidate, *row| {
+            row.* = .{ .seed = candidate.seed, .score = candidate.score };
+        }
+        break :summaries rows;
+    } else &.{};
     return .{
         .baseline = baseline.score,
         .optimized = optimized.score,
         .artifact = try dszig.state.saveAlloc(arena, &compiled.program),
-        .candidates = if (search) compiled.candidates else &.{},
+        .candidates = candidates,
     };
 }
+
+const CandidateSummary = struct { seed: i64, score: f64 };
 
 fn runCase(
     comptime P: type,
