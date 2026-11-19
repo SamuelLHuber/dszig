@@ -2664,6 +2664,9 @@ handle, or null if every predictor is unbound. Mixed bound/unbound predictors,
 distinct LM identities, and modules without predictors return `error.MultipleLMs`.
 Program value copies retain model identity without owning the model.
 `PredictState.reset` and `predict.resetPredictors` clear both demos and bindings.
+When calling `PredictState.call` or `callMany` with a record, omitted input
+fields use their declared signature defaults in the prompt and trace. An
+explicit `null` stays `null`; the caller's record is not modified.
 
 Program save/dump now stores a bound LM's configuration rather than silently
 writing null. `lm.OpenAI` supports native configuration persistence, including

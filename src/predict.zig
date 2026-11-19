@@ -359,17 +359,34 @@ pub const PredictState = struct {
         var ctx = try state.resolveContext(ctx_in);
         ctx.lm_options.n = n;
         if (n > 1 and (ctx.lm_options.temperature orelse 0) <= 0.15) ctx.lm_options.temperature = 0.7;
-        const prepared = try state.prepare(ctx, inputs);
+        var defaulted_inputs: Record = undefined;
+        const prepared = try state.prepare(ctx, inputs, &defaulted_inputs);
         const outputs = try runPredict(state, ctx, prepared);
         if (ctx.trace) |t| try t.record(state, prepared.inputs, &outputs[0]);
         return outputs;
     }
 
-    fn prepare(state: *const PredictState, ctx: Context, inputs: *const Record) Error!PreparedCall {
+    fn prepare(state: *const PredictState, ctx: Context, inputs: *const Record, defaulted: *Record) Error!PreparedCall {
+        const view_ = try state.view(ctx.arena);
+        var missing_defaults: usize = 0;
+        for (view_.inputs) |field| {
+            // Explicit null is an input, not an omitted argument.
+            if (field.default_value != null and !inputs.contains(field.name)) missing_defaults += 1;
+        }
+        if (missing_defaults != 0) {
+            defaulted.* = .empty;
+            try defaulted.ensureTotalCapacity(ctx.arena, inputs.count() + missing_defaults);
+            for (inputs.keys(), inputs.values()) |key, item| defaulted.putAssumeCapacity(key, item);
+            for (view_.inputs) |field| {
+                const default = field.default_value orelse continue;
+                if (!inputs.contains(field.name))
+                    defaulted.putAssumeCapacity(field.name, try default(ctx.arena));
+            }
+        }
         const call_: PreparedCall = .{
             .signature_class = state.signature_class,
-            .view = try state.view(ctx.arena),
-            .inputs = inputs,
+            .view = view_,
+            .inputs = if (missing_defaults != 0) defaulted else inputs,
         };
         return if (ctx.preparation) |wrapper| wrapper.apply(ctx.arena, call_) else call_;
     }
@@ -1556,6 +1573,32 @@ pub fn getLM(arena: Allocator, program: anytype) (Allocator.Error || error{Multi
 }
 
 const testing = std.testing;
+
+test "record prediction renders and traces omitted defaults without replacing explicit null" {
+    const Sig = signature.Signature(struct {
+        pub const Input = struct { locale: []const u8 = "en-GB" };
+        pub const Output = struct { answer: i64 };
+    });
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var history: lm_mod.History = .{ .arena = arena };
+    var model: lm_mod.KeywordLM = .{ .rules = &.{}, .default = "<answer>1</answer>", .history = &history };
+    var trace: Trace = .{ .arena = arena };
+    const ctx: Context = .{ .arena = arena, .lm = model.lm(), .trace = &trace };
+    const program: Predict(Sig) = .{};
+    var input: Record = .empty;
+
+    _ = try program.state.call(ctx, &input);
+    try testing.expect(!input.contains("locale"));
+    try testing.expectEqualStrings("en-GB", trace.steps.items[0].inputs.get("locale").?.string);
+    const messages = history.requests.items[0].messages;
+    try testing.expect(std.mem.indexOf(u8, messages[messages.len - 1].content.text, "<locale>\nen-GB\n</locale>") != null);
+
+    try input.put(arena, "locale", .null);
+    _ = try program.state.call(ctx, &input);
+    try testing.expect(trace.steps.items[1].inputs.get("locale").? == .null);
+}
 
 test "bound LM precedence includes explicit null and fanout and resets without changing copies" {
     const Sig = signature.Signature(struct {
