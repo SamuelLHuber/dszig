@@ -3747,7 +3747,10 @@ The following prevent a claim that DSZig can do everything DSPy can:
   models and the total budget on adaptive models. Select `thinking_format`
   `.deepseek`, `.adaptive`, or `.effort` for compatible endpoints whose dial
   is effort-only. Those dialects send an explicit disabled block for an off
-  request and leave absent reasoning settings untouched. Canonical assistant
+  request and leave absent reasoning settings untouched. An optional
+  `reasoning_efforts` list clamps unsupported levels to the nearest supported
+  level (ties go lower); strict adaptation policy refuses the clamp.
+  Canonical assistant
   messages preserve signed and redacted thinking for subsequent requests.
   The Messages implementation has been compared against DSPy over loopback,
   not against a hosted Claude model. `Anthropic.streamRequest` emits
@@ -3762,8 +3765,8 @@ The following prevent a claim that DSZig can do everything DSPy can:
   resources are not supported. Canonical requests can declare hosted web
   search and code execution. Buffered responses expose citations in message
   order and retain hosted tool blocks in raw provider data rather than
-  treating them as client tool calls. Additional media kinds, unsigned
-  thinking replay and endpoint-specific effort allowlists are not supported.
+  treating them as client tool calls. Additional media kinds and unsigned
+  thinking replay are not supported.
   `Gemini.lm()` and `Gemini.completeRequest` support nonstreaming text,
   JSON/schema-constrained generation, and function calls with text results
   on the Gemini Developer API, with `x-goog-api-key` authentication and

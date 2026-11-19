@@ -39,6 +39,8 @@ pub const Anthropic = struct {
     /// Endpoints with implicit caching can opt out of explicit cache markers.
     cache_control: enum { anthropic, none } = .anthropic,
     thinking_format: enum { anthropic, deepseek, adaptive, effort } = .anthropic,
+    /// Borrowed endpoint effort levels, in their declared order for diagnostics.
+    reasoning_efforts: ?[]const sdk.ReasoningEffort = null,
     supports_reasoning: bool = false,
     supports_response_schema: bool = false,
     adaptations: enum { note, silent, refuse } = .note,
@@ -79,12 +81,18 @@ pub const Anthropic = struct {
             for (prefixes) |prefix| arena.free(prefix);
             arena.free(prefixes);
         };
+        const reasoning_efforts = if (self.reasoning_efforts) |levels|
+            try arena.dupe(sdk.ReasoningEffort, levels)
+        else
+            null;
+        errdefer if (reasoning_efforts) |levels| arena.free(levels);
         const copy = try arena.create(Anthropic);
         copy.* = self.*;
         copy.model = model;
         copy.base_url = base_url;
         copy.system_prefix = system_prefix;
         copy.model_prefixes = model_prefixes;
+        copy.reasoning_efforts = reasoning_efforts;
         return copy.lm();
     }
 
@@ -412,13 +420,14 @@ pub const Anthropic = struct {
         records: *std.ArrayList(sdk.Adaptation),
     ) Error!Value {
         const reasoning = fields.config.reasoning orelse return .null;
-        const effort = reasoning.effort orelse return error.LMFailure;
-        if (effort == .off) {
+        const asked = reasoning.effort orelse return error.LMFailure;
+        if (asked == .off) {
             if (self.thinking_format != .anthropic) {
                 try putThinking(arena, body, "disabled", false, .null);
             }
             return .null;
         }
+        const effort = try self.resolveEffort(arena, records, asked);
         if (reasoning.summary) |summary| if (summary != .auto) {
             try self.adapt(arena, records, "config.reasoning.summary", .substituted, "the Messages API has no summary detail levels; it returns one summary of the " ++
                 "thinking, which is 'auto'", str(@tagName(summary)), str("auto"));
@@ -469,6 +478,37 @@ pub const Anthropic = struct {
             try putThinking(arena, body, "enabled", display, budget);
         }
         return budget;
+    }
+
+    fn resolveEffort(
+        self: *const Anthropic,
+        arena: Allocator,
+        records: *std.ArrayList(sdk.Adaptation),
+        asked: sdk.ReasoningEffort,
+    ) Error!sdk.ReasoningEffort {
+        const levels = self.reasoning_efforts orelse return asked;
+        const nearest = try @import("openai_request.zig").nearestEffort(asked, levels);
+        if (nearest == asked) return asked;
+        var reason: std.Io.Writer.Allocating = .init(arena);
+        const writer = &reason.writer;
+        writer.print("this server has no '{s}' level (it accepts ", .{@tagName(asked)}) catch
+            return error.OutOfMemory;
+        for (levels, 0..) |level, index| {
+            if (index != 0) writer.writeAll(", ") catch return error.OutOfMemory;
+            writer.writeAll(@tagName(level)) catch return error.OutOfMemory;
+        }
+        writer.writeAll(") and would have accepted the word silently") catch
+            return error.OutOfMemory;
+        try self.adapt(
+            arena,
+            records,
+            "config.reasoning.effort",
+            .clamped,
+            reason.written(),
+            str(@tagName(asked)),
+            str(@tagName(nearest)),
+        );
+        return nearest;
     }
 
     fn putThinking(arena: Allocator, body: *Object, kind: []const u8, display: bool, budget: Value) Error!void {

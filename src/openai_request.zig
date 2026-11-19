@@ -1197,7 +1197,7 @@ const Builder = struct {
     }
 };
 
-fn nearestEffort(asked: ?sdk.ReasoningEffort, levels: []const sdk.ReasoningEffort) Error!sdk.ReasoningEffort {
+pub fn nearestEffort(asked: ?sdk.ReasoningEffort, levels: []const sdk.ReasoningEffort) Error!sdk.ReasoningEffort {
     std.debug.assert(asked != .off);
     const wanted = @backingInt(asked orelse .minimal);
     var nearest: ?sdk.ReasoningEffort = null;
