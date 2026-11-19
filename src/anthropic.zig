@@ -30,6 +30,8 @@ pub const Anthropic = struct {
     system_prefix: []const u8 = "",
     /// Borrowed allowed model prefixes for compatible endpoints. Null allows all.
     model_prefixes: ?[]const []const u8 = null,
+    /// Set to reject on endpoints whose model sampling is fixed.
+    sampling_params: enum { send, reject } = .send,
     supports_reasoning: bool = false,
     supports_response_schema: bool = false,
     adaptations: enum { note, silent, refuse } = .note,
@@ -432,17 +434,40 @@ pub const Anthropic = struct {
     }
 
     fn addSampling(self: *const Anthropic, arena: Allocator, body: *Object, config: *const sdk.Config, records: *std.ArrayList(sdk.Adaptation)) Error!void {
+        if (self.sampling_params == .reject) {
+            inline for (.{ "temperature", "top_p", "top_k" }) |name| {
+                const asked: Value = if (comptime std.mem.eql(u8, name, "top_k"))
+                    config.top_k
+                else if (@field(config, name)) |number|
+                    .{ .float = number }
+                else
+                    .null;
+                if (asked != .null) {
+                    try self.adapt(
+                        arena,
+                        records,
+                        "config." ++ name,
+                        .dropped,
+                        "this server ignores sampling parameters (the model's sampling is fixed)",
+                        asked,
+                        .null,
+                    );
+                }
+            }
+        }
         inline for (.{ "seed", "frequency_penalty", "presence_penalty" }) |name| {
             const asked: Value = if (comptime std.mem.eql(u8, name, "seed")) config.seed else if (@field(config, name)) |num| .{ .float = num } else .null;
             if (asked != .null) try self.adapt(arena, records, "config." ++ name, .dropped, "the Messages API has no " ++ name ++ " field", asked, .null);
         }
-        if (config.temperature) |temp| {
-            const applied: Value = .{ .float = @min(temp, 1) };
-            if (temp > 1) try self.adapt(arena, records, "config.temperature", .clamped, "the Messages API accepts temperature in [0, 1]; the canonical range is [0, 2]", .{ .float = temp }, applied);
-            try body.put(arena, "temperature", applied);
+        if (self.sampling_params == .send) {
+            if (config.temperature) |temp| {
+                const applied: Value = .{ .float = @min(temp, 1) };
+                if (temp > 1) try self.adapt(arena, records, "config.temperature", .clamped, "the Messages API accepts temperature in [0, 1]; the canonical range is [0, 2]", .{ .float = temp }, applied);
+                try body.put(arena, "temperature", applied);
+            }
+            if (config.top_p) |top_p| try body.put(arena, "top_p", .{ .float = top_p });
+            if (config.top_k != .null) try body.put(arena, "top_k", config.top_k);
         }
-        if (config.top_p) |top_p| try body.put(arena, "top_p", .{ .float = top_p });
-        if (config.top_k != .null) try body.put(arena, "top_k", config.top_k);
         if (config.stop.len != 0) try body.put(arena, "stop_sequences", try strings(arena, config.stop));
     }
 
@@ -1179,6 +1204,26 @@ test "Anthropic hosted blocks do not shift client calls, but citations do" {
     try std.testing.expectEqualStrings("Paris", parts[0].text.text);
     try std.testing.expectEqualStrings("https://example.org", parts[1].citation.url.?);
     try std.testing.expectEqualStrings("tool_2", parts[2].tool_call.id);
+}
+
+test "Anthropic fixed sampling omits explicit zero and refuses under strict policy" {
+    var backing: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer backing.deinit();
+    const arena = backing.allocator();
+    const request = try sdk.Request.fromFields(arena, &.{
+        .model = "fixture",
+        .messages = &.{.{ .role = .user, .parts = &.{.{ .text = .{ .text = "Next" } }} }},
+        .config = .{ .temperature = 0, .max_tokens = .{ .integer = 16 } },
+    });
+    defer request.release();
+    var provider: Anthropic = .{ .client = undefined, .model = "fixture", .sampling_params = .reject };
+    var records: std.ArrayList(sdk.Adaptation) = .empty;
+    const payload_bytes = try provider.requestBody(arena, request, &records, false);
+    const wire = try @import("json_repair.zig").parseJson(arena, payload_bytes);
+    try std.testing.expect(get(wire, "temperature") == .null);
+    try std.testing.expectEqualStrings("config.temperature", records.items[0].field);
+    provider.adaptations = .refuse;
+    try std.testing.expectError(error.LMFailure, provider.requestBody(arena, request, &records, false));
 }
 
 test "Anthropic rejects foreign canonical models before credentials" {
