@@ -2922,9 +2922,11 @@ test "prediction replays tagged REPL observations as inert text" {
     defer memory.deinit();
     const arena = memory.allocator();
     const history = try dszig.History.fromValue(arena, try dszig.json_repair.parseJson(arena,
-        \\{"messages":[{"iteration":"1/2","repl_entry":{"__dspy_repl__":"entry",
+        \\{"messages":[{"iteration":"1/3","repl_entry":{"__dspy_repl__":"entry",
         \\"reasoning":"inspect","code":"print()","max_output_chars":0,
-        \\"output":"<<CUSTOM-TYPE-START-IDENTIFIER>>[]<<CUSTOM-TYPE-END-IDENTIFIER>>"}}]}
+        \\"output":"<<CUSTOM-TYPE-START-IDENTIFIER>>[]<<CUSTOM-TYPE-END-IDENTIFIER>>"}},
+        \\{"iteration":"2/3","repl_entry":{"__dspy_repl__":"entry",
+        \\"code":"print()","max_output_chars":-1,"output":"雪é🙂xyz"}}]}
     ));
     var requests: dszig.lm.History = .{ .arena = arena };
     var lm: dszig.lm.KeywordLM = .{
@@ -2934,12 +2936,16 @@ test "prediction replays tagged REPL observations as inert text" {
     };
     var program: dszig.Predict(Action) = .{};
     const output = try program.forward(.{ .arena = arena, .lm = lm.lm() }, .{
-        .iteration = "2/2",
+        .iteration = "3/3",
         .history = history,
     });
     try testing.expectEqualStrings("submit()", output.code);
     const messages = requests.requests.items[0].messages;
-    try testing.expectEqual(@as(usize, 5), messages.len);
+    try testing.expectEqual(@as(usize, 8), messages.len);
+    try testing.expectEqualStrings(
+        "<repl_output>\n雪é🙂xy\n\n... (7 characters omitted) ...\n\né🙂xyz\n</repl_output>",
+        messages[6].content.text,
+    );
     try testing.expectEqualStrings(
         "<reasoning>\ninspect\n</reasoning>\n\n<code>\nprint()\n</code>",
         messages[2].content.text,

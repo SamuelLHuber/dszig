@@ -3791,8 +3791,8 @@ The following prevent a claim that DSZig can do everything DSPy can:
   action and observation turns through XML, Chat and JSON adapters without
   executing code. Observation truncation counts Unicode characters, and
   replayed code and observations cannot create provider media parts. This
-  supports persisted records with nonnegative observation limits, not
-  creation or resumption of an interpreter session.
+  preserves DSPy's slicing for zero and negative signed 64-bit observation
+  limits. Replay does not create or resume an interpreter session.
 - **Other modules and optimizers:** bounded native Avatar/AvatarOptimizer follow
   Source methods, with broken Source constructors and the explicit native
   capacity, class-identity, callback-ownership and serial-execution boundaries

@@ -145,7 +145,7 @@ fn appendReplEvent(
     const output = try replString(&entry.object, "output", null);
     const reasoning = try replString(&entry.object, "reasoning", "");
     const limit = entry.object.get("max_output_chars") orelse Value{ .integer = 10_000 };
-    if (limit != .integer or limit.integer < 0) return error.AdapterParse;
+    if (limit != .integer) return error.AdapterParse;
 
     var inputs: Record = .empty;
     var main_request = false;
@@ -180,7 +180,7 @@ fn appendReplEvent(
 
     var observation: Record = .empty;
     try observation.put(arena, "repl_output", .{
-        .string = try truncateReplOutput(arena, output, @intCast(limit.integer)),
+        .string = try truncateReplOutput(arena, output, limit.integer),
     });
     const rendered = try adapter.formatUser(selected, arena, .{
         .instructions = "",
@@ -276,22 +276,35 @@ fn escapeReplText(arena: Allocator, text: []const u8, omit_media: bool) Allocato
     return out.written();
 }
 
-fn truncateReplOutput(arena: Allocator, text: []const u8, limit: u64) adapter.Error![]const u8 {
-    if (text.len <= limit) return text;
+fn truncateReplOutput(arena: Allocator, text: []const u8, limit: i64) adapter.Error![]const u8 {
+    if (limit >= 0 and text.len <= @as(u64, @intCast(limit))) return text;
     const utf8 = std.unicode.Utf8View.init(text) catch return error.AdapterParse;
     const count = std.unicode.utf8CountCodepoints(text) catch return error.AdapterParse;
-    if (count <= limit) return text;
-    const head: usize = @intCast(limit / 2);
-    const tail: usize = @intCast(limit - head);
+    const length: i128 = count;
+    if (length <= limit) return text;
+
+    const half: i128 = @divFloor(limit, 2);
+    const head_end: usize = @intCast(if (half < 0) @max(0, length + half) else half);
+    // Negative limits use a positive slice start; -0 starts at zero.
+    const tail_start: usize = @intCast(if (limit < 0)
+        @min(length, -half)
+    else if (limit == 0)
+        0
+    else
+        length - (limit - half));
+
     var iter = utf8.iterator();
-    for (0..head) |_| _ = iter.nextCodepointSlice().?;
-    const head_end = iter.i;
-    // Python's output[-0:] is the entire output.
-    if (tail != 0) for (head..count - tail) |_| {
+    for (0..@min(head_end, tail_start)) |_| _ = iter.nextCodepointSlice().?;
+    const first = iter.i;
+    for (@min(head_end, tail_start)..@max(head_end, tail_start)) |_| {
         _ = iter.nextCodepointSlice().?;
-    };
+    }
+    const head_byte = if (head_end <= tail_start) first else iter.i;
+    const tail_byte = if (tail_start <= head_end) first else iter.i;
+
     var digits_buffer: [32]u8 = undefined;
-    const digits = std.fmt.bufPrint(&digits_buffer, "{d}", .{count - limit}) catch unreachable;
+    const omitted: u128 = @intCast(length - limit);
+    const digits = std.fmt.bufPrint(&digits_buffer, "{d}", .{omitted}) catch unreachable;
     var grouped_buffer: [48]u8 = undefined;
     var grouped_len: usize = 0;
     for (digits, 0..) |digit, index| {
@@ -303,11 +316,11 @@ fn truncateReplOutput(arena: Allocator, text: []const u8, limit: u64) adapter.Er
         grouped_len += 1;
     }
     return std.mem.concat(arena, u8, &.{
-        text[0..head_end],
+        text[0..head_byte],
         "\n\n... (",
         grouped_buffer[0..grouped_len],
         " characters omitted) ...\n\n",
-        text[iter.i..],
+        text[tail_byte..],
     });
 }
 
