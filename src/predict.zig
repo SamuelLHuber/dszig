@@ -61,6 +61,8 @@ pub const Context = struct {
     /// Privileged per-call override. Explicit null selects the settings LM.
     lm_override: ?lm_mod.LM = null,
     lm_override_present: bool = false,
+    /// Borrowed for the call: null uses stored demonstrations; empty clears them.
+    demos_override: ?[]const Record = null,
     adapter: Adapter = .xml,
     /// Borrowed extraction configuration when adapter is .two_step.
     two_step: ?*const TwoStepAdapter = null,
@@ -432,7 +434,8 @@ fn runPredict(predictor: *const PredictState, ctx: Context, prepared: PreparedCa
     for (prepared.view.outputs) |field| {
         if (field.decision) |binding| active = active or binding.automatic;
     }
-    if (!active) return runWithFallback(ctx, predictor, prepared.signature_class, prepared.view, predictor.demos, prepared.inputs);
+    const demos = ctx.demos_override orelse predictor.demos;
+    if (!active) return runWithFallback(ctx, predictor, prepared.signature_class, prepared.view, demos, prepared.inputs);
     if (native) if (ctx.stream_session) |session| {
         if (session.selects(predictor)) return error.UnsupportedStreamField;
     };
@@ -444,7 +447,7 @@ fn runPredict(predictor: *const PredictState, ctx: Context, prepared: PreparedCa
     var questions: Record = .empty;
     for (snapshot.types) |entry| try questions.put(ctx.arena, entry.field.name, try snapshot.question(ctx.arena, entry.field.name));
     const completions = if (native)
-        try runSystemOne(ctx, prepared, predictor.demos, snapshot, &questions)
+        try runSystemOne(ctx, prepared, demos, snapshot, &questions)
     else blk: {
         var wire = prepared.view;
         const fields = try ctx.arena.dupe(Field, wire.outputs);
@@ -470,8 +473,8 @@ fn runPredict(predictor: *const PredictState, ctx: Context, prepared: PreparedCa
             };
         }
         wire.outputs = fields;
-        if (predictor.demos.len != 0) {
-            const examples = try decisionDemos(ctx.arena, prepared.view, predictor.demos);
+        if (demos.len != 0) {
+            const examples = try decisionDemos(ctx.arena, prepared.view, demos);
             var instructions: std.Io.Writer.Allocating = .init(ctx.arena);
             instructions.writer.writeAll(wire.instructions) catch return error.OutOfMemory;
             instructions.writer.writeAll("\n\nTask examples (labels or evidence):\n") catch return error.OutOfMemory;
@@ -1597,6 +1600,35 @@ pub fn getLM(arena: Allocator, program: anytype) (Allocator.Error || error{Multi
 }
 
 const testing = std.testing;
+
+test "a zero-shot predictor invocation does not discard stored demos" {
+    const Sig = signature.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: []const u8 };
+    });
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var history: lm_mod.History = .{ .arena = arena };
+    var model: lm_mod.KeywordLM = .{
+        .rules = &.{},
+        .default = "<answer>Paris</answer>",
+        .history = &history,
+    };
+    var stored: Record = .empty;
+    try stored.put(arena, "question", .{ .string = "A stored question?" });
+    try stored.put(arena, "answer", .{ .string = "Berlin" });
+    var program: Predict(Sig) = .{};
+    program.state.demos = &.{stored};
+    const input: Sig.Input = .{ .question = "Capital of France?" };
+    const zero_shot = try program.forward(.{ .arena = arena, .lm = model.lm(), .demos_override = &.{} }, input);
+    const few_shot = try program.forward(.{ .arena = arena, .lm = model.lm() }, input);
+    try testing.expectEqualStrings("Paris", zero_shot.answer);
+    try testing.expectEqualStrings("Paris", few_shot.answer);
+    for (history.requests.items[0].messages) |message|
+        try testing.expect(std.mem.indexOf(u8, message.content.text, "A stored question?") == null);
+    try testing.expect(std.mem.indexOf(u8, history.requests.items[1].messages[1].content.text, "A stored question?") != null);
+}
 
 test "record prediction renders and traces omitted defaults without replacing explicit null" {
     const Sig = signature.Signature(struct {

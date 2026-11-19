@@ -2671,6 +2671,11 @@ Typed programs run from an `Example` also use declared input defaults for
 omitted arguments. Fields not marked as inputs are not passed to the program,
 even if a label has the same name as an input.
 
+Set `Context.demos_override` on an individual predictor call to replace its
+stored demonstrations without changing the program. Use `&.{}` for a zero-shot
+call or `null` to use the stored demonstrations. In a composed program, pass
+the override only to the child calls that should receive it.
+
 For OpenAI inference, set `Context.lm_options.prediction` to the predicted-output
 object. A record-based `Predict` call also moves a `prediction` argument with
 `type: "content"` and a `content` key into the LM options, overriding an
