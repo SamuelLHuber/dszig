@@ -3028,7 +3028,7 @@ pub const GEPA = struct {
                 shape.parents * shape.mutations > max_proposal_tasks)
                 return error.ProposalTaskLimitExceeded;
         }
-        assert(trainset.len > 0);
+        if (trainset.len == 0) return error.EmptyTrainset;
         if (self.val_evaluation_policy) |policy| {
             if (policy.max_batch_size == 0) return error.InvalidValidationBatch;
         }
@@ -3045,7 +3045,7 @@ pub const GEPA = struct {
         const owned = try out.create(P);
         owned.* = student;
         const preds = try predict.namedPredictors(out, owned);
-        assert(preds.len > 0);
+        if (preds.len == 0) return error.NoComponents;
         const max_calls: usize = if (self.auto) |a|
             autoBudget(preds.len, switch (a) {
                 .light => 6,
@@ -3514,6 +3514,16 @@ test "GEPA requires one budget and evaluates the seed even with a zero budget" {
         overflowing.compile(Program, arena, ctx, .{}, &examples, options),
     );
     const optimizer: GEPA = .{ .metric = Metric.score, .max_metric_calls = 0 };
+    const Plain = struct {
+        pub const Input = Sig.Input;
+        pub const Output = Sig.Output;
+        pub fn forward(_: *const @This(), _: Context, input: Input) error{}!Output {
+            return .{ .answer = input.question };
+        }
+    };
+    try std.testing.expectError(error.EmptyTrainset, optimizer.compile(Program, arena, ctx, .{}, &.{}, options));
+    try std.testing.expectError(error.NoComponents, optimizer.compile(Plain, arena, ctx, .{}, &examples, options));
+    try std.testing.expectEqual(@as(usize, 0), script.index);
     const result = try optimizer.compile(Program, arena, ctx, .{}, &examples, options);
     try std.testing.expect(result.best_outputs_valset == null);
     try std.testing.expectEqualSlices(f64, &.{ 1, 0 }, result.val_subscores[0]);

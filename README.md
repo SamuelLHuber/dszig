@@ -3956,6 +3956,9 @@ The following prevent a claim that DSZig can do everything DSPy can:
   `max_full_evals`, or `max_metric_calls`. Zero counts as a supplied budget;
   GEPA still evaluates the seed program before checking whether to stop.
   The native full-evaluation budget rejects overflow instead of wrapping.
+  GEPA returns `error.EmptyTrainset` for empty training data and
+  `error.NoComponents` for programs with no native predictors, before calling
+  the metric or model.
   GEPA returns the best candidate indices for each
   validation example, including ties. Set `track_best_outputs = true` to also
   retain their predictions in `best_outputs_valset`, in candidate discovery
