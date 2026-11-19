@@ -37,7 +37,63 @@ pub const Runtime = struct {
         pub fn query(self: *Execution, prompt: []const u8) ![]const u8 {
             if (prompt.len == 0) return error.EmptySubModelPrompt;
             try self.reserve(1);
-            return self.dispatch(self.ctx.arena, prompt, self.ctx.usage_failure);
+            return self.dispatch(self.ctx.arena, .{ .text = prompt }, self.ctx.usage_failure);
+        }
+
+        /// Dispatch one ordered list of canonical text/media parts without
+        /// rendering markers or allowing the LM to read a local file.
+        pub fn queryParts(self: *Execution, parts: []const Value) ![]const u8 {
+            try validateParts(parts);
+            try self.reserve(1);
+            return self.dispatch(self.ctx.arena, .{ .parts = parts }, self.ctx.usage_failure);
+        }
+
+        /// Validate the entire mixed batch before charging or dispatching.
+        /// As with queryBatch, empty text is allowed, but empty part lists are not.
+        pub fn queryContentBatch(
+            self: *Execution,
+            prompts: []const adapter.Content,
+            concurrency: ?BatchConcurrency,
+        ) ![]const []const u8 {
+            for (prompts) |prompt| switch (prompt) {
+                .text => {},
+                .parts => |parts| try validateParts(parts),
+            };
+            return self.batch(adapter.Content, prompts, concurrency);
+        }
+
+        fn validateParts(parts: []const Value) error{ EmptySubModelPrompt, InvalidSubModelPart, SubModelHostFile }!void {
+            if (parts.len == 0) return error.EmptySubModelPrompt;
+            for (parts) |part| {
+                if (part != .object) return error.InvalidSubModelPart;
+                if ((part.object.get("path") orelse .null) != .null) return error.SubModelHostFile;
+                const kind = part.object.get("type") orelse return error.InvalidSubModelPart;
+                if (kind != .string) return error.InvalidSubModelPart;
+                if (std.mem.eql(u8, kind.string, "text")) {
+                    if ((part.object.get("text") orelse Value{ .string = "" }) != .string)
+                        return error.InvalidSubModelPart;
+                    continue;
+                }
+                if (!std.mem.eql(u8, kind.string, "image") and
+                    !std.mem.eql(u8, kind.string, "audio") and
+                    !std.mem.eql(u8, kind.string, "document")) return error.InvalidSubModelPart;
+                const mime = part.object.get("media_type") orelse return error.InvalidSubModelPart;
+                if (mime != .string or mime.string.len == 0) return error.InvalidSubModelPart;
+                var sources: u8 = 0;
+                for ([_][]const u8{ "data", "url", "file_id" }) |key| {
+                    const source = part.object.get(key) orelse continue;
+                    if (source == .null) continue;
+                    if (source != .string or source.string.len == 0) return error.InvalidSubModelPart;
+                    sources += 1;
+                    if (std.mem.eql(u8, key, "data"))
+                        @import("file.zig").validateBase64(source.string) catch return error.InvalidSubModelPart;
+                }
+                if (sources != 1) return error.InvalidSubModelPart;
+            }
+        }
+
+        fn asContent(prompt: anytype) adapter.Content {
+            return if (@TypeOf(prompt) == adapter.Content) prompt else .{ .text = prompt };
         }
 
         /// Reserve the entire text batch before dispatch; retain input order. Empty
@@ -47,6 +103,15 @@ pub const Runtime = struct {
         pub fn queryBatch(
             self: *Execution,
             prompts: []const []const u8,
+            concurrency: ?BatchConcurrency,
+        ) ![]const []const u8 {
+            return self.batch([]const u8, prompts, concurrency);
+        }
+
+        fn batch(
+            self: *Execution,
+            comptime Prompt: type,
+            prompts: []const Prompt,
             concurrency: ?BatchConcurrency,
         ) ![]const []const u8 {
             if (prompts.len == 0) return &.{};
@@ -60,12 +125,12 @@ pub const Runtime = struct {
                 var start: usize = 0;
                 while (start < prompts.len) {
                     const end = start + @min(batch_workers, prompts.len - start);
-                    try self.dispatchWave(prompts[start..end], outputs[start..end], parallel, &first_error);
+                    try self.dispatchWave(Prompt, prompts[start..end], outputs[start..end], parallel, &first_error);
                     start = end;
                 }
             } else {
                 for (prompts, outputs) |prompt, *output| {
-                    collect(self.dispatch(self.ctx.arena, prompt, self.ctx.usage_failure), output, &first_error);
+                    collect(self.dispatch(self.ctx.arena, asContent(prompt), self.ctx.usage_failure), output, &first_error);
                 }
             }
             if (first_error) |err| return err;
@@ -82,7 +147,7 @@ pub const Runtime = struct {
                 task: *BatchTask,
                 execution: *const Execution,
                 arena: Allocator,
-                prompt: []const u8,
+                prompt: adapter.Content,
             ) std.Io.Cancelable!void {
                 task.result = execution.dispatch(
                     arena,
@@ -94,7 +159,8 @@ pub const Runtime = struct {
 
         fn dispatchWave(
             self: *const Execution,
-            prompts: []const []const u8,
+            comptime Prompt: type,
+            prompts: []const Prompt,
             outputs: [][]const u8,
             parallel: BatchConcurrency,
             first_error: *?lm.Error,
@@ -115,7 +181,7 @@ pub const Runtime = struct {
                 }
             }
             for (prompts, tasks[0..prompts.len]) |prompt, *task| {
-                try group.concurrent(parallel.io, BatchTask.run, .{ task, self, parallel.arena, prompt });
+                try group.concurrent(parallel.io, BatchTask.run, .{ task, self, parallel.arena, asContent(prompt) });
                 started += 1;
             }
             try group.await(parallel.io);
@@ -140,11 +206,11 @@ pub const Runtime = struct {
         fn dispatch(
             self: *const Execution,
             arena: Allocator,
-            prompt: []const u8,
+            prompt: adapter.Content,
             failure: ?*lm.AccountingFailure,
         ) lm.Error![]const u8 {
             return self.model.complete(arena, .{
-                .messages = &.{.{ .role = .user, .content = .{ .text = prompt } }},
+                .messages = &.{.{ .role = .user, .content = prompt }},
                 .usage_tracker = self.ctx.usage_tracker,
                 .usage_failure = failure,
             });

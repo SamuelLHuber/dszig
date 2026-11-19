@@ -3816,9 +3816,14 @@ The following prevent a claim that DSZig can do everything DSPy can:
   errors fail the batch. It runs serially by default; pass `BatchConcurrency`
   with a concurrency-capable `Io`, a thread-safe LM and a thread-safe arena
   to run up to eight requests at once. Workers are joined before return and
-  their text is retained by that arena. The loop does not provide multimodal
-  sub-LM queries, execute arbitrary Python, provide guest DSPy, or sandbox
-  runtime callbacks. The caller must enforce runtime time and memory limits.
+  their text is retained by that arena. `queryParts` accepts ordered canonical
+  text, image, audio and document parts; `queryContentBatch` accepts a mix of
+  text and part-list prompts with the same batch semantics. Parts are not
+  interpreted as adapter markers, and local paths are rejected before any
+  calls are charged. Actual media support depends on the sub-LM and its
+  provider. The loop does not execute arbitrary Python, provide guest DSPy,
+  or sandbox runtime callbacks. The caller must enforce runtime time and
+  memory limits.
 - **Other modules and optimizers:** bounded native Avatar/AvatarOptimizer follow
   Source methods, with broken Source constructors and the explicit native
   capacity, class-identity, callback-ownership and serial-execution boundaries

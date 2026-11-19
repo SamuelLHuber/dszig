@@ -106,7 +106,16 @@ test "RLM batch reserves atomically and isolates only provider failures" {
         ) dszig.lm.Error![]const dszig.lm.Completion {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
-            const prompt = request.messages[0].content.text;
+            const content = request.messages[0].content;
+            if (content == .parts) {
+                if (content.parts.len != 3) return error.ScriptExhausted;
+                const expected = [_][]const u8{ "text", "image", "text" };
+                for (content.parts, expected) |part, kind| {
+                    if (!std.mem.eql(u8, part.object.get("type").?.string, kind)) return error.ScriptExhausted;
+                }
+                return arena.dupe(dszig.lm.Completion, &.{.{ .text = "media" }});
+            }
+            const prompt = content.text;
             if (std.mem.eql(u8, prompt, "provider")) return error.LMFailure;
             if (std.mem.eql(u8, prompt, "contract")) return error.NoLM;
             return arena.dupe(dszig.lm.Completion, &.{.{ .text = "verified" }});
@@ -125,15 +134,35 @@ test "RLM batch reserves atomically and isolates only provider failures" {
         .ctx = &ctx,
         .calls_remaining = 4,
     };
+    const local = try std.json.parseFromSliceLeaky(dszig.runtime_value.Value, ctx.arena,
+        \\{"type":"image","media_type":"image/png","path":"/must-not-read"}
+    , .{});
+    const malformed = try std.json.parseFromSliceLeaky(dszig.runtime_value.Value, ctx.arena,
+        \\{"type":"image","media_type":"image/png","data":"not base64!"}
+    , .{});
+    try testing.expectError(error.SubModelHostFile, execution.queryContentBatch(&.{
+        .{ .text = "valid first" }, .{ .parts = &.{local} },
+    }, null));
+    try testing.expectError(error.InvalidSubModelPart, execution.queryContentBatch(&.{
+        .{ .parts = &.{malformed} },
+    }, null));
+    try testing.expectError(error.EmptySubModelPrompt, execution.queryParts(&.{}));
+    try testing.expectEqual(@as(u32, 4), execution.calls_remaining);
     try testing.expectError(error.SubModelCallLimit, execution.queryBatch(&.{
         "blank", "provider", "extra", "extra", "extra",
     }, null));
     try testing.expectEqual(@as(u32, 0), model.calls);
-    const outputs = try execution.queryBatch(&.{ "", "provider" }, null);
+    const parts = try std.json.parseFromSliceLeaky(dszig.Value, ctx.arena,
+        \\[{"type":"text","text":""},{"type":"image","media_type":"image/png","data":"eA=="},{"type":"text","text":"end"}]
+    , .{});
+    const outputs = try execution.queryContentBatch(&.{
+        .{ .text = "" }, .{ .parts = parts.array.items }, .{ .text = "provider" },
+    }, null);
     try testing.expectEqualStrings("verified", outputs[0]);
-    try testing.expectEqualStrings("[ERROR] LMFailure", outputs[1]);
+    try testing.expectEqualStrings("media", outputs[1]);
+    try testing.expectEqualStrings("[ERROR] LMFailure", outputs[2]);
 
-    try testing.expectError(error.NoLM, execution.queryBatch(&.{ "contract", "last" }, null));
+    try testing.expectError(error.NoLM, execution.queryBatch(&.{"contract"}, null));
     try testing.expectEqual(@as(u32, 4), model.calls);
     try testing.expectError(error.SubModelCallLimit, execution.query("over budget"));
 }
