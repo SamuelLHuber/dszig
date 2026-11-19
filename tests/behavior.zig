@@ -1431,9 +1431,28 @@ test "detailed evaluation preserves successful predictions after scratch reuse" 
         try testing.expect(row.prediction == null);
         try testing.expectEqual(@as(f64, -0.25), row.score);
     }
+    const limits: dszig.parallel.Limits = .{ .workers = 2, .tasks = 4, .attempts = 4, .failures = 4 };
+    const E = dszig.parallel.Evaluator(P, limits);
+    const evaluator = try testing.allocator.create(E);
+    defer testing.allocator.destroy(evaluator);
+    const buffers = try arena.alloc([4096]u8, limits.attempts);
+    var backing: [limits.attempts][]u8 = undefined;
+    for (buffers, &backing) |*buffer, *slot| slot.* = buffer;
+    const concurrent = blk: {
+        try evaluator.init(testing.io, .{}, &backing);
+        defer evaluator.deinit();
+        evaluator.failure_score = -0.25;
+        const ctx: dszig.Context = .{ .arena = arena, .lm = undefined };
+        break :blk try evaluator.evaluateDetailed(arena, &@as(
+            [limits.attempts]dszig.Context,
+            @splat(ctx),
+        ), &.{}, &devset, P.metric, .{ .max_errors = 3, .straggler_timeout_ns = 0 });
+    };
+    @memset(std.mem.sliceAsBytes(buffers), 0xaa);
+    try testing.expectEqual(result.summary, concurrent.summary);
     var bytes: std.Io.Writer.Allocating = .init(testing.allocator);
     defer bytes.deinit();
-    try result.writeCsv(testing.allocator, &bytes.writer, "reward");
+    try concurrent.writeCsv(testing.allocator, &bytes.writer, "reward");
     try testing.expectEqualStrings(
         "question,answer,reward\r\n" ++
             "first,first,1.0\r\n" ++

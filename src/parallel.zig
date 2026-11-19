@@ -381,7 +381,8 @@ pub fn Parallel(comptime Result: type, comptime limits: Limits) type {
 /// states, typed outputs and scratch allocators are created at initialization.
 /// Out-of-memory aborts the run, as in serial `optimize.evaluate`.
 pub fn Evaluator(comptime P: type, comptime limits: Limits) type {
-    const Pool = Parallel(f64, limits);
+    const Scored = struct { score: f64, prediction: optimize.RecordPrediction };
+    const Pool = Parallel(Scored, limits);
     const Storage = value.RecordStorage(@typeInfo(P.Output).@"struct".field_names.len);
     return struct {
         pool: Pool,
@@ -444,7 +445,9 @@ pub fn Evaluator(comptime P: type, comptime limits: Limits) type {
             var options = self.bound_options;
             options.max_errors = std.math.cast(u32, max_errors) orelse std.math.maxInt(u32);
             const typed: *const P = @ptrCast(@alignCast(program));
-            return self.evaluateScores(self.bound_contexts, typed, devset, metric, options, subscores);
+            return self.evaluateScores(self.bound_contexts, typed, devset, metric, options, .{
+                .subscores = subscores,
+            });
         }
 
         /// contexts supply independent per-attempt LM/retriever pointees; their
@@ -463,8 +466,33 @@ pub fn Evaluator(comptime P: type, comptime limits: Limits) type {
             metric: optimize.Metric,
             options: Options,
         ) !optimize.Evaluation {
-            return self.evaluateScores(contexts, program, devset, metric, options, null);
+            return self.evaluateScores(contexts, program, devset, metric, options, .{});
         }
+
+        /// Retain only winning predictions after all attempts have joined.
+        /// The output arena owns rows and predictions; rows borrow examples.
+        pub fn evaluateDetailed(
+            self: *Self,
+            out: std.mem.Allocator,
+            contexts: []const Context,
+            program: *const P,
+            devset: []const optimize.Example,
+            metric: optimize.Metric,
+            options: Options,
+        ) !optimize.DetailedEvaluation {
+            if (devset.len == 0) return error.EmptyDevset;
+            if (devset.len > limits.tasks) return error.TaskCapacity;
+            const rows = try out.alloc(optimize.EvaluationRow, devset.len);
+            const summary = try self.evaluateScores(contexts, program, devset, metric, options, .{
+                .rows = .{ .out = out, .items = rows },
+            });
+            return .{ .summary = summary, .rows = rows };
+        }
+
+        const Retention = struct {
+            subscores: ?[]f64 = null,
+            rows: ?struct { out: std.mem.Allocator, items: []optimize.EvaluationRow } = null,
+        };
 
         fn evaluateScores(
             self: *Self,
@@ -473,10 +501,11 @@ pub fn Evaluator(comptime P: type, comptime limits: Limits) type {
             devset: []const optimize.Example,
             metric: optimize.Metric,
             options: Options,
-            subscores: ?[]f64,
+            retention: Retention,
         ) !optimize.Evaluation {
             if (devset.len == 0) return error.EmptyDevset;
-            if (subscores) |scores| assert(scores.len == devset.len);
+            if (retention.subscores) |scores| assert(scores.len == devset.len);
+            if (retention.rows) |rows| assert(rows.items.len == devset.len);
             assert(contexts.len >= limits.attempts);
             assert(!options.return_failed_tasks);
             if (devset.len > limits.tasks) return error.TaskCapacity;
@@ -502,15 +531,25 @@ pub fn Evaluator(comptime P: type, comptime limits: Limits) type {
                         errors += 1;
                         break :blk self.failure_score;
                     },
-                    .value => |score| score.*,
+                    .value => |scored| scored.score,
                 };
                 sum += score;
-                if (subscores) |scores| scores[index] = score;
+                if (retention.subscores) |scores| scores[index] = score;
+                // Each attempt has a unique backing slot for this forward;
+                // its prediction is valid until the next forward reuses it.
+                if (retention.rows) |rows| rows.items[index] = .{
+                    .example = &devset[index],
+                    .prediction = switch (slot) {
+                        .value => |scored| try scored.prediction.clone(rows.out),
+                        .failed => null,
+                    },
+                    .score = score,
+                };
             }
             return optimize.summarize(sum, devset.len, errors);
         }
 
-        fn invoke(ptr: *anyopaque, attempt: Attempt, score: *f64) anyerror!void {
+        fn invoke(ptr: *anyopaque, attempt: Attempt, scored: *Scored) anyerror!void {
             const call: *Call = @ptrCast(@alignCast(ptr));
             const self = call.evaluator;
             assert(attempt.index < limits.attempts);
@@ -530,7 +569,7 @@ pub fn Evaluator(comptime P: type, comptime limits: Limits) type {
                 return err;
             };
             const state = &self.states[attempt.index];
-            score.* = scoreExample(self, ctx, call.example, &self.outputs[attempt.index], state) catch |err| {
+            scored.* = scoreExample(self, ctx, call.example, &self.outputs[attempt.index], state) catch |err| {
                 if (err == error.OutOfMemory) {
                     self.out_of_memory.store(true, .release);
                     self.pool.cancel();
@@ -545,9 +584,12 @@ pub fn Evaluator(comptime P: type, comptime limits: Limits) type {
             example: *const optimize.Example,
             output: *P.Output,
             state: *optimize.RecordPrediction.State,
-        ) !f64 {
+        ) !Scored {
             const prediction = try optimize.runProgramInto(P, ctx, self.program, example, output, state);
-            return self.metric(ctx.arena, example, &prediction, null);
+            return .{
+                .score = try self.metric(ctx.arena, example, &prediction, null),
+                .prediction = prediction,
+            };
         }
     };
 }

@@ -3282,6 +3282,9 @@ Use `optimize.evaluateDetailed` for serial evaluation with a configurable
 predictions in the output arena; a recoverable program or metric error
 produces a row with no prediction and the configured score. Rows borrow the
 original examples. The aggregate-only evaluator does not retain predictions.
+`parallel.Evaluator.evaluateDetailed` has the same result shape. It clones
+only the winning predictions after all attempts join, so rows survive
+subsequent evaluations and evaluator teardown.
 
 `DetailedEvaluation.writeJson` and `.writeCsv` write the evaluation table to a
 caller-owned writer. Supply the metric column name explicitly. Both preserve
