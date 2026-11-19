@@ -3765,8 +3765,9 @@ The following prevent a claim that DSZig can do everything DSPy can:
   resources are not supported. Canonical requests can declare hosted web
   search and code execution. Buffered responses expose citations in message
   order and retain hosted tool blocks in raw provider data rather than
-  treating them as client tool calls. Additional media kinds and unsigned
-  thinking replay are not supported.
+  treating them as client tool calls. Set `thinking_replay = .unsigned` only
+  on endpoints that accept unsigned thinking blocks. Signed and redacted
+  continuation still takes precedence. Additional media kinds are not supported.
   `Gemini.lm()` and `Gemini.completeRequest` support nonstreaming text,
   JSON/schema-constrained generation, and function calls with text results
   on the Gemini Developer API, with `x-goog-api-key` authentication and
