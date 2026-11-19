@@ -57,8 +57,8 @@ pub const BootstrapFewShotWithOptuna = struct {
     max_rounds: usize = 1,
     num_candidate_programs: usize = 16,
     concurrent_evaluation: ?optimize.ConcurrentEvaluation = null,
-    /// Native counterpart of DSPy settings.max_errors, for bootstrap/evaluate.
-    max_errors: usize = 10,
+    /// Null inherits the caller context for bootstrap and objective evaluation.
+    max_errors: ?usize = null,
     seed: ?u32 = null,
 
     pub fn Trial(comptime P: type) type {
@@ -152,7 +152,16 @@ pub const BootstrapFewShotWithOptuna = struct {
             }
             // No catch-and-continue: study.optimize's default catch=() aborts
             // on objective exceptions, including a later failed candidate.
-            const evaluation = try optimize.evaluateWith(P, self.concurrent_evaluation, gpa, ctx, &program, val, self.metric, self.max_errors);
+            const evaluation = try optimize.evaluateWith(
+                P,
+                self.concurrent_evaluation,
+                gpa,
+                ctx,
+                &program,
+                val,
+                self.metric,
+                self.max_errors orelse ctx.max_errors,
+            );
             const failed = std.math.isNan(evaluation.score);
             const state: tpe.State = if (failed) .fail else .complete;
             trial.* = .{ .number = number, .program = program, .params = saved, .score = if (failed) null else evaluation.score, .state = state };
@@ -468,6 +477,65 @@ test "BootstrapOptuna catches individual evaluation failures but never swallows 
     const abort_val = try testExamples(arena, &.{ "fail", "fail", "fail", "fail", "fail", "fail", "fail", "fail", "fail", "fail" });
     try testing.expectError(error.LMFailure, optimizer.compile(TestProgram, arena, testing.allocator, testing.io, ctx, .{ .fail = true }, null, 3, trainset, abort_val));
     try testing.expectError(error.LMFailure, optimizer.compile(TestProgram, arena, testing.allocator, testing.io, ctx, .{ .fail = true, .fail_after_first = true }, null, 3, trainset, abort_val));
+}
+
+test "BootstrapOptuna inherits the caller limit in bootstrap and trial evaluation" {
+    const Metric = struct {
+        fn score(
+            _: Allocator,
+            example: *const Example,
+            _: ?*const optimize.RecordPrediction,
+            _: ?*const predict.Trace,
+        ) value.ParseError!f64 {
+            if (std.mem.eql(u8, example.record.get("question").?.string, "fail"))
+                return error.ParseValue;
+            return 1;
+        }
+    };
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    const a = out.allocator();
+    var history: @import("lm.zig").History = .{ .arena = a };
+    var model: @import("lm.zig").KeywordLM = .{
+        .history = &history,
+        .rules = &.{},
+        .default = "<answer>yes</answer>",
+    };
+    const rows = try testExamples(a, &.{ "fail", "pass" });
+    const P = predict.Predict(TestSignature);
+    const opt: BootstrapFewShotWithOptuna = .{
+        .metric = Metric.score,
+        .num_candidate_programs = 1,
+        .max_labeled_demos = 1,
+        .seed = 0,
+    };
+    const ctx: predict.Context = .{ .arena = a, .lm = model.lm(), .max_errors = 1 };
+    try testing.expectError(error.ParseValue, opt.compile(
+        P,
+        a,
+        testing.allocator,
+        testing.io,
+        ctx,
+        .{},
+        null,
+        1,
+        rows,
+        rows[1..],
+    ));
+    try testing.expectEqual(@as(usize, 1), history.requests.items.len);
+    try testing.expectError(error.ParseValue, opt.compile(
+        P,
+        a,
+        testing.allocator,
+        testing.io,
+        ctx,
+        .{},
+        null,
+        0,
+        rows[1..],
+        rows,
+    ));
+    try testing.expectEqual(@as(usize, 2), history.requests.items.len);
 }
 
 test "BootstrapOptuna keeps supplied teacher demos but resets the implicit teacher" {

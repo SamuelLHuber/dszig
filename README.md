@@ -3469,6 +3469,8 @@ nested optimizer's own limit.
 `COPRO` inherits the caller context's limit for candidate evaluation. Setting
 `COPRO.max_errors` is a native override, not a translation of DSPy's
 `eval_kwargs["max_errors"]`, which DSPy 3.5 rejects during evaluation.
+`BootstrapFewShotWithOptuna` inherits the same caller setting for both
+bootstrap and trial evaluation; its explicit `max_errors` is a native override.
 
 SIMBA's `num_threads` is `rollouts`: a `Parallel(SIMBA.Run, limits).runner()` and
 per-attempt contexts supplying LM and retriever pointees. Trajectory sampling,
