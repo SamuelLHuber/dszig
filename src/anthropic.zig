@@ -34,11 +34,14 @@ pub const Anthropic = struct {
     sampling_params: enum { send, reject } = .send,
     /// Set to reject on endpoints that ignore disable_parallel_tool_use.
     parallel_tool_calls: enum { send, reject } = .send,
+    /// Set to reject on endpoints that accept but ignore response schemas.
+    structured_output: enum { send, reject } = .send,
     supports_reasoning: bool = false,
     supports_response_schema: bool = false,
     adaptations: enum { note, silent, refuse } = .note,
 
     pub fn lm(self: *Anthropic) lm_mod.LM {
+        const supports_schema = self.supports_response_schema and self.structured_output == .send;
         return .{
             .ptr = self,
             .vtable = &.{
@@ -49,8 +52,8 @@ pub const Anthropic = struct {
                 .clone = clone,
             },
             .supports_reasoning = self.supports_reasoning,
-            .supports_response_format = self.supports_response_schema,
-            .supports_response_schema = self.supports_response_schema,
+            .supports_response_format = supports_schema,
+            .supports_response_schema = supports_schema,
             .supports_function_calling = true,
         };
     }
@@ -316,7 +319,10 @@ pub const Anthropic = struct {
         }
         try self.addSampling(arena, &body, config, records);
         try self.addTools(arena, &body, fields, records);
-        try self.addOutput(arena, &body, config, records);
+        if (config.response_format) |format| {
+            try self.addFormat(arena, &body, config, format, records);
+        }
+        try self.addOutputOptions(arena, &body, config, records);
         // Extensions can replace system; the application prefix still comes first.
         if (self.system_prefix.len != 0) {
             try prependSystem(arena, &body, self.system_prefix);
@@ -533,39 +539,65 @@ pub const Anthropic = struct {
         }
     }
 
-    fn addOutput(self: *const Anthropic, arena: Allocator, body: *Object, config: *const sdk.Config, records: *std.ArrayList(sdk.Adaptation)) Error!void {
-        if (config.response_format) |format| {
-            const value = try project(arena, format);
-            if (!std.mem.eql(u8, text(get(value, "type")), "json_schema")) return error.LMFailure;
-            var schema = get(value, "schema");
-            if (schema != .object) return error.LMFailure;
-            const found = try @import("typesafe.zig").responseJudgments(arena, schema);
-            for (found) |judgment| {
-                if (judgment.kind == .box) continue;
-                switch (config.probabilities orelse .off) {
-                    .off => {},
-                    .required => return error.LMFailure,
-                    .if_available => try self.adapt(
-                        arena,
-                        records,
-                        "config.probabilities",
-                        .dropped,
-                        "this wire cannot measure a distribution over the declared keys; the answer carries the pick only",
-                        str("if_available"),
-                        .null,
-                    ),
-                }
-                break;
-            }
-            try encodeJudgmentSchema(arena, &schema, found);
-            var wire_format: Object = .empty;
-            try wire_format.put(arena, "type", str("json_schema"));
-            try wire_format.put(arena, "schema", schema);
-            const existing = body.get("output_config");
-            var output: Object = if (existing) |item| item.object else .empty;
-            try output.put(arena, "format", .{ .object = wire_format });
-            try body.put(arena, "output_config", .{ .object = output });
+    fn addFormat(
+        self: *const Anthropic,
+        arena: Allocator,
+        body: *Object,
+        config: *const sdk.Config,
+        format: sdk.JsonValue,
+        records: *std.ArrayList(sdk.Adaptation),
+    ) Error!void {
+        const value = try project(arena, format);
+        if (self.structured_output == .reject) {
+            return self.adapt(
+                arena,
+                records,
+                "config.response_format",
+                .dropped,
+                "this server accepts output_config.format and does not apply it; " ++
+                    "describe the shape in the prompt",
+                value,
+                .null,
+            );
         }
+        if (!std.mem.eql(u8, text(get(value, "type")), "json_schema")) return error.LMFailure;
+        var schema = get(value, "schema");
+        if (schema != .object) return error.LMFailure;
+        const found = try @import("typesafe.zig").responseJudgments(arena, schema);
+        for (found) |judgment| {
+            if (judgment.kind == .box) continue;
+            switch (config.probabilities orelse .off) {
+                .off => {},
+                .required => return error.LMFailure,
+                .if_available => try self.adapt(
+                    arena,
+                    records,
+                    "config.probabilities",
+                    .dropped,
+                    "this wire cannot measure a distribution over the declared keys; the answer carries the pick only",
+                    str("if_available"),
+                    .null,
+                ),
+            }
+            break;
+        }
+        try encodeJudgmentSchema(arena, &schema, found);
+        var wire_format: Object = .empty;
+        try wire_format.put(arena, "type", str("json_schema"));
+        try wire_format.put(arena, "schema", schema);
+        const existing = body.get("output_config");
+        var output: Object = if (existing) |item| item.object else .empty;
+        try output.put(arena, "format", .{ .object = wire_format });
+        try body.put(arena, "output_config", .{ .object = output });
+    }
+
+    fn addOutputOptions(
+        self: *const Anthropic,
+        arena: Allocator,
+        body: *Object,
+        config: *const sdk.Config,
+        records: *std.ArrayList(sdk.Adaptation),
+    ) Error!void {
         if (config.service_tier) |tier| try body.put(arena, "service_tier", str(tier));
         if (config.user_id) |user| {
             var metadata: Object = .empty;
@@ -1220,6 +1252,33 @@ test "Anthropic hosted blocks do not shift client calls, but citations do" {
     try std.testing.expectEqualStrings("Paris", parts[0].text.text);
     try std.testing.expectEqualStrings("https://example.org", parts[1].citation.url.?);
     try std.testing.expectEqualStrings("tool_2", parts[2].tool_call.id);
+}
+
+test "Anthropic format rejection retains adaptive effort without advertising schemas" {
+    var backing: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer backing.deinit();
+    const arena = backing.allocator();
+    const parse = @import("json_repair.zig").parseJson;
+    const request = try sdk.Request.fromValue(arena, try parse(arena,
+        \\{"model":"claude-opus-4-6","messages":[{"role":"user","parts":[{"type":"text","text":"Next"}]}],
+        \\"config":{"max_tokens":16,"reasoning":{"effort":"low"},
+        \\"response_format":{"type":"json_schema","schema":{"type":"object"}}}}
+    ));
+    defer request.release();
+    var provider: Anthropic = .{
+        .client = undefined,
+        .model = "fixture",
+        .supports_response_schema = true,
+        .structured_output = .reject,
+    };
+    try std.testing.expect(!provider.lm().supports_response_schema);
+    var records: std.ArrayList(sdk.Adaptation) = .empty;
+    const body = try parse(arena, try provider.requestBody(arena, request, &records, false));
+    const output = get(body, "output_config");
+    try std.testing.expectEqualStrings("low", text(get(output, "effort")));
+    try std.testing.expect(get(output, "format") == .null);
+    provider.adaptations = .refuse;
+    try std.testing.expectError(error.LMFailure, provider.requestBody(arena, request, &records, false));
 }
 
 test "Anthropic parallel-tool rejection preserves forced tool selection" {
