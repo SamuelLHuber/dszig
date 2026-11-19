@@ -454,6 +454,7 @@ pub fn Evaluator(comptime P: type, comptime limits: Limits) type {
         /// fields and its usage are valid only during the metric call, and a
         /// metric must `clone` what it keeps. With `track_usage` set and no
         /// active tracker the usage snapshot comes from the attempt scratch.
+        /// An empty devset returns `error.EmptyDevset` without scheduling work.
         pub fn evaluate(
             self: *Self,
             contexts: []const Context,
@@ -474,7 +475,7 @@ pub fn Evaluator(comptime P: type, comptime limits: Limits) type {
             options: Options,
             subscores: ?[]f64,
         ) !optimize.Evaluation {
-            assert(devset.len > 0);
+            if (devset.len == 0) return error.EmptyDevset;
             if (subscores) |scores| assert(scores.len == devset.len);
             assert(contexts.len >= limits.attempts);
             assert(!options.return_failed_tasks);

@@ -4105,6 +4105,8 @@ The following prevent a claim that DSZig can do everything DSPy can:
   Candidates are sorted by aggregate score, with ties preserving seed order.
   The candidate programs and scores use the caller's output allocator and
   do not trigger extra evaluations.
+  Serial and concurrent evaluation reject an empty validation set with
+  `error.EmptyDevset` instead of invoking the program or scheduling work.
   MIPROv2 `track_stats` retains native program values in trial order with
   stable score-ranked full and minibatch indices in `Result.tracked_programs`.
   Trial logs expose cumulative evaluation counts and distinguish minibatch

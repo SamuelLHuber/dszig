@@ -67,7 +67,8 @@ pub const Evaluation = struct {
 };
 
 /// Run `program` and `metric` over `devset`. Failed examples score 0; once
-/// `max_errors` failures accumulate, return an error.
+/// `max_errors` failures accumulate, return an error. An empty devset returns
+/// `error.EmptyDevset` before invoking the program or metric.
 pub fn evaluate(
     comptime P: type,
     gpa: Allocator,
@@ -90,7 +91,7 @@ fn evaluateScores(
     max_errors: usize,
     subscores: ?[]f64,
 ) !Evaluation {
-    assert(devset.len > 0);
+    if (devset.len == 0) return error.EmptyDevset;
     if (subscores) |scores| assert(scores.len == devset.len);
     // Static outer storage survives each scratch reset without consuming the
     // per-example backing budget. Retained optimizer runs use runProgram.

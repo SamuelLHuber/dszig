@@ -1408,7 +1408,34 @@ test "random search with concurrent evaluation ranks the same candidates as seri
     defer testing.allocator.destroy(evaluator);
     try evaluator.init(testing.io, .{}, &backing);
     defer evaluator.deinit();
+    try testing.expectError(error.EmptyDevset, dszig.optimize.evaluate(
+        rag.RAG,
+        testing.failing_allocator,
+        ctx,
+        &.{},
+        &.{},
+        rag.keywordMetric,
+        10,
+    ));
+    try testing.expectError(error.EmptyDevset, evaluator.evaluate(
+        &contexts,
+        &.{},
+        &.{},
+        rag.keywordMetric,
+        .{},
+    ));
     search.concurrent_evaluation = evaluator.concurrent(&contexts, .{ .straggler_timeout_ns = 0 });
+    try testing.expectError(error.EmptyDevset, search.compile(
+        rag.RAG,
+        out.allocator(),
+        testing.allocator,
+        ctx,
+        .{},
+        null,
+        &.{},
+        null,
+        .{ .restrict = &.{-3} },
+    ));
     const concurrent = try search.compile(rag.RAG, out.allocator(), testing.allocator, ctx, .{}, null, trainset, null, .{ .restrict = null, .labeled_sample = true });
 
     try testing.expectEqual(serial.candidates.len, concurrent.candidates.len);
