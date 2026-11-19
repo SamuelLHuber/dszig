@@ -20,6 +20,12 @@ pub const Runtime = struct {
     execute: *const fn (*anyopaque, []const u8, *Execution) anyerror!Result,
     close: *const fn (*anyopaque) void,
 
+    pub const BatchConcurrency = struct {
+        io: std.Io,
+        /// Must support concurrent allocations and retain the returned text until consumed.
+        arena: Allocator,
+    };
+
     pub const Execution = struct {
         variables: *const Record,
         model: lm.LM,
@@ -30,12 +36,117 @@ pub const Runtime = struct {
         /// The returned text is owned by the invocation arena.
         pub fn query(self: *Execution, prompt: []const u8) ![]const u8 {
             if (prompt.len == 0) return error.EmptySubModelPrompt;
-            if (self.calls_remaining == 0) return error.SubModelCallLimit;
-            self.calls_remaining -= 1;
-            return self.model.complete(self.ctx.arena, .{
+            try self.reserve(1);
+            return self.dispatch(self.ctx.arena, prompt, self.ctx.usage_failure);
+        }
+
+        /// Reserve the entire text batch before dispatch; retain input order. Empty
+        /// strings are valid here. Only LMFailure becomes an in-band observation.
+        /// Concurrency is explicit: the model and its dependencies must be safe
+        /// for concurrent calls. All workers finish before this method returns.
+        pub fn queryBatch(
+            self: *Execution,
+            prompts: []const []const u8,
+            concurrency: ?BatchConcurrency,
+        ) ![]const []const u8 {
+            if (prompts.len == 0) return &.{};
+            if (prompts.len > self.calls_remaining) return error.SubModelCallLimit;
+            const outputs = try self.ctx.arena.alloc([]const u8, prompts.len);
+            errdefer self.ctx.arena.free(outputs);
+            try self.reserve(@intCast(prompts.len));
+
+            var first_error: ?lm.Error = null;
+            if (concurrency) |parallel| {
+                var start: usize = 0;
+                while (start < prompts.len) {
+                    const end = start + @min(batch_workers, prompts.len - start);
+                    try self.dispatchWave(prompts[start..end], outputs[start..end], parallel, &first_error);
+                    start = end;
+                }
+            } else {
+                for (prompts, outputs) |prompt, *output| {
+                    collect(self.dispatch(self.ctx.arena, prompt, self.ctx.usage_failure), output, &first_error);
+                }
+            }
+            if (first_error) |err| return err;
+            return outputs;
+        }
+
+        const batch_workers = 8;
+
+        const BatchTask = struct {
+            result: lm.Error![]const u8 = undefined,
+            failure: lm.AccountingFailure = .{},
+
+            fn run(
+                task: *BatchTask,
+                execution: *const Execution,
+                arena: Allocator,
+                prompt: []const u8,
+            ) std.Io.Cancelable!void {
+                task.result = execution.dispatch(
+                    arena,
+                    prompt,
+                    if (execution.ctx.usage_failure != null) &task.failure else null,
+                );
+            }
+        };
+
+        fn dispatchWave(
+            self: *const Execution,
+            prompts: []const []const u8,
+            outputs: [][]const u8,
+            parallel: BatchConcurrency,
+            first_error: *?lm.Error,
+        ) !void {
+            std.debug.assert(prompts.len <= batch_workers);
+            std.debug.assert(prompts.len == outputs.len);
+            var tasks: [batch_workers]BatchTask = @splat(.{});
+            var group: std.Io.Group = .init;
+            var started: usize = 0;
+            defer {
+                // Join before reading tasks, including when dispatch fails partway.
+                group.cancel(parallel.io);
+                if (self.ctx.usage_failure) |failure| {
+                    for (tasks[0..started]) |task| {
+                        if (failure.first == null) failure.first = task.failure.first;
+                        failure.count +|= task.failure.count;
+                    }
+                }
+            }
+            for (prompts, tasks[0..prompts.len]) |prompt, *task| {
+                try group.concurrent(parallel.io, BatchTask.run, .{ task, self, parallel.arena, prompt });
+                started += 1;
+            }
+            try group.await(parallel.io);
+            for (tasks[0..started], outputs) |task, *output| collect(task.result, output, first_error);
+        }
+
+        fn collect(result: lm.Error![]const u8, output: *[]const u8, first_error: *?lm.Error) void {
+            output.* = result catch |err| switch (err) {
+                error.LMFailure => "[ERROR] LMFailure",
+                else => {
+                    if (first_error.* == null) first_error.* = err;
+                    return;
+                },
+            };
+        }
+
+        fn reserve(self: *Execution, count: u32) error{SubModelCallLimit}!void {
+            if (count > self.calls_remaining) return error.SubModelCallLimit;
+            self.calls_remaining -= count;
+        }
+
+        fn dispatch(
+            self: *const Execution,
+            arena: Allocator,
+            prompt: []const u8,
+            failure: ?*lm.AccountingFailure,
+        ) lm.Error![]const u8 {
+            return self.model.complete(arena, .{
                 .messages = &.{.{ .role = .user, .content = .{ .text = prompt } }},
                 .usage_tracker = self.ctx.usage_tracker,
-                .usage_failure = self.ctx.usage_failure,
+                .usage_failure = failure,
             });
         }
     };

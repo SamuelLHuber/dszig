@@ -3810,10 +3810,15 @@ The following prevent a claim that DSZig can do everything DSPy can:
   record through `variables` and call `query` to dispatch a text-only sub-LM
   request. It uses `sub_lm` when configured, otherwise the context LM.
   `max_llm_calls` is shared across that invocation's actions; empty prompts do
-  not consume it, but failed dispatched calls do. The loop does not provide
-  batched or multimodal sub-LM queries, execute arbitrary Python, provide guest
-  DSPy, or sandbox runtime callbacks. The caller must enforce runtime time and
-  memory limits.
+  not consume it, but failed dispatched calls do. `queryBatch` reserves all
+  calls before dispatch, accepts empty text prompts, preserves input order,
+  and converts native `LMFailure` to `[ERROR] LMFailure` per item. Other
+  errors fail the batch. It runs serially by default; pass `BatchConcurrency`
+  with a concurrency-capable `Io`, a thread-safe LM and a thread-safe arena
+  to run up to eight requests at once. Workers are joined before return and
+  their text is retained by that arena. The loop does not provide multimodal
+  sub-LM queries, execute arbitrary Python, provide guest DSPy, or sandbox
+  runtime callbacks. The caller must enforce runtime time and memory limits.
 - **Other modules and optimizers:** bounded native Avatar/AvatarOptimizer follow
   Source methods, with broken Source constructors and the explicit native
   capacity, class-identity, callback-ownership and serial-execution boundaries

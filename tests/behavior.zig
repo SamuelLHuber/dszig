@@ -95,6 +95,49 @@ test "custom RLM retains observations across runtime buffer reuse and closes on 
     try testing.expectEqual(@as(u32, 2), runtime.closes);
 }
 
+test "RLM batch reserves atomically and isolates only provider failures" {
+    const Model = struct {
+        calls: u32 = 0,
+
+        fn complete(
+            ptr: *anyopaque,
+            arena: Allocator,
+            request: dszig.lm.Request,
+        ) dszig.lm.Error![]const dszig.lm.Completion {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const prompt = request.messages[0].content.text;
+            if (std.mem.eql(u8, prompt, "provider")) return error.LMFailure;
+            if (std.mem.eql(u8, prompt, "contract")) return error.NoLM;
+            return arena.dupe(dszig.lm.Completion, &.{.{ .text = "verified" }});
+        }
+    };
+    var backing: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer backing.deinit();
+    var model: Model = .{};
+    const ctx: dszig.Context = .{
+        .arena = backing.allocator(),
+        .lm = .{ .ptr = &model, .vtable = &.{ .complete = Model.complete } },
+    };
+    var execution: dszig.rlm.Runtime.Execution = .{
+        .variables = &dszig.value.Record.empty,
+        .model = ctx.lm,
+        .ctx = &ctx,
+        .calls_remaining = 4,
+    };
+    try testing.expectError(error.SubModelCallLimit, execution.queryBatch(&.{
+        "blank", "provider", "extra", "extra", "extra",
+    }, null));
+    try testing.expectEqual(@as(u32, 0), model.calls);
+    const outputs = try execution.queryBatch(&.{ "", "provider" }, null);
+    try testing.expectEqualStrings("verified", outputs[0]);
+    try testing.expectEqualStrings("[ERROR] LMFailure", outputs[1]);
+
+    try testing.expectError(error.NoLM, execution.queryBatch(&.{ "contract", "last" }, null));
+    try testing.expectEqual(@as(u32, 4), model.calls);
+    try testing.expectError(error.SubModelCallLimit, execution.query("over budget"));
+}
+
 const BootstrapTraceSignature = dszig.Signature(struct {
     pub const Input = struct { token: []const u8 };
     pub const Output = struct { first: i64, second: i64, third: i64 = 9 };
