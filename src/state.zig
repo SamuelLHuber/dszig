@@ -33,17 +33,23 @@ pub const LoadOptions = struct {
 /// `module.dump_state()` plus the `metadata` key added by `save`.
 /// Read-only: `program` may be a const pointer.
 pub fn dumpState(arena: Allocator, program: anytype) SaveError!Value {
+    const P = @typeInfo(@TypeOf(program)).pointer.child;
     var root: Record = .empty;
-    // The parameter walk yields mutable pointers; nothing here writes through them.
-    for (try predict.namedParameters(arena, @constCast(program))) |p| {
-        try root.put(arena, p.name, switch (p.param) {
-            .predict => |s| try dumpPredict(arena, s),
-            .retrieve => |r| blk: {
-                var obj: Record = .empty;
-                try obj.put(arena, "k", .{ .integer = r.k });
-                break :blk .{ .object = obj };
-            },
-        });
+    // The synthetic optimizer path "self" is not part of standalone Predict state.
+    if (@hasDecl(P, "is_dszig_predict")) {
+        root = try dumpPredict(arena, &program.state);
+    } else {
+        // The parameter walk yields mutable pointers; nothing here writes through them.
+        for (try predict.namedParameters(arena, @constCast(program))) |p| {
+            try root.put(arena, p.name, switch (p.param) {
+                .predict => |s| .{ .object = try dumpPredict(arena, s) },
+                .retrieve => |r| blk: {
+                    var obj: Record = .empty;
+                    try obj.put(arena, "k", .{ .integer = r.k });
+                    break :blk .{ .object = obj };
+                },
+            });
+        }
     }
     var versions: Record = .empty;
     for (dependency_versions) |kv| try versions.put(arena, kv[0], .{ .string = kv[1] });
@@ -53,7 +59,7 @@ pub fn dumpState(arena: Allocator, program: anytype) SaveError!Value {
     return .{ .object = root };
 }
 
-fn dumpPredict(arena: Allocator, s: *const predict.PredictState) SaveError!Value {
+fn dumpPredict(arena: Allocator, s: *const predict.PredictState) SaveError!Record {
     var obj: Record = .empty;
     try obj.put(arena, "traces", .{ .array = .init(arena) });
     try obj.put(arena, "train", .{ .array = .init(arena) });
@@ -85,7 +91,7 @@ fn dumpPredict(arena: Allocator, s: *const predict.PredictState) SaveError!Value
         };
         try obj.put(arena, "fields", try value.cloneValue(arena, s.decision_fields));
     }
-    return .{ .object = obj };
+    return obj;
 }
 
 /// Write the state exactly as DSPy's `orjson` OPT_INDENT_2 | OPT_APPEND_NEWLINE.
@@ -109,6 +115,10 @@ pub fn saveAlloc(arena: Allocator, program: anytype) (error{JsonTooDeep} || Save
 /// Loaded strings and demos are copied into `arena`.
 pub fn loadState(arena: Allocator, program: anytype, state: Value, options: LoadOptions) LoadError!void {
     if (state != .object) return error.InvalidState;
+    const P = @typeInfo(@TypeOf(program)).pointer.child;
+    if (@hasDecl(P, "is_dszig_predict")) {
+        return loadPredict(arena, &program.state, &state.object, options);
+    }
     for (try predict.namedParameters(arena, program)) |p| {
         const saved = state.object.get(p.name) orelse return error.MissingState;
         if (saved != .object) return error.InvalidState;
@@ -196,12 +206,11 @@ test "state LM failures retain source partial commits and null clears an existin
     var program: predict.Predict(Sig) = .{};
     var model: lm.ScriptedLM = .{ .responses = &.{} };
     var saved = try dumpState(arena, &program);
-    const entry = saved.object.getPtr("self").?;
-    const sig = entry.object.getPtr("signature").?;
+    const sig = saved.object.getPtr("signature").?;
     try sig.object.put(arena, "instructions", .{ .string = "changed before failed LM restore" });
     var nonempty: Record = .empty;
     try nonempty.put(arena, "__lm_class__", .{ .string = "unknown.NativeLM" });
-    try entry.object.put(arena, "lm", .{ .object = nonempty });
+    try saved.object.put(arena, "lm", .{ .object = nonempty });
     program.state.lm = model.lm();
     try testing.expectError(error.MissingLMLoader, loadState(arena, &program, saved, .{}));
     try testing.expectEqualStrings("changed before failed LM restore", program.state.instructions);
@@ -209,7 +218,7 @@ test "state LM failures retain source partial commits and null clears an existin
     const falsy = [_]Value{ .null, .{ .bool = false }, .{ .integer = 0 }, .{ .string = "" }, .{ .array = .init(arena) }, .{ .object = .empty } };
     for (falsy) |item| {
         program.state.lm = model.lm();
-        try entry.object.put(arena, "lm", item);
+        try saved.object.put(arena, "lm", item);
         try loadState(arena, &program, saved, .{});
         try testing.expect(program.state.lm == null);
     }
