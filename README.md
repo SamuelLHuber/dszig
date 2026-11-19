@@ -4042,6 +4042,9 @@ The following prevent a claim that DSZig can do everything DSPy can:
   Automatic presets keep their own budgets.
   A zero instruction-candidate count with a nonempty predictor graph returns
   `error.InvalidOptions` rather than starting trial evaluation.
+  With zero demo candidates, the few-shot-aware proposer rejects the missing
+  demo set. If it is disabled, a manual few-shot search rejects an empty
+  categorical demo space before sampling a trial.
   SIMBA `Result.candidate_programs` retains the final native program values
   alongside their full-trainset scores, descending and stable across ties.
   It reuses the final evaluations and does not deep-copy opaque program state.
