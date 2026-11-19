@@ -30,6 +30,36 @@ pub const LoadOptions = struct {
     allow_unsafe_lm_state: bool = false,
 };
 
+/// Startup routing for a program with bindings from several native providers.
+pub const ProviderLoaders = struct {
+    openai: ?*lm.OpenAI.StateLoader = null,
+    anthropic: ?*@import("anthropic.zig").Anthropic.StateLoader = null,
+    gemini: ?*@import("gemini.zig").Gemini.StateLoader = null,
+
+    pub fn loader(self: *ProviderLoaders) lm.LM.StateLoader {
+        return .{ .ptr = self, .restore_engine = restore };
+    }
+
+    fn restore(ptr: *anyopaque, arena: Allocator, saved: Value) lm.StateError!lm.LM {
+        const self: *ProviderLoaders = @ptrCast(@alignCast(ptr));
+        if (saved != .object) return error.InvalidLMState;
+        const class = saved.object.get("__lm_class__") orelse return error.InvalidLMState;
+        if (class != .string) return error.InvalidLMState;
+        const selected = inline for (.{
+            .{ "dszig.lm.OpenAI", self.openai },
+            .{ "dszig.lm.Anthropic", self.anthropic },
+            .{ "dszig.lm.Gemini", self.gemini },
+        }) |entry| {
+            if (std.mem.eql(u8, class.string, entry[0])) {
+                const provider = entry[1] orelse return error.UnsupportedLMState;
+                break provider.loader();
+            }
+        } else return error.UnsupportedLMState;
+        // The outer StateLoader already validates and reapplies the public model mode.
+        return selected.restore_engine(selected.ptr, arena, saved);
+    }
+};
+
 /// `module.dump_state()` plus the `metadata` key added by `save`.
 /// Read-only: `program` may be a const pointer.
 pub fn dumpState(arena: Allocator, program: anytype) SaveError!Value {

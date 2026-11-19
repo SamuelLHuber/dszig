@@ -2700,6 +2700,14 @@ Express, supply the corresponding `door` and fully constructed `base_url`
 together. The runtime resources must outlive the loaded program. These are
 native provider records, not Python provider records or saved Live sessions.
 
+For a program with bound predictors from several native providers, pass
+`dszig.state.ProviderLoaders.loader()` instead. Set `openai`, `anthropic`, or
+`gemini` to pointers to the application-configured loaders for the providers you
+allow. An unknown or unconfigured provider fails with `UnsupportedLMState`.
+Each binding is restored with its own provider's runtime endpoint and credentials.
+The provider loaders need to exist during loading; the resources they inject
+must outlive the loaded program.
+
 Use `.{}` when loading programs without bound models. A nonempty LM state
 without a loader fails with `error.MissingLMLoader`, never a fake restored model.
 By default, loading removes the top-level `api_base`, `base_url` and `model_list`
