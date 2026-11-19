@@ -1382,6 +1382,57 @@ test "random search scores every seed, ranks them and keeps the best" {
     try testing.expectEqual(result.candidates[0].score, best.score);
 }
 
+test "detailed evaluation preserves successful predictions after scratch reuse" {
+    const P = struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: []const u8 };
+
+        pub fn forward(_: *const @This(), ctx: dszig.Context, input: Input) !Output {
+            if (std.mem.eql(u8, input.question, "program_error")) return error.BadQuestion;
+            return .{ .answer = try ctx.arena.dupe(u8, input.question) };
+        }
+
+        fn metric(
+            _: std.mem.Allocator,
+            example: *const dszig.Example,
+            _: ?*const dszig.optimize.RecordPrediction,
+            _: ?*const dszig.Trace,
+        ) dszig.value.ParseError!f64 {
+            if (std.mem.eql(u8, example.record.get("question").?.string, "metric_error"))
+                return error.ParseValue;
+            return 1;
+        }
+    };
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    const arena = out.allocator();
+    const inputs = &.{"question"};
+    const devset = [_]dszig.Example{
+        try dszig.Example.fromJson(arena, "{\"question\":\"first\"}", inputs),
+        try dszig.Example.fromJson(arena, "{\"question\":\"program_error\"}", inputs),
+        try dszig.Example.fromJson(arena, "{\"question\":\"metric_error\"}", inputs),
+        try dszig.Example.fromJson(arena, "{\"question\":\"last\"}", inputs),
+    };
+    const result = try dszig.optimize.evaluateDetailed(
+        P,
+        arena,
+        testing.allocator,
+        .{ .arena = arena, .lm = undefined },
+        &.{},
+        &devset,
+        P.metric,
+        .{ .failure_score = -0.25, .max_errors = 3 },
+    );
+    try testing.expectEqual(@as(f64, 37.5), result.summary.score);
+    try testing.expectEqual(@as(usize, 2), result.summary.errors);
+    try testing.expectEqualStrings("first", result.rows[0].prediction.?.get("answer").?.string);
+    try testing.expectEqualStrings("last", result.rows[3].prediction.?.get("answer").?.string);
+    for (result.rows[1..3]) |row| {
+        try testing.expect(row.prediction == null);
+        try testing.expectEqual(@as(f64, -0.25), row.score);
+    }
+}
+
 test "random search with concurrent evaluation ranks the same candidates as serial evaluation" {
     var out: std.heap.ArenaAllocator = .init(testing.allocator);
     defer out.deinit();

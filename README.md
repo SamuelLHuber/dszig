@@ -3277,6 +3277,12 @@ serial `optimize.evaluate` returns the triggering error. Out-of-memory, includin
 exhausted attempt scratch, cancels the run and returns `error.OutOfMemory`, as
 serially.
 
+Use `optimize.evaluateDetailed` for serial evaluation with a configurable
+`failure_score` and ordered per-example results. It retains successful
+predictions in the output arena; a recoverable program or metric error
+produces a row with no prediction and the configured score. Rows borrow the
+original examples. The aggregate-only evaluator does not retain predictions.
+
 ### Trace bootstrapping
 
 `bootstrapTraceData(P, out, ctx, &program, dataset, options)` is the native

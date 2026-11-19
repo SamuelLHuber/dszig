@@ -66,6 +66,48 @@ pub const Evaluation = struct {
     errors: usize,
 };
 
+pub const EvaluationRow = struct {
+    example: *const Example,
+    /// Null for either a program failure or a metric failure.
+    prediction: ?RecordPrediction,
+    score: f64,
+};
+
+pub const DetailedEvaluation = struct {
+    summary: Evaluation,
+    rows: []const EvaluationRow,
+};
+
+pub const EvaluationOptions = struct {
+    max_errors: usize = 10,
+    failure_score: f64 = 0,
+};
+
+/// Serial evaluation retaining predictions in devset order. Predictions and
+/// rows live in `out` (an arena); each row borrows its example from `devset`.
+pub fn evaluateDetailed(
+    comptime P: type,
+    out: Allocator,
+    gpa: Allocator,
+    ctx: Context,
+    program: *const P,
+    devset: []const Example,
+    metric: Metric,
+    options: EvaluationOptions,
+) !DetailedEvaluation {
+    if (devset.len == 0) return error.EmptyDevset;
+    const rows = try out.alloc(EvaluationRow, devset.len);
+    const summary = try evaluateScores(P, gpa, ctx, program, devset, metric, options, .{
+        .rows = .{ .out = out, .items = rows },
+    });
+    return .{ .summary = summary, .rows = rows };
+}
+
+const EvaluationRetention = struct {
+    subscores: ?[]f64 = null,
+    rows: ?struct { out: Allocator, items: []EvaluationRow } = null,
+};
+
 /// Run `program` and `metric` over `devset`. Failed examples score 0; once
 /// `max_errors` failures accumulate, return an error. An empty devset returns
 /// `error.EmptyDevset` before invoking the program or metric.
@@ -78,7 +120,7 @@ pub fn evaluate(
     metric: Metric,
     max_errors: usize,
 ) !Evaluation {
-    return evaluateScores(P, gpa, ctx, program, devset, metric, max_errors, null);
+    return evaluateScores(P, gpa, ctx, program, devset, metric, .{ .max_errors = max_errors }, .{});
 }
 
 fn evaluateScores(
@@ -88,11 +130,12 @@ fn evaluateScores(
     program: *const P,
     devset: []const Example,
     metric: Metric,
-    max_errors: usize,
-    subscores: ?[]f64,
+    options: EvaluationOptions,
+    retention: EvaluationRetention,
 ) !Evaluation {
     if (devset.len == 0) return error.EmptyDevset;
-    if (subscores) |scores| assert(scores.len == devset.len);
+    if (retention.subscores) |scores| assert(scores.len == devset.len);
+    if (retention.rows) |rows| assert(rows.items.len == devset.len);
     // Static outer storage survives each scratch reset without consuming the
     // per-example backing budget. Retained optimizer runs use runProgram.
     var storage: value.RecordStorage(@typeInfo(P.Output).@"struct".field_names.len) = undefined;
@@ -107,21 +150,24 @@ fn evaluateScores(
         var c = ctx;
         c.arena = scratch.allocator();
         c.trace = null;
-        const score: anyerror!f64 = if (runProgramInto(P, c, program, example, &output, &state)) |prediction|
-            metric(c.arena, example, &prediction, null)
+        const prediction = runProgramInto(P, c, program, example, &output, &state);
+        const scored = (if (prediction) |pred|
+            metric(c.arena, example, &pred, null)
         else |err|
-            err;
-        const scored = score catch |err| blk: {
+            err) catch |err| blk: {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             errors += 1;
-            if (errors >= max_errors) return err;
-            if (subscores) |scores| scores[index] = 0;
+            if (errors >= options.max_errors) return err;
             break :blk null;
         };
-        if (scored) |s| {
-            sum += s;
-            if (subscores) |scores| scores[index] = s;
-        }
+        const score = scored orelse options.failure_score;
+        sum += score;
+        if (retention.subscores) |scores| scores[index] = score;
+        if (retention.rows) |rows| rows.items[index] = .{
+            .example = example,
+            .prediction = if (scored != null) try (prediction catch unreachable).clone(rows.out) else null,
+            .score = score,
+        };
     }
     return summarize(sum, devset.len, errors);
 }
@@ -168,8 +214,16 @@ fn evaluateWithScores(
     max_errors: usize,
     subscores: ?[]f64,
 ) !Evaluation {
-    const bound = concurrent orelse
-        return evaluateScores(P, gpa, ctx, program, devset, metric, max_errors, subscores);
+    const bound = concurrent orelse return evaluateScores(
+        P,
+        gpa,
+        ctx,
+        program,
+        devset,
+        metric,
+        .{ .max_errors = max_errors },
+        .{ .subscores = subscores },
+    );
     if (bound.program_type != @import("runtime_value.zig").typeIdentity(P))
         return error.ProgramTypeMismatch;
     return bound.run(bound.ptr, program, devset, metric, max_errors, subscores);
