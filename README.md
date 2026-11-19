@@ -3741,6 +3741,10 @@ The following prevent a claim that DSZig can do everything DSPy can:
   Set `cache_control = .none` for endpoints with implicit caching. Explicit
   marks are omitted, unsupported long retention is reported, and references
   to stored cache resources still fail before HTTP.
+  `Anthropic.bindPreset` selects the documented Messages wire policy and
+  default endpoint for `.anthropic`, `.deepseek`, `.meta`, or `.moonshotai`.
+  Pass a trusted URL override for a proxy. Binding does not discover or
+  change credentials; supply credentials for the selected server.
   For compatible Claude models, set `supports_reasoning = true` to advertise
   native reasoning to typed predictors. Canonical requests support manual
   budgets and adaptive effort; `max_tokens` is the visible budget on manual

@@ -17,7 +17,7 @@ fn str(bytes: []const u8) Value {
 
 pub const Anthropic = struct {
     client: *std.http.Client,
-    base_url: []const u8 = "https://api.anthropic.com/v1",
+    base_url: []const u8 = Preset.anthropic.defaultUrl(),
     model: []const u8,
     api_key: ?[]const u8 = null,
     api_version: []const u8 = "2023-06-01",
@@ -48,6 +48,55 @@ pub const Anthropic = struct {
     supports_reasoning: bool = false,
     supports_response_schema: bool = false,
     adaptations: enum { note, silent, refuse } = .note,
+
+    pub const Preset = enum {
+        anthropic,
+        deepseek,
+        meta,
+        moonshotai,
+
+        pub fn defaultUrl(preset: Preset) []const u8 {
+            return switch (preset) {
+                .anthropic => "https://api.anthropic.com/v1",
+                .deepseek => "https://api.deepseek.com/anthropic/v1",
+                .meta => "https://api.meta.ai/v1",
+                .moonshotai => "https://api.moonshot.ai/anthropic/v1",
+            };
+        }
+    };
+
+    /// Bind wire policy and address together; credentials remain caller-supplied.
+    /// As in DSPy, the exact Anthropic default address selects the preset default.
+    pub fn bindPreset(self: *Anthropic, preset: Preset, base_url: ?[]const u8) void {
+        const default = Preset.anthropic.defaultUrl();
+        const requested = base_url orelse default;
+        self.base_url = if (std.mem.eql(u8, requested, default)) preset.defaultUrl() else requested;
+        self.thinking_format = switch (preset) {
+            .anthropic => .anthropic,
+            .deepseek => .deepseek,
+            .meta => .adaptive,
+            .moonshotai => .effort,
+        };
+        self.thinking_replay = if (preset == .moonshotai) .unsigned else .signed;
+        self.cache_control = if (preset == .anthropic) .anthropic else .none;
+        self.structured_output = if (preset == .deepseek) .reject else .send;
+        self.parallel_tool_calls = switch (preset) {
+            .deepseek, .moonshotai => .reject,
+            .anthropic, .meta => .send,
+        };
+        self.sampling_params = if (preset == .moonshotai) .reject else .send;
+        self.tool_result_media = switch (preset) {
+            .anthropic, .meta => .native,
+            .deepseek => .reject,
+            .moonshotai => .images,
+        };
+        self.model_prefixes = switch (preset) {
+            .anthropic, .meta => null,
+            .deepseek => &.{"deepseek-"},
+            .moonshotai => &.{"kimi-"},
+        };
+        self.reasoning_efforts = if (preset == .moonshotai) &.{ .low, .high, .max } else null;
+    }
 
     pub fn lm(self: *Anthropic) lm_mod.LM {
         const supports_schema = self.supports_response_schema and self.structured_output == .send;
