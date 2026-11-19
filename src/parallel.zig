@@ -430,7 +430,17 @@ pub fn Evaluator(comptime P: type, comptime limits: Limits) type {
             assert(contexts.len >= limits.attempts);
             self.bound_contexts = contexts;
             self.bound_options = options;
-            return .{ .ptr = self, .program_type = @import("runtime_value.zig").typeIdentity(P), .run = runBound };
+            return .{
+                .ptr = self,
+                .program_type = @import("runtime_value.zig").typeIdentity(P),
+                .contexts = boundAttemptContexts,
+                .run = runBound,
+            };
+        }
+
+        fn boundAttemptContexts(ptr: *anyopaque) []const Context {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            return self.bound_contexts[0..limits.attempts];
         }
 
         fn runBound(

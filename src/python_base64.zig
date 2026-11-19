@@ -12,6 +12,12 @@ pub fn decode(text: []const u8, destination: Output, padding: u2) error{InvalidB
     // CPython validates the whole string as ASCII before decoding, even when
     // an earlier padded quartet would otherwise terminate processing.
     for (text) |c| if (c > 127) return error.InvalidBase64;
+    return decodeIgnoringNonAlphabetBytes(text, destination, padding);
+}
+
+/// Decode an already-validated payload without copying ignorable whitespace.
+/// Unlike decode, this also skips bytes outside ASCII.
+pub fn decodeIgnoringNonAlphabetBytes(text: []const u8, destination: Output, padding: u2) error{InvalidBase64}!usize {
     var chunk: [4]u8 = undefined;
     var position: u3 = 0;
     var previous: u8 = 0;

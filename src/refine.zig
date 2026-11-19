@@ -3,6 +3,15 @@
 //! Python's inspect.getsource. All borrowed source slices must outlive Self.
 //! Attempt programs, signatures, advice, outputs and trace snapshots live in the
 //! call arena. Mutable program data must be stored by value, like BestOfN.
+//! Feedback uses typed or dynamic record fields (`void` input means no kwargs).
+//! Runtime lists/tuples and native arrays/slices of `Value` can supply result
+//! fields when they contain string-keyed pairs.
+//! Scalar results can win, but cannot supply feedback fields. Native scalar
+//! inputs likewise work until feedback needs keyword names that they lack.
+//! Canonical Prediction metadata and Python's general iteration protocol
+//! are not used.
+//! Trace rows remain snapshots, and tolerated failures affect the budget
+//! without printing DSPy's stdout diagnostics.
 
 const std = @import("std");
 const predict = @import("predict.zig");
@@ -98,19 +107,25 @@ pub fn Refine(comptime P: type) type {
         };
 
         pub fn forward(self: *Self, ctx: Context, input: Input) anyerror!Output {
+            const rollout = try best_of_n.rolloutContext(ctx, &self.module);
             if (self.n <= 0) return null;
-            const start = ctx.lm_options.rollout_id orelse Value{ .integer = 0 };
             var best: Selection = .{};
             var advice: Record = .empty;
             for (0..@as(usize, @intCast(self.n))) |index| {
-                var attempt_ctx = ctx;
                 // LM.copy and program.deepcopy are outside the caught region.
-                attempt_ctx.lm_options.rollout_id = try best_of_n.rolloutAt(ctx.arena, start, index);
-                attempt_ctx.lm_options.temperature = 1.0;
                 const module = try ctx.arena.create(P);
                 module.* = self.module;
                 const names = try predict.namedPredictors(ctx.arena, module);
+                var scope: predict.PredictRollout = undefined;
+                var attempt_ctx = try rollout.attempt(index, names, &scope);
+                const has_advice = advice.count() != 0;
+                const classes = if (has_advice) try SignatureName.capture(ctx.arena, names) else &.{};
+                const wrapper: HintWrapper = .{ .parent = ctx.preparation, .names = classes, .advice = advice };
+                if (has_advice) attempt_ctx.preparation = wrapper.preparation();
                 const stop = self.runIteration(ctx, attempt_ctx, module, names, &input, index, &best, &advice) catch |err| {
+                    // Cancellation and a native stream sink's .stop bypass
+                    // the retry budget, including during feedback.
+                    if (err == error.Canceled or err == error.StreamStopped) return err;
                     if (@as(i128, @intCast(index)) > self.fail_count) return err;
                     self.fail_count -= 1;
                     continue;
@@ -120,11 +135,7 @@ pub fn Refine(comptime P: type) type {
             // Feedback runs on the outer trace naturally. Only the winning
             // program trace is appended here; reward calls remain isolated.
             if (ctx.trace) |trace| {
-                for (best.steps) |step| try trace.steps.append(trace.arena, .{
-                    .predictor = step.predictor,
-                    .inputs = try value.cloneRecord(trace.arena, &step.inputs),
-                    .outputs = try value.cloneRecord(trace.arena, &step.outputs),
-                });
+                for (best.steps) |step| try trace.steps.append(trace.arena, try step.clone(trace.arena));
             }
             return best.output;
         }
@@ -144,8 +155,6 @@ pub fn Refine(comptime P: type) type {
             defer trace.steps.deinit(ctx.arena);
             var isolated = attempt_ctx;
             isolated.trace = &trace;
-            const wrapper: HintWrapper = .{ .parent = ctx.preparation, .names = names, .advice = advice.* };
-            if (advice.count() != 0) isolated.preparation = wrapper.preparation();
             const output = try module.forward(isolated, input.*);
             // Snapshot before reward callbacks can append/reallocate the trace.
             const steps = try ctx.arena.dupe(Trace.Step, trace.steps.items);
@@ -159,13 +168,14 @@ pub fn Refine(comptime P: type) type {
             if (index + 1 == @as(usize, @intCast(self.n))) return true;
             // Preserve an already-selected best and prior advice if feedback
             // fails. That failure consumes the same persistent attempt budget.
-            advice.* = try self.offerAdvice(ctx, names, steps, input, &output, reward);
+            advice.* = try self.offerAdvice(ctx, module, names, steps, input, &output, reward);
             return false;
         }
 
         fn offerAdvice(
             self: *const Self,
             ctx: Context,
+            module: *P,
             names: []const predict.NamedParam,
             steps: []const Trace.Step,
             input: *const Input,
@@ -173,6 +183,9 @@ pub fn Refine(comptime P: type) type {
             reward: f64,
         ) anyerror!Record {
             const arena = ctx.arena;
+            // Source re-enumerates for modules_defn after forward and reward.
+            // Trajectory labels and module_names still use the original map.
+            const modules_defn = try @import("simba.zig").inspectModules(arena, try predict.namedPredictors(arena, module));
             var trajectory: @import("runtime_value.zig").Array = .init(arena);
             try trajectory.ensureTotalCapacity(steps.len);
             for (steps) |step| {
@@ -190,8 +203,9 @@ pub fn Refine(comptime P: type) type {
             for (names) |named| module_names.appendAssumeCapacity(.{ .string = named.name });
             var inputs: Record = .empty;
             try inputs.put(arena, "program_code", .{ .string = self.module_code });
-            try inputs.put(arena, "modules_defn", .{ .string = try @import("simba.zig").inspectModules(arena, names) });
-            try inputs.put(arena, "program_inputs", try dumps(arena, .{ .object = try typedRecord(arena, Input, input.*) }));
+            try inputs.put(arena, "modules_defn", .{ .string = modules_defn });
+            const program_inputs: Record = if (Input == void) .empty else try typedRecord(arena, Input, input.*);
+            try inputs.put(arena, "program_inputs", try dumps(arena, .{ .object = program_inputs }));
             try inputs.put(arena, "program_trajectory", try dumps(arena, .{ .array = trajectory }));
             try inputs.put(arena, "program_outputs", try dumps(arena, .{ .object = try predictionRecord(arena, Prediction, output.*) }));
             try inputs.put(arena, "reward_code", .{ .string = self.reward_code });
@@ -202,7 +216,15 @@ pub fn Refine(comptime P: type) type {
             try inputs.put(arena, "module_names", try dumps(arena, .{ .array = module_names }));
             const adviser = try arena.create(predict.Predict(OfferFeedback));
             adviser.* = .{};
-            const result = try adviser.state.call(ctx, &inputs);
+            // DSPy invokes a fresh, unbound Predict with only feedback kwargs.
+            // Keep the ambient adapter, trace, and settings LM/options, but
+            // don't pass the wrapped program's privileged predictor arguments.
+            var adviser_ctx = ctx;
+            adviser_ctx.lm_override = null;
+            adviser_ctx.lm_override_present = false;
+            adviser_ctx.demos_override = null;
+            adviser_ctx.predict_config = null;
+            const result = try adviser.state.call(adviser_ctx, &inputs);
             return result.get("advice").?.object;
         }
     };
@@ -216,9 +238,25 @@ const hint_field: signature.Field = .{
     .prefix = "Hint :",
 };
 
+const SignatureName = struct {
+    class: *const anyopaque,
+    name: []const u8,
+
+    fn capture(arena: Allocator, names: []const predict.NamedParam) Allocator.Error![]SignatureName {
+        // DSPy's signature2name keys are captured before the program runs.
+        // A predictor assigning itself a fresh signature during forward does
+        // not move its advice to that class. Last name wins on shared classes.
+        const classes = try arena.alloc(SignatureName, names.len);
+        for (names, classes) |named, *entry| {
+            entry.* = .{ .class = named.param.predict.signature_class, .name = named.name };
+        }
+        return classes;
+    }
+};
+
 const HintWrapper = struct {
     parent: ?predict.Preparation,
-    names: []const predict.NamedParam,
+    names: []const SignatureName,
     advice: Record,
 
     fn preparation(self: *const HintWrapper) predict.Preparation {
@@ -228,8 +266,14 @@ const HintWrapper = struct {
     fn prepare(ptr: *const anyopaque, arena: Allocator, call: predict.PreparedCall) predict.Error!predict.PreparedCall {
         const self: *const HintWrapper = @ptrCast(@alignCast(ptr));
         var name: ?[]const u8 = null;
-        for (self.names) |named| {
-            if (named.param.predict.signature_class == call.signature_class) name = named.name;
+        var remaining = self.names.len;
+        while (remaining > 0) {
+            remaining -= 1;
+            const named = self.names[remaining];
+            if (named.class == call.signature_class) {
+                name = named.name;
+                break;
+            }
         }
         const hint = if (name) |key| self.advice.get(key) orelse Value{ .string = "N/A" } else Value{ .string = "N/A" };
         const inputs = try arena.create(Record);
@@ -266,6 +310,22 @@ const HintWrapper = struct {
 };
 
 fn typedRecord(arena: Allocator, comptime T: type, v: T) (feedback.Error || value.ConvertError)!Record {
+    // A runtime object represents the same keyword dictionary as a Record.
+    // Do not stringify scalar inputs or invent a keyword for them.
+    if (T == Value) {
+        if (v != .object) return error.TypeMismatch;
+        return typedRecord(arena, Record, v.object);
+    }
+    if (comptime T == Record or T == signature.StrDict or @import("types.zig").isDict(T)) {
+        // A typed dictionary's entries are its fields, not its Zig storage
+        // (`map` or `keys`/`values`). Preserve value types for recursive masking.
+        const object = try value.toValue(arena, T, v);
+        const mask = comptime feedback.masker(T);
+        return (if (mask) |apply| (try apply(arena, object)) orelse object else object).object;
+    }
+    // A native program may take a scalar instead of a keyword record. Only
+    // feedback needs named inputs; do not guess a key or fail compilation.
+    if (@typeInfo(T) != .@"struct") return error.TypeMismatch;
     var record = try value.toRecord(arena, T, v);
     inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types) |name, FT| {
         if (comptime feedback.masker(FT)) |mask| {
@@ -279,24 +339,92 @@ fn predictionRecord(arena: Allocator, comptime T: type, v: T) (feedback.Error ||
     if (@typeInfo(T) == .optional) {
         return if (v) |prediction| predictionRecord(arena, @typeInfo(T).optional.child, prediction) else error.InvalidPrediction;
     }
+    // These typed scalars have struct storage in Zig, but `value` and
+    // `index` are not Python prediction fields. Only feedback needs this
+    // projection; the reward and selection keep the original result type.
+    if (comptime T == @import("integer.zig").Integer or @import("literal.zig").isLiteral(T) or
+        @import("enum.zig").isEnum(T) or @import("decimal_type.zig").isDecimal(T))
+        return predictionRecord(arena, Value, try value.toValue(arena, T, v));
+    // DSPy uses dict(outputs) only when offering feedback. A scalar can still
+    // win an attempt; fail at feedback time, not when compiling the wrapper.
+    if (T == Value) {
+        if (v == .object) return typedRecord(arena, Record, v.object);
+        const pairs = feedbackSequence(v) orelse return error.InvalidPrediction;
+        return feedbackPairRecord(arena, pairs);
+    }
+    // These native containers already hold runtime pairs; borrow the slice
+    // instead of boxing an extra list or tuple just to read its elements.
+    const typed_pairs: ?[]const Value = switch (@typeInfo(T)) {
+        .array => |info| if (info.child == Value) &v else null,
+        .pointer => |info| if (info.size == .slice and info.child == Value) v else null,
+        else => null,
+    };
+    if (typed_pairs) |pairs| return feedbackPairRecord(arena, pairs);
+    if (@typeInfo(T) != .@"struct") return error.InvalidPrediction;
+    // Completion rows and usage attached to a canonical Prediction are not
+    // `dict(outputs)` fields.
+    if (comptime @import("prediction.zig").isPrediction(T)) return predictionRecord(arena, T.Fields, v.fields().*);
     return typedRecord(arena, T, v);
 }
 
+fn feedbackPairRecord(arena: Allocator, entries: []const Value) (feedback.Error || error{InvalidPrediction})!Record {
+    var fields: Record = .empty;
+    errdefer fields.deinit(arena);
+    for (entries) |entry| {
+        const pair = feedbackSequence(entry) orelse return error.InvalidPrediction;
+        // orjson refuses non-string dictionary keys. For duplicate string
+        // keys, dict() keeps the first insertion position and the last value.
+        if (pair.len != 2 or pair[0] != .string) return error.InvalidPrediction;
+        try fields.put(arena, pair[0].string, pair[1]);
+    }
+    // Mask only the final values, after duplicate resolution. This record is
+    // newly owned, so no copy is needed and the original pairs stay intact.
+    const mask = feedback.masker(Value).?;
+    for (fields.values()) |*item| {
+        if (try mask(arena, item.*)) |changed| item.* = changed;
+    }
+    return fields;
+}
+
+fn feedbackSequence(v: Value) ?[]const Value {
+    if (v == .array) return v.array.items;
+    const builtin = @import("python_value.zig").view(v) orelse return null;
+    return if (builtin == .tuple) builtin.tuple else null;
+}
+
 fn maskedFields(arena: Allocator, fields: []const signature.Field, record: *const Record) feedback.Error!Record {
-    var result = record.*;
-    var copied = false;
+    const runtime_mask = feedback.masker(Value).?;
+    var masked: ?Record = null;
+    var matched: usize = 0;
     for (fields) |field| {
-        const mask = field.refine_mask orelse continue;
-        const original = record.get(field.name) orelse continue;
-        if (try mask(arena, original)) |changed| {
-            if (!copied) {
-                result = try record.clone(arena);
-                copied = true;
-            }
-            result.getPtr(field.name).?.* = changed;
+        const item = record.get(field.name) orelse continue;
+        matched += 1;
+        // Declared metadata can recover a model flattened into a container,
+        // but an actual scalar is still a scalar. In particular, the adapter
+        // can replace a model-typed `hint_` input with an advice string.
+        const mask = switch (item) {
+            .array, .object, .custom => field.refine_mask orelse runtime_mask,
+            else => runtime_mask,
+        };
+        if (try mask(arena, item)) |changed| {
+            if (masked == null) masked = try record.clone(arena);
+            masked.?.getPtr(field.name).?.* = changed;
         }
     }
-    return result;
+    // Source masks the whole trace dictionary, not just signature fields.
+    // Extra kwargs and adapter-injected hints have only runtime type identity.
+    if (matched < record.count()) {
+        extra: for (record.keys(), record.values()) |name, item| {
+            for (fields) |field| {
+                if (std.mem.eql(u8, field.name, name)) continue :extra;
+            }
+            if (try runtime_mask(arena, item)) |changed| {
+                if (masked == null) masked = try record.clone(arena);
+                masked.?.getPtr(name).?.* = changed;
+            }
+        }
+    }
+    return masked orelse record.*;
 }
 
 fn dumps(arena: Allocator, v: Value) (Allocator.Error || error{ JsonTooDeep, AdapterParse })!Value {
@@ -626,4 +754,624 @@ test "Refine recursive masking retains Reasoning content but masks nested Code m
     try testing.expectEqualStrings("1e-6", (try dumps(arena, .{ .float = 1e-6 })).string);
     try testing.expectEqualStrings("1e+16", (try dumps(arena, .{ .float = 1e16 })).string);
     try testing.expectEqualStrings("-0.0", (try dumps(arena, .{ .float = -0.0 })).string);
+}
+
+test "Refine uses the original signature map and serializes canonical prediction fields" {
+    const Program = struct {
+        pub const Input = void;
+        pub const Output = predict.Prediction(Record);
+
+        qa: predict.Predict(TestSignature) = .{},
+        auxiliary: TestPair(false) = .{},
+        compiled: bool = false,
+
+        pub fn forward(self: *@This(), ctx: Context, _: Input) !Output {
+            self.auxiliary.compiled = true;
+            try self.qa.state.forkSignatureClass(ctx.arena);
+            self.qa.state.instructions = "Use the current instructions.";
+            const answer = try self.qa.forward(ctx, .{ .question = "q" });
+            const completions = try ctx.arena.alloc(Record, 2);
+            completions[0] = .empty;
+            completions[1] = .empty;
+            try completions[0].put(ctx.arena, "answer", .{ .string = answer.answer });
+            try completions[0].put(ctx.arena, "reasoning", try value.toValue(ctx.arena, signature.Reasoning, .{ .content = "a plan" }));
+            try completions[1].put(ctx.arena, "answer", .{ .string = "secondary" });
+            return Output.fromCompletions(ctx.arena, completions);
+        }
+
+        fn reward(_: Context, _: *const Input, output: *const Output) anyerror!f64 {
+            return std.fmt.parseFloat(f64, output.get("answer").?.string);
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var trace: Trace = .{ .arena = arena };
+    var lm: lm_mod.ScriptedLM = .{ .responses = &.{
+        "<answer>7</answer>",
+        "<discussion>Try again.</discussion><advice>{\"qa\":\"specific advice\"}</advice>",
+        "<answer>8</answer>",
+    } };
+    var refined = Refine(Program).init(.{}, .{
+        .n = 2,
+        .reward_fn = Program.reward,
+        .threshold = .{ .integer = 8 },
+        .module_code = "Program",
+        .reward_code = "reward",
+    });
+    const original_class = refined.module.qa.state.signature_class;
+    const result = (try refined.forward(.{ .arena = arena, .lm = lm.lm(), .trace = &trace }, {})).?;
+    try testing.expectEqualStrings("8", result.get("answer").?.string);
+    try testing.expectEqual(@as(usize, 3), lm.index);
+    try testing.expectEqual(@as(i128, 2), refined.fail_count);
+    try testing.expectEqual(@as(usize, 2), trace.steps.items.len);
+    const feedback_inputs = &trace.steps.items[0].inputs;
+    try testing.expectEqualStrings("{}", feedback_inputs.get("program_inputs").?.string);
+    try testing.expectEqualStrings(
+        "{\n  \"answer\": \"7\",\n  \"reasoning\": \"a plan\"\n}",
+        feedback_inputs.get("program_outputs").?.string,
+    );
+    const definitions = feedback_inputs.get("modules_defn").?.string;
+    try testing.expect(std.mem.indexOf(u8, definitions, "Use the current instructions.") != null);
+    try testing.expect(std.mem.indexOf(u8, definitions, "auxiliary.") == null);
+    try testing.expectEqualStrings(
+        "[\n  \"qa\",\n  \"auxiliary.first\",\n  \"auxiliary.last\"\n]",
+        feedback_inputs.get("module_names").?.string,
+    );
+    try testing.expectEqualStrings("N/A", trace.steps.items[1].inputs.get("hint_").?.string);
+    try testing.expectEqual(original_class, refined.module.qa.state.signature_class);
+}
+
+test "Refine resolves the LM before returning for an empty range" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    var refined = Refine(predict.Predict(TestSignature)).init(.{}, .{
+        .n = 0,
+        .fail_count = 2,
+        .reward_fn = testScore,
+        .threshold = null,
+        .module_code = "Predict",
+        .reward_code = "score",
+    });
+    const ctx: Context = .{ .arena = memory.allocator() };
+    try testing.expectError(error.NoLM, refined.forward(ctx, .{ .question = "q" }));
+    try testing.expectEqual(@as(i128, 2), refined.fail_count);
+}
+
+test "Refine masks undeclared trace kwargs without rewriting the selected trace" {
+    const QA = predict.Predict(TestSignature);
+    const Code = @import("code.zig").Code;
+    const Program = struct {
+        pub const Input = QA.Input;
+        pub const Output = QA.Output;
+
+        qa: QA = .{},
+        compiled: bool = false,
+
+        pub fn forward(self: *const @This(), ctx: Context, input: Input) !Output {
+            var kwargs: Record = .empty;
+            try kwargs.put(ctx.arena, "question", .{ .string = input.question });
+            try kwargs.put(ctx.arena, "extra_code", try Code.init("x = 1").toRuntime(ctx.arena));
+            try kwargs.put(ctx.arena, "extra_reasoning", try value.toValue(ctx.arena, signature.Reasoning, .{ .content = "a plan" }));
+            const result = try self.qa.state.call(ctx, &kwargs);
+            return .{ .answer = result.get("answer").?.string };
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var trace: Trace = .{ .arena = arena };
+    var lm: lm_mod.ScriptedLM = .{ .responses = &.{
+        "<answer>7</answer>",
+        "<discussion>Try again.</discussion><advice>{}</advice>",
+        "<answer>8</answer>",
+    } };
+    var refined = Refine(Program).init(.{}, .{
+        .n = 2,
+        .reward_fn = testScore,
+        .threshold = .{ .integer = 8 },
+        .module_code = "Program",
+        .reward_code = "score",
+    });
+    const result = (try refined.forward(.{ .arena = arena, .lm = lm.lm(), .trace = &trace }, .{ .question = "q" })).?;
+    try testing.expectEqualStrings("8", result.answer);
+    try testing.expectEqual(@as(usize, 3), lm.index);
+    try testing.expectEqual(@as(usize, 2), trace.steps.items.len);
+    const trajectory = trace.steps.items[0].inputs.get("program_trajectory").?.string;
+    try testing.expect(std.mem.indexOf(u8, trajectory, "\"extra_code\": \"<non-serializable: Code>\"") != null);
+    try testing.expect(std.mem.indexOf(u8, trajectory, "\"extra_reasoning\": \"a plan\"") != null);
+    const selected = trace.steps.items[1].inputs;
+    try testing.expectEqualStrings("x = 1", selected.get("extra_code").?.custom.get(Code).?.code);
+    try testing.expectEqualStrings("a plan", selected.get("extra_reasoning").?.custom.get(signature.Reasoning).?.content);
+}
+
+test "Refine masks the actual hint value rather than the overwritten field annotation" {
+    const HintModel = struct {
+        pub const model_name = "HintModel";
+        text: []const u8,
+    };
+    const Sig = signature.Signature(struct {
+        pub const instructions = "Answer the question.";
+        pub const Input = struct { question: []const u8, hint_: HintModel };
+        pub const Output = TestSignature.Output;
+    });
+    const Reward = struct {
+        fn score(_: Context, _: *const Sig.Input, output: *const Sig.Output) anyerror!f64 {
+            return std.fmt.parseFloat(f64, output.answer);
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var trace: Trace = .{ .arena = arena };
+    var lm: lm_mod.ScriptedLM = .{ .responses = &.{
+        "<answer>7</answer>",
+        "<discussion>Try again.</discussion><advice>{\"self\":\"repair once\"}</advice>",
+        "<answer>8</answer>",
+        "<discussion>Try again.</discussion><advice>{\"self\":\"repair once more\"}</advice>",
+        "<answer>9</answer>",
+    } };
+    var refined = Refine(predict.Predict(Sig)).init(.{}, .{
+        .n = 3,
+        .reward_fn = Reward.score,
+        .threshold = .{ .integer = 9 },
+        .module_code = "Predict",
+        .reward_code = "score",
+    });
+    const result = (try refined.forward(.{ .arena = arena, .lm = lm.lm(), .trace = &trace }, .{
+        .question = "q",
+        .hint_ = .{ .text = "original" },
+    })).?;
+    try testing.expectEqualStrings("9", result.answer);
+    try testing.expectEqual(@as(usize, 5), lm.index);
+    try testing.expectEqual(@as(usize, 3), trace.steps.items.len);
+    const first = trace.steps.items[0].inputs.get("program_trajectory").?.string;
+    const second = trace.steps.items[1].inputs.get("program_trajectory").?.string;
+    try testing.expect(std.mem.indexOf(u8, first, "\"hint_\": \"<non-serializable: HintModel>\"") != null);
+    try testing.expect(std.mem.indexOf(u8, second, "\"hint_\": \"repair once\"") != null);
+    try testing.expectEqualStrings("repair once more", trace.steps.items[2].inputs.get("hint_").?.string);
+}
+
+test "Refine adviser uses settings rather than the task predictor overrides" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var task_history: lm_mod.History = .{ .arena = arena };
+    var adviser_history: lm_mod.History = .{ .arena = arena };
+    var task_lm: lm_mod.ScriptedLM = .{
+        .responses = &.{ "<answer>7</answer>", "<answer>8</answer>" },
+        .history = &task_history,
+    };
+    var settings_lm: lm_mod.ScriptedLM = .{
+        .responses = &.{"<discussion>Try again.</discussion><advice>{}</advice>"},
+        .history = &adviser_history,
+    };
+    var demo: Record = .empty;
+    try demo.put(arena, "question", .{ .string = "task-demo-question" });
+    try demo.put(arena, "answer", .{ .string = "task-demo-answer" });
+    try demo.put(arena, "program_code", .{ .string = "task-demo-program" });
+    try demo.put(arena, "discussion", .{ .string = "task-demo-discussion" });
+    try demo.put(arena, "advice", .{ .object = .empty });
+    var trace: Trace = .{ .arena = arena };
+    var refined = Refine(predict.Predict(TestSignature)).init(.{}, .{
+        .n = 2,
+        .reward_fn = testScore,
+        .threshold = .{ .integer = 8 },
+        .module_code = "Predict",
+        .reward_code = "score",
+    });
+    const result = (try refined.forward(.{
+        .arena = arena,
+        .lm = settings_lm.lm(),
+        .lm_override = task_lm.lm(),
+        .lm_override_present = true,
+        .lm_options = .{ .rollout_id = .{ .integer = 97 }, .temperature = 0.25 },
+        .before_settings_rollout = .{ .rollout_id = .{ .integer = 7 }, .temperature = 0.25 },
+        .predict_config = &.{ .temperature = 0.6 },
+        .demos_override = &.{demo},
+        .trace = &trace,
+    }, .{ .question = "q" })).?;
+    try testing.expectEqualStrings("8", result.answer);
+    try testing.expectEqual(@as(usize, 2), task_history.requests.items.len);
+    try testing.expectEqual(@as(usize, 1), adviser_history.requests.items.len);
+    for (task_history.requests.items) |request| {
+        try testing.expectEqual(@as(?f64, 0.6), request.options.temperature);
+        try testing.expectEqual(@as(i64, 7), request.options.rollout_id.?.integer);
+        try testing.expect(for (request.messages) |message| {
+            if (std.mem.indexOf(u8, message.content.text, "task-demo-question") != null) break true;
+        } else false);
+    }
+    const adviser_request = adviser_history.requests.items[0];
+    try testing.expectEqual(@as(?f64, 0.25), adviser_request.options.temperature);
+    try testing.expectEqual(@as(i64, 97), adviser_request.options.rollout_id.?.integer);
+    for (adviser_request.messages) |message| {
+        try testing.expect(std.mem.indexOf(u8, message.content.text, "task-demo-") == null);
+    }
+    try testing.expectEqual(@as(usize, 2), trace.steps.items.len);
+    try testing.expect(trace.steps.items[0].outputs.contains("advice"));
+    try testing.expectEqualStrings("8", trace.steps.items[1].outputs.get("answer").?.string);
+}
+
+test "BestOfN keeps the ambient adviser and reward options in nested Refine" {
+    for ([_]bool{ false, true }) |task_bound| try checkNestedRollout(task_bound);
+}
+
+fn checkNestedRollout(task_bound: bool) !void {
+    const QA = predict.Predict(TestSignature);
+    const Inner = Refine(QA);
+    const Reward = struct {
+        fn inner(ctx: Context, input: *const QA.Input, output: *const QA.Output) anyerror!f64 {
+            const judge: QA = .{};
+            _ = try judge.forward(ctx, .{ .question = "judge" });
+            return testScore(ctx, input, output);
+        }
+
+        fn score(ctx: Context, input: *const Inner.Input, output: *const Inner.Output) anyerror!f64 {
+            return if (output.*) |prediction| testScore(ctx, input, &prediction) else 0;
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var task_history: lm_mod.History = .{ .arena = arena };
+    var adviser_history: lm_mod.History = .{ .arena = arena };
+    var task: lm_mod.ScriptedLM = .{
+        .responses = &.{ "<answer>7</answer>", "<answer>8</answer>" },
+        .history = &task_history,
+    };
+    var settings: lm_mod.ScriptedLM = .{
+        .responses = if (task_bound) &.{
+            "<answer>97</answer>",
+            "<discussion>Try again.</discussion><advice>{}</advice>",
+            "<answer>97</answer>",
+        } else &.{
+            "<answer>7</answer>",
+            "<answer>97</answer>",
+            "<discussion>Try again.</discussion><advice>{}</advice>",
+            "<answer>8</answer>",
+            "<answer>97</answer>",
+        },
+        .history = &adviser_history,
+    };
+    var qa: QA = .{};
+    if (task_bound) qa.state.lm = task.lm();
+    const inner = Inner.init(qa, .{
+        .n = 2,
+        .reward_fn = Reward.inner,
+        .threshold = .{ .integer = 8 },
+        .module_code = "Predict",
+        .reward_code = "score",
+    });
+    var outer = best_of_n.BestOfN(Inner).init(inner, .{
+        .n = 2,
+        .reward_fn = Reward.score,
+        .threshold = .{ .integer = 8 },
+    });
+    var trace: Trace = .{ .arena = arena };
+    const result = (try outer.forward(.{
+        .arena = arena,
+        .lm = settings.lm(),
+        .lm_options = .{ .rollout_id = .{ .integer = 97 }, .temperature = 0.25 },
+        .before_settings_rollout = .{ .rollout_id = .{ .integer = 7 }, .temperature = 0.25 },
+        .trace = &trace,
+    }, .{ .question = "q" })).?.?;
+    try testing.expectEqualStrings("8", result.answer);
+    var tasks: [2]lm_mod.Request = undefined;
+    var helpers: [3]lm_mod.Request = undefined;
+    if (task_bound) {
+        try testing.expectEqual(@as(usize, 2), task_history.requests.items.len);
+        try testing.expectEqual(@as(usize, 3), adviser_history.requests.items.len);
+        tasks = task_history.requests.items[0..2].*;
+        helpers = adviser_history.requests.items[0..3].*;
+    } else {
+        try testing.expectEqual(@as(usize, 5), adviser_history.requests.items.len);
+        const requests = adviser_history.requests.items;
+        tasks = .{ requests[0], requests[3] };
+        helpers = .{ requests[1], requests[2], requests[4] };
+    }
+    for (tasks, 0..) |request, index| {
+        try testing.expectEqual(@as(i64, @as(i64, if (task_bound) 7 else 97) + @as(i64, @intCast(index))), request.options.rollout_id.?.integer);
+        try testing.expectEqual(@as(?f64, 1), request.options.temperature);
+    }
+    for (helpers, 0..) |request, index| {
+        try testing.expectEqual(@as(i64, 97), request.options.rollout_id.?.integer);
+        try testing.expectEqual(@as(?f64, 0.25), request.options.temperature);
+        const prompt = request.messages[request.messages.len - 1].content.text;
+        try testing.expectEqual(index != 1, std.mem.indexOf(u8, prompt, "<question>\njudge\n</question>") != null);
+    }
+    try testing.expectEqual(@as(usize, 2), trace.steps.items.len);
+    try testing.expect(trace.steps.items[0].outputs.contains("advice"));
+    try testing.expectEqualStrings("q", trace.steps.items[1].inputs.get("question").?.string);
+    try testing.expectEqualStrings("8", trace.steps.items[1].outputs.get("answer").?.string);
+}
+
+test "Refine interruption keeps prior feedback but does not publish a selected attempt" {
+    const QA = predict.Predict(TestSignature);
+    inline for (.{ error.Canceled, error.StreamStopped }) |interruption| {
+        const Reward = struct {
+            fn score(ctx: Context, input: *const QA.Input, output: *const QA.Output) anyerror!f64 {
+                if (std.mem.eql(u8, output.answer, "8")) return interruption;
+                return testScore(ctx, input, output);
+            }
+        };
+        var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer memory.deinit();
+        const arena = memory.allocator();
+        var lm: lm_mod.ScriptedLM = .{ .responses = &.{
+            "<answer>7</answer>",
+            "<discussion>Try again.</discussion><advice>{}</advice>",
+            "<answer>8</answer>",
+            "<discussion>Should not be called.</discussion><advice>{}</advice>",
+            "<answer>9</answer>",
+        } };
+        var trace: Trace = .{ .arena = arena };
+        var refine = Refine(QA).init(.{}, .{
+            .n = 3,
+            .threshold = .{ .integer = 9 },
+            .reward_fn = Reward.score,
+            .module_code = "Predict",
+            .reward_code = "score",
+        });
+        try testing.expectError(interruption, refine.forward(
+            .{ .arena = arena, .lm = lm.lm(), .trace = &trace },
+            .{ .question = "q" },
+        ));
+        try testing.expectEqual(@as(usize, 3), lm.index);
+        try testing.expectEqual(@as(i128, 3), refine.fail_count);
+        try testing.expectEqual(@as(usize, 1), trace.steps.items.len);
+        try testing.expect(trace.steps.items[0].outputs.contains("advice"));
+    }
+}
+
+test "Refine selects scalar results and rejects them only when feedback needs fields" {
+    const QA = predict.Predict(TestSignature);
+    const Integer = @import("integer.zig").Integer;
+    const Decimal = @import("decimal_type.zig").Decimal;
+    const Literal = @import("literal.zig").Literal(&.{ .{ .integer = 7 }, .{ .integer = 8 } });
+    const Grade = @import("enum.zig").IntEnum("Grade", &.{
+        .{ .name = "SEVEN", .value = .{ .integer = 7 } },
+        .{ .name = "EIGHT", .value = .{ .integer = 8 } },
+    });
+    inline for (.{ i64, Integer, Decimal, Literal, Grade }) |Result| {
+        const Program = struct {
+            pub const Input = QA.Input;
+            pub const Output = Result;
+
+            qa: QA = .{},
+            compiled: bool = false,
+
+            pub fn forward(self: *const @This(), ctx: Context, input: Input) !Output {
+                const prediction = try self.qa.forward(ctx, input);
+                const number = try std.fmt.parseInt(i64, prediction.answer, 10);
+                const raw: Value = .{ .integer = number };
+                if (Output == Integer) return Integer.init(number);
+                if (Output == Decimal) return Decimal.coerce(ctx.arena, raw);
+                if (Output == Literal) return Literal.fromValue(raw);
+                if (Output == Grade) return Grade.fromValue(try Grade.member(if (number == 7) "SEVEN" else "EIGHT"));
+                return number;
+            }
+
+            fn score(ctx: Context, _: *const Input, output: *const Output) anyerror!f64 {
+                const result = try value.toValue(ctx.arena, Output, output.*);
+                return if (try value.numericOrder(result, .{ .integer = 7 }) == .eq) 7 else 8;
+            }
+        };
+        for ([_]i64{ 7, 8 }) |threshold| {
+            var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer memory.deinit();
+            const arena = memory.allocator();
+            var lm: lm_mod.ScriptedLM = .{ .responses = &.{ "<answer>7</answer>", "<answer>8</answer>" } };
+            var trace: Trace = .{ .arena = arena };
+            var refined = Refine(Program).init(.{}, .{
+                .n = 3,
+                .reward_fn = Program.score,
+                .threshold = .{ .integer = threshold },
+                .module_code = "ScalarProgram",
+                .reward_code = "score",
+            });
+            const selected = try refined.forward(.{
+                .arena = arena,
+                .lm = lm.lm(),
+                .lm_options = .{ .rollout_id = .{ .integer = 7 } },
+                .trace = &trace,
+            }, .{ .question = "q" });
+            const retried = threshold == 8;
+            const result = try value.toValue(arena, Result, selected.?);
+            try testing.expectEqual(@as(?std.math.Order, .eq), try value.numericOrder(result, .{ .integer = threshold }));
+            try testing.expectEqual(@as(usize, if (retried) 2 else 1), lm.index);
+            try testing.expectEqual(@as(i128, if (retried) 2 else 3), refined.fail_count);
+            try testing.expectEqual(@as(usize, 1), trace.steps.items.len);
+            try testing.expectEqualStrings(if (retried) "8" else "7", trace.steps.items[0].outputs.get("answer").?.string);
+        }
+    }
+}
+
+test "Refine projects runtime dictionary fields and pairs without changing the selected result" {
+    const QA = predict.Predict(TestSignature);
+    const python = @import("python_value.zig");
+    const Form = enum { object, list, tuple, invalid_key };
+    const Program = struct {
+        pub const Input = Value;
+        pub const Output = Value;
+
+        qa: QA = .{},
+        form: Form,
+        compiled: bool = false,
+
+        pub fn forward(self: *const @This(), ctx: Context, input: Input) !Output {
+            const prediction = try self.qa.state.call(ctx, &input.object);
+            const number = try std.fmt.parseInt(i64, prediction.get("answer").?.string, 10);
+            const answer: Value = .{ .integer = number };
+            if (number != 7) return answer;
+            const reasoning = try value.toValue(ctx.arena, signature.Reasoning, .{ .content = "a plan" });
+            if (self.form == .object) {
+                var record: Record = .empty;
+                try record.put(ctx.arena, "answer", answer);
+                try record.put(ctx.arena, "reasoning", reasoning);
+                return .{ .object = record };
+            }
+            const first_key: Value = if (self.form == .invalid_key) answer else .{ .string = "answer" };
+            const first = try pair(ctx.arena, &.{ first_key, .{ .integer = 0 } });
+            const middle: Value = .{ .array = .fromOwnedSlice(ctx.arena, try ctx.arena.dupe(Value, &.{ .{ .string = "reasoning" }, reasoning })) };
+            const last = try pair(ctx.arena, &.{ .{ .string = "answer" }, answer });
+            const entries = try ctx.arena.dupe(Value, &.{ first, middle, last });
+            return if (self.form == .tuple)
+                python.tupleFromOwnedSlice(ctx.arena, entries)
+            else
+                .{ .array = .fromOwnedSlice(ctx.arena, entries) };
+        }
+
+        fn pair(arena: Allocator, entries: []const Value) !Value {
+            return python.tupleFromOwnedSlice(arena, try arena.dupe(Value, entries));
+        }
+
+        fn score(_: Context, _: *const Input, output: *const Output) anyerror!f64 {
+            return if (output.* == .integer) @floatFromInt(output.integer) else 7;
+        }
+    };
+    for ([_]Form{ .object, .list, .tuple, .invalid_key }) |form| {
+        var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer memory.deinit();
+        const arena = memory.allocator();
+        const has_feedback = form != .invalid_key;
+        var lm: lm_mod.ScriptedLM = .{ .responses = if (has_feedback) &.{
+            "<answer>7</answer>",
+            "<discussion>Try again.</discussion><advice>{}</advice>",
+            "<answer>8</answer>",
+        } else &.{ "<answer>7</answer>", "<answer>8</answer>" } };
+        var trace: Trace = .{ .arena = arena };
+        var refined = Refine(Program).init(.{ .form = form }, .{
+            .n = 2,
+            .reward_fn = Program.score,
+            .threshold = .{ .integer = 8 },
+            .module_code = "DynamicProgram",
+            .reward_code = "score",
+        });
+        var kwargs: Record = .empty;
+        try kwargs.put(arena, "question", .{ .string = "q" });
+        try kwargs.put(arena, "extra_code", try @import("code.zig").Code.init("x = 1").toRuntime(arena));
+        const selected = (try refined.forward(.{ .arena = arena, .lm = lm.lm(), .trace = &trace }, .{ .object = kwargs })).?;
+        try testing.expectEqual(@as(i64, 8), selected.integer);
+        try testing.expectEqual(@as(usize, if (has_feedback) 3 else 2), lm.index);
+        try testing.expectEqual(@as(i128, if (has_feedback) 2 else 1), refined.fail_count);
+        try testing.expectEqual(@as(usize, if (has_feedback) 2 else 1), trace.steps.items.len);
+        if (has_feedback) {
+            try testing.expectEqualStrings(
+                "{\n  \"question\": \"q\",\n  \"extra_code\": \"<non-serializable: Code>\"\n}",
+                trace.steps.items[0].inputs.get("program_inputs").?.string,
+            );
+            try testing.expectEqualStrings(
+                "{\n  \"answer\": 7,\n  \"reasoning\": \"a plan\"\n}",
+                trace.steps.items[0].inputs.get("program_outputs").?.string,
+            );
+        }
+        try testing.expectEqualStrings("8", trace.steps.items[trace.steps.items.len - 1].outputs.get("answer").?.string);
+    }
+}
+
+test "Refine needs named inputs only for feedback" {
+    const QA = predict.Predict(TestSignature);
+    const Program = struct {
+        pub const Input = []const u8;
+        pub const Output = QA.Output;
+
+        qa: QA = .{},
+
+        pub fn forward(self: *const @This(), ctx: Context, question: Input) !Output {
+            return self.qa.forward(ctx, .{ .question = question });
+        }
+
+        fn score(_: Context, _: *const Input, output: *const Output) anyerror!f64 {
+            return std.fmt.parseFloat(f64, output.answer);
+        }
+    };
+    for ([_]i64{ 7, 8 }) |threshold| {
+        var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer memory.deinit();
+        const arena = memory.allocator();
+        var lm: lm_mod.ScriptedLM = .{ .responses = &.{ "<answer>7</answer>", "<answer>8</answer>" } };
+        var trace: Trace = .{ .arena = arena };
+        var refined = Refine(Program).init(.{}, .{
+            .n = 3,
+            .threshold = .{ .integer = threshold },
+            .reward_fn = Program.score,
+            .module_code = "ScalarInput",
+            .reward_code = "score",
+        });
+        const result = (try refined.forward(.{ .arena = arena, .lm = lm.lm(), .trace = &trace }, "q")).?;
+        const retried = threshold == 8;
+        try testing.expectEqualStrings(if (retried) "8" else "7", result.answer);
+        try testing.expectEqual(@as(usize, if (retried) 2 else 1), lm.index);
+        try testing.expectEqual(@as(i128, if (retried) 2 else 3), refined.fail_count);
+        try testing.expectEqual(@as(usize, 1), trace.steps.items.len);
+        try testing.expectEqualStrings("q", trace.steps.items[0].inputs.get("question").?.string);
+        try testing.expectEqualStrings(result.answer, trace.steps.items[0].outputs.get("answer").?.string);
+    }
+}
+
+test "Refine accepts native arrays and slices of runtime feedback pairs" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const pair: Value = .{ .array = .fromOwnedSlice(arena, try arena.dupe(Value, &.{
+        .{ .string = "answer" },
+        .{ .integer = 7 },
+    })) };
+    const pairs = [_]Value{pair};
+    inline for (.{ @TypeOf(pairs), []const Value }) |Result| {
+        const result: Result = if (Result == @TypeOf(pairs)) pairs else &pairs;
+        const record = try predictionRecord(arena, Result, result);
+        try testing.expectEqual(@as(usize, 1), record.count());
+        try testing.expectEqual(@as(i64, 7), record.get("answer").?.integer);
+    }
+}
+
+test "Refine sends typed dictionary entries rather than storage fields to feedback" {
+    const QA = predict.Predict(TestSignature);
+    const Code = @import("code.zig").Code;
+    const Program = struct {
+        pub const Input = signature.StrDict;
+        pub const Output = @import("types.zig").Dict(Code);
+
+        qa: QA = .{},
+        compiled: bool = false,
+
+        pub fn forward(self: *const @This(), ctx: Context, input: Input) !Output {
+            const answer = try self.qa.forward(ctx, .{ .question = input.map.get("question").?.string });
+            const code = Code.init(try std.fmt.allocPrint(ctx.arena, "x = {s}", .{answer.answer}));
+            return .{ .keys = &.{"implementation"}, .values = try ctx.arena.dupe(Code, &.{code}) };
+        }
+
+        fn score(_: Context, _: *const Input, output: *const Output) anyerror!f64 {
+            return std.fmt.parseFloat(f64, output.get("implementation").?.code["x = ".len..]);
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var lm: lm_mod.ScriptedLM = .{ .responses = &.{
+        "<answer>7</answer>",
+        "<discussion>Try again.</discussion><advice>{}</advice>",
+        "<answer>8</answer>",
+    } };
+    var trace: Trace = .{ .arena = arena };
+    var refined = Refine(Program).init(.{}, .{
+        .n = 2,
+        .reward_fn = Program.score,
+        .threshold = .{ .integer = 8 },
+        .module_code = "DictProgram",
+        .reward_code = "score",
+    });
+    var kwargs: Record = .empty;
+    try kwargs.put(arena, "question", .{ .string = "q" });
+    const winner = (try refined.forward(.{ .arena = arena, .lm = lm.lm(), .trace = &trace }, .{ .map = kwargs })).?;
+    try testing.expectEqualStrings("x = 8", winner.get("implementation").?.code);
+    try testing.expectEqual(@as(usize, 3), lm.index);
+    try testing.expectEqual(@as(i128, 2), refined.fail_count);
+    try testing.expectEqual(@as(usize, 2), trace.steps.items.len);
+    try testing.expectEqualStrings("{\n  \"question\": \"q\"\n}", trace.steps.items[0].inputs.get("program_inputs").?.string);
+    try testing.expectEqualStrings(
+        "{\n  \"implementation\": \"<non-serializable: Code>\"\n}",
+        trace.steps.items[0].inputs.get("program_outputs").?.string,
+    );
 }

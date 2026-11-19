@@ -133,8 +133,8 @@ def search_case(name, restrict, labeled_sample=True, teacher="none", metric_name
     row = {"name": name, "restrict": None if restrict is None else list(restrict),
            "labeled_sample": labeled_sample, "teacher": teacher, "metric": metric_name,
            "stop_at_score": stop_at_score, "num_candidate_programs": candidates, "train": train,
-           "val": None if val is None else list(val), "max_labeled_demos": max_labeled_demos,
-           "max_bootstrapped_demos": max_bootstrapped_demos,
+           "val": None if val is None else list(val), "max_labeled_demos": str(max_labeled_demos),
+           "max_bootstrapped_demos": str(max_bootstrapped_demos),
            "error": None, "candidates": None, "best_demos": None}
     try:
         best = optimizer.compile(student, teacher=teacher_value, trainset=trainset, valset=valset,
@@ -186,6 +186,13 @@ def main():
         search_case("labeled_prefix_wide", [-2], labeled_sample=False, max_labeled_demos=16),
         search_case("labeled_sampled_wide", [-2], max_labeled_demos=16),
         search_case("labeled_zero", [-2], labeled_sample=False, max_labeled_demos=0),
+        search_case("negative_labeled_prefix", [-2], labeled_sample=False, max_labeled_demos=-2, val=None),
+        search_case("negative_labeled_sample", [-2], max_labeled_demos=-2),
+        search_case("negative_labeled_teacher_preparation", [-1], max_labeled_demos=-2),
+        search_case("negative_labeled_compiled_teacher", [-1], teacher="program", metric_name="teacher", max_labeled_demos=-2),
+        search_case("negative_bootstrap_fixed", [-1], max_bootstrapped_demos=-1),
+        search_case("negative_bootstrap_shuffled", [-3, 0], max_bootstrapped_demos=-1),
+        search_case("wide_bootstrap_shuffled", [0, 1], max_bootstrapped_demos=2**64, max_labeled_demos=2**64),
     ]
     receipt = {"dspy": dspy.__version__, "python": platform.python_version(),
                "platform": platform.platform(), "labeled": labeled, "search": search,

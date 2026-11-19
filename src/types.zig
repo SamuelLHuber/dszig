@@ -14,6 +14,7 @@ const BoundingBox = @import("bounding_box.zig").BoundingBox;
 const File = @import("file.zig").File;
 const Image = @import("image.zig").Image;
 const Audio = @import("audio.zig").Audio;
+const Document = @import("document.zig").Document;
 const citation = @import("citation.zig");
 const decision = @import("decision.zig");
 const Integer = @import("integer.zig").Integer;
@@ -330,6 +331,8 @@ fn modelEntries(comptime S: type, comptime ordered_properties: bool) []const Ent
             if (hasDefault(S, i)) {
                 if (S == citation.Citations.Citation and std.mem.eql(u8, name, "type")) {
                     e = e ++ &[_]Entry{.{ .key = "default", .val = quote("char_location") }};
+                } else if (S == Document and FT == Document.MediaType) {
+                    e = e ++ &[_]Entry{.{ .key = "default", .val = quote(@tagName(Document.MediaType.@"text/plain")) }};
                 } else {
                     if (@typeInfo(FT) != .optional or @as(*const FT, @ptrCast(@alignCast(info.field_attrs[i].default_value_ptr.?))).* != null) {
                         @compileError("dszig: model field `" ++ name ++ "` may only default to null");
@@ -511,7 +514,7 @@ fn validateMode(comptime T: type, arena: Allocator, input: Value, comptime xml_l
     if (comptime decimal_type.isDecimal(T)) return T.validate(arena, v);
     if (comptime citation.isCitation(T)) return T.validate(arena, v);
     if (comptime decision.isDecision(T)) return if (xml_lax) T.validateLax(arena, v) else T.validate(arena, v);
-    if (T == File or T == Image or T == Audio) {
+    if (T == File or T == Image or T == Audio or T == Document) {
         const media = T.fromValue(arena, v) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.ParseValue,

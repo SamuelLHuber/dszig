@@ -274,7 +274,7 @@ fn labeledRow(arena: Allocator, tally: *Tally, row: Value, case: []const u8) !vo
 const SearchOutcome = struct {
     failure: ?[]const u8 = null,
     program: Program = .{},
-    candidates: []const RandomSearch.Candidate = &.{},
+    candidates: []const RandomSearch.Candidate(Program) = &.{},
 };
 
 fn searchOutcome(result: anytype) SearchOutcome {
@@ -294,8 +294,8 @@ fn searchConfig(row: Value) !RandomSearch {
             teacherMetric
         else
             return error.InvalidReceipt,
-        .max_bootstrapped_demos = try count(row, "max_bootstrapped_demos"),
-        .max_labeled_demos = try count(row, "max_labeled_demos"),
+        .max_bootstrapped_demos = try std.fmt.parseInt(i128, try text(row, "max_bootstrapped_demos"), 10),
+        .max_labeled_demos = try std.fmt.parseInt(i128, try text(row, "max_labeled_demos"), 10),
         .num_candidate_programs = try count(row, "num_candidate_programs"),
         .stop_at_score = if (stop == .null) null else try number(stop),
     };
@@ -340,7 +340,7 @@ fn searchRun(arena: Allocator, gpa: Allocator, row: Value) !SearchOutcome {
     return error.InvalidReceipt;
 }
 
-fn sameCandidates(expected: Value, actual: []const RandomSearch.Candidate) !bool {
+fn sameCandidates(expected: Value, actual: []const RandomSearch.Candidate(Program)) !bool {
     if (expected != .array) return error.InvalidReceipt;
     if (expected.array.items.len != actual.len) return false;
     for (expected.array.items, actual) |want, got| {
@@ -360,7 +360,13 @@ fn searchRow(arena: Allocator, gpa: Allocator, tally: *Tally, row: Value) !void 
         const source_error = try field(row, "error");
         const random_range = std.mem.eql(u8, source_type, "ValueError") and
             std.mem.startsWith(u8, try text(source_error, "message"), "empty range for randrange()");
-        return tally.refusal(if (random_range) "RandomRangeValueError" else source_type, outcome.failure, case);
+        const invalid_sample = std.mem.eql(u8, source_type, "ValueError") and
+            std.mem.eql(u8, try text(source_error, "message"), "Sample larger than population or is negative");
+        return tally.refusal(
+            if (random_range) "RandomRangeValueError" else if (invalid_sample) "LabeledValueError" else source_type,
+            outcome.failure,
+            case,
+        );
     }
     if (outcome.failure) |name| return tally.check(false, case, name);
     try tally.check(try sameCandidates(try field(row, "candidates"), outcome.candidates), case, "candidates");

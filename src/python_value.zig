@@ -654,7 +654,7 @@ const Table = struct {
         return self.find(pairs, key, hash, true);
     }
 
-    fn find(self: *const Table, items: anytype, key: Value, hash: u64, comptime entries: bool) Error!Lookup {
+    fn find(self: *const Table, items: anytype, key: anytype, hash: u64, comptime entries: bool) Error!Lookup {
         if (self.slots.len == 0) return .{ .slot = 0, .found = false };
         const mask = self.slots.len - 1;
         var index: usize = @as(usize, @truncate(hash)) & mask;
@@ -665,8 +665,10 @@ const Table = struct {
                 const slot = self.slots[index + offset];
                 if (slot.index == absent) return .{ .slot = index + offset, .found = false };
                 const prior = if (entries) items[slot.index].key else items[slot.index];
-                if (slot.hash == hash and try containerEqual(prior, key))
-                    return .{ .slot = index + offset, .found = true };
+                if (slot.hash == hash) {
+                    const matches = if (@TypeOf(key) == usize) prior == key else try containerEqual(prior, key);
+                    if (matches) return .{ .slot = index + offset, .found = true };
+                }
             }
             perturb >>= 5;
             index = (index *% 5 +% 1 +% @as(usize, @truncate(perturb))) & mask;
@@ -746,6 +748,43 @@ const Table = struct {
         }
     }
 };
+
+fn indexLookup(table: *const Table, ids: []const usize, id: usize) Table.Lookup {
+    return table.find(ids, id, @as(u64, id) % hash_modulus, false) catch unreachable;
+}
+
+const IndexMap = std.AutoArrayHashMapUnmanaged(usize, usize);
+
+/// CPython 3.11 iteration order for `set(left) & set(right)` on ordered map keys.
+/// Intersection walks the smaller operand (right on ties); membership in the
+/// other operand uses the existing map because its traversal order is not read.
+pub fn indexSetIntersection(a: Allocator, left: *const IndexMap, right: *const IndexMap) Allocator.Error![]usize {
+    const scan_ids, const probe = if (left.count() < right.count())
+        .{ left.keys(), right }
+    else
+        .{ right.keys(), left };
+    var scan: Table = .{ .allocator = a };
+    defer scan.deinit();
+    for (scan_ids, 0..) |id, i| {
+        try scan.add(indexLookup(&scan, scan_ids, id).slot, i, @as(u64, id) % hash_modulus, false);
+    }
+    var result: Table = .{ .allocator = a };
+    defer result.deinit();
+    for (scan.slots) |slot| {
+        if (slot.index == absent) continue;
+        const id = scan_ids[slot.index];
+        if (!probe.contains(id)) continue;
+        try result.add(indexLookup(&result, scan_ids, id).slot, slot.index, slot.hash, false);
+    }
+    const ids = try a.alloc(usize, result.used);
+    var i: usize = 0;
+    for (result.slots) |slot| {
+        if (slot.index == absent) continue;
+        ids[i] = scan_ids[slot.index];
+        i += 1;
+    }
+    return ids;
+}
 
 fn makeSet(a: Allocator, items: []const Value, seed: u32, frozen: bool) Error!Value {
     var builder: Table = .{ .allocator = a };

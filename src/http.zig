@@ -23,6 +23,9 @@ pub const BodyProvider = struct {
 pub const ResponseConsumer = struct {
     context: *anyopaque,
     consume: *const fn (*anyopaque, Allocator, *std.Io.Reader, usize) anyerror!void,
+    /// Called for the accepted response before reading its body. Copy any
+    /// header bytes that must survive into body consumption.
+    on_head: ?*const fn (*anyopaque, Allocator, *const std.http.Client.Response.Head) Allocator.Error!void = null,
     failure: ?anyerror = null,
 };
 
@@ -37,6 +40,11 @@ pub const Response = struct {
     content_type: ?[]const u8 = null,
 };
 
+pub const FailureDecision = union(enum) {
+    retry,
+    terminal: anyerror,
+};
+
 pub const Request = struct {
     url: []const u8,
     method: std.http.Method = .GET,
@@ -44,8 +52,8 @@ pub const Request = struct {
     body_provider: ?BodyProvider = null,
     response_consumer: ?*ResponseConsumer = null,
     /// Classifies a rejected status after the bounded body has been read.
-    /// A recognized rejection is terminal, even on an otherwise retryable status.
-    classify_failure: ?*const fn (Allocator, std.http.Status, []const u8) ?anyerror = null,
+    /// Null leaves the decision to the default transport retry policy.
+    classify_failure: ?*const fn (Allocator, std.http.Status, []const u8) ?FailureDecision = null,
     capture_content_type: bool = false,
     content_type: ?[]const u8 = null,
     authorization: ?[]const u8 = null,
@@ -106,12 +114,25 @@ pub const Transport = struct {
     timeout_ns: ?u64 = null,
     connect_timeout_ns: ?u64 = null,
     header_provider: ?HeaderProvider = null,
-    /// Generation accepts only HTTP 200; callers inspecting status use .any.
-    success: enum { ok, any } = .any,
+    success: Success = .any,
     failure_error: anyerror = error.HttpFailure,
     response_limit_error: anyerror = error.ResponseTooLarge,
     max_redirects: u8 = 0,
     normalize_url: bool = false,
+
+    pub const Success = enum {
+        ok,
+        below_400,
+        any,
+
+        fn accepts(policy: Success, status: std.http.Status) bool {
+            return switch (policy) {
+                .ok => status == .ok,
+                .below_400 => @backingInt(status) < 400,
+                .any => true,
+            };
+        }
+    };
 
     const WireResponse = struct { response: Response, location: ?[]const u8 };
 
@@ -159,15 +180,19 @@ pub const Transport = struct {
                     break :failed null;
                 },
             };
-            const status: ?std.http.Status = if (response) |r| r.status else null;
+            var should_retry = true; // Transport failures reaching this point are retryable.
             if (response) |r| {
-                if (self.success == .any or r.status == .ok) return r;
+                if (self.success.accepts(r.status)) return r;
                 defer self.client.allocator.free(r.body);
+                should_retry = retryable(r.status);
                 if (prepared.classify_failure) |classify| {
-                    if (classify(self.client.allocator, r.status, r.body)) |err| return err;
+                    if (classify(self.client.allocator, r.status, r.body)) |decision| switch (decision) {
+                        .retry => should_retry = true,
+                        .terminal => |err| return err,
+                    };
                 }
             }
-            if (!retryable(status) or attempt >= self.max_retries) return last_error;
+            if (!should_retry or attempt >= self.max_retries) return last_error;
             const delay_ms = @as(i64, self.retry_base_ms) << @as(u6, @intCast(@min(attempt, 31)));
             try std.Io.sleep(self.client.io, .fromMilliseconds(delay_ms), .awake);
         }
@@ -286,10 +311,11 @@ pub const Transport = struct {
         defer self.client.allocator.free(decompress_buffer);
         var transfer_buffer: [64]u8 = undefined;
         var decompress: std.http.Decompress = undefined;
-        const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
-        if (status == .ok) {
+        if (location == null and self.success.accepts(status)) {
             if (input.response_consumer) |consumer| {
                 consumer.failure = null;
+                if (consumer.on_head) |on_head| try on_head(consumer.context, arena, &response.head);
+                const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
                 consumer.consume(consumer.context, arena, reader, self.max_response_bytes) catch |err| {
                     consumer.failure = err;
                     return error.ResponseConsumerFailed;
@@ -305,6 +331,7 @@ pub const Transport = struct {
                 };
             }
         }
+        const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
         return .{
             .response = .{
                 .status = status,

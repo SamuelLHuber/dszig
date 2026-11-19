@@ -42,6 +42,15 @@ pub const Gemini = @import("gemini.zig").Gemini;
 
 pub const Options = struct {
     temperature: ?f64 = null,
+    /// Nucleus sampling in [0, 1]; null leaves it unspecified.
+    top_p: ?f64 = null,
+    /// Positive integer sampling cutoff; null leaves it unspecified.
+    top_k: @import("runtime_value.zig").Value = .null,
+    /// Repetition penalties in [-2, 2]; null leaves each unspecified.
+    frequency_penalty: ?f64 = null,
+    presence_penalty: ?f64 = null,
+    /// Best-effort integer sampling seed. Fanout advances it per candidate.
+    seed: @import("runtime_value.zig").Value = .null,
     /// DSPy cache identity; candidate groups use a tagged JSON-array tuple.
     rollout_id: ?@import("runtime_value.zig").Value = null,
     response_format: ?ResponseFormat = null,
@@ -59,15 +68,40 @@ pub const Options = struct {
     reasoning_effort_present: bool = false,
     /// OpenAI predicted-output payload, separate from signature inputs.
     prediction: ?@import("runtime_value.zig").Value = null,
+    /// Client-side response cache control. Null uses the native LM's default;
+    /// true cannot install a cache on an uncached engine.
+    cache: ?bool = null,
+    /// Provider-side response storage; null leaves provider defaults.
+    store: ?bool = null,
+    /// Borrowed opaque end-user identifier; null leaves attribution unset.
+    user_id: ?[]const u8 = null,
+    /// Borrowed provider-owned tier; null leaves scheduling unspecified.
+    service_tier: ?[]const u8 = null,
+    /// Per-request output-token cap. Outer null inherits the provider's
+    /// configured default; a present inner null removes that default.
+    max_tokens: ??u32 = null,
+    /// Ordered stop sequences; an empty slice disables stops.
+    stop: []const []const u8 = &.{},
 
-    // Omitting a missing hint preserves existing native cache keys.
+    // Execution controls are not part of physical request identity.
     pub fn jsonStringify(self: Options, writer: *std.json.Stringify) Writer.Error!void {
         try writer.beginObject();
         inline for (@typeInfo(Options).@"struct".field_names) |name| {
-            const is_hint = comptime std.mem.eql(u8, name, "prediction");
-            if (!is_hint or self.prediction != null) {
+            if (comptime std.mem.eql(u8, name, "cache")) continue;
+            const value = @field(self, name);
+            const omit_unset = comptime std.mem.eql(u8, name, "prediction") or
+                std.mem.eql(u8, name, "max_tokens") or std.mem.eql(u8, name, "top_p") or
+                std.mem.eql(u8, name, "frequency_penalty") or std.mem.eql(u8, name, "presence_penalty") or
+                std.mem.eql(u8, name, "store") or std.mem.eql(u8, name, "user_id") or std.mem.eql(u8, name, "service_tier");
+            const include = if (comptime std.mem.eql(u8, name, "stop"))
+                value.len != 0
+            else if (comptime std.mem.eql(u8, name, "seed") or std.mem.eql(u8, name, "top_k"))
+                value != .null
+            else
+                !omit_unset or value != null;
+            if (include) {
                 try writer.objectField(name);
-                try writer.write(@field(self, name));
+                try writer.write(value);
             }
         }
         try writer.endObject();
@@ -143,6 +177,10 @@ pub const Error = error{
     NoLM,
     LMFailure,
     ContextWindowExceeded,
+    /// The engine canceled generation. Do not retry the request.
+    Canceled,
+    /// A custom engine explicitly classified this failed attempt as safe to replay.
+    RetryableLMFailure,
     ScriptExhausted,
     MissingUsageModel,
     StreamStopped,
@@ -580,10 +618,19 @@ pub fn cloneOptions(arena: Allocator, options: Options) Allocator.Error!Options 
     var out = options;
     if (options.rollout_id) |id| out.rollout_id = try inference.cloneJsonValue(arena, id);
     out.logprobs = try inference.cloneJsonValue(arena, options.logprobs);
+    out.seed = try inference.cloneJsonValue(arena, options.seed);
+    out.top_k = try inference.cloneJsonValue(arena, options.top_k);
     if (options.prediction) |hint| out.prediction = try inference.cloneJsonValue(arena, hint);
     if (options.reasoning_effort) |effort| out.reasoning_effort = try arena.dupe(u8, effort);
+    if (options.user_id) |user| out.user_id = try arena.dupe(u8, user);
+    if (options.service_tier) |tier| out.service_tier = try arena.dupe(u8, tier);
     if (options.response_format) |format| out.response_format = try inference.cloneResponseFormat(arena, format);
     if (options.tool_choice) |choice| out.tool_choice = try inference.cloneToolChoice(arena, choice);
+    if (options.stop.len != 0) {
+        const stops = try arena.alloc([]const u8, options.stop.len);
+        for (stops, options.stop) |*dest, stop| dest.* = try arena.dupe(u8, stop);
+        out.stop = stops;
+    }
     return out;
 }
 
@@ -594,12 +641,20 @@ pub fn cloneMessage(arena: Allocator, message: Message) Allocator.Error!Message 
         .reasoning = if (message.reasoning) |reasoning| try arena.dupe(u8, reasoning) else null,
         .tool_calls = try inference.cloneToolCalls(arena, message.tool_calls),
         .tool_call_id = if (message.tool_call_id) |id| try arena.dupe(u8, id) else null,
+        .tool_result_name = if (message.tool_result_name) |name| try arena.dupe(u8, name) else null,
         .continuation = try inference.cloneContinuations(arena, message.continuation),
     };
 }
 
+fn stopValue(arena: Allocator, stops: []const []const u8) Allocator.Error!@import("runtime_value.zig").Value {
+    var values: @import("runtime_value.zig").Array = .init(arena);
+    try values.ensureTotalCapacity(stops.len);
+    for (stops) |stop| values.appendAssumeCapacity(.{ .string = stop });
+    return .{ .array = values };
+}
+
 /// Canonical metadata, before a provider dialect adds its wire wrappers.
-/// A missing predicted-output hint is omitted for legacy transcript compatibility.
+/// Unset extensions are omitted for transcript compatibility.
 pub fn optionsValue(arena: Allocator, options: Options) Allocator.Error!@import("runtime_value.zig").Value {
     var object: @import("runtime_value.zig").ObjectMap = .empty;
     try object.put(arena, "temperature", if (options.temperature) |temperature| .{ .float = temperature } else .null);
@@ -612,6 +667,17 @@ pub fn optionsValue(arena: Allocator, options: Options) Allocator.Error!@import(
     try object.put(arena, "parallel_tool_calls", if (options.parallel_tool_calls) |parallel| .{ .bool = parallel } else .null);
     try object.put(arena, "logprobs", options.logprobs);
     if (options.prediction) |hint| try object.put(arena, "prediction", hint);
+    if (options.max_tokens) |cap| try object.put(arena, "max_tokens", if (cap) |limit| .{ .integer = limit } else .null);
+    if (options.stop.len != 0) try object.put(arena, "stop", try stopValue(arena, options.stop));
+    if (options.top_p) |top_p| try object.put(arena, "top_p", .{ .float = top_p });
+    if (options.top_k != .null) try object.put(arena, "top_k", options.top_k);
+    inline for (.{ "frequency_penalty", "presence_penalty" }) |name| {
+        if (@field(options, name)) |number| try object.put(arena, name, .{ .float = number });
+    }
+    if (options.seed != .null) try object.put(arena, "seed", options.seed);
+    if (options.store) |store| try object.put(arena, "store", .{ .bool = store });
+    if (options.user_id) |user| try object.put(arena, "user_id", .{ .string = user });
+    if (options.service_tier) |tier| try object.put(arena, "service_tier", .{ .string = tier });
     return .{ .object = object };
 }
 
@@ -622,6 +688,7 @@ pub fn messageValue(arena: Allocator, message: Message) sdk.Error!@import("runti
     try object.put(arena, "reasoning", if (message.reasoning) |reasoning| .{ .string = reasoning } else .null);
     try object.put(arena, "tool_calls", try inference.toolCallsValue(arena, message.tool_calls));
     try object.put(arena, "tool_call_id", if (message.tool_call_id) |id| .{ .string = id } else .null);
+    if (message.tool_result_name) |name| try object.put(arena, "tool_result_name", .{ .string = name });
     try object.put(arena, "continuation", try inference.continuationsValue(arena, message.continuation));
     return .{ .object = object };
 }
@@ -665,18 +732,52 @@ pub fn completionValue(arena: Allocator, completion: Completion) sdk.Error!@impo
     return .{ .object = object };
 }
 
+fn normalizeSeed(arena: Allocator, input: @import("runtime_value.zig").Value) inference.MetadataError!@import("runtime_value.zig").Value {
+    // Native option metadata uses JSON primitives, not boxed integer identity.
+    const normalized = sdk.normalizeConfigInteger(arena, input) catch |err|
+        return if (err == error.OutOfMemory) error.OutOfMemory else error.BadMetadata;
+    return if (normalized == .custom) normalized.custom.integerValue().? else normalized;
+}
+
+fn normalizeTopK(arena: Allocator, input: @import("runtime_value.zig").Value) inference.MetadataError!@import("runtime_value.zig").Value {
+    const integer = try normalizeSeed(arena, input);
+    if (integer == .null) return .null;
+    const order = @import("value.zig").numericOrder(integer, .{ .integer = 1 }) catch return error.BadMetadata;
+    if (order != .eq and order != .gt) return error.BadMetadata;
+    return integer;
+}
+
 /// Owning readers accept extra row fields, allowing a transcript call to carry
 /// completion evidence alongside its canonical request without dropping it.
 pub fn optionsFromValue(arena: Allocator, input: @import("runtime_value.zig").Value) inference.MetadataError!Options {
     if (input != .object) return error.BadMetadata;
     var out: Options = .{};
-    if (input.object.get("temperature")) |temperature| {
-        out.temperature = switch (temperature) {
-            .null => null,
-            .float => temperature.float,
-            .integer => @floatFromInt(temperature.integer),
-            else => return error.BadMetadata,
-        };
+    if (input.object.get("max_tokens")) |cap| {
+        out.max_tokens = if (cap == .null) @as(?u32, null) else try metadataU32(cap);
+    }
+    if (input.object.get("stop")) |stop| {
+        if (stop != .null) {
+            if (stop != .array) return error.BadMetadata;
+            const stops = try arena.alloc([]const u8, stop.array.items.len);
+            for (stops, stop.array.items) |*dest, item| dest.* = try arena.dupe(u8, try metadataString(item));
+            out.stop = stops;
+        }
+    }
+    inline for (.{ "temperature", "top_p", "frequency_penalty", "presence_penalty" }) |name| {
+        if (input.object.get(name)) |number| {
+            @field(out, name) = switch (number) {
+                .null => null,
+                .float => number.float,
+                .integer => @floatFromInt(number.integer),
+                else => return error.BadMetadata,
+            };
+        }
+    }
+    if (input.object.get("top_k")) |top_k| {
+        out.top_k = try normalizeTopK(arena, try inference.cloneJsonValue(arena, top_k));
+    }
+    if (input.object.get("seed")) |seed| {
+        out.seed = try normalizeSeed(arena, try inference.cloneJsonValue(arena, seed));
     }
     if (input.object.get("rollout_id")) |id| {
         if (id != .null) out.rollout_id = try inference.cloneJsonValue(arena, id);
@@ -709,10 +810,18 @@ pub fn optionsFromValue(arena: Allocator, input: @import("runtime_value.zig").Va
         if (hint != .object) return error.BadMetadata;
         out.prediction = try inference.cloneJsonValue(arena, hint);
     }
-    if (input.object.get("parallel_tool_calls")) |parallel| {
-        if (parallel != .null) {
-            if (parallel != .bool) return error.BadMetadata;
-            out.parallel_tool_calls = parallel.bool;
+    if (input.object.get("user_id")) |user| {
+        if (user != .null) out.user_id = try arena.dupe(u8, try metadataString(user));
+    }
+    if (input.object.get("service_tier")) |tier| {
+        if (tier != .null) out.service_tier = try arena.dupe(u8, try metadataString(tier));
+    }
+    inline for (.{ "parallel_tool_calls", "store" }) |name| {
+        if (input.object.get(name)) |setting| {
+            if (setting != .null) {
+                if (setting != .bool) return error.BadMetadata;
+                @field(out, name) = setting.bool;
+            }
         }
     }
     return out;
@@ -735,6 +844,9 @@ pub fn messageFromValue(arena: Allocator, input: @import("runtime_value.zig").Va
     if (input.object.get("tool_calls")) |calls| out.tool_calls = try inference.toolCallsFromValue(arena, calls);
     if (input.object.get("tool_call_id")) |id| {
         if (id != .null) out.tool_call_id = try arena.dupe(u8, try metadataString(id));
+    }
+    if (input.object.get("tool_result_name")) |name| {
+        if (name != .null) out.tool_result_name = try arena.dupe(u8, try metadataString(name));
     }
     if (input.object.get("continuation")) |continuation| out.continuation = try inference.continuationsFromValue(arena, continuation);
     return out;
@@ -895,6 +1007,15 @@ pub const LM = struct {
         written: u32 = 0,
     };
 
+    /// Synchronous SDK candidates only. Never replay adapter calls or streams:
+    /// a stream may already have delivered output to its observer.
+    pub const CanonicalRetry = struct {
+        max_retries: u8 = 0,
+        /// Runs before each extra attempt (numbered from 1). The engine can
+        /// wait via its injected I/O or abort by returning an error.
+        backoff: ?*const fn (*anyopaque, *const sdk.Request, u8) Error!void = null,
+    };
+
     pub const VTable = struct {
         /// Returns `request.options.n` completions, allocated in `arena`.
         complete: *const fn (ptr: *anyopaque, arena: Allocator, request: Request) Error![]const Completion,
@@ -911,6 +1032,8 @@ pub const LM = struct {
             arena: Allocator,
             request: *const sdk.Request,
         ) Error!Completion = null,
+        /// HTTP providers leave this disabled; their transport owns retries.
+        canonical_retry: CanonicalRetry = .{},
         /// Transparent wrappers delegate exactly one whole public group.
         /// Final accounting runs after all wrappers, not inside cache storage.
         handles_candidate_groups: bool = false,
@@ -926,6 +1049,9 @@ pub const LM = struct {
         /// Ordinary Module.deepcopy clones model instances; native engines must
         /// provide a real snapshot rather than silently sharing mutable state.
         clone: ?*const fn (ptr: *anyopaque, arena: Allocator) anyerror!LM = null,
+        /// Whether identical requests reuse stored responses. Absent means
+        /// no recognized response cache; transparent wrappers delegate.
+        caches_responses: ?*const fn (ptr: *anyopaque) bool = null,
     };
 
     /// Explicit application resources, never reconstructed from serialized pointers.
@@ -967,6 +1093,12 @@ pub const LM = struct {
         result.pricing = model.pricing;
         result.model_type = model.model_type;
         return result;
+    }
+
+    /// ReAnchor's static cache check. Unrecognized engines fail closed.
+    pub fn cachesResponses(model: LM) bool {
+        const query = model.vtable.caches_responses orelse return false;
+        return query(model.ptr);
     }
 
     pub fn modelName(model: LM) ?[]const u8 {
@@ -1212,7 +1344,16 @@ pub const LM = struct {
         errdefer if (execution.result) |*result| result.free(arena);
         var delegated = request;
         delegated.execution = execution;
+        execution.use_cache = execution.use_cache and (request.options.cache orelse true);
+        delegated.options.cache = null;
+        inline for (.{ request.options.frequency_penalty, request.options.presence_penalty }) |penalty| {
+            if (penalty) |number| if (!(number >= -2 and number <= 2)) return error.LMFailure;
+        }
         delegated.options.logprobs = (try checkedUsage(arena, .{ .input_tokens = request.options.logprobs })).input_tokens;
+        delegated.options.top_k = normalizeTopK(arena, request.options.top_k) catch |err|
+            return if (err == error.OutOfMemory) error.OutOfMemory else error.LMFailure;
+        delegated.options.seed = normalizeSeed(arena, request.options.seed) catch |err|
+            return if (err == error.OutOfMemory) error.OutOfMemory else error.LMFailure;
         const completions = lm.dispatch(arena, delegated) catch |err| {
             if (execution.engine) |engine|
                 engine.accountFailure(arena, request, execution.completions[0..execution.written]);
@@ -1263,10 +1404,18 @@ pub const LM = struct {
                 completion.* = try lm.completeSdkCandidate(arena, canonical, @intCast(index));
             } else {
                 if (request.options.n > 1) candidate.options.rollout_id = .{ .array = rollout };
+                if (index != 0 and request.options.seed != .null)
+                    candidate.options.seed = try candidateSeed(arena, request.options.seed, @intCast(index));
                 completion.* = try lm.completeCandidate(arena, candidate);
             }
             completion.cache_hit = false;
-            if (execution.pricing) |pricing| completion.billing = lm.price(pricing, completion);
+            if (execution.pricing) |pricing| {
+                const tier = if (execution.canonical) |canonical|
+                    canonical.fields.config.service_tier
+                else
+                    candidate.options.service_tier;
+                completion.billing = lm.price(pricing, completion, tier);
+            }
             written += 1;
             execution.written = written;
             try notifyRecordings(candidate, out[index..][0..1]);
@@ -1277,9 +1426,8 @@ pub const LM = struct {
     }
 
     fn completeSdkCandidate(lm: LM, arena: Allocator, base: *const sdk.Request, index: u32) Error!Completion {
-        const complete_canonical = lm.vtable.complete_canonical orelse return error.LMFailure;
         if (index == 0 or base.fields.config.seed == .null)
-            return complete_canonical(lm.ptr, arena, base);
+            return lm.invokeSdkCandidate(arena, base);
 
         var scratch: std.heap.ArenaAllocator = .init(arena);
         defer scratch.deinit();
@@ -1287,7 +1435,21 @@ pub const LM = struct {
         const candidate = base.withSeed(arena, seed) catch |err|
             return if (err == error.OutOfMemory) error.OutOfMemory else error.LMFailure;
         defer candidate.release();
-        return complete_canonical(lm.ptr, arena, candidate);
+        return lm.invokeSdkCandidate(arena, candidate);
+    }
+
+    fn invokeSdkCandidate(lm: LM, arena: Allocator, candidate: *const sdk.Request) Error!Completion {
+        const complete_canonical = lm.vtable.complete_canonical orelse return error.LMFailure;
+        const retry = lm.vtable.canonical_retry;
+        var retries: u8 = 0;
+        while (true) {
+            return complete_canonical(lm.ptr, arena, candidate) catch |err| {
+                if (err != error.RetryableLMFailure or retries == retry.max_retries) return err;
+                retries += 1;
+                if (retry.backoff) |backoff| try backoff(lm.ptr, candidate, retries);
+                continue;
+            };
+        }
     }
 
     fn candidateSeed(arena: Allocator, seed: @import("runtime_value.zig").Value, index: u32) Error!@import("runtime_value.zig").Value {
@@ -1309,7 +1471,7 @@ pub const LM = struct {
         execution.result = try client.resultsFromCompletions(arena, completions, request.options);
     }
 
-    fn price(lm: LM, pricing: Pricing, completion: *const Completion) ?@import("lm_cost.zig").Estimate {
+    fn price(lm: LM, pricing: Pricing, completion: *const Completion, service_tier: ?[]const u8) ?@import("lm_cost.zig").Estimate {
         const model = lm.modelName() orelse return null;
         const facts: @import("lm_cost.zig").Facts = .{
             .provider = pricing.provider,
@@ -1319,6 +1481,7 @@ pub const LM = struct {
             .provider_data = if (completion.provider_data) |data| data.toValue(pricing.arena) catch return null else null,
             .namespaces = pricing.namespaces,
             .generated_media = completion.generated_media,
+            .service_tier = service_tier,
         };
         // Pricing failure cannot invalidate generation or required recording.
         return @import("lm_cost.zig").estimate(pricing.arena, pricing.catalogue, &facts) catch null;
@@ -1546,6 +1709,8 @@ pub const ReplayLM = struct {
     supports_response_schema: bool = false,
     supports_function_calling: bool = false,
     supports_decision_requests: bool = false,
+    /// Only for transcripts captured before flat messages recorded result names.
+    legacy_tool_result_names: bool = false,
 
     pub const Call = struct {
         messages: []const Message,
@@ -1623,7 +1788,7 @@ pub const ReplayLM = struct {
             const recorded = call.all();
             const first = offset;
             offset += recorded.len;
-            if (!(try sameMessages(call.messages, request.messages))) continue;
+            if (!(try sameMessages(call.messages, request.messages, self.legacy_tool_result_names))) continue;
             if (!(try inference.toolsEqual(call.tools, request.tools))) continue;
             if (!(try decisionEqual(call.decision, request.decision))) continue;
             if (call.options) |options| {
@@ -1676,11 +1841,21 @@ pub const ReplayLM = struct {
     }
 
     fn sameOptions(a: Options, b: Options) @import("runtime_value.zig").CustomError!bool {
-        if (a.temperature != b.temperature or
-            a.parallel_tool_calls != b.parallel_tool_calls or a.n != b.n or
+        if (a.temperature != b.temperature or a.top_p != b.top_p or a.max_tokens != b.max_tokens or
+            a.frequency_penalty != b.frequency_penalty or a.presence_penalty != b.presence_penalty or
+            a.parallel_tool_calls != b.parallel_tool_calls or a.store != b.store or a.n != b.n or
             a.reasoning_effort_present != b.reasoning_effort_present) return false;
+        inline for (.{ "user_id", "service_tier" }) |name| {
+            if (@field(a, name)) |text| {
+                if (!std.mem.eql(u8, text, @field(b, name) orelse return false)) return false;
+            } else if (@field(b, name) != null) return false;
+        }
+        if (a.stop.len != b.stop.len) return false;
+        for (a.stop, b.stop) |x, y| if (!std.mem.eql(u8, x, y)) return false;
         if (!(try inference.jsonEqual(a.rollout_id orelse .null, b.rollout_id orelse .null))) return false;
         if (!(try inference.jsonEqual(a.logprobs, b.logprobs))) return false;
+        if (!(try inference.jsonEqual(a.seed, b.seed))) return false;
+        if (!(try inference.jsonEqual(a.top_k, b.top_k))) return false;
         if (!(try inference.jsonEqual(a.prediction orelse .null, b.prediction orelse .null)))
             return false;
         if (a.response_format) |format| {
@@ -1696,11 +1871,13 @@ pub const ReplayLM = struct {
         return b.reasoning_effort == null;
     }
 
-    fn sameMessages(a: []const Message, b: []const Message) @import("runtime_value.zig").CustomError!bool {
+    fn sameMessages(a: []const Message, b: []const Message, legacy_tool_result_names: bool) @import("runtime_value.zig").CustomError!bool {
         if (a.len != b.len) return false;
         for (a, b) |x, y| {
             if (x.role != y.role or !(try adapter.Content.eql(x.content, y.content))) return false;
             if (!optionalStringEqual(x.tool_call_id, y.tool_call_id)) return false;
+            if ((!legacy_tool_result_names or x.tool_result_name != null) and
+                !optionalStringEqual(x.tool_result_name, y.tool_result_name)) return false;
             if (!optionalStringEqual(x.reasoning, y.reasoning)) return false;
             if (!(try inference.toolCallsEqual(x.tool_calls, y.tool_calls))) return false;
             if (!(try inference.continuationsEqual(x.continuation, y.continuation))) return false;
@@ -1723,9 +1900,9 @@ pub const RecordingLM = struct {
         return .{
             .ptr = self,
             .vtable = if (self.inner.vtable.model_name == null)
-                &.{ .complete = complete, .handles_candidate_groups = true }
+                &.{ .complete = complete, .handles_candidate_groups = true, .caches_responses = cachesResponses }
             else
-                &.{ .complete = complete, .handles_candidate_groups = true, .model_name = modelName },
+                &.{ .complete = complete, .handles_candidate_groups = true, .model_name = modelName, .caches_responses = cachesResponses },
             .supports_reasoning = self.inner.supports_reasoning,
             .supports_response_format = self.inner.supports_response_format,
             .supports_response_schema = self.inner.supports_response_schema,
@@ -1739,6 +1916,11 @@ pub const RecordingLM = struct {
     fn modelName(ptr: *anyopaque) []const u8 {
         const self: *RecordingLM = @ptrCast(@alignCast(ptr));
         return self.inner.modelName().?;
+    }
+
+    fn cachesResponses(ptr: *anyopaque) bool {
+        const self: *RecordingLM = @ptrCast(@alignCast(ptr));
+        return self.inner.cachesResponses();
     }
 
     fn complete(ptr: *anyopaque, arena: Allocator, request: Request) Error![]const Completion {
@@ -1936,6 +2118,35 @@ test "Azure OpenAI v1 keeps gateway prefixes and refuses ambiguous endpoint URLs
     }
 }
 
+test "Azure OpenAI routes static access tokens as bearer credentials" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var client: std.http.Client = .{ .allocator = testing.allocator, .io = testing.io };
+    defer client.deinit();
+    const cases = [_]struct { credential: []const u8, bearer: bool }{
+        .{ .credential = "opaque-subscription-key", .bearer = false },
+        .{ .credential = "eyJhbGciOiJSUzI1NiJ9.claims.signature", .bearer = true },
+        .{ .credential = "eyJhbGciOm51bGx9.claims.signature", .bearer = true },
+        .{ .credential = "eyJ0eXAiOiJKV1QifQ.claims.signature", .bearer = false },
+        .{ .credential = "eyJhbGciOiJSUzI1NiJ9..signature", .bearer = false },
+        .{ .credential = "ya29.synthetic-access-token", .bearer = true },
+    };
+    for (cases) |case| {
+        const provider = try OpenAI.initAzure(arena, &client, .{
+            .endpoint = "https://azure.invalid",
+            .deployment = "test",
+            .credential = .{ .api_key = case.credential },
+        });
+        const auth = provider.header_provider.?;
+        const headers = try auth.prepare(auth.context, arena, &.{});
+        try testing.expectEqual(@as(usize, 1), headers.len);
+        try testing.expectEqualStrings(if (case.bearer) "Authorization" else "api-key", headers[0].name);
+        const expected = if (case.bearer) try std.fmt.allocPrint(arena, "Bearer {s}", .{case.credential}) else case.credential;
+        try testing.expectEqualStrings(expected, headers[0].value);
+    }
+}
+
 /// OpenAI-compatible Chat Completions and Responses clients on `std.http`.
 pub const OpenAI = struct {
     client: *std.http.Client,
@@ -1988,6 +2199,7 @@ pub const OpenAI = struct {
         deployment: []const u8,
         api: Api = .responses,
         credential: union(enum) {
+            /// Static Azure key or token. Access-token shapes use Authorization.
             api_key: []const u8,
             /// Supplies Authorization per attempt. Token acquisition is caller-owned.
             entra: http.HeaderProvider,
@@ -2013,8 +2225,12 @@ pub const OpenAI = struct {
             .entra => |provider| provider,
             .api_key => |key| blk: {
                 const header = try arena.create(std.http.Header);
-                header.* = .{ .name = "api-key", .value = key };
-                break :blk .{ .context = header, .prepare = azureKeyHeader };
+                errdefer arena.destroy(header);
+                header.* = if (try azureLooksLikeAccessToken(arena, key))
+                    .{ .name = "Authorization", .value = try std.fmt.allocPrint(arena, "Bearer {s}", .{key}) }
+                else
+                    .{ .name = "api-key", .value = key };
+                break :blk .{ .context = header, .prepare = azureCredentialHeader };
             },
         };
         return .{
@@ -2024,6 +2240,36 @@ pub const OpenAI = struct {
             .api = options.api,
             .header_provider = provider,
         };
+    }
+
+    // Classify the credential for routing, not for verification. In particular
+    // the payload and signature are opaque to the client.
+    fn azureLooksLikeAccessToken(allocator: Allocator, key: []const u8) Allocator.Error!bool {
+        if (std.mem.startsWith(u8, key, "ya29.")) return true;
+        var segments = std.mem.splitScalar(u8, key, '.');
+        const head = segments.next().?;
+        const claims = segments.next() orelse return false;
+        const signature = segments.next() orelse return false;
+        if (head.len == 0 or claims.len == 0 or signature.len == 0 or segments.next() != null) return false;
+
+        const decoder = if (head[head.len - 1] == '=')
+            std.base64.url_safe.Decoder
+        else
+            std.base64.url_safe_no_pad.Decoder;
+        const size = decoder.calcSizeForSlice(head) catch return false;
+        var buffer: [256]u8 = undefined;
+        const bytes = if (size <= buffer.len) buffer[0..size] else try allocator.alloc(u8, size);
+        defer if (size > buffer.len) allocator.free(bytes);
+        decoder.decode(bytes, head) catch return false;
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{
+            .duplicate_field_behavior = .use_last,
+            .allocate = .alloc_if_needed,
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return false,
+        };
+        defer parsed.deinit();
+        return parsed.value == .object and parsed.value.object.contains("alg");
     }
 
     fn azureBaseUrl(arena: Allocator, endpoint: []const u8) ![]const u8 {
@@ -2076,7 +2322,7 @@ pub const OpenAI = struct {
         return output;
     }
 
-    fn azureKeyHeader(
+    fn azureCredentialHeader(
         context: *anyopaque,
         arena: Allocator,
         headers: []const std.http.Header,
@@ -2443,12 +2689,28 @@ pub const OpenAI = struct {
         }
         try fields.put(arena, "tools", .{ .array = tools });
         var config: runtime.ObjectMap = .empty;
-        if (max_tokens) |limit| try config.put(arena, "max_tokens", .{ .integer = limit });
+        if (request.options.max_tokens orelse max_tokens) |limit|
+            try config.put(arena, "max_tokens", .{ .integer = limit });
+        if (request.options.stop.len != 0)
+            try config.put(arena, "stop", try stopValue(arena, request.options.stop));
         if (request.options.temperature) |temperature| try config.put(arena, "temperature", .{ .float = temperature });
+        if (request.options.top_p) |top_p| try config.put(arena, "top_p", .{ .float = top_p });
+        if (request.options.top_k != .null) try config.put(arena, "top_k", request.options.top_k);
+        inline for (.{ "frequency_penalty", "presence_penalty" }) |name| {
+            if (@field(request.options, name)) |number| try config.put(arena, name, .{ .float = number });
+        }
+        if (request.options.seed != .null) try config.put(arena, "seed", request.options.seed);
+        if (request.options.store) |store| try config.put(arena, "store", .{ .bool = store });
+        if (request.options.user_id) |user| try config.put(arena, "user_id", .{ .string = user });
+        if (request.options.service_tier) |tier| try config.put(arena, "service_tier", .{ .string = tier });
         if (request.options.logprobs != .null) try config.put(arena, "logprobs", request.options.logprobs);
         if (request.options.reasoning_effort) |effort| {
             var reasoning: runtime.ObjectMap = .empty;
-            try reasoning.put(arena, "effort", .{ .string = if (std.mem.eql(u8, effort, "none")) "off" else effort });
+            const off = std.mem.eql(u8, effort, "none") or std.mem.eql(u8, effort, "off");
+            try reasoning.put(arena, "effort", .{ .string = if (off) "off" else effort });
+            // DSPy's prediction bridge requests a visible summary for enabled
+            // native reasoning. Direct canonical SDK requests keep their own policy.
+            if (!off) try reasoning.put(arena, "summary", .{ .string = "auto" });
             try config.put(arena, "reasoning", .{ .object = reasoning });
         }
         if (request.options.response_format) |format| {
@@ -2624,10 +2886,12 @@ pub const OpenAI = struct {
             var result: runtime.ObjectMap = .empty;
             try result.put(arena, "type", .{ .string = "tool_result" });
             try result.put(arena, "id", .{ .string = message.tool_call_id orelse return error.LMFailure });
+            if (message.tool_result_name) |name| try result.put(arena, "name", .{ .string = name });
             try result.put(arena, "content", try nativeContentParts(arena, message.content));
             try parts.append(.{ .object = result });
         } else {
-            if (message.tool_call_id != null or (message.role != .assistant and message.tool_calls.len != 0)) return error.LMFailure;
+            if (message.tool_call_id != null or message.tool_result_name != null or
+                (message.role != .assistant and message.tool_calls.len != 0)) return error.LMFailure;
             if (message.continuation.len > 1 and message.reasoning != null and message.reasoning.?.len != 0) return error.LMFailure;
             if (message.reasoning != null or message.continuation.len != 0) {
                 if (message.role != .assistant) return error.LMFailure;
@@ -2716,17 +2980,17 @@ pub const OpenAI = struct {
         allocator: Allocator,
         status: std.http.Status,
         body: []const u8,
-    ) ?anyerror {
+    ) ?http.FailureDecision {
         if (status != .bad_request) return null;
         const Envelope = struct {
             @"error": struct { code: []const u8 },
         };
         const parsed = std.json.parseFromSlice(Envelope, allocator, body, .{
             .ignore_unknown_fields = true,
-        }) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else null;
+        }) catch |err| return if (err == error.OutOfMemory) .{ .terminal = err } else null;
         defer parsed.deinit();
         if (std.mem.eql(u8, parsed.value.@"error".code, "context_length_exceeded"))
-            return error.ContextWindowExceeded;
+            return .{ .terminal = error.ContextWindowExceeded };
         return null;
     }
 
@@ -3043,7 +3307,7 @@ pub const OpenAI = struct {
     }
 
     fn readScoringPost(self: *OpenAI, arena: Allocator, prepared: http.Request) Error!@import("runtime_value.zig").Value {
-        const reply = self.sendWithHeaders(arena, prepared, null) catch |err| return sdkCodecError(err);
+        const reply = self.sendWithHeaders(arena, prepared, null, .ok) catch |err| return sdkCodecError(err);
         defer self.client.allocator.free(reply.body);
         return parseJson(arena, reply.body);
     }
@@ -3145,7 +3409,9 @@ pub const OpenAI = struct {
         }
         const index = text_index orelse return;
         const text = message.parts[index].text;
-        const parsed = @import("json_repair.zig").parseJson(arena, text.text) catch |err| return switch (err) {
+        // DSPy strips Python whitespace before strict JSON decoding.
+        const answer = @import("unicode.zig").strip(text.text, false);
+        const parsed = @import("json_repair.zig").parseJson(arena, answer) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             else => {},
         };
@@ -3163,21 +3429,21 @@ pub const OpenAI = struct {
     }
 
     fn fetchWithRetries(self: *OpenAI, arena: Allocator, url: []const u8, auth: ?[]const u8, body: []const u8, headers: []const std.http.Header) anyerror!http.Response {
-        return self.sendRequest(arena, .{
+        return self.sendWithHeaders(arena, .{
             .url = url,
             .method = .POST,
             .body = body,
             .content_type = "application/json",
             .authorization = auth,
             .headers = headers,
-        });
+        }, self.header_provider, .ok);
     }
 
     fn sendRequest(self: *OpenAI, arena: Allocator, input: http.Request) anyerror!http.Response {
-        return self.sendWithHeaders(arena, input, self.header_provider);
+        return self.sendWithHeaders(arena, input, self.header_provider, .below_400);
     }
 
-    fn sendWithHeaders(self: *OpenAI, arena: Allocator, input: http.Request, header_provider: ?http.HeaderProvider) anyerror!http.Response {
+    fn sendWithHeaders(self: *OpenAI, arena: Allocator, input: http.Request, header_provider: ?http.HeaderProvider, success: http.Transport.Success) anyerror!http.Response {
         const transport: http.Transport = .{
             .client = self.client,
             .max_response_bytes = self.max_response_bytes,
@@ -3186,7 +3452,7 @@ pub const OpenAI = struct {
             .timeout_ns = self.timeout_ns,
             .connect_timeout_ns = self.connect_timeout_ns,
             .header_provider = header_provider,
-            .success = .ok,
+            .success = success,
             .failure_error = error.LMFailure,
             .response_limit_error = error.LMFailure,
         };
@@ -4135,10 +4401,9 @@ fn testNestedConfig(arena: Allocator, tag: []const u8) !@import("runtime_value.z
 
 test "OpenAI distinguishes explicit context overflow from ordinary bad requests" {
     const exact = "{\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"too long\"}}";
-    try testing.expectEqual(
-        @as(?anyerror, error.ContextWindowExceeded),
-        OpenAI.classifyGenerationFailure(testing.allocator, .bad_request, exact),
-    );
+    const decision = OpenAI.classifyGenerationFailure(testing.allocator, .bad_request, exact);
+    try testing.expect(decision != null and decision.? == .terminal);
+    try testing.expectEqual(error.ContextWindowExceeded, decision.?.terminal);
     try testing.expect(OpenAI.classifyGenerationFailure(testing.allocator, .unauthorized, exact) == null);
     for ([_][]const u8{
         "{\"error\":{\"code\":\"invalid_request_error\",\"message\":\"context_length_exceeded\"}}",
@@ -4146,6 +4411,124 @@ test "OpenAI distinguishes explicit context overflow from ordinary bad requests"
         "{\"error\":{\"code\":\"context_length_exceeded\"}",
     }) |body| {
         try testing.expect(OpenAI.classifyGenerationFailure(testing.allocator, .bad_request, body) == null);
+    }
+}
+
+test "OpenAI generation parses non-200 success in buffered and streamed calls" {
+    const Fixture = struct {
+        const Case = enum {
+            created,
+            bad_request,
+            context_overflow,
+        };
+
+        fn serve(io: std.Io, listener: *std.Io.net.Server, streaming: bool, scenario: Case) !void {
+            const stream = try listener.accept(io);
+            defer stream.close(io);
+            var read_buffer: [4096]u8 = undefined;
+            var write_buffer: [1024]u8 = undefined;
+            var input = stream.reader(io, &read_buffer);
+            var output = stream.writer(io, &write_buffer);
+            var server = std.http.Server.init(&input.interface, &output.interface);
+            var request = try server.receiveHead();
+            try testing.expectEqual(.POST, request.head.method);
+            try testing.expectEqualStrings("/v1/chat/completions", request.head.target);
+            // respond(keep_alive=false) does not drain the POST. Read the
+            // complete body before replying so closing the socket cannot race
+            // bytes of the request that are still arriving.
+            var body_buffer: [4096]u8 = undefined;
+            const body_reader = try request.readerExpectContinue(&body_buffer);
+            const body = try body_reader.allocRemaining(testing.allocator, .limited(4096));
+            defer testing.allocator.free(body);
+            const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+            defer parsed.deinit();
+            const wire_stream: std.json.Value = parsed.value.object.get("stream") orelse .{ .bool = false };
+            try testing.expect(wire_stream == .bool);
+            try testing.expectEqual(streaming, wire_stream.bool);
+
+            try request.respond(if (scenario == .context_overflow)
+                "{\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"too long\"}}"
+            else if (streaming)
+                "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"four\"},\"finish_reason\":null}]}\n\n" ++
+                    "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" ++
+                    "data: [DONE]\n\n"
+            else
+                "{\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"four\"},\"finish_reason\":\"stop\"}]}", .{
+                .status = if (scenario == .created) .created else .bad_request,
+                .keep_alive = false,
+                .extra_headers = &.{.{ .name = "content-type", .value = if (streaming and scenario != .context_overflow) "text/event-stream" else "application/json" }},
+            });
+        }
+
+        const Observation = struct {
+            events: usize = 0,
+            text_deltas: usize = 0,
+            matched: bool = false,
+
+            fn observe(ptr: *anyopaque, event: OpenAI.StreamEvent) OpenAI.StreamSink.Action {
+                const observation: *@This() = @ptrCast(@alignCast(ptr));
+                observation.events += 1;
+                if (event == .delta and event.delta.data == .text) {
+                    observation.text_deltas += 1;
+                    observation.matched = std.mem.eql(u8, "four", event.delta.data.text.text);
+                }
+                return .proceed;
+            }
+        };
+    };
+    const io = testing.io;
+    var listener = try (try std.Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{});
+    defer listener.deinit(io);
+    var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    var client: std.http.Client = .{ .allocator = testing.allocator, .io = io };
+    defer client.deinit();
+    var provider: OpenAI = .{
+        .client = &client,
+        .model = "gpt-4o-mini",
+        .base_url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/v1", .{listener.socket.address.getPort()}),
+        .max_retries = 0,
+        .timeout_ns = 5 * std.time.ns_per_s,
+    };
+    const request = try sdk.Request.fromValue(arena, try OpenAI.parseJson(arena,
+        \\{"model":"gpt-4o-mini","messages":[{"role":"user","parts":[{"type":"text","text":"2+2?"}]}]}
+    ));
+    defer request.release();
+    for ([_]Fixture.Case{ .created, .bad_request, .context_overflow }) |scenario| {
+        const expected_error = if (scenario == .context_overflow) error.ContextWindowExceeded else error.LMFailure;
+        for ([_]bool{ false, true }) |streaming| {
+            errdefer std.debug.print("OpenAI loopback case: {s}, streaming={}\n", .{ @tagName(scenario), streaming });
+            var serving = try io.concurrent(Fixture.serve, .{ io, &listener, streaming, scenario });
+            defer serving.cancel(io) catch {};
+            if (streaming) {
+                var observation: Fixture.Observation = .{};
+                const result = provider.streamRequest(testing.allocator, request, .{
+                    .context = &observation,
+                    .on_event = Fixture.Observation.observe,
+                });
+                if (scenario == .created) {
+                    try testing.expectEqual(OpenAI.StreamOutcome.exhausted, try result);
+                    try testing.expectEqual(@as(usize, 1), observation.text_deltas);
+                    try testing.expect(observation.matched);
+                } else {
+                    try testing.expectError(expected_error, result);
+                    try testing.expectEqual(@as(usize, 0), observation.events);
+                }
+            } else {
+                const result = provider.completeRequest(arena, request);
+                if (scenario == .created) {
+                    const reply = try result;
+                    defer reply.release();
+                    const part = reply.fields.message.parts[0];
+                    try testing.expect(part == .text);
+                    try testing.expectEqualStrings("four", part.text.text);
+                } else {
+                    try testing.expectError(expected_error, result);
+                }
+            }
+            try serving.await(io);
+        }
     }
 }
 
@@ -5248,6 +5631,33 @@ test "Responses compatibility distinguishes direct and nested empty overrides" {
     });
     defer invalid.release();
     try testing.expectError(error.LMFailure, provider.requestBody(arena, invalid));
+}
+
+test "Responses prediction requests a visible summary only when reasoning is enabled" {
+    var scratch = std.heap.ArenaAllocator.init(testing.allocator);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    var client: std.http.Client = .{ .allocator = testing.allocator, .io = testing.io };
+    defer client.deinit();
+    const provider: OpenAI = .{ .client = &client, .base_url = "https://example.invalid", .model = "reasoning-model", .api = .responses };
+    const messages: []const Message = &.{.{ .role = .user, .content = .{ .text = "Explain." } }};
+    for ([_]?[]const u8{ "low", "none", "off", null }) |effort| {
+        const request = try provider.predictionRequest(arena, .{
+            .messages = messages,
+            .options = .{ .reasoning_effort = effort },
+        });
+        defer request.release();
+        const wire = try provider.requestBody(arena, request);
+        const body = try OpenAI.parseJson(arena, wire.body);
+        if (effort) |requested| {
+            const reasoning = body.object.get("reasoning").?.object;
+            const enabled = std.mem.eql(u8, requested, "low");
+            try testing.expectEqualStrings(if (enabled) "low" else "none", reasoning.get("effort").?.string);
+            if (enabled) {
+                try testing.expectEqualStrings("auto", reasoning.get("summary").?.string);
+            } else try testing.expect(!reasoning.contains("summary"));
+        } else try testing.expect(!body.object.contains("reasoning"));
+    }
 }
 
 test "native Responses replay retains separate opaque reasoning items" {

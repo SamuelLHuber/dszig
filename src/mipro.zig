@@ -28,6 +28,7 @@ const value = @import("value.zig");
 const Context = predict.Context;
 const Example = optimize.Example;
 const Field = signature.Field;
+const LM = @import("lm.zig").LM;
 const Metric = optimize.Metric;
 const Record = value.Record;
 
@@ -376,6 +377,27 @@ pub const MIPROv2 = struct {
     log_dir: ?LogDir = null,
     /// Used while bootstrapping demo candidates.
     teacher_settings: optimize.TeacherSettings = .{},
+    /// When present, borrow live settings for the duration of compile. Each
+    /// teacher attempt reads them anew instead of using teacher_settings.
+    teacher_settings_ref: ?*const optimize.TeacherSettings = null,
+    /// Borrowed model handles captured by init. Unbound struct literals use
+    /// the compile contexts for model selection.
+    prompt_model: ?LM = null,
+    task_model: ?LM = null,
+
+    /// Resolve both model roles independently, as DSPy does at construction.
+    /// The backing LMs must outlive compilation. No other context settings
+    /// are captured.
+    pub fn init(config: MIPROv2, settings: Context) error{NoLM}!MIPROv2 {
+        const prompt_model = config.prompt_model orelse settings.lm;
+        const task_model = config.task_model orelse settings.lm;
+        if (prompt_model.sameInstance(.unconfigured) or task_model.sameInstance(.unconfigured))
+            return error.NoLM;
+        var self = config;
+        self.prompt_model = prompt_model;
+        self.task_model = task_model;
+        return self;
+    }
 
     pub const LogDir = struct {
         io: std.Io,
@@ -508,20 +530,24 @@ pub const MIPROv2 = struct {
 
     pub const Error = error{ InvalidOptions, EmptyTrainset, MinibatchTooLarge, NoCandidate };
 
-    /// Everything the result references lives in `out`. `prompt` is the
-    /// `prompt_model` context (defaults to `ctx`, the task model).
+    /// Results use `out`. `prompt` supplies proposal execution settings and
+    /// defaults to `ctx`. Bound models override the respective context LMs.
     pub fn compile(
         defaults: MIPROv2,
         comptime P: type,
         out: Allocator,
         gpa: Allocator,
-        ctx: Context,
+        context: Context,
         prompt: ?Context,
         student: P,
         teacher: anytype,
         trainset_in: []const Example,
         options: Options,
     ) !Result(P) {
+        var ctx = context;
+        if (defaults.task_model) |model| ctx.lm = model;
+        var prompt_ctx = prompt orelse ctx;
+        if (defaults.prompt_model) |model| prompt_ctx.lm = model;
         var self = defaults;
         self.max_bootstrapped_demos = options.max_bootstrapped_demos orelse defaults.max_bootstrapped_demos;
         self.max_labeled_demos = options.max_labeled_demos orelse defaults.max_labeled_demos;
@@ -564,6 +590,12 @@ pub const MIPROv2 = struct {
         }
         if (minibatch and options.minibatch_size > valset.len) return error.MinibatchTooLarge;
         if (options.minibatch_full_eval_steps == 0) return error.InvalidOptions;
+        // A wrong evaluator binding is a compile configuration error, not
+        // a failed candidate evaluation to be scored as zero.
+        if (self.concurrent_evaluation) |bound| {
+            if (bound.program_type != @import("runtime_value.zig").typeIdentity(P))
+                return error.ProgramTypeMismatch;
+        }
 
         const demo_sets = try self.demoCandidates(
             P,
@@ -577,7 +609,7 @@ pub const MIPROv2 = struct {
             zeroshot,
             &rng,
         );
-        const instructions = try self.proposeInstructions(P, out, prompt orelse ctx, &program, trainset, demo_sets, n_instruct, options, &rng);
+        const instructions = try self.proposeInstructions(P, out, prompt_ctx, &program, trainset, demo_sets, n_instruct, options, &rng);
         const demos: []const []const []const Record = if (zeroshot) &.{} else demo_sets;
 
         return self.search(P, out, gpa, ctx, program, instructions, demos, valset, num_trials, minibatch, options, seed, &rng);
@@ -634,6 +666,7 @@ pub const MIPROv2 = struct {
                     .max_labeled_demos = max_labeled,
                     .max_errors = self.max_errors,
                     .teacher_settings = self.teacher_settings,
+                    .teacher_settings_ref = self.teacher_settings_ref,
                 };
                 candidate = (try bootstrap.compile(P, out, gpa, ctx, student, teacher, shuffled)).program;
             }
@@ -854,8 +887,6 @@ pub const MIPROv2 = struct {
         defer scratch.deinit();
 
         const default_score = try self.score(P, out, gpa, ctx, &program, valset, valset.len, rng);
-        var history: std.ArrayList(tpe.Trial) = .empty;
-        try history.append(out, .{ .params = try zeros(out, params.items.len), .value = default_score });
         var logs: std.ArrayList(TrialLog) = .empty;
         var programs: std.ArrayList(P) = .empty;
         if (self.track_stats) try programs.ensureTotalCapacity(out, program_limit);
@@ -878,6 +909,12 @@ pub const MIPROv2 = struct {
         const Combo = struct { params: []const usize, total: f64, count: usize, program: P, evaluated: bool };
         var combos: std.ArrayList(Combo) = .empty;
 
+        // Optuna create_trial rejects NaN for explicitly inserted observations.
+        // The baseline's snapshot has already been written at this point.
+        if (std.math.isNan(default_score)) return error.NaNStudyObservation;
+        var history: std.ArrayList(tpe.Trial) = .empty;
+        try history.append(out, .{ .params = try zeros(out, params.items.len), .value = default_score });
+
         var sampler: tpe.Sampler = .init(seed);
 
         if (num_trials > 0) {
@@ -886,7 +923,9 @@ pub const MIPROv2 = struct {
             }
         }
         for (0..num_trials) |_| {
-            const trial_num = history.items.len + 1;
+            // Failed objectives still get a study number and a candidate log,
+            // but only completed observations count toward TPE startup/fitting.
+            const trial_num = logs.items.len + 1;
             const chosen = try out.alloc(usize, params.items.len);
             _ = scratch.reset(.retain_capacity);
             try sampler.sample(scratch.allocator(), params.items, history.items, chosen);
@@ -927,7 +966,7 @@ pub const MIPROv2 = struct {
                 ),
             });
             if (self.track_stats) try programs.append(out, candidate);
-            try history.append(out, .{ .params = chosen, .value = s });
+            if (!std.math.isNan(s)) try history.append(out, .{ .params = chosen, .value = s });
             const combo = for (combos.items) |*c| {
                 if (std.mem.eql(usize, c.params, chosen)) break c;
             } else blk: {
@@ -950,6 +989,7 @@ pub const MIPROv2 = struct {
                 }
                 const target = pick orelse return error.NoCandidate;
                 const full_score = try self.score(P, out, gpa, ctx, &target.program, valset, valset.len, rng);
+                if (std.math.isNan(full_score)) return error.NaNStudyObservation;
                 full_count += 1;
                 if (!self.track_stats) try full_scores.append(out, full_score);
                 try history.append(out, .{ .params = target.params, .value = full_score });
@@ -1119,12 +1159,16 @@ test "MIPRO compile demo overrides select zero-shot and seed zero samples indepe
         var history: lm_mod.History = .{ .arena = arena };
         var task: lm_mod.ScriptedLM = .{ .responses = &answers, .history = &history };
         var prompt: lm_mod.ScriptedLM = .{ .responses = &proposals };
-        const result = try optimizer.compile(
+        var unused: lm_mod.ScriptedLM = .{ .responses = &.{} };
+        var config = optimizer;
+        config.task_model = task.lm();
+        const bound = try config.init(.{ .arena = arena, .lm = prompt.lm() });
+        const result = try bound.compile(
             P,
             arena,
             arena,
-            .{ .arena = arena, .lm = task.lm() },
-            .{ .arena = arena, .lm = prompt.lm() },
+            .{ .arena = arena, .lm = unused.lm() },
+            null,
             student,
             student,
             rows[0..2],
@@ -1143,6 +1187,8 @@ test "MIPRO compile demo overrides select zero-shot and seed zero samples indepe
             },
         );
         try testing.expectEqualSlices(usize, &.{1}, result.trials[1].params.?);
+        try testing.expectEqual(proposals.len, prompt.index);
+        try testing.expectEqualStrings("beta", result.instruction_candidates[0][1]);
         const request = history.requests.items[7];
         const actual = request.messages[request.messages.len - 1].content.text;
         const expected = try std.fmt.allocPrint(arena, "<question>\n{s}\n</question>", .{first_sample});
@@ -1187,6 +1233,115 @@ test "MIPRO compile demo overrides select zero-shot and seed zero samples indepe
             try testing.expect(std.mem.indexOf(u8, input, "<question>\n2\n</question>") == null);
         }
     }
+}
+
+test "MIPRO refuses a mismatched evaluator before using either model" {
+    const Program = predict.Predict(signature.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: i64 };
+    }));
+    const Callback = struct {
+        fn evaluate(_: *anyopaque, _: *const anyopaque, _: []const Example, _: Metric, _: usize, _: ?[]f64) anyerror!optimize.Evaluation {
+            return error.UnexpectedEvaluatorDispatch;
+        }
+
+        fn score(_: Allocator, _: *const Example, _: ?*const optimize.RecordPrediction, _: ?*const predict.Trace) value.ParseError!f64 {
+            return 1;
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const rows = [_]Example{try Example.fromJson(arena, "{\"question\":\"example\",\"answer\":1}", &.{"question"})};
+    const lm = @import("lm.zig");
+    var task: lm.ScriptedLM = .{ .responses = &.{"<answer>1</answer>"} };
+    var prompt: lm.ScriptedLM = .{ .responses = &.{"<proposed_instruction>candidate</proposed_instruction>"} };
+    const optimizer: MIPROv2 = .{
+        .metric = Callback.score,
+        .auto = null,
+        .num_candidates = 1,
+        .max_bootstrapped_demos = 0,
+        .max_labeled_demos = 0,
+        .concurrent_evaluation = .{
+            .ptr = &memory,
+            .program_type = @import("runtime_value.zig").typeIdentity(struct {}),
+            .run = Callback.evaluate,
+        },
+    };
+    const result = optimizer.compile(
+        Program,
+        arena,
+        testing.allocator,
+        .{ .arena = arena, .lm = task.lm() },
+        .{ .arena = arena, .lm = prompt.lm() },
+        .{},
+        null,
+        &rows,
+        .{
+            .valset = &rows,
+            .num_trials = 1,
+            .minibatch = false,
+            .program_aware_proposer = false,
+            .data_aware_proposer = false,
+            .tip_aware_proposer = false,
+            .fewshot_aware_proposer = false,
+        },
+    );
+    try testing.expectError(error.ProgramTypeMismatch, result);
+    try testing.expectEqual(@as(usize, 0), task.index);
+    try testing.expectEqual(@as(usize, 0), prompt.index);
+}
+
+test "MIPRO demo candidates observe teacher setting changes between examples" {
+    const lm = @import("lm.zig");
+    const P = predict.Predict(signature.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: i64 };
+    }));
+    const FirstTeacher = struct {
+        settings: *optimize.TeacherSettings,
+        next: lm.LM,
+        scripted: lm.ScriptedLM,
+
+        fn complete(ptr: *anyopaque, arena: Allocator, request: lm.Request) lm.Error![]const lm.Completion {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.settings.lm = self.next;
+            return self.scripted.lm().completeResponses(arena, request);
+        }
+    };
+    var backing: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer backing.deinit();
+    const arena = backing.allocator();
+    const rows = [_]Example{
+        try Example.fromJson(arena, "{\"question\":\"one\",\"answer\":1}", &.{"question"}),
+        try Example.fromJson(arena, "{\"question\":\"two\",\"answer\":2}", &.{"question"}),
+    };
+    var task: lm.ScriptedLM = .{ .responses = &.{} };
+    var second: lm.ScriptedLM = .{ .responses = &.{"<answer>22</answer>"} };
+    var settings: optimize.TeacherSettings = .{};
+    var first: FirstTeacher = .{
+        .settings = &settings,
+        .next = second.lm(),
+        .scripted = .{ .responses = &.{"<answer>11</answer>"} },
+    };
+    settings.lm = .{ .ptr = &first, .vtable = &.{ .complete = FirstTeacher.complete } };
+    const optimizer: MIPROv2 = .{
+        .metric = struct {
+            fn pass(_: Allocator, _: *const Example, _: ?*const optimize.RecordPrediction, _: ?*const predict.Trace) value.ParseError!f64 {
+                return 1;
+            }
+        }.pass,
+        .max_bootstrapped_demos = 2,
+        .max_labeled_demos = 1,
+        .teacher_settings_ref = &settings,
+    };
+    var rng: pyrandom.Random = .init(0);
+    const sets = try optimizer.demoCandidates(P, arena, testing.allocator, .{
+        .arena = arena,
+        .lm = task.lm(),
+    }, .{}, null, &rows, 3, false, &rng);
+    try testing.expectEqual(@as(i64, 11), sets[0][2][0].get("answer").?.integer);
+    try testing.expectEqual(@as(i64, 22), sets[0][2][1].get("answer").?.integer);
 }
 
 test "MIPRO inherits the compile context error limit for demos and trial evaluation" {
@@ -1346,6 +1501,74 @@ test "MIPRO snapshot serialization failure preserves the previous artifact" {
     var restored: P = .{};
     try program_state.load(arena, &restored, saved, .{});
     try testing.expectEqualStrings("original", restored.state.instructions);
+}
+
+test "MIPRO distinguishes failed NaN objectives from explicit Optuna observations" {
+    const P = predict.Predict(signature.Signature(struct {
+        pub const instructions = "base";
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: i64 };
+    }));
+    const metric = struct {
+        fn score(_: Allocator, _: *const Example, pred: ?*const optimize.RecordPrediction, _: ?*const predict.Trace) value.ParseError!f64 {
+            const n = pred.?.get("answer").?.integer;
+            return if (n < 0) std.math.nan(f64) else @as(f64, @floatFromInt(n)) / 4;
+        }
+    }.score;
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const row = try Example.fromJson(arena, "{\"question\":\"q\"}", &.{"question"});
+    const rows = [_]Example{ row, row };
+    const optimizer: MIPROv2 = .{ .metric = metric };
+    const nan = "<answer>-1</answer>";
+    const low = "<answer>1</answer>";
+    const mid = "<answer>2</answer>";
+    const high = "<answer>3</answer>";
+    const perfect = "<answer>4</answer>";
+    // Actual DSPy 3.5 / Optuna 4.5 _optimize_prompt_parameters, seed 9.
+    const Scenario = enum { startup, promotion, invalid_baseline, invalid_promotion };
+    for ([_]Scenario{ .startup, .promotion, .invalid_baseline, .invalid_promotion }) |case| {
+        const responses: []const []const u8 = switch (case) {
+            .startup => &.{ low, nan, nan, nan, nan, nan, nan, nan, nan, nan, mid, high, perfect },
+            .promotion => &.{ low, low, nan, high, mid, mid, low, perfect, perfect },
+            .invalid_baseline => &.{nan},
+            .invalid_promotion => &.{ low, low, high, nan, nan },
+        };
+        var task: @import("lm.zig").ScriptedLM = .{ .responses = responses };
+        const minibatch = case == .promotion or case == .invalid_promotion;
+        var rng = pyrandom.Random.init(9);
+        const run = optimizer.search(P, arena, testing.allocator, .{ .arena = arena, .lm = task.lm() }, .{}, &.{&.{ "base", "beta", "gamma" }}, &.{}, rows[0..if (minibatch) @as(usize, 2) else 1], switch (case) {
+            .startup => 12,
+            .promotion => 3,
+            else => 1,
+        }, minibatch, .{ .minibatch_size = 1, .minibatch_full_eval_steps = if (case == .invalid_promotion) 1 else 2 }, 9, &rng);
+        try testing.expectEqual(responses.len, task.index);
+        if (case == .invalid_baseline or case == .invalid_promotion) {
+            try testing.expectError(error.NaNStudyObservation, run);
+            continue;
+        }
+        const result = try run;
+        try testing.expectEqualStrings("gamma", result.program.state.instructions);
+        try testing.expectEqual(@as(f64, 100), result.score);
+        if (case == .startup) {
+            const choices = [_]usize{ 1, 2, 0, 2, 0, 1, 1, 1, 2, 2, 2, 2 };
+            try testing.expectEqual(choices.len + 1, result.trials.len);
+            for (result.trials[1..], choices, 2..) |trial, choice, n| {
+                try testing.expectEqual(n, trial.number);
+                try testing.expectEqual(choice, trial.params.?[0]);
+                try testing.expectEqual(n <= 10, std.math.isNan(trial.score));
+            }
+        } else {
+            const tracked = result.tracked_programs.?.by_trial;
+            for (result.trials, tracked, [_][]const u8{ "base", "beta", "gamma", "beta", "base", "gamma" }, [_]usize{ 2, 3, 4, 6, 7, 9 }, 1..) |trial, prog, instruction, calls, n| {
+                try testing.expectEqual(n, trial.number);
+                try testing.expectEqualStrings(instruction, prog.state.instructions);
+                try testing.expectEqual(calls, trial.total_eval_calls_so_far);
+            }
+            try testing.expect(std.math.isNan(result.trials[1].score));
+        }
+    }
 }
 
 test "MIPRO ranks full-set minibatch trials as full candidates and preserves ties" {

@@ -326,6 +326,10 @@ pub const Options = struct {
     sub_lm: ?lm.LM = null,
     max_output_chars: i64 = 10_000,
     history_processor: ?HistoryProcessor = null,
+    /// Reject overlong model actions before fence normalization.
+    max_action_bytes: ?usize = null,
+    /// Return an error rather than asking the model to invent final outputs.
+    require_submit: bool = false,
 };
 
 /// Bounds history preallocation and the number of model-driven executions.
@@ -341,10 +345,27 @@ const action_fields = [_]Field{
 };
 
 pub fn CustomRLM(comptime Sig: type) type {
-    const extract_fields = [_]Field{
+    // DSPy's signature field merge keeps the output when it has this name.
+    const extract_history_input = !@hasField(Sig.Output, "repl_history");
+    const extract_inputs = if (extract_history_input) [_]Field{
         variable_field,
         .{ .name = "repl_history", .kind = .str, .type_name = "REPLHistory", .desc = "Your REPL interactions so far", .prefix = "Repl History:" },
-    } ++ Sig.output_fields_list[0..Sig.output_fields_list.len].*;
+    } else [_]Field{variable_field};
+    const extract_fields = extract_inputs ++ if (extract_history_input)
+        Sig.output_fields_list[0..Sig.output_fields_list.len].*
+    else fields: {
+        var outputs: [Sig.output_fields_list.len]Field = undefined;
+        var next: usize = 1;
+        for (Sig.output_fields_list) |field| {
+            if (std.mem.eql(u8, field.name, "repl_history")) {
+                outputs[0] = field;
+            } else {
+                outputs[next] = field;
+                next += 1;
+            }
+        }
+        break :fields outputs;
+    };
     const extract_instructions = (if (Sig.instructions.len == 0) "" else "The trajectory was generated with the following objective: \n" ++ Sig.instructions ++ "\n\n\n") ++
         "Based on the REPL trajectory, extract the final outputs now.\n\n" ++
         "            Review your trajectory to see what information you gathered and what values you computed, then provide the final outputs.";
@@ -359,21 +380,24 @@ pub fn CustomRLM(comptime Sig: type) type {
         };
 
         generate_action: predict.PredictFields(&action_fields, 3, ""),
-        extract: predict.PredictFields(&extract_fields, 2, extract_instructions) = .{},
+        extract: predict.PredictFields(&extract_fields, extract_inputs.len, extract_instructions) = .{},
         factory: Factory,
         max_iters: u32,
         max_llm_calls: u32,
         sub_lm: ?lm.LM,
         max_output_chars: i64,
         history_processor: ?HistoryProcessor,
+        max_action_bytes: ?usize,
+        require_submit: bool,
         compiled: bool = false,
 
         pub fn init(arena: Allocator, factory: Factory, options: Options) !Self {
             if (options.max_iters > iterations_max) return error.TooManyIterations;
-            inline for (Sig.fields) |field| {
-                for ([_][]const u8{ "history", "variables_info", "iteration", "repl_entry", "repl_history" }) |name| {
-                    if (std.mem.eql(u8, field.name, name)) return error.ReservedRLMField;
-                }
+            inline for (Sig.input_fields_list) |field| {
+                if (comptime reservedInput(field.name)) return error.ReservedRLMField;
+            }
+            inline for (Sig.output_fields_list) |field| {
+                if (comptime reservedOutput(field.name)) return error.ReservedRLMField;
             }
             var self: Self = .{
                 .generate_action = .{},
@@ -383,6 +407,8 @@ pub fn CustomRLM(comptime Sig: type) type {
                 .sub_lm = options.sub_lm,
                 .max_output_chars = options.max_output_chars,
                 .history_processor = options.history_processor,
+                .max_action_bytes = options.max_action_bytes,
+                .require_submit = options.require_submit,
             };
             try self.generate_action.state.forkSignatureClass(arena);
             try self.extract.state.forkSignatureClass(arena);
@@ -436,7 +462,12 @@ pub fn CustomRLM(comptime Sig: type) type {
                     .output = undefined,
                     .max_output_chars = self.max_output_chars,
                 };
-                const result = try executeAction(arena, runtime, &execution, entry);
+                const over_limit = if (self.max_action_bytes) |limit| entry.code.len > limit else false;
+                const result: Runtime.Result = if (over_limit) rejected: {
+                    // Do not echo an oversized model response back in the trace.
+                    entry.code = "";
+                    break :rejected .{ .execution_error = "Python action exceeds the configured source limit." };
+                } else try executeAction(arena, runtime, &execution, entry);
                 const final = try processResult(arena, Sig.output_fields_list, result, entry);
                 var event = if (index == 0) try variables.clone(arena) else Record.empty;
                 try event.put(arena, "variables_info", info);
@@ -454,6 +485,7 @@ pub fn CustomRLM(comptime Sig: type) type {
                 }
                 history.append(event);
             }
+            if (self.require_submit) return error.RLMSubmissionRequired;
             return self.extractFinal(ctx, info, &history, entries);
         }
 
@@ -461,13 +493,15 @@ pub fn CustomRLM(comptime Sig: type) type {
             const arena = ctx.arena;
             var inputs: Record = .empty;
             try inputs.put(arena, "variables_info", info);
-            try inputs.put(arena, "repl_history", text(try formatTrajectory(arena, entries)));
+            if (extract_history_input) try inputs.put(arena, "repl_history", text(try formatTrajectory(arena, entries)));
             const outputs = try self.extract.state.call(ctx, &inputs);
             var tag: Record = .empty;
             try tag.put(arena, "__dspy_repl__", text("extract_fallback"));
             var event: Record = .empty;
             try event.put(arena, "repl_entry", .{ .object = tag });
-            try appendOutputs(arena, &event, &outputs);
+            inline for (Sig.output_fields_list) |field| {
+                try event.put(arena, field.name, outputs.get(field.name) orelse return error.MissingField);
+            }
             history.append(event);
             return .{
                 .outputs = try value.fromRecord(arena, Sig.Output, &outputs),
@@ -477,6 +511,106 @@ pub fn CustomRLM(comptime Sig: type) type {
             };
         }
     };
+}
+
+fn reservedHistoryField(name: []const u8) bool {
+    for ([_][]const u8{ "history", "variables_info", "iteration", "repl_entry" }) |reserved| {
+        if (std.mem.eql(u8, name, reserved)) return true;
+    }
+    return false;
+}
+
+fn reservedInput(name: []const u8) bool {
+    if (reservedHistoryField(name)) return true;
+    if (std.mem.startsWith(u8, name, "_dspy") or std.mem.startsWith(u8, name, "__dspy")) return true;
+    for ([_][]const u8{ "llm_query", "llm_query_batched", "SUBMIT", "print", "dspy", "history_processor", "interpreter_factory" }) |reserved| {
+        if (std.mem.eql(u8, name, reserved)) return true;
+    }
+    return false;
+}
+
+fn reservedOutput(name: []const u8) bool {
+    if (reservedHistoryField(name)) return true;
+    for ([_][]const u8{ "final_reasoning", "trajectory" }) |reserved| {
+        if (std.mem.eql(u8, name, reserved)) return true;
+    }
+    return false;
+}
+
+test "RLM rejects inputs and results that collide with runtime-owned names" {
+    const testing = std.testing;
+    const unopened = struct {
+        fn open(_: *anyopaque) anyerror!Runtime {
+            return error.UnexpectedRuntimeOpen;
+        }
+    };
+    var context: u8 = 0;
+    const factory: Factory = .{ .ptr = &context, .open = unopened.open };
+    inline for (.{
+        struct {
+            pub const Input = struct { interpreter_factory: i64 };
+            pub const Output = struct { answer: i64 };
+        },
+        struct {
+            pub const Input = struct { history_processor: i64 };
+            pub const Output = struct { answer: i64 };
+        },
+        struct {
+            pub const Input = struct { llm_query: i64 };
+            pub const Output = struct { answer: i64 };
+        },
+        struct {
+            pub const Input = struct { dspy: i64 };
+            pub const Output = struct { answer: i64 };
+        },
+        struct {
+            pub const Input = struct { question: i64 };
+            pub const Output = struct { final_reasoning: i64 };
+        },
+        struct {
+            pub const Input = struct { question: i64 };
+            pub const Output = struct { trajectory: i64 };
+        },
+    }) |Pair| {
+        const Program = CustomRLM(signature.Signature(Pair));
+        try testing.expectError(error.ReservedRLMField, Program.init(testing.failing_allocator, factory, .{ .action_instructions = "test" }));
+    }
+}
+
+test "RLM extraction preserves an output named repl_history" {
+    const testing = std.testing;
+    const Dummy = struct {
+        fn open(ptr: *anyopaque) anyerror!Runtime {
+            return .{ .ptr = ptr, .execute = execute, .close = close };
+        }
+        fn execute(_: *anyopaque, _: []const u8, _: *Runtime.Execution) anyerror!Runtime.Result {
+            return error.UnexpectedAction;
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var storage: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    const Program = CustomRLM(signature.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { first: []const u8, repl_history: i64 };
+    }));
+    var context: u8 = 0;
+    const program = try Program.init(arena, .{ .ptr = &context, .open = Dummy.open }, .{ .action_instructions = "test", .max_iters = 0 });
+    var history: lm.History = .{ .arena = arena };
+    var script: lm.ScriptedLM = .{
+        .history = &history,
+        .responses = &.{"<repl_history>\n42\n</repl_history>\n\n<first>\nresult\n</first>"},
+    };
+    const result = try program.forward(.{ .arena = arena, .lm = script.lm(), .json_fallback = false }, .{ .question = "input" });
+    const system_prompt = history.requests.items[0].messages[0].content.text;
+    const repl_history_position = std.mem.indexOf(u8, system_prompt, "1. `repl_history`") orelse return error.WrongExtractionFieldOrder;
+    const first_position = std.mem.indexOf(u8, system_prompt, "2. `first`") orelse return error.WrongExtractionFieldOrder;
+    try testing.expect(repl_history_position < first_position);
+    try testing.expectEqual(@as(i64, 42), result.outputs.repl_history);
+    const event = &result.history.messages[0];
+    try testing.expectEqualStrings("first", event.keys()[1]);
+    try testing.expectEqual(@as(i64, 42), event.get("repl_history").?.integer);
 }
 
 fn stringField(name: []const u8, desc: []const u8) Field {
@@ -730,9 +864,30 @@ fn processResult(arena: Allocator, fields: []const Field, result: Runtime.Result
     return null;
 }
 
+fn submittedTypeName(submitted: Value) []const u8 {
+    return switch (submitted) {
+        .null => "NoneType",
+        .bool => "bool",
+        .integer => "int",
+        .number_string => |number| if (std.json.isNumberFormattedLikeAnInteger(number)) "int" else "float",
+        .float => "float",
+        .string => "str",
+        .array => "list",
+        .object => "dict",
+        .custom => |custom| custom.vtable.model_name,
+    };
+}
+
 fn parseSubmit(arena: Allocator, fields: []const Field, submitted: Value, entry: *Entry) !?Record {
     if (submitted != .object) {
-        entry.output = "[Error] FINAL must return a dictionary";
+        var buffer: std.Io.Writer.Allocating = .init(arena);
+        try buffer.writer.print("[Error] FINAL returned {s}, expected dict with fields: [", .{submittedTypeName(submitted)});
+        for (fields, 0..) |field, i| {
+            if (i != 0) try buffer.writer.writeAll(", ");
+            try pyjson.writeRepr(&buffer.writer, text(field.name), 0);
+        }
+        try buffer.writer.writeByte(']');
+        entry.output = buffer.written();
         return null;
     }
     var missing = runtime_value.Array.init(arena);
@@ -755,15 +910,43 @@ fn parseSubmit(arena: Allocator, fields: []const Field, submitted: Value, entry:
         return null;
     }
     var outputs: Record = .empty;
+    var diagnostics: std.Io.Writer.Allocating = .init(arena);
     for (fields) |field| {
-        const parsed = adapter.parseFieldValue(arena, field, submitted.object.get(field.name).?) catch |err| {
+        const raw = submitted.object.get(field.name).?;
+        const parsed = adapter.parseFieldValue(arena, field, raw) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
-            entry.output = try std.fmt.allocPrint(arena, "[Type Error] {s}: expected {s}", .{ field.name, field.type_name });
-            return null;
+            try diagnostics.writer.writeAll(if (diagnostics.written().len == 0) "[Type Error] " else "; ");
+            try diagnostics.writer.print("{s}: expected {s}, got {s}: {s}", .{
+                field.name, field.type_name, submittedTypeName(raw), @errorName(err),
+            });
+            continue;
         };
-        try outputs.put(arena, field.name, try value.cloneValue(arena, parsed));
+        if (diagnostics.written().len == 0) try outputs.put(arena, field.name, parsed);
     }
+    if (diagnostics.written().len != 0) {
+        entry.output = diagnostics.written();
+        return null;
+    }
+    for (outputs.values()) |*output| output.* = try value.cloneValue(arena, output.*);
     return outputs;
+}
+
+test "RLM submission observation covers every invalid output in signature order" {
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const Sig = signature.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { z_count: i64, a_count: i64 };
+    });
+    var entry: Entry = undefined;
+
+    var raw: Record = .empty;
+    try raw.put(arena, "a_count", text("invalid"));
+    try raw.put(arena, "z_count", text("invalid"));
+    try std.testing.expectEqual(null, try parseSubmit(arena, Sig.output_fields_list, .{ .object = raw }, &entry));
+    try std.testing.expect(std.mem.startsWith(u8, entry.output, "[Type Error] z_count:"));
+    try std.testing.expect(std.mem.indexOf(u8, entry.output, "; a_count:") != null);
 }
 
 fn formatTrajectory(arena: Allocator, entries: []const Entry) ![]const u8 {

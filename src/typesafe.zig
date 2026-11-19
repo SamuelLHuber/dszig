@@ -185,7 +185,10 @@ pub const TypeSafe = struct {
         const decision = request.decision orelse return error.LMFailure;
         if (request.tools.len != 0 or request.options.tool_choice != null or
             request.options.response_format != null or request.options.n != 1 or
-            decision.questions != .object) return error.LMFailure;
+            request.options.max_tokens != null or request.options.stop.len != 0 or
+            request.options.top_p != null or request.options.top_k != .null or request.options.seed != .null or
+            request.options.frequency_penalty != null or request.options.presence_penalty != null or
+            request.options.store != null or request.options.user_id != null or decision.questions != .object) return error.LMFailure;
         const state = try predictionState(request.messages, decision.state);
         const part: sdk.Part = if (request.messages.len == 0)
             .{ .data = .{ .value = try jsonPayload(arena, state) } }
@@ -211,6 +214,7 @@ pub const TypeSafe = struct {
                 .temperature = request.options.temperature,
                 .logprobs = request.options.logprobs,
                 .reasoning = reasoning,
+                .service_tier = request.options.service_tier,
             },
         }) catch |err| return sdkError(err);
     }
@@ -479,7 +483,7 @@ fn predictionState(messages: []const @import("adapter.zig").Message, state: Valu
     if (state != .null or messages.len != 1) return error.LMFailure;
     const message = messages[0];
     if (message.role != .user or message.tool_calls.len != 0 or message.tool_call_id != null or
-        message.reasoning != null or message.continuation.len != 0) return error.LMFailure;
+        message.tool_result_name != null or message.reasoning != null or message.continuation.len != 0) return error.LMFailure;
     return switch (message.content) {
         .text => |text| .{ .string = text },
         .parts => |parts| blk: {

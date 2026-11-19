@@ -433,6 +433,12 @@ fn DecisionType(comptime config: Configuration) type {
                 error.OutOfMemory => error.OutOfMemory,
                 else => error.ParseValue,
             };
+            return validateParsedJson(arena, input, mode);
+        }
+
+        /// Validate an already parsed JSON value; JSON object keys are strings
+        /// even when a model declares an integer-keyed dictionary.
+        pub fn validateParsedJson(arena: Allocator, input: Value, mode: ValidationMode) runtime.CustomError!Value {
             return (try decode(arena, input, mode, true)).toRuntime(arena);
         }
 

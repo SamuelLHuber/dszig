@@ -39,6 +39,10 @@ pub const ErrorDetail = struct {
     code: enum { provider, server, rate_limit, invalid_request, timeout, unsupported_model, context_length, auth, billing },
     provider_code: []const u8,
     message: []const u8,
+    /// Provider request ID from the stream handshake, when available.
+    request_id: ?[]const u8 = null,
+    /// Provider retry hint in seconds. This is diagnostic, not an automatic retry.
+    retry_after: ?f64 = null,
 };
 
 pub const Sink = struct {

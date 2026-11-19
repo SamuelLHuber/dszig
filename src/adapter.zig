@@ -11,6 +11,7 @@ const inference = @import("inference.zig");
 const tool = @import("tool.zig");
 
 const pyjson = @import("pyjson.zig");
+const unicode = @import("unicode.zig");
 pub const XmlAdapter = @import("xml.zig").XmlAdapter;
 const History = @import("history.zig").History;
 const signature = @import("signature.zig");
@@ -38,6 +39,24 @@ pub const Message = struct {
     tool_calls: []const inference.ToolCall = &.{},
     tool_call_id: ?[]const u8 = null,
     continuation: []const inference.Continuation = &.{},
+    /// Recorded tool-result name, when supplied by the adapter or caller.
+    tool_result_name: ?[]const u8 = null,
+
+    // A missing name must not change the JSON used for existing cache keys.
+    pub fn jsonStringify(self: Message, writer: *std.json.Stringify) std.Io.Writer.Error!void {
+        try writer.beginObject();
+        const fields = @typeInfo(Message).@"struct";
+        inline for (fields.field_names, fields.field_types) |field, T| {
+            const omit_null = std.mem.eql(u8, field, "tool_result_name") or !writer.options.emit_null_optional_fields;
+            const field_value = @field(self, field);
+            const emit = if (@typeInfo(T) == .optional) !omit_null or field_value != null else true;
+            if (emit) {
+                try writer.objectField(field);
+                try writer.write(field_value);
+            }
+        }
+        try writer.endObject();
+    }
 };
 
 /// Runtime view of a signature, after instruction/description overrides
@@ -95,7 +114,13 @@ pub const Adapter = enum {
     xml,
     two_step,
 
+    pub const HistoryRename = struct { from: []const u8, to: []const u8 };
+
     pub fn format(adapter: Adapter, arena: Allocator, view: View, demos: []const Record, inputs: *const Record) Error![]Message {
+        return adapter.formatWithHistoryRenames(arena, view, demos, inputs, &.{});
+    }
+
+    pub fn formatWithHistoryRenames(adapter: Adapter, arena: Allocator, view: View, demos: []const Record, inputs: *const Record, renames: []const HistoryRename) Error![]Message {
         var messages: std.ArrayList(Message) = .empty;
         try messages.append(arena, .{ .role = .system, .content = .{ .text = try systemMessage(adapter, arena, view) } });
         try formatDemos(adapter, arena, view, demos, &messages);
@@ -117,7 +142,7 @@ pub const Adapter = enum {
             if (!std.mem.eql(u8, field.type_name, "History")) continue;
             const history_value = inputs.get(field.name) orelse continue;
             const history = try History.fromValue(arena, history_value);
-            try messages.appendSlice(arena, try history.format(adapter, arena, current_view));
+            try messages.appendSlice(arena, try history.formatWithRenames(adapter, arena, current_view, renames));
         }
         const content = try userMessage(adapter, arena, current_view, inputs, "", true);
         if (content.len > 0) try messages.append(arena, .{ .role = .user, .content = try renderedContent(arena, content) });
@@ -438,16 +463,20 @@ fn needsFieldTitle(schema: Value) bool {
     return true;
 }
 
-fn schemaTitle(arena: Allocator, name: []const u8) Allocator.Error![]const u8 {
-    const title = try arena.dupe(u8, name);
-    var previous_cased = false;
-    for (title) |*byte| {
-        if (byte.* == '_') byte.* = ' ';
-        const cased = std.ascii.isAlphabetic(byte.*);
-        if (cased) byte.* = if (previous_cased) std.ascii.toLower(byte.*) else std.ascii.toUpper(byte.*);
-        previous_cased = cased;
-    }
-    return std.mem.trim(u8, title, " ");
+fn schemaTitle(arena: Allocator, name: []const u8) Error![]const u8 {
+    const utf8 = std.unicode.Utf8View.init(name) catch return error.AdapterParse;
+    var scratch: [64]u21 = undefined;
+    // Each UTF-8 code point takes at least one byte.
+    const points = if (name.len <= scratch.len) scratch[0..name.len] else try arena.alloc(u21, name.len);
+    defer if (name.len > scratch.len) arena.free(points);
+    var iter = utf8.iterator();
+    var count: usize = 0;
+    while (iter.nextCodepoint()) |cp| : (count += 1) points[count] = cp;
+
+    var title: Writer.Allocating = .init(arena);
+    defer title.deinit();
+    unicode.writeSchemaTitle(&title.writer, points[0..count]) catch return error.OutOfMemory;
+    return title.toOwnedSlice();
 }
 
 /// Match DSPy's strict-schema traversal: direct object properties, array items,
@@ -804,17 +833,25 @@ fn assistantMessage(adapter: Adapter, arena: Allocator, view: View, outputs: *co
     return aw.written();
 }
 
-fn isWordByte(c: u8) bool {
-    return std.ascii.isAlphanumeric(c) or c == '_' or c >= 0x80;
-}
-
 /// Match `\[\[ ## (\w+) ## \]\]` at the start of `s`; returns name and end.
 fn matchHeader(s: []const u8) ?struct { name: []const u8, end: usize } {
     const open = "[[ ## ";
     const close = " ## ]]";
     if (!std.mem.startsWith(u8, s, open)) return null;
     var i: usize = open.len;
-    while (i < s.len and isWordByte(s[i])) i += 1;
+    while (i < s.len) {
+        const byte = s[i];
+        if (byte < 0x80) {
+            if (!std.ascii.isAlphanumeric(byte) and byte != '_') break;
+            i += 1;
+        } else {
+            const len = std.unicode.utf8ByteSequenceLength(byte) catch return null;
+            if (len > s.len - i) return null;
+            const cp = std.unicode.utf8Decode(s[i..][0..len]) catch return null;
+            if (!unicode.isWord(cp)) break;
+            i += len;
+        }
+    }
     if (i == open.len) return null;
     if (!std.mem.startsWith(u8, s[i..], close)) return null;
     return .{ .name = s[open.len..i], .end = i + close.len };
@@ -840,9 +877,17 @@ fn parseChat(arena: Allocator, view: View, completion: []const u8, failure: ?*Pa
     try sections.append(arena, .{ .header = null, .lines = .empty });
     var lines = LineIterator{ .text = completion };
     while (lines.next()) |line| {
-        if (matchHeader(value.pyStrip(line))) |m| {
-            // DSPy slices the *unstripped* line at the stripped match end.
-            const remaining = value.pyStrip(if (m.end <= line.len) line[m.end..] else "");
+        const stripped = value.pyStrip(line);
+        if (matchHeader(stripped)) |m| {
+            // Python slices the original line using the stripped match's
+            // character count. Both the leading whitespace and match are UTF-8.
+            var end = m.end;
+            if (stripped.ptr != line.ptr) {
+                const characters = std.unicode.utf8CountCodepoints(stripped[0..m.end]) catch unreachable;
+                end = 0;
+                for (0..characters) |_| end += std.unicode.utf8ByteSequenceLength(line[end]) catch unreachable;
+            }
+            const remaining = value.pyStrip(line[end..]);
             var section: Section = .{ .header = m.name, .lines = .empty };
             if (remaining.len > 0) try section.lines.append(arena, remaining);
             try sections.append(arena, section);
@@ -926,21 +971,37 @@ fn parseObject(arena: Allocator, text: []const u8) Error!?Record {
 }
 
 /// Leftmost match of the recursive regex `\{(?:[^{}]|(?R))*\}`.
+/// Braces inside quoted strings count too, just as they do in the regex.
 fn firstBalancedBraces(s: []const u8) ?[]const u8 {
-    var start: usize = 0;
-    while (std.mem.indexOfScalarPos(u8, s, start, '{')) |open| {
-        var depth: usize = 0;
-        var i = open;
-        while (i < s.len) : (i += 1) {
-            if (s[i] == '{') depth += 1;
-            if (s[i] == '}') {
+    // Match from the right to skip unclosed openings without rescanning
+    // their suffixes. The leftmost opening that finds a close starts the match.
+    var start: ?usize = null;
+    var depth: usize = 0;
+    var i = s.len;
+    while (i > 0) {
+        i -= 1;
+        switch (s[i]) {
+            '}' => depth += 1,
+            '{' => if (depth > 0) {
                 depth -= 1;
-                if (depth == 0) return s[open .. i + 1];
-            }
+                start = i;
+            },
+            else => {},
         }
-        start = open + 1;
     }
-    return null;
+    const open = start orelse return null;
+
+    // Find that opening's corresponding close in one forward scan.
+    depth = 0;
+    for (s[open..], open..) |byte, index| switch (byte) {
+        '{' => depth += 1,
+        '}' => {
+            depth -= 1;
+            if (depth == 0) return s[open .. index + 1];
+        },
+        else => {},
+    };
+    unreachable;
 }
 
 const testing = std.testing;

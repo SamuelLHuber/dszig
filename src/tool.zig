@@ -223,7 +223,7 @@ pub const ToolCalls = struct {
         return .{ .object = out };
     }
 
-    pub fn ensureIds(self: ToolCalls, arena: Allocator, turn_index: usize) Allocator.Error!ToolCalls {
+    pub fn ensureIds(self: ToolCalls, arena: Allocator, turn_index: i128) Allocator.Error!ToolCalls {
         var missing = false;
         for (self.tool_calls) |call| if (call.id == null) {
             missing = true;
@@ -367,7 +367,8 @@ pub fn callsToNative(arena: Allocator, input: []const ToolCall) Error![]const in
         for (call.continuation, continuation) |state, *out| {
             const provider = state.get("provider") orelse return error.ParseValue;
             const kind = state.get("kind") orelse return error.ParseValue;
-            const data = state.get("data") orelse return error.ParseValue;
+            // DSPy continuation_from_dict defaults an omitted payload to {}.
+            const data = state.get("data") orelse Value{ .object = .empty };
             if (provider != .string or kind != .string or data != .object) return error.ParseValue;
             if (provider.string.len == 0 or kind.string.len == 0) return error.ParseValue;
             out.* = .{

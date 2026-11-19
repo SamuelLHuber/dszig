@@ -49,9 +49,9 @@ pub const CachedLM = struct {
         return .{
             .ptr = self,
             .vtable = if (self.inner.vtable.model_name == null)
-                &.{ .complete = complete, .handles_candidate_groups = true }
+                &.{ .complete = complete, .handles_candidate_groups = true, .caches_responses = cachesResponses }
             else
-                &.{ .complete = complete, .handles_candidate_groups = true, .model_name = modelName },
+                &.{ .complete = complete, .handles_candidate_groups = true, .model_name = modelName, .caches_responses = cachesResponses },
             .supports_reasoning = self.inner.supports_reasoning,
             .supports_response_format = self.inner.supports_response_format,
             .supports_response_schema = self.inner.supports_response_schema,
@@ -65,6 +65,11 @@ pub const CachedLM = struct {
     fn modelName(ptr: *anyopaque) []const u8 {
         const self: *CachedLM = @ptrCast(@alignCast(ptr));
         return self.inner.modelName().?;
+    }
+
+    fn cachesResponses(ptr: *anyopaque) bool {
+        const self: *CachedLM = @ptrCast(@alignCast(ptr));
+        return self.max_entries > 0;
     }
 
     fn complete(ptr: *anyopaque, arena: Allocator, request: Request) lm_mod.Error![]const Completion {
@@ -672,6 +677,113 @@ test "canonical cache records snapshot outputs and copy opaque graphs only on lo
     };
     var stable = testing.FailingAllocator.init(testing.allocator, .{ .resize_fail_index = 0 });
     try testing.checkAllAllocationFailures(stable.allocator(), Probe.run, .{});
+}
+
+test "public canonical retries replay only the failed candidate, before cache and accounting" {
+    const Mode = enum { recover, disabled, exhaust, terminal, abort_backoff };
+    const Engine = struct {
+        mode: Mode,
+        seeds: [4]i64 = undefined,
+        calls: usize = 0,
+        backoffs: u8 = 0,
+        failed_request: ?*const sdk.Request = null,
+
+        fn complete(_: *anyopaque, _: Allocator, _: Request) lm_mod.Error![]const Completion {
+            unreachable;
+        }
+
+        fn name(_: *anyopaque) []const u8 {
+            return "retry-model";
+        }
+
+        fn backoff(ptr: *anyopaque, request: *const sdk.Request, number: u8) lm_mod.Error!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            assert(request == self.failed_request.?);
+            self.backoffs += 1;
+            assert(number == self.backoffs);
+            if (self.mode == .abort_backoff) return error.StreamStopped;
+        }
+
+        fn canonical(ptr: *anyopaque, arena: Allocator, request: *const sdk.Request) lm_mod.Error!Completion {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const seed = request.fields.config.seed.integer;
+            self.seeds[self.calls] = seed;
+            self.calls += 1;
+            if (seed == 41) {
+                if (self.failed_request) |first| assert(request == first);
+                self.failed_request = request;
+                if (self.mode == .terminal) return error.LMFailure;
+                if (self.mode != .recover or self.calls == 2) return error.RetryableLMFailure;
+            }
+            const text = if (seed == 40) "first" else "second";
+            var result: Completion = .{
+                .text = text,
+                .message = .{ .role = .assistant, .parts = &.{.{ .text = .{ .text = text } }} },
+                .metadata = .{ .usage = .{ .input_tokens = .{ .integer = 1 } } },
+            };
+            try lm_mod.publishResponse(arena, &result, request.fields.model, .borrowed);
+            return result;
+        }
+    };
+    for ([_]Mode{ .recover, .disabled, .exhaust, .terminal, .abort_backoff }) |mode| {
+        var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer memory.deinit();
+        const arena = memory.allocator();
+        const usage = @import("usage_tracker.zig");
+        var storage: usage.Storage = .{ .arena = arena, .io = testing.io };
+        var tracker: usage.UsageTracker = undefined;
+        try tracker.init(&storage, .{ .models = 1, .entries = 1 });
+        var engine: Engine = .{ .mode = mode };
+        var vtable: LM.VTable = .{
+            .complete = Engine.complete,
+            .complete_canonical = Engine.canonical,
+            .model_name = Engine.name,
+        };
+        if (mode != .disabled) vtable.canonical_retry = .{ .max_retries = 2, .backoff = Engine.backoff };
+        var cache: CachedLM = .{ .gpa = testing.allocator, .inner = .{ .ptr = &engine, .vtable = &vtable } };
+        defer cache.deinit();
+        const options: LM.PromptCall = .{
+            .n = 2,
+            .config = .{ .seed = .{ .integer = 40 } },
+            .execution = .{ .usage_tracker = &tracker },
+        };
+        if (mode == .recover) {
+            for ([_]bool{ false, true }) |hit| {
+                const result = try cache.lm().callPromptResult(arena, testing.io, "prompt", options);
+                defer result.free(arena);
+                try testing.expectEqual(hit, result.cache_hit);
+                try testing.expectEqual(2, result.responses.len);
+                try testing.expectEqualStrings("first", result.outputs.root.array.items[0].string);
+                try testing.expectEqualStrings("second", result.outputs.root.array.items[1].string);
+            }
+        } else {
+            const expected: lm_mod.Error = switch (mode) {
+                .recover => unreachable,
+                .disabled, .exhaust => error.RetryableLMFailure,
+                .terminal => error.LMFailure,
+                .abort_backoff => error.StreamStopped,
+            };
+            try testing.expectError(expected, cache.lm().callPromptResult(arena, testing.io, "prompt", options));
+            try testing.expectEqual(0, cache.entries.count());
+        }
+        const seeds: []const i64 = switch (mode) {
+            .recover => &.{ 40, 41, 41 },
+            .exhaust => &.{ 40, 41, 41, 41 },
+            else => &.{ 40, 41 },
+        };
+        try testing.expectEqualSlices(i64, seeds, engine.seeds[0..engine.calls]);
+        const waits: u8 = switch (mode) {
+            .recover, .abort_backoff => 1,
+            .exhaust => 2,
+            else => 0,
+        };
+        try testing.expectEqual(waits, engine.backoffs);
+        try testing.expectEqual(1, cache.misses);
+        try testing.expectEqual(1, tracker.entry_count);
+        const total = try usage.Graph.toValue(arena, try tracker.getTotalTokens(arena));
+        const tokens = total.object.get("retry-model").?.object.get("prompt_tokens").?.integer;
+        try testing.expectEqual(@as(i64, if (mode == .recover) 2 else 1), tokens);
+    }
 }
 
 test "canonical cache separates SDK configuration and honors public bypass" {

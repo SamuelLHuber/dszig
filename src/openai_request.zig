@@ -927,7 +927,9 @@ const Builder = struct {
                         const fields = if (self.options.dialect == .chat) try newObject(self.arena) else entry;
                         if (self.options.dialect == .responses) try fields.put(self.arena, "type", .{ .string = "function" });
                         try fields.put(self.arena, "name", .{ .string = function.name });
-                        if (function.description) |description| try fields.put(self.arena, "description", .{ .string = description });
+                        if (function.description) |description| {
+                            if (description.len != 0) try fields.put(self.arena, "description", .{ .string = description });
+                        }
                         const parameters = function.parameters.?.root;
                         try fields.put(self.arena, "parameters", parameters);
                         if (self.options.compat.strict_tools == .include) try fields.put(self.arena, "strict", .{ .bool = false });
@@ -1270,6 +1272,48 @@ fn mapError(err: anyerror) Error {
         error.OutOfMemory, error.WriteFailed => error.OutOfMemory,
         else => error.LMFailure,
     };
+}
+
+test "OpenAI tool wire omits empty descriptions in both dialects" {
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    // DSPy 3.5.0's OpenAIChatLM and OpenAILM both use MAP-17
+    // (providers/common.py:tool_description): omit None and "", not whitespace.
+    const request = try sdk.Request.fromValue(arena, try std.json.parseFromSliceLeaky(runtime.Value, arena,
+        \\{"model":"fixture","messages":[{"role":"user","parts":[{"type":"text","text":"next"}]}],"tools":[{"type":"function","name":"missing","parameters":{"type":"object"}},{"type":"function","name":"empty","description":"","parameters":{"type":"object"}},{"type":"function","name":"whitespace","description":" ","parameters":{"type":"object"}},{"type":"function","name":"described","description":"Lookup café.","parameters":{"type":"object"}}]}
+    , .{}));
+    defer request.release();
+    const cases = [_]struct { []const u8, ?[]const u8 }{
+        .{ "missing", null },
+        .{ "empty", null },
+        .{ "whitespace", " " },
+        .{ "described", "Lookup café." },
+    };
+    for ([_]Dialect{ .chat, .responses }) |dialect| {
+        const wire = try build(arena, std.testing.io, request, .{
+            .dialect = dialect,
+            .compat = Compat.defaults(dialect),
+            .adaptations = .note,
+            .max_media_bytes = 1024,
+        });
+        const payload = try std.json.parseFromSliceLeaky(runtime.Value, arena, wire.body, .{});
+        const tools_wire = payload.object.get("tools").?.array.items;
+        try std.testing.expectEqual(cases.len, tools_wire.len);
+        for (tools_wire, cases) |tool, expected| {
+            try std.testing.expectEqualStrings("function", tool.object.get("type").?.string);
+            const function = if (dialect == .chat) tool.object.get("function").? else tool;
+            try std.testing.expectEqualStrings(expected[0], function.object.get("name").?.string);
+            const parameters = function.object.get("parameters").?;
+            try std.testing.expectEqualStrings("object", parameters.object.get("type").?.string);
+            const description = function.object.get("description");
+            if (expected[1]) |text| {
+                try std.testing.expectEqualStrings(text, description.?.string);
+            } else {
+                try std.testing.expect(description == null);
+            }
+        }
+    }
 }
 
 test "Chat compatibility drops the whole dial after client-side tool and schema controls" {

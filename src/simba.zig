@@ -1,4 +1,4 @@
-//! `dspy.SIMBA` (DSPy 3.4.1): stochastic introspective mini-batch ascent.
+//! `dspy.SIMBA` (DSPy 3.5.0): stochastic introspective mini-batch ascent.
 //! Each step samples trajectories of the best programs on a mini-batch at
 //! temperature 1.0 (one rollout id per candidate), buckets them per example
 //! by score spread, and builds new programs from the most variable buckets by
@@ -22,6 +22,7 @@ const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
 
 const adapter = @import("adapter.zig");
+const lm_mod = @import("lm.zig");
 const nprandom = @import("nprandom.zig");
 const optimize = @import("optimize.zig");
 const parallel = @import("parallel.zig");
@@ -33,6 +34,7 @@ const value = @import("value.zig");
 
 const Context = predict.Context;
 const Example = optimize.Example;
+const LM = lm_mod.LM;
 const Metric = optimize.Metric;
 const Record = value.Record;
 const Value = @import("runtime_value.zig").Value;
@@ -100,13 +102,15 @@ pub const SIMBA = struct {
     temperature_for_sampling: f64 = 0.2,
     temperature_for_candidates: f64 = 0.2,
     teacher_settings: ?optimize.TeacherSettings = null,
+    /// Borrowed model for OfferFeedback only. Null uses the compile settings LM.
+    prompt_model: ?LM = null,
     /// DSPy `num_threads`; null runs rollouts serially.
     rollouts: ?Rollouts = null,
 
     /// A `parallel.Parallel(SIMBA.Run, limits).runner()` plus per-attempt
-    /// contexts; other settings come from each rollout. A teacher LM, when
-    /// configured, is shared by its rollouts and must be thread-safe, as must
-    /// the metric. Predictions and traces are allocated from `out`, which must
+    /// contexts; other settings come from each rollout. Teacher and
+    /// predictor-bound LMs are shared and must be thread-safe, as must the
+    /// metric. Predictions and traces are allocated from `out`, which must
     /// then be thread-safe (an ArenaAllocator over a thread-safe child is).
     pub const Rollouts = parallel.Rollouts(Run);
 
@@ -127,9 +131,17 @@ pub const SIMBA = struct {
         seed: u32 = 0,
         /// `inspect.getsource(type(program))`, shown to the rule writer.
         program_code: []const u8 = "",
-        /// DSPy's `prompt_model` (defaults to `ctx`).
-        prompt: ?Context = null,
     };
+
+    /// Capture the explicit prompt model, or the current settings LM if omitted.
+    /// Only the LM handle is retained; its backing model must outlive compile.
+    /// An unconfigured handle leaves feedback to the compile settings LM.
+    pub fn init(config: SIMBA, settings: Context, prompt_model: ?LM) SIMBA {
+        var self = config;
+        const model = prompt_model orelse settings.lm;
+        self.prompt_model = if (model.sameInstance(LM.unconfigured)) null else model;
+        return self;
+    }
 
     pub fn ScoredProgram(comptime P: type) type {
         return struct {
@@ -217,8 +229,11 @@ pub const SIMBA = struct {
             }
 
             /// `softmax_sample(rng, program_idxs, temperature)`.
-            fn softmaxSample(s: *const @This(), out: Allocator, rng: *pyrandom.Random, idxs: []const usize, temperature: f64) Allocator.Error!usize {
+            fn softmaxSample(s: *const @This(), out: Allocator, rng: *pyrandom.Random, idxs: []const usize, temperature: f64) (Allocator.Error || error{InvalidSamplingTemperature})!usize {
                 assert(idxs.len > 0);
+                // Python divides before calling NumPy exp, so either signed
+                // zero fails at the sampling stage instead of becoming NaN.
+                if (temperature == 0) return error.InvalidSamplingTemperature;
                 const exps = try out.alloc(f64, idxs.len);
                 var sum: f64 = 0;
                 for (exps, idxs) |*e, idx| {
@@ -233,7 +248,10 @@ pub const SIMBA = struct {
                     cum += e.* / sum;
                     e.* = cum;
                 }
-                const x = rng.random() * (exps[exps.len - 1] + 0.0);
+                const total = cum + 0.0;
+                // Python rejects nonfinite cumulative weights before drawing.
+                if (!std.math.isFinite(total)) return error.InvalidSamplingTemperature;
+                const x = rng.random() * total;
                 var lo: usize = 0;
                 var hi: usize = idxs.len - 1;
                 while (lo < hi) {
@@ -278,7 +296,6 @@ pub const SIMBA = struct {
         else
             0;
         var base = ctx;
-        base.trace = null;
 
         for (0..self.max_steps) |_| {
             if (instance_idx + self.bsize > trainset.len) {
@@ -288,23 +305,37 @@ pub const SIMBA = struct {
             const batch = data_indices[instance_idx..][0..self.bsize];
             instance_idx += self.bsize;
 
+            // Resolve the baseline binding only when sampling. Candidate
+            // scoring and final evaluation keep the original program bindings.
+            const baseline_lm = try predict.getLMFromPredictors(try predict.namedPredictors(out, st.programs.items[0]));
+            const teacher = self.teacher_settings orelse optimize.TeacherSettings{};
+            const has_teacher_settings = teacher.lm != null or teacher.adapter != null or
+                teacher.max_errors != null or teacher.max_trace_size != null;
+            // The first sampler sets a rollout on the selected model. When
+            // that is the baseline, its later evaluations see the same ID.
+            // Native LM handles are borrowed; model configuration stays local.
+            const baseline_engine = baseline_lm orelse base.lm;
+            if (has_teacher_settings and (teacher.lm orelse baseline_engine).sameInstance(baseline_engine)) {
+                base.lm_options.rollout_id = .{ .integer = start_rollout };
+            }
             const top = try st.topK(out, self.num_candidates);
             const runs = try out.alloc(Run, self.num_candidates * self.bsize);
             const rollout_jobs = try out.alloc(Job(P), runs.len);
             for (0..self.num_candidates) |model| {
                 var c = base;
                 c.lm_options.rollout_id = .{ .integer = std.math.add(i64, start_rollout, @as(i64, @intCast(model))) catch return error.InvalidRolloutId };
-                var shared_lm = false;
-                if (model == 0 and self.teacher_settings != null) {
-                    self.teacher_settings.?.apply(&c);
-                    shared_lm = self.teacher_settings.?.lm != null;
-                } else {
-                    c.lm_options.temperature = 1.0;
-                }
+                c.before_settings_rollout = null;
+                const use_teacher = model == 0 and has_teacher_settings;
+                // A nonempty settings record reserves the first sampler,
+                // but SIMBA reads only its LM (not adapter or error settings).
+                const selected_lm = if (use_teacher) teacher.lm orelse baseline_lm else baseline_lm;
+                if (selected_lm) |selected| c.lm = selected;
+                if (!use_teacher) c.lm_options.temperature = 1.0;
                 for (batch, 0..) |ex_i, j| {
                     const chosen = try st.softmaxSample(out, &rng, top, self.temperature_for_sampling);
                     const copy = try clone(P, out, st.programs.items[chosen]);
-                    rollout_jobs[model * self.bsize + j] = .{ .ctx = c, .shared_lm = shared_lm, .program = copy, .example = &trainset[ex_i] };
+                    if (selected_lm) |selected| try predict.setLM(out, copy, selected);
+                    rollout_jobs[model * self.bsize + j] = .{ .ctx = c, .shared_lm = selected_lm != null, .program = copy, .example = &trainset[ex_i] };
                 }
             }
             try self.runAll(P, out, rollout_jobs, runs);
@@ -350,14 +381,14 @@ pub const SIMBA = struct {
                 }
                 const n_strategies: usize = if (self.max_demos > 0) 2 else 1;
                 const pick = rng.randbelow(n_strategies);
-                if (n_strategies == 2 and pick == 0) {
-                    try self.appendDemo(out, bucket.runs, preds, p10);
-                } else {
-                    self.appendRule(P, out, base, system, bucket.runs, p10, p90, options) catch |err| switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        else => continue,
-                    };
-                }
+                const strategy: anyerror!void = if (n_strategies == 2 and pick == 0)
+                    self.appendDemo(out, bucket.runs, preds, p10)
+                else
+                    self.appendRule(P, out, base, system, bucket.runs, p10, p90, options);
+                strategy catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => continue,
+                };
                 try candidates.append(out, system);
                 if (candidates.items.len >= self.num_candidates + 1) break;
             }
@@ -422,7 +453,7 @@ pub const SIMBA = struct {
     fn Job(comptime P: type) type {
         return struct {
             ctx: Context,
-            /// A teacher LM is shared; otherwise each attempt brings its own.
+            /// Explicit sampler LMs are shared; otherwise each attempt brings its own.
             shared_lm: bool,
             program: *P,
             example: *const Example,
@@ -521,50 +552,40 @@ pub const SIMBA = struct {
 
     /// `append_a_demo`: the best run's last trace step per predictor becomes
     /// an augmented demo of that predictor.
-    fn appendDemo(self: SIMBA, out: Allocator, bucket: []Run, preds: []const predict.NamedParam, p10: f64) Allocator.Error!void {
+    fn appendDemo(self: SIMBA, out: Allocator, bucket: []Run, preds: []const predict.NamedParam, p10: f64) optimize.TraceDemoError!void {
         const good = bucket[0];
         if (good.score.? <= p10) return;
-        var names: std.ArrayList([]const u8) = .empty;
-        var demos: std.ArrayList(Record) = .empty;
+        const NamedDemo = struct { name: []const u8, demo: Record };
+        var demos: std.ArrayList(NamedDemo) = .empty;
+        defer demos.deinit(out);
+        errdefer for (demos.items) |*item| item.demo.deinit(out);
         for (good.steps) |step| {
-            const name = nameOf(good.names, step.predictor) orelse continue;
-            var demo: Record = .empty;
-            try demo.put(out, "augmented", .{ .bool = true });
-            var it = step.inputs.iterator();
-            while (it.next()) |e| try demo.put(out, e.key_ptr.*, try self.truncate(out, e.value_ptr.*));
-            var ot = step.outputs.iterator();
-            while (ot.next()) |e| try demo.put(out, e.key_ptr.*, e.value_ptr.*);
-            for (names.items, 0..) |existing, i| {
-                if (std.mem.eql(u8, existing, name)) {
-                    demos.items[i] = demo;
+            var demo = try optimize.traceDemo(out, step, self.demo_input_field_maxlen);
+            const name = nameOf(good.names, step.predictor) orelse {
+                demo.deinit(out);
+                continue;
+            };
+            for (demos.items) |*existing| {
+                if (std.mem.eql(u8, existing.name, name)) {
+                    existing.demo.deinit(out);
+                    existing.demo = demo;
                     break;
                 }
             } else {
-                try names.append(out, name);
-                try demos.append(out, demo);
+                errdefer demo.deinit(out);
+                try demos.append(out, .{ .name = name, .demo = demo });
             }
         }
-        for (names.items, demos.items) |name, demo| {
+        for (demos.items) |item| {
             for (preds) |p| {
-                if (!std.mem.eql(u8, p.name, name)) continue;
+                if (!std.mem.eql(u8, p.name, item.name)) continue;
                 const old = p.param.predict.demos;
                 const grown = try out.alloc(Record, old.len + 1);
                 @memcpy(grown[0..old.len], old);
-                grown[old.len] = demo;
+                grown[old.len] = item.demo;
                 p.param.predict.demos = grown;
             }
         }
-    }
-
-    fn truncate(self: SIMBA, out: Allocator, v: Value) Allocator.Error!Value {
-        if (self.demo_input_field_maxlen == 0) return v;
-        const text = try pyStr(out, v);
-        const len = std.unicode.utf8CountCodepoints(text) catch text.len;
-        if (len <= self.demo_input_field_maxlen) return v;
-        var view = std.unicode.Utf8View.initUnchecked(text).iterator();
-        var end: usize = 0;
-        for (0..self.demo_input_field_maxlen) |_| end += (view.nextCodepointSlice() orelse break).len;
-        return .{ .string = try std.fmt.allocPrint(out, "{s}\n\t\t... <TRUNCATED FOR BREVITY>", .{text[0..end]}) };
     }
 
     /// `append_a_rule`: ask the prompt model to contrast the best and worst
@@ -580,7 +601,6 @@ pub const SIMBA = struct {
         p90: f64,
         options: Options,
     ) !void {
-        _ = self;
         const good = &bucket[0];
         const bad = &bucket[bucket.len - 1];
         if (good.score.? <= p10 or bad.score.? >= p90) return;
@@ -612,8 +632,12 @@ pub const SIMBA = struct {
         try inputs.put(out, "better_reward_info", try rewardInfo(out, good.metadata));
         try inputs.put(out, "module_names", try dumps(out, .{ .array = module_names }));
 
-        var c = options.prompt orelse ctx;
+        var c = ctx;
         c.arena = out;
+        c.lm = self.prompt_model orelse ctx.lm;
+        // OfferFeedback is a fresh predictor, not a call to the student.
+        c.lm_override = null;
+        c.lm_override_present = false;
         c.trace = null;
         const feedback: predict.Predict(OfferFeedback) = .{};
         const outputs = try feedback.state.call(c, &inputs);
@@ -686,13 +710,6 @@ fn dumps(out: Allocator, v: Value) (@import("feedback.zig").Error || error{Parse
         else => |failure| failure,
     };
     return .{ .string = aw.written() };
-}
-
-fn pyStr(out: Allocator, v: Value) Allocator.Error![]const u8 {
-    if (v == .string) return v.string;
-    var aw: Writer.Allocating = .init(out);
-    pyjson.writeStr(&aw.writer, v) catch return error.OutOfMemory;
-    return aw.written();
 }
 
 /// `inspect_modules(program)`.
@@ -860,6 +877,96 @@ test "SIMBA lets metrics score missing predictions after program failure" {
     try std.testing.expectEqual(@as(usize, 0), script.index);
 }
 
+test "SIMBA binds trace demos before predictor lookup and drops invalid candidates before scoring" {
+    const P = predict.Predict(signature.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: []const u8 };
+    }));
+    const TraceCase = enum { output_base, truncated_input_base, mapped_duplicate, unmapped_duplicate };
+    const Program = struct {
+        predictor: P = .{},
+        trace_case: TraceCase = .output_base,
+        compiled: bool = false,
+
+        const unmapped: P = .{};
+        pub const Input = P.Input;
+        pub const Output = struct { reward: f64 };
+
+        pub fn forward(self: *const @This(), ctx: Context, input: Input) !Output {
+            if (ctx.lm_options.rollout_id) |rollout_id| {
+                if (rollout_id.integer != 0) return .{ .reward = 0 };
+                const trace = ctx.trace.?;
+                var inputs = try value.toRecord(ctx.arena, Input, input);
+                var outputs: Record = .empty;
+                try outputs.put(ctx.arena, "answer", .{ .string = "first" });
+                try trace.record(&self.predictor.state, &inputs, &outputs);
+                const base = try Example.fromJson(ctx.arena, "{\"answer\":\"stale\",\"question\":\"old\",\"augmented\":false,\"inherited\":7}", &.{});
+                const base_owner = if (self.trace_case == .truncated_input_base) &inputs else &outputs;
+                try base_owner.put(ctx.arena, "base", .{ .object = base.record });
+                try outputs.put(ctx.arena, "answer", .{ .string = "teacher" });
+                try trace.record(&self.predictor.state, &inputs, &outputs);
+                if (self.trace_case == .mapped_duplicate or self.trace_case == .unmapped_duplicate) {
+                    const malformed = try value.toRecord(ctx.arena, struct { augmented: bool }, .{ .augmented = false });
+                    const state = if (self.trace_case == .mapped_duplicate) &self.predictor.state else &unmapped.state;
+                    try trace.record(state, &inputs, &malformed);
+                }
+                return .{ .reward = 1 };
+            }
+            return .{ .reward = if (self.predictor.state.demos.len == 0) 0 else 1 };
+        }
+    };
+    const MetricCheck = struct {
+        var calls: usize = 0;
+
+        fn score(_: Allocator, _: *const Example, pred: ?*const optimize.RecordPrediction, _: ?*const predict.Trace) value.ParseError!f64 {
+            calls += 1;
+            return pred.?.get("reward").?.float;
+        }
+    };
+
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var script: @import("lm.zig").ScriptedLM = .{ .responses = &.{} };
+    const ctx: Context = .{ .arena = arena, .lm = script.lm() };
+    const train = try Example.fromJson(arena, "{\"question\":\"é长rest\"}", &.{"question"});
+    const optimizer: SIMBA = .{
+        .metric = MetricCheck.score,
+        .max_steps = 1,
+        .num_candidates = 2,
+        .bsize = 1,
+        .demo_input_field_maxlen = 2,
+    };
+    // Seed 2 selects append_a_demo after two rollout draws and one source draw.
+    for ([_]TraceCase{ .output_base, .truncated_input_base, .mapped_duplicate, .unmapped_duplicate }) |trace_case| {
+        MetricCheck.calls = 0;
+        const result = try optimizer.compile(Program, arena, ctx, .{ .trace_case = trace_case }, &.{train}, .{ .seed = 2 });
+        if (trace_case == .output_base or trace_case == .truncated_input_base) {
+            // Two rollouts, one candidate mini-batch evaluation, two final evaluations.
+            try std.testing.expectEqual(@as(usize, 5), MetricCheck.calls);
+            try std.testing.expectEqualSlices(f64, &.{ 1, 0 }, result.scores);
+            try std.testing.expectEqual(@as(usize, 1), result.program.predictor.state.demos.len);
+            const demo = result.program.predictor.state.demos[0];
+            try std.testing.expect(!demo.contains("base"));
+            try std.testing.expect(demo.get("augmented").?.bool);
+            if (trace_case == .output_base) {
+                try std.testing.expectEqual(@as(i64, 7), demo.get("inherited").?.integer);
+            } else {
+                // A truncated input base is a string by the time Example binds it.
+                try std.testing.expect(!demo.contains("inherited"));
+            }
+            try std.testing.expectEqualStrings("teacher", demo.get("answer").?.string);
+            try std.testing.expectEqualStrings("é长\n\t\t... <TRUNCATED FOR BREVITY>", demo.get("question").?.string);
+        } else {
+            // Two rollouts and one final baseline evaluation; no candidate scoring.
+            try std.testing.expectEqual(@as(usize, 3), MetricCheck.calls);
+            try std.testing.expectEqualSlices(f64, &.{0}, result.scores);
+            try std.testing.expectEqual(@as(usize, 0), result.program.predictor.state.demos.len);
+            try std.testing.expectEqual(@as(?f64, null), result.train_scores[0]);
+        }
+    }
+}
+
 test "SIMBA scores only the baseline when no search steps are requested" {
     const Sig = signature.Signature(struct {
         pub const Input = struct { question: []const u8 };
@@ -887,6 +994,8 @@ test "SIMBA scores only the baseline when no search steps are requested" {
         .num_candidates = 0,
         .bsize = 1,
     };
+    optimizer.temperature_for_sampling = 0.0;
+    optimizer.temperature_for_candidates = 0.0;
     const scored = try optimizer.compile(P, arena, ctx, .{}, &train, .{});
     try std.testing.expectEqualSlices(f64, &.{1}, scored.scores);
     try std.testing.expectEqual(@as(usize, 1), script.index);
@@ -901,6 +1010,254 @@ test "SIMBA scores only the baseline when no search steps are requested" {
     optimizer.bsize = 1;
     optimizer.num_candidates = 0;
     try std.testing.expectError(error.InvalidOptions, optimizer.compile(P, arena, ctx, .{}, &train, .{}));
+}
+
+test "SIMBA rejects zero temperatures at the respective sampling stages" {
+    const Sig = signature.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: []const u8 };
+    });
+    const P = predict.Predict(Sig);
+    const CountingMetric = struct {
+        var calls: usize = 0;
+        fn score(_: Allocator, _: *const Example, _: ?*const optimize.RecordPrediction, _: ?*const predict.Trace) error{}!f64 {
+            calls += 1;
+            return 1;
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const train = [_]Example{
+        try Example.fromJson(arena, "{\"question\":\"ok?\",\"answer\":\"yes\"}", &.{"question"}),
+    };
+    for ([_]bool{ true, false }) |zero_before_rollout| {
+        CountingMetric.calls = 0;
+        var script: @import("lm.zig").ScriptedLM = .{ .responses = &.{"<answer>yes</answer>"} };
+        const ctx: Context = .{ .arena = arena, .lm = script.lm() };
+        const optimizer: SIMBA = .{
+            .metric = CountingMetric.score,
+            .max_steps = 1,
+            .num_candidates = 1,
+            .bsize = 1,
+            .temperature_for_sampling = if (zero_before_rollout) 0.0 else 0.2,
+            .temperature_for_candidates = if (zero_before_rollout) 0.2 else -0.0,
+        };
+        const result = optimizer.compile(P, arena, ctx, .{}, &train, .{});
+        const expected_calls: usize = if (zero_before_rollout) 0 else 1;
+        try std.testing.expectEqual(expected_calls, script.index);
+        try std.testing.expectEqual(expected_calls, CountingMetric.calls);
+        try std.testing.expectError(error.InvalidSamplingTemperature, result);
+    }
+}
+
+test "SIMBA rejects nonfinite sampling weights at the respective sampling stages" {
+    const P = predict.Predict(signature.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: []const u8 };
+    }));
+    const CountingMetric = struct {
+        var calls: usize = 0;
+
+        fn score(_: Allocator, example: *const Example, _: ?*const optimize.RecordPrediction, _: ?*const predict.Trace) error{}!f64 {
+            calls += 1;
+            return @floatFromInt(example.record.get("reward").?.integer);
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const train = try Example.fromJson(arena, "{\"question\":\"ok?\",\"reward\":1000}", &.{"question"});
+    const nan = std.math.nan(f64);
+    const responses: [5][]const u8 = @splat("<answer>yes</answer>");
+    const cases = [_]struct {
+        sampling: f64,
+        candidates: f64,
+        steps: usize,
+        num_candidates: usize,
+        calls: usize,
+    }{
+        .{ .sampling = nan, .candidates = 0.2, .steps = 1, .num_candidates = 1, .calls = 0 },
+        .{ .sampling = 0.2, .candidates = nan, .steps = 1, .num_candidates = 1, .calls = 1 },
+        // The first batch registers a score of 1000, so exp(1000 / 0.2)
+        // overflows at the respective sampling stage of the second batch.
+        .{ .sampling = 0.2, .candidates = 1e6, .steps = 2, .num_candidates = 2, .calls = 3 },
+        .{ .sampling = 1e6, .candidates = 0.2, .steps = 2, .num_candidates = 2, .calls = 5 },
+    };
+    for (cases) |case| {
+        CountingMetric.calls = 0;
+        var script: @import("lm.zig").ScriptedLM = .{ .responses = &responses };
+        const ctx: Context = .{ .arena = arena, .lm = script.lm() };
+        const optimizer: SIMBA = .{
+            .metric = CountingMetric.score,
+            .max_steps = case.steps,
+            .num_candidates = case.num_candidates,
+            .bsize = 1,
+            .max_demos = 0,
+            .temperature_for_sampling = case.sampling,
+            .temperature_for_candidates = case.candidates,
+        };
+        try std.testing.expectError(error.InvalidSamplingTemperature, optimizer.compile(P, arena, ctx, .{}, &.{train}, .{}));
+        try std.testing.expectEqual(case.calls, script.index);
+        try std.testing.expectEqual(case.calls, CountingMetric.calls);
+    }
+}
+
+test "SIMBA sampler settings preserve bound model precedence and the ambient adapter" {
+    const Sig = signature.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: []const u8 };
+    });
+    const P = predict.Predict(Sig);
+    const MetricCheck = struct {
+        fn score(_: Allocator, _: *const Example, prediction: ?*const optimize.RecordPrediction, _: ?*const predict.Trace) value.ParseError!f64 {
+            return if (prediction) |p| if (std.mem.eql(u8, p.get("answer").?.string, "yes")) 1 else 0 else 0;
+        }
+    };
+    const lm = @import("lm.zig");
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const train = [_]Example{try Example.fromJson(arena, "{\"question\":\"ok?\",\"answer\":\"yes\"}", &.{"question"})};
+    for (0..4) |scenario| {
+        var base_history: lm.History = .{ .arena = arena };
+        var teacher_history: lm.History = .{ .arena = arena };
+        var base: lm.KeywordLM = .{ .rules = &.{}, .default = "<answer>yes</answer>", .history = &base_history };
+        var teacher: lm.KeywordLM = .{ .rules = &.{}, .default = "<answer>yes</answer>", .history = &teacher_history };
+        var student: P = .{};
+        if (scenario == 3) student.state.lm = base.lm();
+        const optimizer: SIMBA = .{
+            .metric = MetricCheck.score,
+            .max_steps = 1,
+            .bsize = 1,
+            .num_candidates = 2,
+            .teacher_settings = switch (scenario) {
+                0 => null,
+                1 => .{},
+                2 => .{ .adapter = .json },
+                else => .{ .lm = teacher.lm() },
+            },
+        };
+        const result = try optimizer.compile(P, arena, .{
+            .arena = arena,
+            .lm = if (scenario == 3) lm.LM.unconfigured else base.lm(),
+            .lm_options = .{ .temperature = 0.25 },
+            .json_fallback = false,
+        }, student, &train, .{});
+        try std.testing.expectEqual(@as(usize, if (scenario == 3) 1 else 0), teacher_history.requests.items.len);
+        const first = if (scenario == 3) teacher_history.requests.items[0] else base_history.requests.items[0];
+        const sampling_calls: usize = if (scenario == 3) 1 else 2;
+        const second = base_history.requests.items[sampling_calls - 1];
+        try std.testing.expectEqual(@as(i64, 0), first.options.rollout_id.?.integer);
+        try std.testing.expectEqual(@as(i64, 1), second.options.rollout_id.?.integer);
+        try std.testing.expectEqual(@as(?f64, if (scenario < 2) 1 else 0.25), first.options.temperature);
+        try std.testing.expectEqual(@as(?f64, 1), second.options.temperature);
+        try std.testing.expect(std.mem.indexOf(u8, first.messages[first.messages.len - 1].content.text, "<question>") != null);
+        try std.testing.expectEqual(@as(usize, 3), base_history.requests.items.len - sampling_calls);
+        for (base_history.requests.items[sampling_calls..]) |evaluation| {
+            if (scenario == 2) {
+                try std.testing.expectEqual(@as(i64, 0), evaluation.options.rollout_id.?.integer);
+            } else {
+                try std.testing.expect(evaluation.options.rollout_id == null);
+            }
+        }
+        try std.testing.expectEqual(@as(f64, 1), result.scores[0]);
+        if (scenario == 3) try std.testing.expect(result.program.state.lm.?.sameInstance(base.lm()));
+    }
+}
+
+test "SIMBA captures only the feedback LM and leaves compile routing and trace intact" {
+    const lm = lm_mod;
+    const Predictor = predict.Predict(signature.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: []const u8 };
+    }));
+    const Program = struct {
+        predictor: Predictor = .{},
+
+        pub const Input = Predictor.Input;
+        pub const Output = Predictor.Output;
+
+        pub fn forward(self: *const @This(), ctx: Context, input: Input) !Output {
+            return self.predictor.forward(ctx, input);
+        }
+
+        fn score(_: Allocator, _: *const Example, pred: ?*const optimize.RecordPrediction, _: ?*const predict.Trace) value.ParseError!f64 {
+            return if (pred) |p| @floatFromInt(@intFromBool(std.mem.eql(u8, p.get("answer").?.string, "yes"))) else 0;
+        }
+    };
+
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const train = [_]Example{try Example.fromJson(arena, "{\"question\":\"ok?\"}", &.{"question"})};
+    const config: SIMBA = .{ .metric = Program.score, .bsize = 1, .num_candidates = 2, .max_steps = 1, .max_demos = 0 };
+    const yes = "<answer>yes</answer>";
+    const no = "<answer>no</answer>";
+    const feedback = "<discussion>Compare the answers.</discussion><module_advice><predictor>Give the better answer.</predictor></module_advice>";
+    const Case = enum { explicit, captured, fallback, unconfigured_explicit };
+
+    for ([_]Case{ .explicit, .captured, .fallback, .unconfigured_explicit }) |case| {
+        var history: lm.History = .{ .arena = arena };
+        var task_history: lm.History = .{ .arena = arena };
+        var compile_history: lm.History = .{ .arena = arena };
+        var explicit: lm.ScriptedLM = .{ .responses = &.{feedback}, .history = &history };
+        var captured: lm.ScriptedLM = .{ .responses = &.{feedback}, .history = &history };
+        var task: lm.ScriptedLM = .{ .responses = &.{ yes, no, yes, no, yes }, .history = &task_history };
+        var current: lm.ScriptedLM = .{ .responses = &.{feedback}, .history = &compile_history };
+        var construction: Context = .{
+            .arena = arena,
+            .lm = if (case == .fallback) LM.unconfigured else captured.lm(),
+            .adapter = .json,
+            .lm_options = .{ .temperature = 0.81 },
+            .lm_override = task.lm(),
+        };
+        const optimizer = config.init(construction, switch (case) {
+            .explicit => explicit.lm(),
+            .unconfigured_explicit => LM.unconfigured,
+            else => null,
+        });
+        construction.lm = current.lm();
+        var trace: predict.Trace = .{ .arena = arena };
+        const ctx: Context = .{
+            .arena = arena,
+            .lm = construction.lm,
+            .lm_override = task.lm(),
+            .lm_override_present = true,
+            .adapter = .xml,
+            .lm_options = .{ .temperature = 0.37, .rollout_id = .{ .integer = 6 } },
+            .trace = &trace,
+            .json_fallback = false,
+        };
+
+        const result = try optimizer.compile(Program, arena, ctx, .{}, &train, .{});
+        try std.testing.expectEqualSlices(f64, &.{ 1, 0 }, result.scores);
+        try std.testing.expect(std.mem.endsWith(u8, result.program.predictor.state.instructions, "\n\nGive the better answer."));
+        try std.testing.expect(result.program.predictor.state.lm == null);
+        try std.testing.expectEqual(@as(usize, 0), trace.steps.items.len);
+
+        try std.testing.expectEqual(@as(usize, @intFromBool(case == .explicit)), explicit.index);
+        try std.testing.expectEqual(@as(usize, @intFromBool(case == .captured)), captured.index);
+        const fallback = case == .fallback or case == .unconfigured_explicit;
+        try std.testing.expectEqual(@as(usize, @intFromBool(fallback)), current.index);
+        const feedback_requests = if (fallback) compile_history.requests.items else history.requests.items;
+        try std.testing.expectEqual(@as(usize, 1), feedback_requests.len);
+        try std.testing.expectEqual(@as(usize, 0), if (fallback) history.requests.items.len else compile_history.requests.items.len);
+        const request = feedback_requests[0];
+        try std.testing.expect(std.mem.indexOf(u8, request.messages[request.messages.len - 1].content.text, "<module_names>") != null);
+        try std.testing.expectEqual(@as(?f64, 0.37), request.options.temperature);
+        try std.testing.expectEqual(@as(i64, 6), request.options.rollout_id.?.integer);
+
+        try std.testing.expectEqual(@as(usize, 5), task.index);
+        try std.testing.expectEqual(@as(usize, 5), task_history.requests.items.len);
+        for (task_history.requests.items, 0..) |call, i| {
+            try std.testing.expect(std.mem.indexOf(u8, call.messages[call.messages.len - 1].content.text, "<question>") != null);
+            const has_advice = std.mem.indexOf(u8, call.messages[0].content.text, "Give the better answer.") != null;
+            try std.testing.expectEqual(i == 2 or i == 4, has_advice);
+            try std.testing.expectEqual(@as(?f64, if (i < 2) 1 else 0.37), call.options.temperature);
+            try std.testing.expectEqual(@as(i64, if (i == 1) 7 else 6), call.options.rollout_id.?.integer);
+        }
+    }
 }
 
 test "roundHalfEven matches Python round" {

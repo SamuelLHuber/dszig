@@ -40,7 +40,8 @@ pub const Options = struct {
     teachers: ?[]const finetune.Teacher = null,
     valset: ?[]const optimize.Example = null,
     valset_ratio: f64 = 0.1,
-    seed: ?u32 = null,
+    /// CPython integer seeding uses the absolute value, including for minInt(i64).
+    seed: ?i64 = null,
     shuffle_trainset_between_steps: bool = true,
     strategy: []const u8 = "p -> w -> p",
     optimizer_compile_args: []const CompileArgs = &.{},
@@ -148,13 +149,12 @@ pub const BetterTogether = struct {
             .teacher = if (teachers) |list| .{ .list = list } else .none,
             .step_index = 0,
         };
-        var seed = options.seed;
-        if (seed == null) {
+        const magnitude: u64 = if (options.seed) |seed| @abs(seed) else seed: {
             var bytes: [4]u8 = undefined;
             try io.randomSecure(&bytes);
-            seed = std.mem.readInt(u32, &bytes, .little);
-        }
-        var rng = pyrandom.Random.init(seed.?);
+            break :seed std.mem.readInt(u32, &bytes, .little);
+        };
+        var rng = pyrandom.Random.initWide(magnitude);
         const candidates = try out.alloc(Candidate(P), steps.len + 1);
         lifecycle(initial, .launch, &.{}) catch |err| {
             try lifecycle(initial, .kill, &.{});
@@ -696,6 +696,50 @@ fn testOptimizer() BetterTogether {
             .max_strategy_bytes = 256,
         },
     };
+}
+
+test "BetterTogether signed seeds reproduce both DSPy trainset shuffles" {
+    const Probe = struct {
+        orders: [2][6]u8 = undefined,
+        calls: usize = 0,
+
+        pub fn compile(self: *@This(), comptime P: type, request: optimizers.Request(P)) !P {
+            for (request.trainset, &self.orders[self.calls]) |row, *id| id.* = row.record.get("question").?.string[0];
+            self.calls += 1;
+            return request.student;
+        }
+    };
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var trainset: [6]optimize.Example = undefined;
+    inline for (0..6) |i| {
+        trainset[i] = try optimize.Example.fromJson(out, std.fmt.comptimePrint("{{\"question\":\"{d}\"}}", .{i}), &.{"question"});
+    }
+    // Recorded from DSPy 3.5 BetterTogether.compile(strategy="probe -> probe", valset_ratio=0).
+    const cases = [_]struct { seed: i64, first: []const u8, second: []const u8 }{
+        .{ .seed = @as(u32, 9), .first = "501243", .second = "432150" },
+        .{ .seed = 0x100000009, .first = "425310", .second = "320145" },
+        .{ .seed = -0x100000009, .first = "425310", .second = "320145" },
+        .{ .seed = std.math.minInt(i64), .first = "520134", .second = "152340" },
+    };
+    for (cases) |case| {
+        var student: TestProgram = .{};
+        var model: lm.OpenAI = .{ .client = undefined, .base_url = "http://unused", .model = "base" };
+        try predict.setLM(out, &student, model.lm());
+        var probe: Probe = .{};
+        const result = try testOptimizer().compileWith(TestProgram, out, testing.allocator, testing.io, .{ .arena = out }, &student, &trainset, .{
+            .seed = case.seed,
+            .strategy = "probe -> probe",
+            .valset_ratio = 0,
+        }, .{ .probe = &probe });
+        try testing.expect(!result.flag_compilation_error_occurred);
+        try testing.expectEqual(@as(usize, 2), probe.calls);
+        try testing.expectEqualStrings(case.first, &probe.orders[0]);
+        try testing.expectEqualStrings(case.second, &probe.orders[1]);
+        for (trainset, "012345") |row, id| try testing.expectEqual(id, row.record.get("question").?.string[0]);
+    }
 }
 
 test "BetterTogether retains first validation tie and distinct memoized LM snapshots" {

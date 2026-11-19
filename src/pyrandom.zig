@@ -17,11 +17,18 @@ pub const Random = struct {
     mt: [state_len]u32,
     index: u32,
 
-    /// Equivalent to `random.Random(seed)` for a non-negative integer seed
-    /// below 2^32 (CPython seeds with the 32-bit words of `abs(seed)`).
+    /// Equivalent to `random.Random(seed)` for a non-negative 32-bit seed.
     pub fn init(seed: u32) Random {
+        return initWide(seed);
+    }
+
+    /// CPython seeds with the significant 32-bit limbs, least significant
+    /// first. Zero still supplies one limb.
+    pub fn initWide(seed: u64) Random {
+        const high: u32 = @truncate(seed >> 32);
+        const words = [_]u32{ @truncate(seed), high };
         var r: Random = .{ .mt = undefined, .index = state_len };
-        r.initBySeed(ArraySeed{ .words = &.{seed}, .len = 1 });
+        r.initBySeed(ArraySeed{ .words = &words, .len = if (high == 0) 1 else 2 });
         return r;
     }
 
@@ -121,14 +128,29 @@ pub const Random = struct {
         return r.nextU32() >> shift;
     }
 
-    /// `_randbelow_with_getrandbits(n)`: rejection sampling, n in [1, 2^32).
     pub fn randbelow(r: *Random, n: usize) usize {
         assert(n > 0);
-        assert(n <= std.math.maxInt(u32));
+        if (n > std.math.maxInt(u32)) return @intCast(r.randbelowWide(n));
         const k: u6 = @intCast(std.math.log2_int(usize, n) + 1);
         var x: usize = r.getrandbits(k);
         while (x >= n) x = r.getrandbits(k);
         return x;
+    }
+
+    /// CPython's `_randbelow_with_getrandbits`: full low words first,
+    /// followed by the high bits of the final word, then reject out of range.
+    pub fn randbelowWide(r: *Random, n: u128) u128 {
+        assert(n > 0);
+        const bits = 128 - @as(u8, @clz(n));
+        while (true) {
+            var x: u128 = 0;
+            var shift: u8 = 0;
+            while (shift < bits) : (shift += 32) {
+                const width: u6 = @intCast(@min(32, bits - shift));
+                x |= @as(u128, r.getrandbits(width)) << @as(u7, @intCast(shift));
+            }
+            if (x < n) return x;
+        }
     }
 
     /// `random.Random(s)` for a UTF-8 string seed. Read the little-endian
@@ -218,6 +240,27 @@ test "Random(0).getrandbits(32) matches CPython" {
     try testing.expectEqual(@as(u32, 3626764237), r.getrandbits(32));
     try testing.expectEqual(@as(u32, 1654615998), r.getrandbits(32));
     try testing.expectEqual(@as(u32, 3255389356), r.getrandbits(32));
+}
+
+test "wide integer seeds preserve CPython high limbs" {
+    const cases = [_]struct { seed: u64, draws: [3]u32 }{
+        .{ .seed = 4294967295, .draws = .{ 2728839433, 2661025012, 872737089 } },
+        .{ .seed = 4294967296, .draws = .{ 485306839, 1508871100, 1794561286 } },
+        .{ .seed = 9223372036854775806, .draws = .{ 3987324819, 3991979437, 3564015380 } },
+        .{ .seed = 18446744073709551615, .draws = .{ 93740670, 1068495656, 1452108352 } },
+    };
+    for (cases) |case| {
+        var r = Random.initWide(case.seed);
+        for (case.draws) |draw| try testing.expectEqual(draw, r.getrandbits(32));
+    }
+}
+
+test "wide bounded draws preserve the CPython rejection stream" {
+    var r = Random.init(0);
+    // random.Random(0).randrange(n) for each bound in order, CPython 3.11.
+    const bounds = [_]u128{ (1 << 32) - 1, 1 << 32, 1 << 63, 1 << 64, (1 << 127) - 1, std.math.maxInt(u128), 17 };
+    const draws = [_]u128{ 3626764237, 3823568514, 4776171008201404212, 9431353882395063546, 141192154804251934328198056243792298872, 121837888442905784319181249721020049161, 6 };
+    for (bounds, draws) |bound, draw| try testing.expectEqual(draw, r.randbelowWide(bound));
 }
 
 test "sample and shuffle stream matches CPython" {

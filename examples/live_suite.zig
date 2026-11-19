@@ -613,6 +613,7 @@ pub fn writeTranscript(arena: Allocator, runtime: []const u8, model: []const u8,
     try root.put(arena, "supports_response_format", .{ .bool = lm.supports_response_format });
     try root.put(arena, "supports_response_schema", .{ .bool = lm.supports_response_schema });
     try root.put(arena, "supports_function_calling", .{ .bool = lm.supports_function_calling });
+    try root.put(arena, "records_tool_result_names", .{ .bool = true });
     if (lm.supports_decision_requests) try root.put(arena, "supports_decision_requests", .{ .bool = true });
     try root.put(arena, "calls", .{ .array = call_values });
     try appendResult(arena, &root, result);

@@ -5,6 +5,8 @@
 //! The persistent allocator owns the per-instance, in-memory batch cache. Every
 //! result is contiguous float32 storage owned by the caller's output arena,
 //! independent of that cache. Concurrent calls require external synchronization.
+//! If kwargs exceed the native cache key encoder's depth limit or cannot be
+//! projected to JSON, the batch runs uncached. Backend errors still propagate.
 //!
 //! ```zig
 //! const embedding = @import("embedder.zig");
@@ -172,7 +174,14 @@ pub const Embedder = struct {
             // Custom callbacks and native token providers can mutate shared
             // nested kwargs. Snapshot each batch before executing it, as DSPy's
             // request_cache does; a once-per-call hash would alias later batches.
-            const key = if (caching) batchKey(try self.baseCacheHash(scratch, kwargs), texts) else null;
+            const key: ?Key = if (caching) blk: {
+                const base = self.baseCacheHash(scratch, kwargs) catch |err| switch (err) {
+                    // DSPy's Cache.get/put skip requests they cannot serialize.
+                    error.JsonTooDeep, error.ParseValue => break :blk null,
+                    else => return err,
+                };
+                break :blk batchKey(base, texts);
+            } else null;
             if (key) |k| {
                 if (self.entries.fetchOrderedRemove(k)) |hit| {
                     self.entries.putAssumeCapacity(k, hit.value);
@@ -1003,6 +1012,32 @@ test "Embedder cache merges kwargs canonically ignores named credentials and res
     _ = try model.embed(arena, &.{"same"}, .{ .caching = true, .kwargs = try testRecord(arena, "{\"user\":\"call\"}") });
     try testing.expectEqual(@as(usize, 3), state.calls);
     try testing.expectEqual(@as(usize, 3), model.hits);
+}
+
+test "Embedder key encoding failure bypasses lookup and storage, not inference" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var nested: Value = .{ .integer = 0 };
+    for (0..260) |_| {
+        var layer: @import("runtime_value.zig").Array = .init(arena);
+        try layer.append(nested);
+        nested = .{ .array = layer };
+    }
+    var kwargs: Record = .empty;
+    try kwargs.put(arena, "schema", nested);
+
+    var state: TestCustom = .{};
+    var model = Embedder.initCustom(testing.allocator, .{ .context = &state, .embed = TestCustom.run }, .{});
+    defer model.deinit();
+    _ = try model.embedOne(arena, "text", .{});
+    for (0..2) |_| {
+        try testing.expectEqualSlices(f32, &.{ 4, 16_777_216 }, try model.embedOne(arena, "text", .{ .kwargs = kwargs }));
+    }
+    _ = try model.embedOne(arena, "text", .{});
+    try testing.expectEqual(@as(usize, 3), state.calls);
+    try testing.expectEqual(@as(usize, 1), model.hits);
+    try testing.expectEqual(@as(usize, 1), model.entries.count());
 }
 
 test "Embedder successful batches remain cached when a later batch fails" {

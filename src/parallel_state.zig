@@ -12,6 +12,8 @@ pub const Limits = struct {
 pub const Options = struct {
     max_errors: u32 = 10,
     return_failed_tasks: bool = false,
+    /// Treat a task's Canceled error as a request to cancel the whole batch.
+    cancel_on_task_canceled: bool = false,
     /// Zero disables speculative retries, not execution deadlines.
     straggler_timeout_ns: u64 = 120 * std.time.ns_per_s,
     straggler_limit: u32 = 3,
@@ -102,6 +104,10 @@ pub fn Scheduler(comptime limits: Limits) type {
             // but cannot retroactively change a result already accepted by the owner.
             if (self.terminal != .running) return;
             if (failure) |err| {
+                if (self.options.cancel_on_task_canceled and err == error.Canceled) {
+                    self.cancel();
+                    return;
+                }
                 self.error_count += 1;
                 if (self.winners[attempt.task] == null) {
                     assert(self.failure_count < limits.attempts);

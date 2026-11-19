@@ -33,7 +33,7 @@ pub const RunOptions = struct {
     /// Appended in place, including failed final submit events. New events use
     /// Context.arena; clone the History before releasing that arena.
     history: ?*History = null,
-    max_iters: ?usize = null,
+    max_iters: ?i128 = null,
 };
 
 pub const Arg = struct {
@@ -122,7 +122,7 @@ pub fn ReAct(comptime Sig: type, comptime user_tools: []const Tool) type {
     return ReActIters(Sig, user_tools, 20);
 }
 
-pub fn ReActIters(comptime Sig: type, comptime user_tools: []const Tool, comptime default_max_iters: usize) type {
+pub fn ReActIters(comptime Sig: type, comptime user_tools: []const Tool, comptime default_max_iters: i128) type {
     comptime assert(signature.isSignature(Sig));
     const n_in = Sig.input_fields_list.len;
     comptime {
@@ -216,7 +216,8 @@ pub fn ReActIters(comptime Sig: type, comptime user_tools: []const Tool, comptim
         pub const react_fields: []const Field = &react_field_array;
 
         react: predict.PredictFields(react_fields, n_in + 3, instructions),
-        max_iters: usize = default_max_iters,
+        /// Nonpositive limits skip tool turns and go directly to forced submit.
+        max_iters: i128 = default_max_iters,
         compiled: bool = false,
 
         /// Each agent constructs a fresh derived signature class. Copies retain
@@ -250,14 +251,15 @@ pub fn ReActIters(comptime Sig: type, comptime user_tools: []const Tool, comptim
         }
 
         pub fn runWithOptions(self: *const Self, ctx: Context, inputs: *const Record, options: RunOptions) Error!Prediction {
-            const max_iters = options.max_iters orelse try iterationLimit(inputs, self.max_iters);
+            const limit = options.max_iters orelse try iterationLimit(inputs, self.max_iters);
+            const max_iters = std.math.cast(usize, @max(0, limit)) orelse return error.InvalidMaxIters;
             var local_history: History = if (options.history == null) blk: {
                 const supplied = inputs.get("history") orelse break :blk .{};
                 if (supplied == .null) break :blk .{};
                 break :blk try History.fromValue(ctx.arena, supplied);
             } else .{};
             const history = options.history orelse &local_history;
-            var trace_history: TraceHistory = .{ .next_step = if (ctx.trace) |trace| trace.steps.items.len else 0 };
+            var trace_history = TraceHistory.init(ctx.trace);
             var events: std.ArrayList(Record) = .empty;
             try events.appendSlice(ctx.arena, history.messages);
             var pending: Record = .empty;
@@ -292,10 +294,10 @@ pub fn ReActIters(comptime Sig: type, comptime user_tools: []const Tool, comptim
                 };
             }
             // Recovery retains history and the as-yet-unpublished inputs.
-            return self.forcedSubmit(ctx, history, &events, &pending, catalog, max_iters, &trace_history);
+            return self.forcedSubmit(ctx, history, &events, &pending, catalog, limit, &trace_history);
         }
 
-        fn forcedSubmit(self: *const Self, ctx_in: Context, history: *History, events: *std.ArrayList(Record), pending: *const Record, catalog: Value, turn_index: usize, trace_history: *TraceHistory) Error!Prediction {
+        fn forcedSubmit(self: *const Self, ctx_in: Context, history: *History, events: *std.ArrayList(Record), pending: *const Record, catalog: Value, turn_index: i128, trace_history: *TraceHistory) Error!Prediction {
             var ctx = ctx_in;
             ctx.lm_options.reasoning_effort = null;
             ctx.lm_options.reasoning_effort_present = true;
@@ -619,10 +621,12 @@ fn backticked(comptime fields: []const Field) []const u8 {
     }
 }
 
-fn iterationLimit(inputs: *const Record, default: usize) Error!usize {
+fn iterationLimit(inputs: *const Record, default: i128) Error!i128 {
     const supplied = inputs.get("max_iters") orelse return default;
-    if (supplied != .integer or supplied.integer < 0) return error.InvalidMaxIters;
-    return std.math.cast(usize, supplied.integer) orelse error.InvalidMaxIters;
+    return switch (supplied) {
+        .integer => supplied.integer,
+        else => error.InvalidMaxIters,
+    };
 }
 
 fn turnBudget(arena: Allocator, turn_index: usize, max_iters: usize) Allocator.Error![]const u8 {
@@ -654,19 +658,27 @@ fn callInputs(arena: Allocator, history: History, catalog: Value, turn_inputs: *
 /// Link only this run's matching predictor steps, and copy each appended event
 /// once into the trace arena rather than repeatedly cloning its whole prefix.
 const TraceHistory = struct {
-    next_step: usize,
+    next_step: usize = 0,
+    evicted_steps: usize = 0,
     shared: ?Value = null,
+
+    fn init(trace: ?*const predict.Trace) TraceHistory {
+        const active = trace orelse return .{};
+        return .{ .next_step = active.steps.items.len, .evicted_steps = active.evicted_steps };
+    }
 
     fn append(self: *TraceHistory, ctx: Context, predictor: *const predict.PredictState, event: *const Record) Allocator.Error!void {
         const trace = ctx.trace orelse return;
-        assert(self.next_step <= trace.steps.items.len);
-        for (trace.steps.items[self.next_step..]) |*step| {
+        const first_new = self.next_step -| (trace.evicted_steps -% self.evicted_steps);
+        assert(first_new <= trace.steps.items.len);
+        for (trace.steps.items[first_new..]) |*step| {
             if (step.predictor != predictor) continue;
             const history = step.inputs.getPtr("history") orelse continue;
             if (self.shared == null) self.shared = history.*;
             history.* = self.shared.?;
         }
         self.next_step = trace.steps.items.len;
+        self.evicted_steps = trace.evicted_steps;
         if (self.shared) |*shared| {
             assert(shared.* == .object);
             const messages = shared.object.getPtr("messages").?;
@@ -709,6 +721,40 @@ test "ReAct forward retains final history and termination metadata" {
         const event = record.get("history").?.object.get("messages").?.array.items[0].object;
         try testing.expectEqualStrings("retained", event.get("answer").?.string);
     }
+}
+
+test "ReAct links final History into the surviving trace step at capacity" {
+    const testing = std.testing;
+    const Sig = signature.Signature(struct {
+        pub const Input = struct {};
+        pub const Output = struct { answer: []const u8 };
+    });
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var script: @import("lm.zig").ScriptedLM = .{ .responses = &.{
+        \\{"next_thought":"inspect","tool_calls":{"tool_calls":[{"name":"unknown","args":{}}]}}
+        ,
+        \\{"next_thought":"submit","tool_calls":{"tool_calls":[{"name":"submit","args":{"answer":"done"}}]}}
+        ,
+    } };
+    var trace: predict.Trace = .{ .arena = arena };
+    const agent = try ReActIters(Sig, &.{}, 2).init(arena);
+    const result = try agent.forward(.{
+        .arena = arena,
+        .lm = script.lm(),
+        .adapter = .json,
+        .json_fallback = false,
+        .trace = &trace,
+        .max_trace_size = 1,
+    }, .{});
+    try testing.expectEqual(TerminationReason.submit, result.termination_reason);
+    try testing.expectEqualStrings("done", result.answer);
+    try testing.expectEqual(@as(usize, 1), trace.steps.items.len);
+    const history = trace.steps.items[0].inputs.get("history").?.object;
+    const messages = history.get("messages").?.array.items;
+    try testing.expectEqual(@as(usize, 2), messages.len);
+    try testing.expectEqualStrings("done", messages[1].object.get("answer").?.string);
 }
 
 test "ReAct submit validates Code models but retains custom string results" {

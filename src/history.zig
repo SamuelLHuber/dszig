@@ -58,11 +58,32 @@ pub const History = struct {
         return .{ .messages = messages };
     }
 
+    fn remapEvent(arena: Allocator, event: *const Record, renames: []const adapter.Adapter.HistoryRename) Allocator.Error!?Record {
+        for (renames) |rename| {
+            if (event.contains(rename.from)) break;
+        } else return null;
+        var mapped: Record = .empty;
+        try mapped.ensureTotalCapacity(arena, event.count());
+        for (event.keys(), event.values()) |key, data| {
+            const name = for (renames) |rename| {
+                if (std.mem.eql(u8, key, rename.from)) break rename.to;
+            } else key;
+            mapped.putAssumeCapacity(name, data);
+        }
+        return mapped;
+    }
+
     /// History owns message ordering; the selected adapter owns field syntax.
     /// The view excludes the History field itself, as in DSPy History.format.
     pub fn format(self: History, selected_adapter: adapter.Adapter, arena: Allocator, view: adapter.View) adapter.Error![]adapter.Message {
+        return self.formatWithRenames(selected_adapter, arena, view, &.{});
+    }
+
+    pub fn formatWithRenames(self: History, selected_adapter: adapter.Adapter, arena: Allocator, view: adapter.View, renames: []const adapter.Adapter.HistoryRename) adapter.Error![]adapter.Message {
         var messages: std.ArrayList(adapter.Message) = .empty;
-        for (self.messages) |*event| {
+        for (self.messages) |*original| {
+            const remapped = try remapEvent(arena, original, renames);
+            const event = if (remapped) |*record| record else original;
             if (try appendReplEvent(arena, selected_adapter, view, event, &messages)) continue;
             var main_request = false;
             for (view.inputs) |field| {
@@ -410,7 +431,12 @@ fn appendNativeEvent(
             // The supported OpenAI tool-row formats have no error flag;
             // lm15 carries the recorded status as this exact text prefix.
             const result_content = if (result.is_error) try std.fmt.allocPrint(arena, "[error] {s}", .{text}) else text;
-            try messages.append(arena, .{ .role = .tool, .content = try adapter.renderedContent(arena, result_content), .tool_call_id = result.call_id });
+            try messages.append(arena, .{
+                .role = .tool,
+                .content = try adapter.renderedContent(arena, result_content),
+                .tool_call_id = result.call_id,
+                .tool_result_name = result.name,
+            });
         }
     }
 }

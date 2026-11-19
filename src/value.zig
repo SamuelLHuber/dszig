@@ -232,8 +232,8 @@ pub fn parseInteger(v: Value) error{ParseValue}!Value {
     };
 }
 
-/// Pydantic's lax integer strings allow signs, zero prefixes, underscores and
-/// a zero-only fractional suffix, but not exponent strings or non-ASCII digits.
+/// Pydantic's lax integer strings allow signs, zero prefixes and underscores
+/// between whole-part digits. A fractional suffix must contain only zeroes.
 pub fn coerceInteger(arena: Allocator, input: Value) ParseError!Value {
     var v = input;
     if (v == .custom) {
@@ -256,42 +256,43 @@ pub fn coerceInteger(arena: Allocator, input: Value) ParseError!Value {
     const negative = source[0] == '-';
     if (source[0] == '+' or negative) start = 1;
     var end = start;
+    var first: ?usize = null;
     var digits: usize = 0;
     var separated = false;
     while (end < source.len and source[end] != '.') : (end += 1) {
-        if (source[end] == '_') {
+        const byte = source[end];
+        if (byte == '_') {
             if (end == start or end + 1 == source.len or
                 !std.ascii.isDigit(source[end - 1]) or !std.ascii.isDigit(source[end + 1]))
                 return error.ParseValue;
-            separated = true;
-        } else if (std.ascii.isDigit(source[end])) {
-            digits += 1;
+            separated = separated or first != null;
+        } else if (std.ascii.isDigit(byte)) {
+            if (byte != '0' and first == null) first = end;
+            // The digit limit applies after removing leading zero padding.
+            if (first != null) {
+                digits += 1;
+                if (digits > 4300) return error.ParseValue;
+            }
         } else return error.ParseValue;
     }
-    if (digits == 0 or digits > 4300) return error.ParseValue;
+    if (end == start) return error.ParseValue;
     if (end != source.len) {
-        if (end + 1 == source.len) return error.ParseValue;
-        for (source[end + 1 ..], 0..) |byte, offset| {
-            if (byte == '_') {
-                const index = end + 1 + offset;
-                if (offset == 0 or index + 1 == source.len or source[index - 1] != '0' or source[index + 1] != '0')
-                    return error.ParseValue;
-            } else if (byte != '0') return error.ParseValue;
-        }
+        const fraction = source[end + 1 ..];
+        if (fraction.len == 0) return error.ParseValue;
+        for (fraction) |byte| if (byte != '0') return error.ParseValue;
     }
-    var first = start;
-    while (first < end and (source[first] == '0' or source[first] == '_')) first += 1;
-    if (first == end) return .{ .integer = 0 };
-    if (std.fmt.parseInt(i64, source[0..end], 10)) |integer|
-        return .{ .integer = integer }
-    else |_| {}
-    const magnitude = source[first..end];
+    const begin = first orelse return .{ .integer = 0 };
+    const magnitude = source[begin..end];
+    if (digits <= 19) {
+        const unsigned = std.fmt.parseInt(u64, magnitude, 10) catch unreachable;
+        const signed: i128 = if (negative) -@as(i128, unsigned) else unsigned;
+        if (std.math.cast(i64, signed)) |integer| return .{ .integer = integer };
+    }
     if (!separated) {
-        if (!negative) return Value.parseFromNumberSlice(magnitude);
-        if (first == start) return Value.parseFromNumberSlice(source[0..end]);
+        if (!negative) return .{ .number_string = magnitude };
+        if (begin == start) return .{ .number_string = source[0..end] };
     }
-    const count = std.mem.count(u8, magnitude, "_");
-    const canonical = try arena.alloc(u8, @intFromBool(negative) + magnitude.len - count);
+    const canonical = try arena.alloc(u8, @intFromBool(negative) + digits);
     var index: usize = 0;
     if (negative) {
         canonical[0] = '-';
@@ -301,7 +302,7 @@ pub fn coerceInteger(arena: Allocator, input: Value) ParseError!Value {
         canonical[index] = byte;
         index += 1;
     };
-    return Value.parseFromNumberSlice(canonical);
+    return .{ .number_string = canonical };
 }
 
 fn coerceDecimalInteger(arena: Allocator, data: @import("decimal.zig").Decimal) ParseError!Value {
@@ -433,7 +434,7 @@ fn borrowedFieldValue(arena: Allocator, comptime T: type, input: *const T) Alloc
     }
     if (comptime code.isCode(T) or decision.isDecision(T) or citation.isCitation(T) or
         T == @import("file.zig").File or T == @import("image.zig").Image or T == @import("audio.zig").Audio or
-        T == @import("bounding_box.zig").BoundingBox or T == signature.Reasoning)
+        T == @import("document.zig").Document or T == @import("bounding_box.zig").BoundingBox or T == signature.Reasoning)
     {
         return input.borrowedRuntime();
     }
@@ -449,7 +450,7 @@ pub fn toValue(arena: Allocator, comptime T: type, v: T) Allocator.Error!Value {
     if (comptime code.isCode(T) or @import("enum.zig").isEnum(T) or @import("literal.zig").isLiteral(T) or T == @import("integer.zig").Integer or @import("decimal_type.zig").isDecimal(T)) return v.toRuntime(arena);
     if (comptime decision.isDecision(T) or citation.isCitation(T) or T == @import("file.zig").File or
         T == @import("image.zig").Image or T == @import("audio.zig").Audio or
-        T == @import("bounding_box.zig").BoundingBox or T == signature.Reasoning)
+        T == @import("document.zig").Document or T == @import("bounding_box.zig").BoundingBox or T == signature.Reasoning)
         return v.toRuntime(arena);
     if (T == @import("tool.zig").ToolCalls) return v.toValue(arena);
     if (T == Value) return v;
@@ -516,10 +517,11 @@ pub fn fromValue(arena: Allocator, comptime T: type, v: Value) ConvertError!T {
     };
     if (comptime code.isCode(T)) return T.fromValue(v) catch error.TypeMismatch;
     if (T == @import("bounding_box.zig").BoundingBox) return T.fromValue(v) catch error.TypeMismatch;
-    if (T == @import("file.zig").File or T == @import("image.zig").Image or T == @import("audio.zig").Audio) return T.fromValue(arena, v) catch |err| switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        else => error.TypeMismatch,
-    };
+    if (T == @import("file.zig").File or T == @import("image.zig").Image or T == @import("audio.zig").Audio or T == @import("document.zig").Document)
+        return T.fromValue(arena, v) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.TypeMismatch,
+        };
     if (T == Value) return v;
     if (T == @import("integer.zig").Integer) return T.fromValue(v);
     if (comptime @import("decimal_type.zig").isDecimal(T)) return T.fromValue(v) catch error.TypeMismatch;

@@ -106,9 +106,11 @@ pub const COPRO = struct {
         sum: f64 = 0,
         mean: f128 = 0,
         squared_deviations: f128 = 0,
+        has_nonfinite_score: bool = false,
 
         fn add(self: *ScoreStats, score: f64) void {
             self.count += 1;
+            self.has_nonfinite_score = self.has_nonfinite_score or !std.math.isFinite(score);
             self.min = @min(self.min, score);
             self.max = @max(self.max, score);
             self.sum += score;
@@ -117,8 +119,11 @@ pub const COPRO = struct {
             self.squared_deviations += delta * (@as(f128, score) - self.mean);
         }
 
-        fn finish(self: ScoreStats) DepthStats {
+        fn finish(self: ScoreStats) error{NonFiniteScoreStatistics}!DepthStats {
             assert(self.count > 0);
+            // CPython 3.11 pstdev rejects a nonfinite observation. Do not
+            // short-circuit evaluation: DSPy summarizes the finished batch.
+            if (self.has_nonfinite_score) return error.NonFiniteScoreStatistics;
             const variance = self.squared_deviations / @as(f128, @floatFromInt(self.count));
             return .{
                 .min = self.min,
@@ -129,7 +134,7 @@ pub const COPRO = struct {
         }
     };
 
-    fn bestStats(comptime P: type, evaluated: []const CandidateProgram(P)) DepthStats {
+    fn bestStats(comptime P: type, evaluated: []const CandidateProgram(P)) error{NonFiniteScoreStatistics}!DepthStats {
         assert(evaluated.len > 0);
         var top: [10]f64 = undefined;
         var count: usize = 0;
@@ -221,12 +226,13 @@ pub const COPRO = struct {
                     for (evaluated[p_i].items) |*e| {
                         if (!std.mem.eql(u8, e.candidate.instruction, instruction)) continue;
                         if (!std.mem.eql(u8, e.candidate.prefix, prefix)) continue;
-                        if (e.candidate.score < score) e.* = entry;
+                        // DSPy keeps the old entry only when old >= new.
+                        // With NaN on either side that comparison is false.
+                        if (!(e.candidate.score >= score)) e.* = entry;
                         break;
                     } else try evaluated[p_i].append(out, entry);
                 }
-                if (latest_stats) |stats| stats[p_i * self.depth + d] = recent.finish();
-                if (best_stats) |stats| stats[p_i * self.depth + d] = bestStats(P, evaluated[p_i].items);
+                if (latest_stats) |stats| stats[p_i * self.depth + d] = try recent.finish();
                 var best = &evaluated[p_i].items[0];
                 for (evaluated[p_i].items[1..]) |*e| {
                     if (e.candidate.score > best.candidate.score) best = e;
@@ -235,6 +241,7 @@ pub const COPRO = struct {
             }
             if (d == self.depth - 1) break;
             for (preds, 0..) |_, p_i| {
+                if (best_stats) |stats| stats[p_i * self.depth + d] = try bestStats(P, evaluated[p_i].items);
                 const tried = try self.attempts(out, evaluated[p_i].items);
                 var inputs: Record = .empty;
                 try inputs.put(out, "attempted_instructions", .{ .array = tried });
@@ -246,7 +253,12 @@ pub const COPRO = struct {
         }
 
         var flat: std.ArrayList(E) = .empty;
-        for (evaluated) |e| try flat.appendSlice(out, e.items);
+        for (evaluated, 0..) |e, p_i| {
+            try flat.appendSlice(out, e.items);
+            if (best_stats) |stats| {
+                if (self.depth > 0) stats[p_i * self.depth + self.depth - 1] = try bestStats(P, e.items);
+            }
+        }
         // Zero depth still generates initial proposals, but scores none.
         if (flat.items.len == 0) return error.NoCandidates;
         std.sort.insertion(E, flat.items, {}, E.greater);
@@ -436,6 +448,87 @@ test "COPRO stops candidate evaluation at the caller's error limit" {
     const result = try opt.compile(predict.Predict(TestQA), a, testing.allocator, ctx, null, .{}, &rows);
     try testing.expectEqual(@as(usize, 2), result.total_calls);
     try testing.expectEqual(@as(f64, 50), result.candidates[0].score);
+}
+
+test "COPRO replaces duplicate prompt scores when either score is NaN" {
+    const ScoreUndefined = struct {
+        fn score(a: Allocator, example: *const Example, prediction: ?*const optimize.RecordPrediction, trace: ?*const predict.Trace) value.ParseError!f64 {
+            const answer = (prediction orelse return error.ParseValue).get("answer") orelse return error.ParseValue;
+            if (answer == .string and std.mem.eql(u8, answer.string, "undefined")) return std.math.nan(f64);
+            return yesMetric(a, example, prediction, trace);
+        }
+    };
+    const proposed = "{\"proposed_instruction\":\"Recover.\",\"proposed_prefix_for_output_field\":\"Reply:\"}";
+    const undefined_score = "{\"answer\":\"undefined\"}";
+    const finite_score = "{\"answer\":\"yes\"}";
+    const cases = [_]struct { first: []const u8, second: []const u8, want_nan: bool }{
+        .{ .first = undefined_score, .second = finite_score, .want_nan = false },
+        .{ .first = finite_score, .second = undefined_score, .want_nan = true },
+        .{ .first = finite_score, .second = finite_score, .want_nan = false },
+    };
+
+    for (cases) |case| {
+        var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer memory.deinit();
+        const arena = memory.allocator();
+        var model: lm_mod.ScriptedLM = .{ .responses = &.{
+            proposed,
+            proposed,
+            case.first,
+            case.second,
+            "{\"answer\":\"no\"}",
+        } };
+        const ctx: Context = .{ .arena = arena, .lm = model.lm(), .adapter = .json };
+        const train = [_]Example{try Example.fromJson(arena, "{\"question\":\"x\"}", &.{"question"})};
+        const optimizer: COPRO = .{ .metric = ScoreUndefined.score, .breadth = 3, .depth = 1 };
+        const result = try optimizer.compile(TestProgram, arena, testing.allocator, ctx, null, .{}, &train);
+
+        try testing.expectEqual(@as(usize, 5), model.index);
+        try testing.expectEqual(@as(usize, 3), result.total_calls);
+        try testing.expectEqual(@as(usize, 2), result.candidates.len);
+        try testing.expectEqualStrings("Recover.", result.program.generate.state.instructions);
+        try testing.expectEqualStrings("Reply:", result.program.generate.state.prefixes[1]);
+        try testing.expectEqualStrings("Recover.", result.candidates[0].instruction);
+        if (case.want_nan) {
+            try testing.expect(std.math.isNan(result.candidates[0].score));
+        } else {
+            try testing.expectEqual(@as(f64, 100), result.candidates[0].score);
+        }
+        try testing.expectEqual(@as(f64, 0), result.candidates[1].score);
+    }
+}
+
+test "COPRO refuses nonfinite tracked statistics after evaluating the whole batch" {
+    const MetricByAnswer = struct {
+        fn score(a: Allocator, example: *const Example, prediction: ?*const optimize.RecordPrediction, trace: ?*const predict.Trace) value.ParseError!f64 {
+            const answer = (prediction orelse return error.ParseValue).get("answer") orelse return error.ParseValue;
+            if (answer == .string) {
+                if (std.mem.eql(u8, answer.string, "nan")) return std.math.nan(f64);
+                if (std.mem.eql(u8, answer.string, "inf")) return std.math.inf(f64);
+                if (std.mem.eql(u8, answer.string, "-inf")) return -std.math.inf(f64);
+            }
+            return yesMetric(a, example, prediction, trace);
+        }
+    };
+    const proposal = "{\"proposed_instruction\":\"Recover.\",\"proposed_prefix_for_output_field\":\"Reply:\"}";
+    for ([_][]const u8{ "nan", "inf", "-inf" }) |answer| {
+        var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer memory.deinit();
+        const arena = memory.allocator();
+        var model: lm_mod.ScriptedLM = .{ .responses = &.{
+            proposal,
+            proposal,
+            try std.json.Stringify.valueAlloc(arena, .{ .answer = answer }, .{}),
+            "{\"answer\":\"yes\"}",
+            "{\"answer\":\"no\"}",
+        } };
+        const ctx: Context = .{ .arena = arena, .lm = model.lm(), .adapter = .json };
+        const train = [_]Example{try Example.fromJson(arena, "{\"question\":\"x\"}", &.{"question"})};
+        const optimizer: COPRO = .{ .metric = MetricByAnswer.score, .breadth = 3, .depth = 1, .track_stats = true };
+        const result = optimizer.compile(TestProgram, arena, testing.allocator, ctx, null, .{}, &train);
+        try testing.expectEqual(@as(usize, 5), model.index);
+        try testing.expectError(error.NonFiniteScoreStatistics, result);
+    }
 }
 
 test "COPRO climbs from the basic instruction to the best proposal" {

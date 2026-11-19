@@ -4,6 +4,43 @@ const std = @import("std");
 const value = @import("value.zig");
 const runtime = @import("runtime_value.zig");
 pub const Graph = @import("json_graph.zig");
+const logprobs = @import("logprobs.zig");
+
+pub const CompletionLogprobs = struct {
+    tokens: []const logprobs.TokenLogprob,
+    /// False when some retained text has no corresponding original token score.
+    complete: bool,
+    /// False when no score sequence remains but incomplete coverage is known.
+    reported: bool = true,
+
+    pub fn clone(self: CompletionLogprobs, arena: std.mem.Allocator) std.mem.Allocator.Error!CompletionLogprobs {
+        var copy = self;
+        copy.tokens = try logprobs.clone(arena, self.tokens);
+        return copy;
+    }
+
+    pub fn cloneRows(arena: std.mem.Allocator, source: ?[]const ?CompletionLogprobs) std.mem.Allocator.Error!?[]const ?CompletionLogprobs {
+        const rows = source orelse return null;
+        const scores = try arena.alloc(?CompletionLogprobs, rows.len);
+        var written: usize = 0;
+        errdefer freeRows(arena, scores, written);
+        for (rows, scores) |row, *target| {
+            target.* = if (row) |score| try score.clone(arena) else null;
+            written += 1;
+        }
+        return scores;
+    }
+
+    pub fn freeRows(arena: std.mem.Allocator, scores: []const ?CompletionLogprobs, written: usize) void {
+        for (scores[0..written]) |row| if (row) |score| logprobs.free(arena, score.tokens);
+        arena.free(scores);
+    }
+
+    pub fn at(source: ?[]const ?CompletionLogprobs, index: usize) ?CompletionLogprobs {
+        const rows = source orelse return null;
+        return if (index < rows.len) rows[index] else null;
+    }
+};
 
 test "prediction clone preserves mutable native aliases across fields completions and usage" {
     const python = @import("python_value.zig");
@@ -69,12 +106,13 @@ pub fn Prediction(comptime Output: type) type {
         pub const State = struct {
             output: Output,
             outputs: ?[]Output = null,
+            token_scores: ?[]const ?CompletionLogprobs = null,
             usage: ?Graph.Value = null,
         };
         state: *State,
 
         /// Handle onto caller-provisioned state, without allocating. The
-        /// state, its fields and its usage graph must stay alive and unmoved
+        /// state, its fields and its metadata must stay alive and unmoved
         /// while any copy of the handle is used; every copy aliases this one
         /// instance, so rewriting the state rewrites what they all observe.
         /// `clone` is the way to keep a result across such a rewrite.
@@ -110,6 +148,14 @@ pub fn Prediction(comptime Output: type) type {
             return self.state.outputs;
         }
 
+        /// Provider scores and coverage for the corresponding completion.
+        /// Null means neither scores nor incomplete coverage are known, or
+        /// the row does not exist. Check `reported` to distinguish an empty
+        /// score sequence from incomplete coverage with no retained scores.
+        pub fn completionLogprobs(self: Self, index: usize) ?CompletionLogprobs {
+            return CompletionLogprobs.at(self.state.token_scores, index);
+        }
+
         /// Record Predictions only: `prediction[key]`, null for a missing key.
         pub fn get(self: Self, key: []const u8) ?runtime.Value {
             if (Output != runtime.ObjectMap) @compileError("dszig: Prediction.get needs record fields; use fields() for " ++ @typeName(Output));
@@ -135,6 +181,7 @@ pub fn Prediction(comptime Output: type) type {
                     target.* = try cloneFields(&cloner, arena, source);
                 result.state.outputs = outputs;
             }
+            result.state.token_scores = try CompletionLogprobs.cloneRows(arena, self.state.token_scores);
             if (self.state.usage) |usage|
                 result.setLMUsage(try Graph.cloneWithRuntimeContext(arena, arena, usage, &cloner));
             return result;

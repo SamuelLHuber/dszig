@@ -209,12 +209,20 @@ const Lexer = struct {
             '(', '[', '{' => blk: {
                 if (self.brackets == max_depth) return error.ParseValue;
                 self.brackets += 1;
-                break :blk switch (c) { '(' => .lparen, '[' => .lbracket, else => .lbrace };
+                break :blk switch (c) {
+                    '(' => .lparen,
+                    '[' => .lbracket,
+                    else => .lbrace,
+                };
             },
             ')', ']', '}' => blk: {
                 if (self.brackets == 0) return error.ParseValue;
                 self.brackets -= 1;
-                break :blk switch (c) { ')' => .rparen, ']' => .rbracket, else => .rbrace };
+                break :blk switch (c) {
+                    ')' => .rparen,
+                    ']' => .rbracket,
+                    else => .rbrace,
+                };
             },
             '.' => blk: {
                 if (self.at(0) != '.' or self.at(1) != '.') return error.ParseValue;
@@ -1147,11 +1155,11 @@ test "Python literal parse results own source and nested builtin payloads" {
 test "Python literals reject executable and malformed AST shapes without repair" {
     const testing = std.testing;
     for ([_][]const u8{
-        "07", "1__2", "1+-2j", "--1", "-(1+2j)", "1+2", "1j+2j",
-        "1x", "1_0x", "0x1g", "0b18", "0o78", "1jz", "1e2jz",
-        "+{[1]}", "1+{[1]}", "[+{[1]}]", "{[]:1} blah",
-        "b'é'", "f'abc'", "[x for x in []]",
-        "__import__('os')", "set(())", "Ellipsis", "\\\n 1", "1\\\n",
+        "07",                      "1__2",                              "1+-2j",            "--1",         "-(1+2j)",  "1+2",    "1j+2j",
+        "1x",                      "1_0x",                              "0x1g",             "0b18",        "0o78",     "1jz",    "1e2jz",
+        "+{[1]}",                  "1+{[1]}",                           "[+{[1]}]",         "{[]:1} blah",
+        "b'é'",
+        "f'abc'",                  "[x for x in []]",                   "__import__('os')", "set(())",     "Ellipsis", "\\\n 1", "1\\\n",
         "'\\N{KEYCAP DIGIT ONE}'", "'\\N{cjk unified ideograph-4E00}'",
     }) |source| try testing.expectError(error.ParseValue, parse(testing.allocator, source));
 }

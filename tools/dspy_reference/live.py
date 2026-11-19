@@ -31,6 +31,7 @@ def main():
                   "supports_response_format": "response_format" in lm.supported_params,
                   "supports_response_schema": lm.supports_response_schema,
                   "supports_function_calling": lm.supports_function_calling,
+                  "records_tool_result_names": True,
                   "supported_params": sorted(lm.supported_params),
                   "calls": lm.calls, **result}
     out.parent.mkdir(parents=True, exist_ok=True)

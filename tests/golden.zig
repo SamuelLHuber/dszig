@@ -254,10 +254,10 @@ fn checkReact(comptime Agent: type, name: []const u8) !void {
     var history: dszig.lm.History = .{ .arena = arena };
     var scripted: dszig.lm.ScriptedLM = .{ .responses = completions, .history = &history };
     const ctx: dszig.Context = .{ .arena = arena, .lm = scripted.lm() };
-    var agent = try Agent.init(arena);
-    agent.max_iters = @intCast(case.get("max_iters").?.integer);
+    const agent = try Agent.init(arena);
     var inputs: Record = .empty;
     try inputs.put(arena, "question", .{ .string = "When did Apollo 11 land?" });
+    try inputs.put(arena, "max_iters", case.get("max_iters").?);
     const prediction = try agent.run(ctx, &inputs);
     try testing.expectEqual(calls.len, history.requests.items.len);
     for (calls, history.requests.items) |c, request| {
@@ -271,12 +271,13 @@ fn checkReact(comptime Agent: type, name: []const u8) !void {
 
 test "ReAct prompts structured history termination and outputs match DSPy" {
     try checkReact(dszig.ReAct(AgentQA, &.{ search_tool, add_tool }), "react_tools");
-    try checkReact(dszig.ReAct(AgentQA, &.{search_tool}), "react_max_iters");
+    try checkReact(dszig.ReActV2(AgentQA, &.{search_tool}), "react_max_iters");
     try checkReact(dszig.ReAct(AgentQA, &.{ search_tool, add_tool }), "react_batched");
     try checkReact(dszig.ReAct(AgentQA, &.{search_tool}), "react_empty_tool_calls");
     try checkReact(dszig.ReAct(AgentQA, &.{search_tool}), "react_parse_error");
     try checkReact(dszig.ReAct(AgentQA, &.{search_tool}), "react_unknown_tool");
     try checkReact(dszig.ReAct(AgentQA, &.{search_tool}), "react_zero_iters");
+    try checkReact(dszig.ReAct(AgentQA, &.{search_tool}), "react_negative_iters");
 }
 
 test "ReAct records invalid arguments as tool errors before forced typed submit" {
@@ -360,6 +361,40 @@ test "Ensemble reduces with majority and samples like random.sample" {
     const outputs = try sampled.forwardAll(ctx, .{ .question = "?" });
     try testing.expectEqualStrings("Rome", outputs[0].answer);
     try testing.expectEqualStrings("Berlin", outputs[1].answer);
+}
+
+test "Ensemble handles DSPy zero and invalid sizes and custom reduction order" {
+    const Reduce = struct {
+        fn join(ctx: dszig.Context, outputs: []const Echo.Output) ![]const u8 {
+            const answers = try ctx.arena.alloc([]const u8, outputs.len);
+            for (answers, outputs) |*answer, output| answer.* = output.answer;
+            return std.mem.join(ctx.arena, ",", answers);
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    var scripted: dszig.lm.ScriptedLM = .{ .responses = &.{} };
+    const ctx: dszig.Context = .{ .arena = memory.allocator(), .lm = scripted.lm() };
+    const input: Echo.Input = .{ .question = "?" };
+    var rng: dszig.pyrandom.Random = .init(42);
+    var program: dszig.EnsembleWithReducer(Echo, 4, Reduce.join) = .{ .ensemble = .{
+        .programs = .{ .{ .answer = "0" }, .{ .answer = "1" }, .{ .answer = "2" }, .{ .answer = "3" } },
+        .size = 0,
+        .rng = &rng,
+    } };
+    try testing.expectEqualStrings("0,1,2,3", try program.forward(ctx, input));
+    program.ensemble.size = 3;
+    // Actual DSPy 3.5.0 with random.seed(42), after the size=0 call.
+    try testing.expectEqualStrings("0,3,1", try program.forward(ctx, input));
+    for ([_]i128{ -1, 5 }) |size| {
+        program.ensemble.size = size;
+        try testing.expectError(error.InvalidSampleSize, program.forward(ctx, input));
+    }
+    program.ensemble.size = 1;
+    program.ensemble.rng = null;
+    try testing.expectError(error.MissingEnsembleRng, program.forward(ctx, input));
+    const empty: dszig.EnsembleWithReducer(Echo, 0, Reduce.join) = .{ .ensemble = .{ .programs = .{} } };
+    try testing.expectEqualStrings("", try empty.forward(ctx, input));
 }
 
 /// tools/dspy_reference/gen_simba.py's MockLM: answers depend on the rollout

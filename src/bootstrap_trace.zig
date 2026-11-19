@@ -24,6 +24,7 @@ const Context = predict.Context;
 const Example = optimize.Example;
 const PredictState = predict.PredictState;
 const Record = value.Record;
+const CompletionLogprobs = @import("prediction.zig").CompletionLogprobs;
 
 const log = std.log.scoped(.dspy_bootstrap_trace);
 
@@ -48,9 +49,8 @@ pub const Prediction = union(enum) {
     failed: FailedPrediction,
 };
 
-/// A predictor's result inside a trace. Native trace steps record output
-/// fields only, so this is deliberately the field projection that demos and
-/// fine-tuning data serialize: a step never carries usage.
+/// The parsed field projection of a predictor's result, or its failure.
+/// Provider token scores are separate metadata on TraceStep.
 pub const StepPrediction = union(enum) {
     success: Record,
     failed: FailedPrediction,
@@ -61,6 +61,12 @@ pub const TraceStep = struct {
     predictor: *const PredictState,
     inputs: Record,
     prediction: StepPrediction,
+    token_scores: ?[]const ?CompletionLogprobs = null,
+
+    /// Null means no score or coverage information, or out of range.
+    pub fn completionLogprobs(step: TraceStep, index: usize) ?CompletionLogprobs {
+        return CompletionLogprobs.at(step.token_scores, index);
+    }
 };
 
 /// `TraceData`. `score` is null exactly where Source omits the key (no metric).
@@ -353,6 +359,7 @@ fn retain(out: Allocator, index: usize, example: *const Example, row: Run.Row) v
         .predictor = source.predictor,
         .inputs = try value.cloneRecord(out, &source.inputs),
         .prediction = .{ .success = try value.cloneRecord(out, &source.outputs) },
+        .token_scores = try CompletionLogprobs.cloneRows(out, source.token_scores),
     };
     // The attempt's Prediction lives in attempt scratch: an owning clone
     // keeps fields and usage (and objects they share) past its reset.

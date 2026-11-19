@@ -231,6 +231,7 @@ pub const Attempt = struct {
     session: *Session,
     target: *const predict.PredictState,
     failure: ?Error = null,
+    published: ?*bool = null,
 
     pub fn prepare(
         self: *Attempt,
@@ -265,11 +266,22 @@ pub const Attempt = struct {
         return .{ .context = self, .on_event = receive };
     }
 
+    fn publish(context: *anyopaque, fragment: Fragment) lm.OpenAI.StreamSink.Action {
+        const self: *Attempt = @ptrCast(@alignCast(context));
+        self.published.?.* = true;
+        const target = self.session.sink;
+        return target.on_fragment(target.context, fragment);
+    }
+
     fn receive(context: *anyopaque, event: lm.OpenAI.StreamEvent) lm.OpenAI.StreamSink.Action {
         const self: *Attempt = @ptrCast(@alignCast(context));
+        const routed: Sink = if (self.published != null)
+            .{ .context = self, .on_fragment = publish }
+        else
+            self.session.sink;
         for (self.session.bindings) |*binding| {
             if (binding.listener.predictor != self.target) continue;
-            binding.receive(self.session.sink, event) catch |err| {
+            binding.receive(routed, event) catch |err| {
                 self.failure = err;
                 return .stop;
             };
@@ -290,9 +302,11 @@ fn findWireField(
 ) Error!WireField {
     std.debug.assert(wire.len <= original.len);
     var index: usize = 0;
+    var remove_tool_output = native.tools;
     for (original) |field| {
         const selected = std.mem.eql(u8, field.name, name);
-        if (field.native_tool_calls and native.tools) {
+        if (field.native_tool_calls and remove_tool_output) {
+            remove_tool_output = false;
             if (selected) return error.UnsupportedStreamField;
             continue;
         }
@@ -306,6 +320,20 @@ fn findWireField(
     }
     std.debug.assert(index == wire.len);
     return error.UnknownStreamField;
+}
+
+test "only the negotiated tool output has no wire field" {
+    const fields = [_]Field{
+        .{ .name = "calls", .kind = .json, .type_name = "ToolCalls", .desc = "", .prefix = "", .native_tool_calls = true },
+        .{ .name = "spare", .kind = .json, .type_name = "ToolCalls", .desc = "", .prefix = "", .native_tool_calls = true },
+        .{ .name = "answer", .kind = .str, .type_name = "str", .desc = "", .prefix = "" },
+    };
+    const native: NativeFields = .{ .tools = true, .reasoning = false };
+    try std.testing.expectError(error.UnsupportedStreamField, findWireField(&fields, fields[1..], "calls", native));
+    for (fields[1..]) |f| {
+        const wire = try findWireField(&fields, fields[1..], f.name, native);
+        try std.testing.expectEqualStrings(f.name, wire.text.name);
+    }
 }
 
 fn hasField(fields: []const Field, name: []const u8) bool {

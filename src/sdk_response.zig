@@ -1205,14 +1205,17 @@ fn validateRequest(allocator: Allocator, fields: *RequestFields) Error!void {
     }
     if (fields.system) |system| switch (system) {
         .text => |text| try nonempty(text),
-        .parts => |parts| for (parts) |part| {
-            if (part == .citation) return error.InvalidResponse;
-            if (part == .data and part.data.probabilities != null) return error.InvalidResponse;
-            switch (part) {
-                inline else => |payload| {
-                    var checked = payload;
-                    try validateRecord(@TypeOf(payload), allocator, &checked);
-                },
+        .parts => |parts| {
+            if (parts.len == 0) return error.InvalidResponse;
+            for (parts) |part| {
+                if (part == .citation) return error.InvalidResponse;
+                if (part == .data and part.data.probabilities != null) return error.InvalidResponse;
+                switch (part) {
+                    inline else => |payload| {
+                        var checked = payload;
+                        try validateRecord(@TypeOf(payload), allocator, &checked);
+                    },
+                }
             }
         },
     };
@@ -1315,10 +1318,24 @@ fn jsonObject(input: JsonValue) Error!void {
 /// their identity. The slot owns its old value and any replacement.
 fn configInteger(allocator: Allocator, slot: *Value, minimum: ?i64) Error!void {
     if (slot.* == .null) return;
+    const normalized = try normalizeConfigInteger(allocator, slot.*);
+    if (std.meta.activeTag(normalized) != std.meta.activeTag(slot.*)) {
+        runtime.freeValue(allocator, slot.*);
+        slot.* = normalized;
+    }
+    if (minimum) |lower| {
+        const order = @import("value.zig").numericOrder(slot.*, .{ .integer = lower }) catch return error.InvalidResponse;
+        if (order != .eq and order != .gt) return error.InvalidResponse;
+    }
+}
+
+/// Borrow integer inputs unchanged; allocate only when an integral float
+/// needs a decimal representation beyond i64.
+pub fn normalizeConfigInteger(allocator: Allocator, input: Value) Error!Value {
     const numbers = @import("value.zig");
-    const number: ?f64 = switch (slot.*) {
-        .float => slot.float,
-        .custom => if (@import("python_value.zig").view(slot.*)) |builtin|
+    const number: ?f64 = switch (input) {
+        .float => input.float,
+        .custom => if (@import("python_value.zig").view(input)) |builtin|
             if (builtin == .float) builtin.float else null
         else
             null,
@@ -1327,15 +1344,15 @@ fn configInteger(allocator: Allocator, slot: *Value, minimum: ?i64) Error!void {
     if (number) |floating| {
         var buffer: [310]u8 = undefined;
         const text = numbers.integralFloatText(floating, &buffer) orelse return error.InvalidResponse;
-        const replacement: Value = if (std.fmt.parseInt(i64, text, 10)) |small|
+        return if (std.fmt.parseInt(i64, text, 10)) |small|
             .{ .integer = small }
         else |_|
             .{ .number_string = try allocator.dupe(u8, text) };
-        runtime.freeValue(allocator, slot.*);
-        slot.* = replacement;
-    } else switch (slot.*) {
+    }
+    switch (input) {
+        .null => {},
         .integer, .number_string => {
-            _ = numbers.parseInteger(slot.*) catch return error.InvalidResponse;
+            _ = numbers.parseInteger(input) catch return error.InvalidResponse;
         },
         .custom => |custom| {
             const base = custom.integerValue() orelse return error.InvalidResponse;
@@ -1343,10 +1360,7 @@ fn configInteger(allocator: Allocator, slot: *Value, minimum: ?i64) Error!void {
         },
         else => return error.InvalidResponse,
     }
-    if (minimum) |lower| {
-        const order = numbers.numericOrder(slot.*, .{ .integer = lower }) catch return error.InvalidResponse;
-        if (order != .eq and order != .gt) return error.InvalidResponse;
-    }
+    return input;
 }
 
 fn validateReasoning(allocator: Allocator, reasoning: *Reasoning) Error!void {
@@ -1552,13 +1566,22 @@ fn validateBase64(raw: []const u8) Error!void {
     }
     var count: usize = 0;
     var padding: u8 = 0;
+    var saw_space = false;
+    var split = false;
     var index: usize = 0;
     while (index < data.len) {
         const length = std.unicode.utf8ByteSequenceLength(data[index]) catch return error.InvalidResponse;
         if (length > data.len - index) return error.InvalidResponse;
         const cp = std.unicode.utf8Decode(data[index..][0..length]) catch return error.InvalidResponse;
         index += length;
-        if (@import("unicode.zig").isSpace(cp)) continue;
+        if (@import("unicode.zig").isSpace(cp)) {
+            saw_space = true;
+            // DSPy splits on all Python whitespace only if strip() changed
+            // the payload or an ASCII whitespace separator is present.
+            if (count == 0 or index == data.len or cp == ' ' or (cp >= '\t' and cp <= '\r'))
+                split = true;
+            continue;
+        }
         count += 1;
         if (cp == '=') {
             padding += 1;
@@ -1569,7 +1592,41 @@ fn validateBase64(raw: []const u8) Error!void {
                 !(cp >= '0' and cp <= '9') and cp != '+' and cp != '/') return error.InvalidResponse;
         }
     }
-    if (count % 4 != 0) return error.InvalidResponse;
+    if ((saw_space and !split) or count % 4 != 0) return error.InvalidResponse;
+}
+
+test "SDK requests apply Python whitespace rules to inline media" {
+    var scratch: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    const cases = [_]struct { data: []const u8, valid: bool }{
+        .{ .data = "A\u{a0}QJ=", .valid = false },
+        .{ .data = "data:audio/pcm;base64,A\u{a0}QJ=", .valid = false },
+        .{ .data = "\u{a0}AQJ=", .valid = true },
+        .{ .data = "AQJ=\u{a0}\u{2003}", .valid = true },
+        .{ .data = "A\u{a0}QJ=\n", .valid = true },
+        .{ .data = "A\u{a0} QJ=", .valid = true },
+        .{ .data = "A\u{a0}QJ=\u{2003}", .valid = true },
+    };
+    for (cases) |case| {
+        const request = Request.fromFields(arena, &.{
+            .model = "gemini-live-native-audio",
+            .messages = &.{.{ .role = .user, .parts = &.{.{ .audio = .{
+                .media_type = "audio/pcm",
+                .data = case.data,
+            } }} }},
+        });
+        if (case.valid) {
+            const accepted = try request;
+            defer accepted.release();
+            try std.testing.expectEqualStrings(case.data, accepted.fields.messages[0].parts[0].audio.data.?);
+        } else {
+            if (request) |accepted| {
+                accepted.release();
+                return error.TestUnexpectedResult;
+            } else |err| try std.testing.expectEqual(error.InvalidResponse, err);
+        }
+    }
 }
 
 test "SDK request snapshot freezes real files and retains no-path request identity" {
@@ -1935,6 +1992,41 @@ test "SDK request reasoning record imports preserve legacy defaults without weak
     defer typed.release();
     try std.testing.expectEqual(ReasoningEffort.minimal, typed.fields.config.reasoning.?.effort.?);
     try std.testing.expectEqual(@as(i64, 2000), typed.fields.config.reasoning.?.thinking_budget.integer);
+}
+
+test "SDK request rejects empty system part lists across public inputs" {
+    const allocator = std.testing.allocator;
+    const messages: []const Message = &.{.{ .role = .user, .parts = &.{.{ .text = .{ .text = "question" } }} }};
+    const typed = Request.fromFields(allocator, &.{
+        .model = "model",
+        .messages = messages,
+        .system = .{ .parts = &.{} },
+    });
+    defer if (typed) |request| request.release() else |_| {};
+    try std.testing.expectError(error.InvalidResponse, typed);
+
+    var scratch: std.heap.ArenaAllocator = .init(allocator);
+    defer scratch.deinit();
+    const record = try std.json.parseFromSliceLeaky(Value, scratch.allocator(),
+        \\{"model":"model","messages":[{"role":"user","parts":[{"type":"text","text":"question"}]}],"system":[]}
+    , .{});
+    const value = Request.fromValue(allocator, record);
+    defer if (value) |request| request.release() else |_| {};
+    try std.testing.expectError(error.InvalidResponse, value);
+    const payload = try JsonValue.fromValue(allocator, record);
+    defer payload.free();
+    const imported = Request.fromPayload(allocator, .{ .root = payload.root, .storage = payload.storage });
+    defer if (imported) |request| request.release() else |_| {};
+    try std.testing.expectError(error.InvalidResponse, imported);
+
+    // Presence is about the part list, not its rendered text.
+    const accepted = try Request.fromFields(allocator, &.{
+        .model = "model",
+        .messages = messages,
+        .system = .{ .parts = &.{.{ .text = .{ .text = "" } }} },
+    });
+    defer accepted.release();
+    try std.testing.expectEqualStrings("", accepted.fields.system.?.parts[0].text.text);
 }
 
 test "SDK request rejects contradictory config and unavailable tool selections" {

@@ -1223,6 +1223,23 @@ fn appendCitations(
     }
 }
 
+fn unmappedBlockType(arena: Allocator, block: Value, block_type: Value) Error![]const u8 {
+    return switch (block) {
+        .object => blk: {
+            const kind = try lm_mod.OpenAI.responseText(arena, block_type);
+            break :blk if (kind.len == 0) "<missing>" else kind;
+        },
+        .null => "NoneType",
+        .bool => "bool",
+        .integer => "int",
+        .float => "float",
+        .number_string => |number| if (std.json.isNumberFormattedLikeAnInteger(number)) "int" else "float",
+        .string => "str",
+        .array => "list",
+        .custom => unreachable, // HTTP JSON cannot contain native classes.
+    };
+}
+
 fn parseResponse(arena: Allocator, model: []const u8, input: Value, records: []const sdk.Adaptation) Error!lm_mod.Completion {
     if (input != .object) return error.LMFailure;
     var parts: std.ArrayList(sdk.Part) = .empty;
@@ -1232,8 +1249,13 @@ fn parseResponse(arena: Allocator, model: []const u8, input: Value, records: []c
     var reasoning: std.Io.Writer.Allocating = .init(arena);
     const content = get(input, "content");
     if (content != .null and content != .array) return error.LMFailure;
-    for (if (content == .array) content.array.items else &.{}) |block| {
-        const kind = text(get(block, "type"));
+    var unmapped: runtime.Array = .init(arena);
+    for (if (content == .array) content.array.items else &.{}, 0..) |block, index| {
+        const block_type = get(block, "type");
+        const kind = text(block_type);
+        // The source checks object block types against a set of hosted kinds;
+        // a JSON array or object is not a valid type discriminator.
+        if (block_type == .array or block_type == .object) return error.LMFailure;
         if (std.mem.eql(u8, kind, "text")) {
             const chunk = try lm_mod.OpenAI.responseText(arena, get(block, "text"));
             visible.writer.writeAll(chunk) catch return error.OutOfMemory;
@@ -1261,10 +1283,23 @@ fn parseResponse(arena: Allocator, model: []const u8, input: Value, records: []c
         } else if (!is(kind, "server_tool_use") and !is(kind, "web_search_tool_result") and
             !is(kind, "code_execution_tool_result"))
         {
-            return error.LMFailure;
+            var record: Object = .empty;
+            try record.put(arena, "path", str(try std.fmt.allocPrint(arena, "content[{d}]", .{index})));
+            try record.put(arena, "type", str(try unmappedBlockType(arena, block, block_type)));
+            try unmapped.append(.{ .object = record });
         }
     }
     if (parts.items.len == 0) try parts.append(arena, .{ .text = .{} });
+    const provider_data: Value = if (unmapped.items.len == 0) input else blk: {
+        // Annotate a shallow copy so the original wire blocks stay intact.
+        var object: Object = .empty;
+        try object.ensureTotalCapacity(arena, input.object.count() +
+            @intFromBool(!input.object.contains("_lm15_unmapped")));
+        for (input.object.keys(), input.object.values()) |key, value|
+            object.putAssumeCapacity(key, value);
+        object.putAssumeCapacity("_lm15_unmapped", .{ .array = unmapped });
+        break :blk .{ .object = object };
+    };
     const id = text(get(input, "id"));
     const model_id = text(get(input, "model"));
     return .{
@@ -1273,7 +1308,7 @@ fn parseResponse(arena: Allocator, model: []const u8, input: Value, records: []c
         .tool_calls = calls.items,
         .citations = citations.items,
         .message = .{ .role = .assistant, .parts = parts.items },
-        .provider_data = try payload(arena, input),
+        .provider_data = try payload(arena, provider_data),
         .adaptations = records,
         .metadata = .{
             .id = if (id.len != 0) id else null,
@@ -1438,6 +1473,112 @@ test "Anthropic hosted blocks do not shift client calls, but citations do" {
     try std.testing.expectEqualStrings("Paris", parts[0].text.text);
     try std.testing.expectEqualStrings("https://example.org", parts[1].citation.url.?);
     try std.testing.expectEqualStrings("tool_2", parts[2].tool_call.id);
+}
+
+test "Anthropic buffered responses keep usable parts and index unmapped content" {
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const input = try @import("json_repair.zig").parseJson(arena,
+        \\{"id":"msg_fixture","_lm15_unmapped":[{"path":"old","type":"old"}],"content":[
+        \\{"type":"future_block","detail":{"flag":true}},
+        \\{"type":"server_tool_use","id":"server","name":"web_search"},
+        \\{"type":"text","text":"Paris","citations":[{"uri":"https://example.org","quote":"Paris"}]},
+        \\null,
+        \\{"type":"web_search_tool_result","tool_use_id":"server"},
+        \\{"type":"code_execution_tool_result"},
+        \\{"detail":"no type"},
+        \\{"type":"text","text":" is the answer"},
+        \\{"type":false},
+        \\{"type":"tool_use","name":"city","input":{"country":"France"}},
+        \\{"type":17},
+        \\17,
+        \\{"type":"thinking","thinking":"Check the answer","signature":"opaque"}]}
+    );
+    const result = try parseResponse(arena, "fixture", input, &.{});
+    try std.testing.expectEqualStrings("Paris is the answer", result.text.?);
+    try std.testing.expectEqualStrings("Check the answer", result.reasoning.?);
+    const parts = result.message.?.parts;
+    try std.testing.expectEqual(@as(usize, 5), parts.len);
+    try std.testing.expectEqualStrings("Paris", parts[0].text.text);
+    try std.testing.expectEqualStrings("https://example.org", parts[1].citation.url.?);
+    try std.testing.expectEqualStrings(" is the answer", parts[2].text.text);
+    try std.testing.expectEqualStrings("tool_3", parts[3].tool_call.id);
+    try std.testing.expectEqualStrings("Check the answer", parts[4].thinking.text);
+    const replay = try encodeBlock(arena, parts[4], .{});
+    try std.testing.expectEqualStrings("opaque", text(get(replay, "signature")));
+    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
+    try std.testing.expectEqualStrings("city", result.tool_calls[0].name);
+    try std.testing.expectEqualStrings("tool_3", result.tool_calls[0].id);
+    try std.testing.expectEqual(sdk.FinishReason.tool_call, result.metadata.finish_reason.?);
+
+    const raw = result.provider_data.?.root.object;
+    try std.testing.expectEqualStrings("msg_fixture", raw.get("id").?.string);
+    const raw_blocks = raw.get("content").?.array.items;
+    try std.testing.expectEqual(@as(usize, 13), raw_blocks.len);
+    try std.testing.expect(raw_blocks[0].object.get("detail").?.object.get("flag").?.bool);
+    try std.testing.expectEqualStrings("web_search_tool_result", raw_blocks[4].object.get("type").?.string);
+    const unmapped = raw.get("_lm15_unmapped").?.array.items;
+    const paths = [_][]const u8{ "content[0]", "content[3]", "content[6]", "content[8]", "content[10]", "content[11]" };
+    const kinds = [_][]const u8{ "future_block", "NoneType", "<missing>", "<missing>", "17", "int" };
+    try std.testing.expectEqual(paths.len, unmapped.len);
+    for (unmapped, paths, kinds) |record, path, kind| {
+        try std.testing.expectEqualStrings(path, record.object.get("path").?.string);
+        try std.testing.expectEqualStrings(kind, record.object.get("type").?.string);
+    }
+    try std.testing.expectEqualStrings("old", get(input, "_lm15_unmapped").array.items[0].object.get("type").?.string);
+}
+
+test "Anthropic buffered responses with no mapped parts keep an empty text part" {
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const parse = @import("json_repair.zig").parseJson;
+    const unknown = try parse(arena, "{\"content\":[{\"type\":\"future_block\"}]}");
+    const hosted = try parse(arena, "{\"content\":[{\"type\":\"server_tool_use\"}]}");
+    for ([_]Value{ unknown, hosted }, [_]bool{ true, false }) |input, has_unmapped| {
+        const result = try parseResponse(arena, "fixture", input, &.{});
+        try std.testing.expectEqualStrings("", result.text.?);
+        const parts = result.message.?.parts;
+        try std.testing.expectEqual(@as(usize, 1), parts.len);
+        try std.testing.expectEqualStrings("", parts[0].text.text);
+        try std.testing.expectEqual(has_unmapped, result.provider_data.?.root.object.get("_lm15_unmapped") != null);
+    }
+}
+
+test "Anthropic buffered responses preserve existing provider metadata when nothing is unmapped" {
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const input = try @import("json_repair.zig").parseJson(arena,
+        \\{"_lm15_unmapped":[{"path":"upstream[2]","type":"upstream_extension"}],"content":[
+        \\{"type":"server_tool_use","id":"server"},{"type":"text","text":"usable"}]}
+    );
+    const result = try parseResponse(arena, "fixture", input, &.{});
+    try std.testing.expectEqualStrings("usable", result.text.?);
+    const records = result.provider_data.?.root.object.get("_lm15_unmapped").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), records.len);
+    try std.testing.expectEqualStrings("upstream[2]", records[0].object.get("path").?.string);
+    try std.testing.expectEqualStrings("upstream_extension", records[0].object.get("type").?.string);
+}
+
+test "Anthropic buffered responses still reject malformed known content" {
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const parse = @import("json_repair.zig").parseJson;
+    for ([_][]const u8{
+        \\[]
+        ,
+        \\{"content":{}}
+        ,
+        \\{"content":[{"type":"future_block"},{"type":"text","text":"usable"},{"type":"tool_use","input":{}}]}
+        ,
+        \\{"content":[{"type":["future"]}]}
+        ,
+    }) |raw| {
+        try std.testing.expectError(error.LMFailure, parseResponse(arena, "fixture", try parse(arena, raw), &.{}));
+    }
 }
 
 test "Anthropic alternate thinking distinguishes an absent request from off" {

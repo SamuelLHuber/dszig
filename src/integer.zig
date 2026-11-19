@@ -30,7 +30,7 @@ test "Integer normalization retains decimal precision beyond native integer widt
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const result = try Integer.coerce(arena.allocator(), .{
-        .string = " -000_12345678901234567890123456789012345678901234567890.0_0 ",
+        .string = " -000_12345678901234567890123456789012345678901234567890.00 ",
     });
     try std.testing.expect(result.value == .number_string);
     try std.testing.expectEqualStrings("-12345678901234567890123456789012345678901234567890", result.value.number_string);

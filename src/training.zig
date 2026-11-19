@@ -353,15 +353,19 @@ pub const Job = struct {
 
     fn cancelRemote(self: *Job, arena: Allocator, end: u64) !void {
         const path = try std.fmt.allocPrint(arena, "/fine_tuning/jobs/{s}", .{self.job_id.get()});
-        const response = try send(self.io, &self.source, arena, self.limits, end, .GET, path, null, null);
+        const response = try sendRaw(self.io, &self.source, arena, self.limits, end, .GET, path, null, null);
         defer self.source.client.allocator.free(response.body);
-        const parsed = try std.json.parseFromSlice(std.json.Value, arena, response.body, .{});
-        defer parsed.deinit();
-        const state = try parseStatus(try stringField(parsed.value, "status"));
-        if (!state.terminal()) {
-            const cancel_path = try std.fmt.allocPrint(arena, "{s}/cancel", .{path});
-            const canceled = try send(self.io, &self.source, arena, self.limits, end, .POST, cancel_path, "{}", "application/json");
-            self.source.client.allocator.free(canceled.body);
+        // Only confirmed absence permits cleanup to proceed without a status.
+        if (response.status != .not_found) {
+            if (!successfulStatus(response.status)) return error.TrainingHttpFailure;
+            const parsed = try std.json.parseFromSlice(std.json.Value, arena, response.body, .{});
+            defer parsed.deinit();
+            const state = try parseStatus(try stringField(parsed.value, "status"));
+            if (!state.terminal()) {
+                const cancel_path = try std.fmt.allocPrint(arena, "{s}/cancel", .{path});
+                const canceled = try send(self.io, &self.source, arena, self.limits, end, .POST, cancel_path, "{}", "application/json");
+                self.source.client.allocator.free(canceled.body);
+            }
         }
         self.mutex.lockUncancelable(self.io);
         self.job_id.len = 0;
@@ -375,8 +379,12 @@ pub const Job = struct {
         if (self.job_id.len != 0) try self.cancelRemote(arena, end);
         if (self.file_id.len != 0) {
             const path = try std.fmt.allocPrint(arena, "/files/{s}", .{self.file_id.get()});
-            const response = try send(self.io, &self.source, arena, self.limits, end, .DELETE, path, null, null);
-            self.source.client.allocator.free(response.body);
+            const response = try sendRaw(self.io, &self.source, arena, self.limits, end, .DELETE, path, null, null);
+            defer self.source.client.allocator.free(response.body);
+            // A prior DELETE can commit even if its reply was lost. Only a
+            // successful deletion or a confirmed absence releases the file ID.
+            if (!successfulStatus(response.status) and response.status != .not_found)
+                return error.TrainingHttpFailure;
             self.mutex.lockUncancelable(self.io);
             self.file_id.len = 0;
             self.mutex.unlock(self.io);
@@ -509,6 +517,88 @@ test "training rejects unsupported formats and recovers the joined worker slot" 
     try std.testing.expectError(error.UnsupportedTrainingFormat, job.wait());
 }
 
+test "training release deletes the file after the remote job disappears" {
+    const Fixture = struct {
+        const Exchange = struct {
+            method: std.http.Method,
+            target: []const u8,
+            status: std.http.Status = .ok,
+            body: []const u8 = "",
+        };
+        const exchanges: []const Exchange = &.{
+            .{ .method = .POST, .target = "/v1/files", .body = "{\"id\":\"file-test\"}" },
+            .{ .method = .POST, .target = "/v1/fine_tuning/jobs", .body = "{\"id\":\"ftjob-test\"}" },
+            .{ .method = .GET, .target = "/v1/fine_tuning/jobs/ftjob-test/events?limit=1", .body = "{\"data\":[]}" },
+            .{ .method = .GET, .target = "/v1/fine_tuning/jobs/ftjob-test", .body = "{\"status\":\"failed\"}" },
+            .{ .method = .GET, .target = "/v1/fine_tuning/jobs/ftjob-test", .status = .service_unavailable },
+            .{ .method = .GET, .target = "/v1/fine_tuning/jobs/ftjob-test", .status = .not_found },
+            .{ .method = .DELETE, .target = "/v1/files/file-test", .status = .no_content },
+        };
+
+        fn serve(io: Io, listener: *Io.net.Server) !void {
+            for (exchanges) |exchange| try serveOne(io, listener, exchange);
+        }
+
+        fn serveOne(io: Io, listener: *Io.net.Server, exchange: Exchange) !void {
+            const stream = try listener.accept(io);
+            defer stream.close(io);
+            var read_buffer: [4096]u8 = undefined;
+            var write_buffer: [1024]u8 = undefined;
+            var input = stream.reader(io, &read_buffer);
+            var output = stream.writer(io, &write_buffer);
+            var server = std.http.Server.init(&input.interface, &output.interface);
+            var request = try server.receiveHead();
+            try std.testing.expectEqual(exchange.method, request.head.method);
+            try std.testing.expectEqualStrings(exchange.target, request.head.target);
+            if (request.head.content_length) |len| {
+                var body_buffer: [1024]u8 = undefined;
+                try std.testing.expect(len <= body_buffer.len);
+                var transfer_buffer: [256]u8 = undefined;
+                const reader = try request.readerExpectContinue(&transfer_buffer);
+                try reader.readSliceAll(body_buffer[0..@intCast(len)]);
+            }
+            try request.respond(exchange.body, .{ .status = exchange.status, .keep_alive = false });
+        }
+    };
+
+    const io = std.testing.io;
+    var listener = try (try Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{});
+    defer listener.deinit(io);
+    var serving = try io.concurrent(Fixture.serve, .{ io, &listener });
+    defer serving.cancel(io) catch {};
+
+    const allocator = std.testing.allocator;
+    const base_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/v1", .{listener.socket.address.getPort()});
+    defer allocator.free(base_url);
+    var client: std.http.Client = .{ .allocator = allocator, .io = io };
+    defer client.deinit();
+    var source: lm.OpenAI = .{ .client = &client, .base_url = base_url, .model = "local-fixture" };
+    var body: [1024]u8 = undefined;
+    var scratch: [8192]u8 = undefined;
+    var job: Job = undefined;
+    try job.init(io, .{ .body = &body, .scratch = &scratch }, .{
+        .max_rows = 1,
+        .max_polls = 1,
+        .total_timeout_ns = 5 * std.time.ns_per_s,
+        .request_timeout_ns = std.time.ns_per_s,
+        .cleanup_timeout_ns = 2 * std.time.ns_per_s,
+        .poll_interval_ns = 0,
+    }, .{});
+    defer job.deinit() catch {};
+
+    try source.lm().finetune(&job, .{ .data = &.{}, .format = .chat });
+    try std.testing.expectError(error.TrainingFailed, job.wait());
+    const reuse: Request = .{ .data = &.{}, .format = .grpo_chat };
+    try std.testing.expectError(error.TrainingHttpFailure, job.release());
+    try std.testing.expectError(error.TrainingResourcesRetained, job.start(&source, reuse));
+
+    try job.release();
+    try serving.await(io);
+    try job.start(&source, reuse);
+    // The new operation reached the worker without contacting the provider.
+    try std.testing.expectError(error.UnsupportedTrainingFormat, job.wait());
+}
+
 test "training status rejects unknown states and recognizes terminal boundaries" {
     const cases = .{
         .{ "validating_files", Status.pending }, .{ "queued", Status.pending },
@@ -544,9 +634,21 @@ fn deadline(io: Io, duration_ns: u64) u64 {
     return now(io) +| duration_ns;
 }
 
+fn successfulStatus(status: std.http.Status) bool {
+    const code = @backingInt(status);
+    return code >= 200 and code < 300;
+}
+
+fn send(io: Io, source: *const lm.OpenAI, arena: Allocator, limits: Limits, end: u64, method: std.http.Method, path: []const u8, body: ?[]const u8, content_type: ?[]const u8) !http.Response {
+    const response = try sendRaw(io, source, arena, limits, end, method, path, body, content_type);
+    errdefer source.client.allocator.free(response.body);
+    if (!successfulStatus(response.status)) return error.TrainingHttpFailure;
+    return response;
+}
+
 /// Whole-request timer complements transport inactivity timers. Both competing
 /// I/O tasks are canceled AND joined before request/scratch storage is reused.
-fn send(io: Io, source: *const lm.OpenAI, arena: Allocator, limits: Limits, end: u64, method: std.http.Method, path: []const u8, body: ?[]const u8, content_type: ?[]const u8) !http.Response {
+fn sendRaw(io: Io, source: *const lm.OpenAI, arena: Allocator, limits: Limits, end: u64, method: std.http.Method, path: []const u8, body: ?[]const u8, content_type: ?[]const u8) !http.Response {
     const remaining = end -| now(io);
     if (remaining == 0) return error.TrainingTimedOut;
     const url = try std.fmt.allocPrint(arena, "{s}{s}", .{ std.mem.trimEnd(u8, source.base_url, "/"), path });
@@ -582,14 +684,6 @@ fn send(io: Io, source: *const lm.OpenAI, arena: Allocator, limits: Limits, end:
             try result;
             return error.TrainingTimedOut;
         },
-        .response => |result| {
-            const response = try result;
-            const code = @backingInt(response.status);
-            if (code < 200 or code >= 300) {
-                source.client.allocator.free(response.body);
-                return error.TrainingHttpFailure;
-            }
-            return response;
-        },
+        .response => |result| return result,
     }
 }
