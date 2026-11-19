@@ -10,6 +10,8 @@ const runtime_value = @import("runtime_value.zig");
 const pyjson = @import("pyjson.zig");
 const signature = @import("signature.zig");
 const types = @import("types.zig");
+const unicode = @import("unicode.zig");
+const whitespace = @import("xml_unicode.zig");
 const Field = signature.Field;
 const Allocator = std.mem.Allocator;
 const Record = value.Record;
@@ -604,27 +606,72 @@ fn executeAction(
     execution: *Runtime.Execution,
     entry: *Entry,
 ) !Runtime.Result {
-    const whitespace = " \t\n\r\x0b\x0c";
-    const trimmed = std.mem.trim(u8, entry.code, whitespace);
-    entry.code = trimmed;
-    if (std.mem.indexOf(u8, trimmed, "```")) |first| {
-        const fence = trimmed[first + 3 ..];
-        if (std.mem.indexOfScalar(u8, fence, '\n')) |line_end| {
-            var words = std.mem.tokenizeAny(u8, fence[0..line_end], whitespace);
-            if (words.next()) |language| {
-                if (!std.ascii.eqlIgnoreCase(language, "python") and !std.ascii.eqlIgnoreCase(language, "py")) {
+    var code = whitespace.strip(entry.code);
+    const marker = "```";
+    if (std.mem.indexOf(u8, code, marker) != null) {
+        code = try normalizeFenceLines(arena, code);
+        // Drop matching bare decorative lines, without stripping blanks between
+        // the pairs. An explicit language line is handled below instead.
+        while (std.mem.indexOfScalar(u8, code, '\n')) |first| {
+            if (!std.mem.eql(u8, whitespace.strip(code[0..first]), marker)) break;
+            const last = std.mem.lastIndexOfScalar(u8, code, '\n').?;
+            if (!std.mem.eql(u8, whitespace.strip(code[last + 1 ..]), marker)) break;
+            code = if (first == last) "" else code[first + 1 .. last];
+        }
+        code = whitespace.strip(code);
+        if (std.mem.indexOf(u8, code, marker)) |start| {
+            const fence = code[start + marker.len ..];
+            if (std.mem.indexOfScalar(u8, fence, '\n')) |line_end| {
+                const label = whitespace.trimStart(fence[0..line_end]);
+                var chars = (try std.unicode.Utf8View.init(label)).iterator();
+                while (chars.i < label.len and whitespace.whitespaceEnd(label, chars.i) == chars.i) {
+                    _ = chars.nextCodepoint();
+                }
+                const tag = label[0..chars.i];
+                const accepted = tag.len == 0 or
+                    std.ascii.eqlIgnoreCase(tag, "python") or std.ascii.eqlIgnoreCase(tag, "py") or
+                    std.ascii.eqlIgnoreCase(tag, "python3") or std.ascii.eqlIgnoreCase(tag, "py3");
+                if (!accepted) {
+                    const language = try unicode.encode(arena, try unicode.lower(arena, try unicode.decode(arena, tag)));
+                    // Match DSPy: the rejected action is reported as received,
+                    // rather than publishing a partly normalized action.
                     return .{ .execution_error = try std.fmt.allocPrint(
                         arena,
                         "Expected Python code but got ```{s} fence. Write Python code, not {s}.",
                         .{ language, language },
                     ) };
                 }
+                const body = fence[line_end + 1 ..];
+                code = whitespace.strip(body[0 .. std.mem.indexOf(u8, body, marker) orelse body.len]);
             }
-            const body = fence[line_end + 1 ..];
-            entry.code = std.mem.trim(u8, body[0 .. std.mem.indexOf(u8, body, "```") orelse body.len], whitespace);
         }
     }
+    entry.code = code;
     return runtime.execute(runtime.ptr, entry.code, execution);
+}
+
+/// `"\n".join(code.splitlines())` for already stripped action text. Ordinary
+/// LF-only actions borrow their input; other Python line separators shrink.
+fn normalizeFenceLines(arena: Allocator, code: []const u8) ![]const u8 {
+    var lines: adapter.LineIterator = .{ .text = code };
+    var previous: usize = 0;
+    while (lines.next()) |line| {
+        const end = previous + line.len;
+        if (lines.index != end and !std.mem.eql(u8, code[end..lines.index], "\n")) {
+            const buffer = try arena.alloc(u8, code.len);
+            @memcpy(buffer[0..end], code[0..end]);
+            var used = end;
+            while (lines.next()) |next| {
+                buffer[used] = '\n';
+                used += 1;
+                @memcpy(buffer[used..][0..next.len], next);
+                used += next.len;
+            }
+            return buffer[0..used];
+        }
+        previous = lines.index;
+    }
+    return code;
 }
 
 fn processResult(arena: Allocator, fields: []const Field, result: Runtime.Result, entry: *Entry) !?Record {

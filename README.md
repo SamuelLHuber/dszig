@@ -3814,8 +3814,11 @@ The following prevent a claim that DSZig can do everything DSPy can:
   the runtime supports. Each call opens one fresh session, passes model actions
   to it serially, and closes it on success or failure. Typed submissions and
   extraction at the iteration limit return outputs, tagged history, final
-  reasoning, and the current trajectory. Recoverable execution failures become
-  observations; runtime failures propagate. `forwardWithHistory` continues the
+  reasoning, and the current trajectory. Action parsing unwraps nested bare
+  fences, accepts `python`, `py`, `python3`, and `py3` labels, and feeds an
+  unsupported-label error back without executing the action. Recoverable
+  execution failures become observations; runtime failures propagate.
+  `forwardWithHistory` continues the
   conversation, not the runtime state. Variable previews count Unicode code
   points, group the displayed count with commas, and show the first and last
   500 code points when the rendered value exceeds 1,000. List and dictionary

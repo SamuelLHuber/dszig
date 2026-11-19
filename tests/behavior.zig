@@ -64,7 +64,7 @@ test "custom RLM retains observations across runtime buffer reuse and closes on 
     );
     var model: dszig.lm.ScriptedLM = .{
         .responses = &.{
-            "<plan>Inspect.</plan><code>```python\ninspect()\n```</code>",
+            "<plan>Inspect.</plan><code>```\r\n```Py3\r\ninspect()\r\n```\r\n```</code>",
             "<plan>Verify.</plan><code>verify()</code>",
             "<answer>17</answer>",
         },
