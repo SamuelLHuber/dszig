@@ -811,7 +811,8 @@ pub const BootstrapFewShotWithRandomSearch = struct {
     max_labeled_demos: usize = 16,
     max_rounds: usize = 1,
     num_candidate_programs: usize = 16,
-    max_errors: usize = 10,
+    /// Null inherits the compile context for both bootstrapping and evaluation.
+    max_errors: ?usize = null,
     stop_at_score: ?f64 = null,
     /// DSPy `num_threads`; null evaluates candidates serially.
     concurrent_evaluation: ?ConcurrentEvaluation = null,
@@ -866,6 +867,7 @@ pub const BootstrapFewShotWithRandomSearch = struct {
             break :count @min(range_count, seeds.len);
         } else range_count;
         assert(candidate_count_max > 0);
+        const max_errors = self.max_errors orelse ctx.max_errors;
         const val = if (valset) |set| if (set.len > 0) set else trainset else trainset;
         const candidates = try out.alloc(Candidate(P), candidate_count_max);
         var count: usize = 0;
@@ -894,7 +896,7 @@ pub const BootstrapFewShotWithRandomSearch = struct {
                 &program,
                 val,
                 self.metric,
-                self.max_errors,
+                max_errors,
                 subscores,
             );
             assert(count < candidates.len);

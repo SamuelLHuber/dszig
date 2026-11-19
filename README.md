@@ -2894,6 +2894,10 @@ when a nonempty dataset has a predictor; empty data returns a reset copy first.
 Both modes own deep-copied demos in `out`. DSPy aliases the original Examples,
 so native ownership is an intentional difference, not alias-identity parity.
 
+Random search inherits `Context.max_errors` unless its own `max_errors` is
+set. The same limit governs each candidate's bootstrap and validation runs,
+with a fresh failure count for each run.
+
 `BootstrapFewShotWithRandomSearch.compile(..., valset, options)` accepts
 `restrict: ?[]const i64` and `labeled_sample: bool`. Restrictions are a borrowed
 seed set: duplicates and out-of-range entries are ignored, candidates retain

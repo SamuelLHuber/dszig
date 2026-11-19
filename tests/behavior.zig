@@ -1713,6 +1713,57 @@ fn fewShotOptionsSearch(metric: dszig.optimize.Metric) dszig.BootstrapFewShotWit
     return .{ .metric = metric, .max_bootstrapped_demos = 2, .max_labeled_demos = 3, .num_candidate_programs = 4 };
 }
 
+test "random search inherits the outer budget for bootstrap and candidate evaluation" {
+    const Metric = struct {
+        fn score(
+            _: Allocator,
+            example: *const dszig.Example,
+            _: ?*const dszig.optimize.RecordPrediction,
+            _: ?*const dszig.Trace,
+        ) dszig.value.ParseError!f64 {
+            const question = example.record.get("question").?.string;
+            if (std.mem.eql(u8, question, "0")) return error.ParseValue;
+            return 1;
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const P = FewShotOptionsProgram;
+    const trainset = try fewShotOptionsExamples(arena, 2);
+    const ctx: dszig.Context = .{ .arena = arena, .max_errors = 1 };
+    var search = fewShotOptionsSearch(Metric.score);
+    search.teacher_settings.max_errors = 9;
+    for ([_]i64{ -3, -1 }) |seed| {
+        const options: dszig.BootstrapFewShotWithRandomSearch.Options = .{ .restrict = &.{seed} };
+        const devset = if (seed == -3) trainset else trainset[1..];
+        search.max_errors = null;
+        P.forward_calls = 0;
+        try testing.expectError(
+            error.ParseValue,
+            search.compile(P, arena, testing.allocator, ctx, .{}, null, trainset, devset, options),
+        );
+        try testing.expectEqual(@as(u32, 1), P.forward_calls);
+
+        search.max_errors = 2;
+        P.forward_calls = 0;
+        const result = try search.compile(
+            P,
+            arena,
+            testing.allocator,
+            ctx,
+            .{},
+            null,
+            trainset,
+            devset,
+            options,
+        );
+        const score: f64 = if (seed == -3) 50 else 100;
+        try expectFewShotCandidates(&.{.{ .seed = seed, .score = score }}, result.candidates);
+        try testing.expectEqual(@as(u32, if (seed == -3) 2 else 3), P.forward_calls);
+    }
+}
+
 test "LabeledFewShot sample shares one RNG across predictors and prefix mode owns the trainset head" {
     var out: std.heap.ArenaAllocator = .init(testing.allocator);
     defer out.deinit();
