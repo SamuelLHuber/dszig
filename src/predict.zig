@@ -360,35 +360,58 @@ pub const PredictState = struct {
         ctx.lm_options.n = n;
         if (n > 1 and (ctx.lm_options.temperature orelse 0) <= 0.15) ctx.lm_options.temperature = 0.7;
         var defaulted_inputs: Record = undefined;
-        const prepared = try state.prepare(ctx, inputs, &defaulted_inputs);
+        const prepared = try state.prepare(&ctx, inputs, &defaulted_inputs);
         const outputs = try runPredict(state, ctx, prepared);
         if (ctx.trace) |t| try t.record(state, prepared.inputs, &outputs[0]);
         return outputs;
     }
 
-    fn prepare(state: *const PredictState, ctx: Context, inputs: *const Record, defaulted: *Record) Error!PreparedCall {
+    fn prepare(state: *const PredictState, ctx: *Context, inputs: *const Record, defaulted: *Record) Error!PreparedCall {
         const view_ = try state.view(ctx.arena);
+        const hint = predictionHint(inputs);
+        if (hint) |arg| ctx.lm_options.prediction = arg;
         var missing_defaults: usize = 0;
         for (view_.inputs) |field| {
-            // Explicit null is an input, not an omitted argument.
-            if (field.default_value != null and !inputs.contains(field.name)) missing_defaults += 1;
+            if (field.default_value == null) continue;
+            if (!inputs.contains(field.name) or (hint != null and isPrediction(field.name)))
+                missing_defaults += 1;
         }
-        if (missing_defaults != 0) {
+        const rebuild = hint != null or missing_defaults != 0;
+        if (rebuild) {
             defaulted.* = .empty;
-            try defaulted.ensureTotalCapacity(ctx.arena, inputs.count() + missing_defaults);
-            for (inputs.keys(), inputs.values()) |key, item| defaulted.putAssumeCapacity(key, item);
+            try defaulted.ensureTotalCapacity(
+                ctx.arena,
+                inputs.count() - @intFromBool(hint != null) + missing_defaults,
+            );
+            for (inputs.keys(), inputs.values()) |key, item| {
+                if (hint != null and isPrediction(key)) continue;
+                defaulted.putAssumeCapacity(key, item);
+            }
             for (view_.inputs) |field| {
                 const default = field.default_value orelse continue;
-                if (!inputs.contains(field.name))
+                if (!defaulted.contains(field.name))
                     defaulted.putAssumeCapacity(field.name, try default(ctx.arena));
             }
         }
         const call_: PreparedCall = .{
             .signature_class = state.signature_class,
             .view = view_,
-            .inputs = if (missing_defaults != 0) defaulted else inputs,
+            .inputs = if (rebuild) defaulted else inputs,
         };
         return if (ctx.preparation) |wrapper| wrapper.apply(ctx.arena, call_) else call_;
+    }
+
+    fn predictionHint(inputs: *const Record) ?@import("runtime_value.zig").Value {
+        const hint = inputs.get("prediction") orelse return null;
+        if (hint != .object) return null;
+        const kind = hint.object.get("type") orelse return null;
+        if (kind != .string or !std.mem.eql(u8, kind.string, "content")) return null;
+        if (!hint.object.contains("content")) return null;
+        return hint;
+    }
+
+    fn isPrediction(name: []const u8) bool {
+        return std.mem.eql(u8, name, "prediction");
     }
 };
 
@@ -567,7 +590,8 @@ fn runSystemOne(ctx: Context, prepared: PreparedCall, demos: []const Record, sna
     const options = ctx.lm_options;
     if (options.temperature != null or options.rollout_id != null or options.n != 1 or
         options.reasoning_effort != null or options.reasoning_effort_present or options.response_format != null or
-        options.tool_choice != null or options.parallel_tool_calls != null or options.logprobs != .null) return error.InvalidDecision;
+        options.tool_choice != null or options.parallel_tool_calls != null or
+        options.logprobs != .null or options.prediction != null) return error.InvalidDecision;
     var state: Record = .empty;
     try state.put(ctx.arena, "instructions", .{ .string = prepared.view.instructions });
     try state.put(ctx.arena, "input_fields", .{ .string = try adapter_mod.fieldDescriptionString(ctx.arena, prepared.view.inputs) });

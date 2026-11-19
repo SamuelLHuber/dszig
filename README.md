@@ -2671,6 +2671,14 @@ Typed programs run from an `Example` also use declared input defaults for
 omitted arguments. Fields not marked as inputs are not passed to the program,
 even if a label has the same name as an input.
 
+For OpenAI inference, set `Context.lm_options.prediction` to the predicted-output
+object. A record-based `Predict` call also moves a `prediction` argument with
+`type: "content"` and a `content` key into the LM options, overriding an
+explicit hint. The argument is removed before signature defaults are applied and
+is not recorded as a trace input. Other values named `prediction` remain
+ordinary inputs. The hint participates in cache and replay identity; whether
+the hosted model accepts it depends on the endpoint and model.
+
 Program save/dump now stores a bound LM's configuration rather than silently
 writing null. `lm.OpenAI` supports native configuration persistence, including
 its API, model, capability flags, generation token limit, response bound, retries

@@ -57,6 +57,21 @@ pub const Options = struct {
     /// Distinguishes an explicit null from an unset option for preprocessing.
     /// A nonnull effort is inherently present, regardless of this marker.
     reasoning_effort_present: bool = false,
+    /// OpenAI predicted-output payload, separate from signature inputs.
+    prediction: ?@import("runtime_value.zig").Value = null,
+
+    // Omitting a missing hint preserves existing native cache keys.
+    pub fn jsonStringify(self: Options, writer: *std.json.Stringify) Writer.Error!void {
+        try writer.beginObject();
+        inline for (@typeInfo(Options).@"struct".field_names) |name| {
+            const is_hint = comptime std.mem.eql(u8, name, "prediction");
+            if (!is_hint or self.prediction != null) {
+                try writer.objectField(name);
+                try writer.write(@field(self, name));
+            }
+        }
+        try writer.endObject();
+    }
 };
 
 /// A typed System One judgment request. `state` is the provider state value,
@@ -558,6 +573,7 @@ pub fn cloneOptions(arena: Allocator, options: Options) Allocator.Error!Options 
     var out = options;
     if (options.rollout_id) |id| out.rollout_id = try inference.cloneJsonValue(arena, id);
     out.logprobs = try inference.cloneJsonValue(arena, options.logprobs);
+    if (options.prediction) |hint| out.prediction = try inference.cloneJsonValue(arena, hint);
     if (options.reasoning_effort) |effort| out.reasoning_effort = try arena.dupe(u8, effort);
     if (options.response_format) |format| out.response_format = try inference.cloneResponseFormat(arena, format);
     if (options.tool_choice) |choice| out.tool_choice = try inference.cloneToolChoice(arena, choice);
@@ -576,7 +592,7 @@ pub fn cloneMessage(arena: Allocator, message: Message) Allocator.Error!Message 
 }
 
 /// Canonical metadata, before a provider dialect adds its wire wrappers.
-/// All knobs remain visible, including explicitly absent values.
+/// A missing predicted-output hint is omitted for legacy transcript compatibility.
 pub fn optionsValue(arena: Allocator, options: Options) Allocator.Error!@import("runtime_value.zig").Value {
     var object: @import("runtime_value.zig").ObjectMap = .empty;
     try object.put(arena, "temperature", if (options.temperature) |temperature| .{ .float = temperature } else .null);
@@ -588,6 +604,7 @@ pub fn optionsValue(arena: Allocator, options: Options) Allocator.Error!@import(
     try object.put(arena, "tool_choice", if (options.tool_choice) |choice| try inference.toolChoiceValue(arena, choice) else .null);
     try object.put(arena, "parallel_tool_calls", if (options.parallel_tool_calls) |parallel| .{ .bool = parallel } else .null);
     try object.put(arena, "logprobs", options.logprobs);
+    if (options.prediction) |hint| try object.put(arena, "prediction", hint);
     return .{ .object = object };
 }
 
@@ -680,6 +697,10 @@ pub fn optionsFromValue(arena: Allocator, input: @import("runtime_value.zig").Va
             error.InvalidUsage => return error.BadMetadata,
         };
         out.logprobs = try inference.cloneJsonValue(arena, normalized.input_tokens);
+    }
+    if (input.object.get("prediction")) |hint| {
+        if (hint != .object) return error.BadMetadata;
+        out.prediction = try inference.cloneJsonValue(arena, hint);
     }
     if (input.object.get("parallel_tool_calls")) |parallel| {
         if (parallel != .null) {
@@ -1653,6 +1674,8 @@ pub const ReplayLM = struct {
             a.reasoning_effort_present != b.reasoning_effort_present) return false;
         if (!(try inference.jsonEqual(a.rollout_id orelse .null, b.rollout_id orelse .null))) return false;
         if (!(try inference.jsonEqual(a.logprobs, b.logprobs))) return false;
+        if (!(try inference.jsonEqual(a.prediction orelse .null, b.prediction orelse .null)))
+            return false;
         if (a.response_format) |format| {
             if (!(try inference.responseFormatEqual(format, b.response_format orelse return false))) return false;
         } else if (b.response_format != null) return false;
@@ -2457,6 +2480,13 @@ pub const OpenAI = struct {
             try config.put(arena, "tool_choice", .{ .object = selection });
         }
         if (openai) |self| try self.nativeToolOverrides(arena, request.tools, &config);
+        if (request.options.prediction) |hint| {
+            if (openai == null or hint != .object) return error.LMFailure;
+            if (!config.contains("extensions")) {
+                try config.put(arena, "extensions", .{ .object = .empty });
+            }
+            try config.getPtr("extensions").?.object.put(arena, "prediction", hint);
+        }
         try fields.put(arena, "config", .{ .object = config });
         return sdk.Request.fromValue(arena, .{ .object = fields }) catch |err| return sdkCodecError(err);
     }
