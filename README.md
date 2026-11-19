@@ -4192,6 +4192,10 @@ The following prevent a claim that DSZig can do everything DSPy can:
   complete iterations. Native callbacks see a borrowed, read-only state and
   run in caller order until one returns true, before the metric-budget check.
   They do not interrupt an in-flight evaluation or replace the metric budget.
+  With `GEPA.Options.log_dir` configured, creating `gepa.stop` in that
+  directory also requests a stop at the next iteration boundary. GEPA checks
+  the marker after caller callbacks and before the metric budget. It leaves the
+  marker in place; remove it before restarting to continue optimization.
   Set `GEPA.validation_output_dir = .{ .io = io, .path = path }` to save
   successful seed validation predictions under
   `generated_best_outputs_valset/task_<row>/iter_0_prog_0.json`.
@@ -4221,7 +4225,7 @@ The following prevent a claim that DSZig can do everything DSPy can:
   and accepted candidates. Each file is individually bounded and atomically
   replaced; the files are not a transactional bundle. Use a fresh, private
   output directory per run, with one writer and no checkpoint file named
-  `candidates.json`, `run_log.json`, or `candidate_tree.html`. Keep logging
+  `candidates.json`, `run_log.json`, `candidate_tree.html`, or `gepa.stop`. Keep logging
   enabled across restarts to carry the earlier iterations forward from the
   checkpoint. These files do not add model calls or invoke external
   experiment loggers.

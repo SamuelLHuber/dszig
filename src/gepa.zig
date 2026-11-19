@@ -1114,6 +1114,7 @@ pub const GEPA = struct {
             checkpoint_runs: std.ArrayList([]const Run) = .empty,
             log_dir: ?LogDirectory = null,
             run_log: std.ArrayList(IterationLog) = .empty,
+            stop_path: ?[]const u8 = null,
             logged_tree_size: usize = 1,
 
             fn currentLog(e: *Self) ?*IterationLog {
@@ -1439,6 +1440,13 @@ pub const GEPA = struct {
                     for (e.gepa.stop_callbacks) |callback| {
                         if (try callback.should_stop(callback.ptr, &state)) return true;
                     }
+                }
+                if (e.stop_path) |path| {
+                    // Like os.path.exists, an inaccessible marker is not a stop.
+                    // Native I/O cancellation is not an existence result.
+                    if (std.Io.Dir.cwd().access(e.log_dir.?.io, path, .{})) |_| {
+                        return true;
+                    } else |err| if (err == error.Canceled) return err;
                 }
                 return e.total_evals >= max_calls;
             }
@@ -3087,7 +3095,9 @@ pub const GEPA = struct {
         };
         if (e.log_dir) |dir| {
             if (dir.path.len == 0 or dir.max_file_bytes == 0) return error.InvalidGepaLogDirectory;
+            e.stop_path = try std.fs.path.join(out, &.{ dir.path, "gepa.stop" });
         }
+        defer if (e.stop_path) |path| out.free(path);
         if (self.track_best_outputs) {
             const outputs = try out.alloc(std.ArrayList(BestOutput), valset.len);
             @memset(outputs, .empty);
@@ -3826,9 +3836,10 @@ test "GEPA log size failures leave the last complete candidate file intact" {
     var model: @import("lm.zig").ScriptedLM = .{ .responses = &.{
         "<answer>first</answer>",
         "<answer>second</answer>",
+        "<answer>seed with marker</answer>",
     } };
     const ctx: Context = .{ .arena = arena, .lm = model.lm() };
-    const optimizer: GEPA = .{ .metric = Metric.score, .max_metric_calls = 0 };
+    var optimizer: GEPA = .{ .metric = Metric.score, .max_metric_calls = 0 };
     var options: GEPA.Options = .{ .log_dir = .{ .io = io, .path = path } };
     _ = try optimizer.compile(P, arena, ctx, .{}, &data, options);
     try std.testing.expectError(error.FileNotFound, temporary.dir.access(io, "run_log.json", .{}));
@@ -3841,6 +3852,16 @@ test "GEPA log size failures leave the last complete candidate file intact" {
     );
     const bytes = try temporary.dir.readFileAlloc(io, "candidates.json", arena, .limited(512));
     try std.testing.expectEqualStrings("[{\"self\":\"Seed\"}]", bytes);
+
+    const marker = try temporary.dir.createFile(io, "gepa.stop", .{});
+    marker.close(io);
+    optimizer.max_metric_calls = 3;
+    options.log_dir.?.max_file_bytes = 512;
+    const stopped = try optimizer.compile(P, arena, ctx, .{}, &data, options);
+    try std.testing.expectEqual(@as(usize, 1), stopped.total_metric_calls);
+    try std.testing.expectEqual(@as(usize, 3), model.index);
+    try temporary.dir.access(io, "gepa.stop", .{});
+    try std.testing.expectError(error.FileNotFound, temporary.dir.access(io, "run_log.json", .{}));
 }
 
 test "GEPA best outputs keep ties and replace an older frontier without extra evaluations" {
