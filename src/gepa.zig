@@ -494,6 +494,7 @@ pub const GEPA = struct {
         /// DSPy's `reflection_lm` (defaults to `ctx`).
         reflection: ?Context = null,
         checkpoint: ?Checkpoint = null,
+        log_dir: ?LogDirectory = null,
     };
 
     /// A single-writer, caller-trusted native checkpoint. Supply the same revision
@@ -504,6 +505,13 @@ pub const GEPA = struct {
         path: []const u8,
         revision: []const u8,
         max_bytes: usize = 64 * 1024 * 1024,
+    };
+
+    /// Human-readable DSPy run artifacts, separate from the restart checkpoint.
+    pub const LogDirectory = struct {
+        io: std.Io,
+        path: []const u8,
+        max_file_bytes: usize = 64 * 1024 * 1024,
     };
 
     pub const Error = error{
@@ -828,6 +836,51 @@ pub const GEPA = struct {
         run: StoredRun,
     };
 
+    const LogTask = struct {
+        parent_idx: usize,
+        subsample_ids: []const usize,
+        subsample_scores: ?[]const f64 = null,
+        new_subsample_scores: ?[]const f64 = null,
+    };
+
+    const IterationLog = struct {
+        i: usize,
+        selected_program_candidate: ?usize = null,
+        subsample_ids: ?[]const usize = null,
+        n_tasks: ?usize = null,
+        tasks: ?[]const LogTask = null,
+        subsample_scores: ?[]const f64 = null,
+        new_subsample_scores: ?[]const f64 = null,
+        new_program_idx: ?usize = null,
+        new_program_indices: ?[]const usize = null,
+        evaluated_val_indices: ?[]const usize = null,
+        invoked_merge: ?bool = null,
+        merged: ?bool = null,
+        merged_entities: ?[3]usize = null,
+        id1_subsample_scores: ?[]const f64 = null,
+        id2_subsample_scores: ?[]const f64 = null,
+        new_program_subsample_scores: ?[]const f64 = null,
+    };
+
+    const CandidateLog = struct {
+        names: []const []const u8,
+        candidates: []const []const []const u8,
+
+        pub fn jsonStringify(log: CandidateLog, json: anytype) !void {
+            try json.beginArray();
+            for (log.candidates) |candidate| {
+                assert(candidate.len == log.names.len);
+                try json.beginObject();
+                for (log.names, candidate) |name, instructions| {
+                    try json.objectField(name);
+                    try json.write(instructions);
+                }
+                try json.endObject();
+            }
+            try json.endArray();
+        }
+    };
+
     const StoredState = struct {
         version: u32,
         revision: []const u8,
@@ -843,6 +896,7 @@ pub const GEPA = struct {
         total_evals: usize,
         candidates: []const StoredCandidate,
         cache: []const StoredCacheRow,
+        run_log: []const IterationLog = &.{},
     };
 
     const CheckpointWriter = struct {
@@ -1016,6 +1070,60 @@ pub const GEPA = struct {
             descs: std.ArrayList(Desc) = .empty,
             checkpoint: ?Checkpoint = null,
             checkpoint_runs: std.ArrayList([]const Run) = .empty,
+            log_dir: ?LogDirectory = null,
+            run_log: std.ArrayList(IterationLog) = .empty,
+
+            fn currentLog(e: *Self) ?*IterationLog {
+                if (e.log_dir == null) return null;
+                assert(e.run_log.items.len != 0);
+                const entry = &e.run_log.items[e.run_log.items.len - 1];
+                assert(entry.i == e.i);
+                return entry;
+            }
+
+            fn saveRunArtifacts(e: *const Self) !void {
+                const dir = e.log_dir orelse return;
+                var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                defer scratch.deinit();
+                const arena = scratch.allocator();
+                if (e.run_log.items.len != 0) {
+                    const path = try std.fs.path.join(arena, &.{ dir.path, "run_log.json" });
+                    try writeBoundedJson(dir.io, path, dir.max_file_bytes, e.run_log.items, .run_log);
+                }
+                const path = try std.fs.path.join(arena, &.{ dir.path, "candidates.json" });
+                const candidates: CandidateLog = .{ .names = e.names, .candidates = e.candidates.items };
+                try writeBoundedJson(dir.io, path, dir.max_file_bytes, candidates, .run_log);
+            }
+
+            fn writeBoundedJson(
+                io: std.Io,
+                path: []const u8,
+                limit: usize,
+                data: anytype,
+                kind: enum { checkpoint, run_log },
+            ) !void {
+                var target = try std.Io.Dir.cwd().createFileAtomic(io, path, .{
+                    .make_path = true,
+                    .replace = true,
+                });
+                defer target.deinit(io);
+                var buffer: [4096]u8 = undefined;
+                var writer = target.file.writer(io, &buffer);
+                var limited: CheckpointWriter = .{ .sink = &writer.interface, .remaining = limit };
+                const options: std.json.Stringify.Options = .{
+                    .emit_null_optional_fields = kind == .checkpoint,
+                };
+                std.json.Stringify.value(data, options, &limited.writer) catch |err| {
+                    if (!limited.too_large) return err;
+                    return switch (kind) {
+                        .checkpoint => error.GepaCheckpointTooLarge,
+                        .run_log => error.GepaLogTooLarge,
+                    };
+                };
+                try writer.interface.flush();
+                try target.file.sync(io);
+                try target.replace(io);
+            }
 
             fn saveCheckpoint(e: *const Self, last_iteration: ?usize) !void {
                 const checkpoint = e.checkpoint orelse return;
@@ -1062,25 +1170,15 @@ pub const GEPA = struct {
                     .total_evals = e.total_evals,
                     .candidates = candidates,
                     .cache = cache,
+                    .run_log = e.run_log.items,
                 };
-                var target = try std.Io.Dir.cwd().createFileAtomic(checkpoint.io, checkpoint.path, .{
-                    .make_path = true,
-                    .replace = true,
-                });
-                defer target.deinit(checkpoint.io);
-                var buffer: [4096]u8 = undefined;
-                var writer = target.file.writer(checkpoint.io, &buffer);
-                var limited: CheckpointWriter = .{
-                    .sink = &writer.interface,
-                    .remaining = checkpoint.max_bytes,
-                };
-                std.json.Stringify.value(snapshot, .{}, &limited.writer) catch |err| {
-                    if (limited.too_large) return error.GepaCheckpointTooLarge;
-                    return err;
-                };
-                try writer.interface.flush();
-                try target.file.sync(checkpoint.io);
-                try target.replace(checkpoint.io);
+                try writeBoundedJson(
+                    checkpoint.io,
+                    checkpoint.path,
+                    checkpoint.max_bytes,
+                    snapshot,
+                    .checkpoint,
+                );
             }
 
             fn readCheckpoint(e: *Self) !?StoredState {
@@ -1121,6 +1219,15 @@ pub const GEPA = struct {
                     !sameCandidate(snapshot.candidates[0].instructions, seed))
                 {
                     return error.InvalidGepaCheckpoint;
+                }
+                if (e.log_dir != null) {
+                    if (snapshot.last_iteration) |last| {
+                        if (snapshot.run_log.len != last + 1) return error.IncompatibleGepaCheckpoint;
+                    } else if (snapshot.run_log.len != 0) return error.InvalidGepaCheckpoint;
+                    for (snapshot.run_log, 0..) |row, i| {
+                        if (row.i != i) return error.InvalidGepaCheckpoint;
+                    }
+                    try e.run_log.appendSlice(e.out, snapshot.run_log);
                 }
                 const trace = try e.out.create(Trace);
                 trace.* = .{ .arena = e.out };
@@ -1569,8 +1676,7 @@ pub const GEPA = struct {
                 if (idx == 0) e.total_evals = ids.len;
                 e.full_evals += 1;
                 try e.objectives.update(e.out, e.gepa.frontier_type, idx, runs, if (sparse) ids else null);
-                const scores = try e.out.alloc(f64, runs.len);
-                for (scores, runs) |*s, r| s.* = r.score;
+                const scores = try e.runScores(runs);
                 var next: usize = 0;
                 for (parent_ids) |p| if (p) |pi| {
                     next = @max(next, e.next_pred.items[pi]);
@@ -1608,7 +1714,24 @@ pub const GEPA = struct {
                         try outputs[k].append(e.out, .{ .candidate_idx = idx, .prediction = prediction });
                     }
                 }
-                if (mode == .live and idx != 0) try e.validationDiagnostics(idx, e.i);
+                if (mode == .live and idx != 0) {
+                    try e.validationDiagnostics(idx, e.i);
+                    if (e.currentLog()) |log| log.evaluated_val_indices = ids;
+                }
+            }
+
+            fn finishIterationLog(e: *Self, first: usize) !void {
+                const log = e.currentLog() orelse return;
+                const end = e.candidates.items.len;
+                assert(first <= end);
+                if (first == end) return;
+                const accepted = try e.out.alloc(usize, end - first);
+                for (accepted, first..end) |*id, index| id.* = index;
+                const ids = try e.out.dupe(usize, log.evaluated_val_indices.?);
+                std.mem.sort(usize, ids, {}, comptime std.sort.asc(usize));
+                log.new_program_idx = end - 1;
+                log.new_program_indices = accepted;
+                log.evaluated_val_indices = ids;
             }
 
             fn retainValidationRows(e: *Self, ids: []const usize, runs: *[]Run) ![]const usize {
@@ -1945,10 +2068,14 @@ pub const GEPA = struct {
                 try e.cacheReflection(parent_candidate, ids, before);
                 var task: ReflectionTask = .{ .parent = parent, .ids = ids, .before = before };
                 try e.prepareReflection(&task);
-                const child = (try e.proposeChild(&task)) orelse return;
-                const after = try e.evalIds(child, e.trainset, ids, true);
-                try e.cacheReflection(child, ids, after);
-                if (try e.accepts(&task, child, after)) {
+                if (try e.proposeChild(&task)) |child| {
+                    task.child = child;
+                    task.after = try e.evalIds(child, e.trainset, ids, true);
+                    try e.cacheReflection(child, ids, task.after);
+                }
+                try e.logReflection(&.{task});
+                const child = task.child orelse return;
+                if (try e.accepts(&task, child, task.after)) {
                     const parent_ids = try e.out.dupe(?usize, &.{parent});
                     try e.addProgram(child, parent_ids);
                     e.scheduleMerge();
@@ -1968,6 +2095,35 @@ pub const GEPA = struct {
                 val_ids: []const usize = &.{},
                 validation: ScoredRows = undefined,
             };
+
+            fn runScores(e: *Self, runs: []const Run) ![]const f64 {
+                const scores = try e.out.alloc(f64, runs.len);
+                for (scores, runs) |*score, run| score.* = run.score;
+                return scores;
+            }
+
+            fn logReflection(e: *Self, tasks: []const ReflectionTask) !void {
+                const log = e.currentLog() orelse return;
+                if (tasks.len == 0) return;
+                const entries = try e.out.alloc(LogTask, tasks.len);
+                for (entries, tasks) |*entry, task| {
+                    entry.* = .{
+                        .parent_idx = task.parent,
+                        .subsample_ids = try e.out.dupe(usize, task.ids),
+                    };
+                    if (task.child == null) continue;
+                    entry.subsample_scores = try e.runScores(task.before);
+                    entry.new_subsample_scores = try e.runScores(task.after);
+                    if (log.subsample_scores == null) {
+                        log.subsample_scores = entry.subsample_scores;
+                        log.new_subsample_scores = entry.new_subsample_scores;
+                    }
+                }
+                log.selected_program_candidate = entries[0].parent_idx;
+                log.subsample_ids = entries[0].subsample_ids;
+                log.n_tasks = entries.len;
+                log.tasks = entries;
+            }
 
             fn prepareReflection(e: *Self, task: *ReflectionTask) !void {
                 if (e.gepa.skip_perfect_score) {
@@ -2139,6 +2295,7 @@ pub const GEPA = struct {
                     try e.cacheReflection(child, task.ids, task.after);
                 };
 
+                try e.logReflection(tasks);
                 var selected: [max_proposal_tasks]*ReflectionTask = undefined;
                 const retained = try e.selectProposals(tasks, &selected);
                 // Every policy request sees the same pre-commit pool and budget.
@@ -2459,6 +2616,8 @@ pub const GEPA = struct {
             /// `MergeProposer.propose` + the engine's merge acceptance.
             /// Returns whether a merge was evaluated (the iteration ends).
             fn merge(e: *Self) !bool {
+                const log = e.currentLog();
+                if (log) |entry| entry.invoked_merge = true;
                 const flags = try e.dominated(null, null);
                 var dominators: std.ArrayList(usize) = .empty;
                 for (0..e.candidates.items.len) |p| {
@@ -2470,7 +2629,12 @@ pub const GEPA = struct {
                 }
                 const agg = try e.averages();
                 const attempt = (try e.attemptMerge(dominators.items, agg)) orelse return false;
-                try e.triplets.append(e.out, .{ attempt.id1, attempt.id2, attempt.ancestor });
+                const triplet = [3]usize{ attempt.id1, attempt.id2, attempt.ancestor };
+                try e.triplets.append(e.out, triplet);
+                if (log) |entry| {
+                    entry.merged = true;
+                    entry.merged_entities = triplet;
+                }
                 const common = try e.commonValidationIds(attempt.id1, attempt.id2);
                 const ids = try e.mergeSubsample(attempt.id1, attempt.id2, common);
                 if (ids.len == 0) return false;
@@ -2482,6 +2646,18 @@ pub const GEPA = struct {
                 }
                 const rows = try e.scoreRows(attempt.candidate, ids, .requested);
                 e.total_evals = try std.math.add(usize, e.total_evals, rows.calls);
+                if (log) |entry| {
+                    const scores1 = try e.out.alloc(f64, ids.len);
+                    const scores2 = try e.out.alloc(f64, ids.len);
+                    for (ids, scores1, scores2) |id, *score1, *score2| {
+                        score1.* = e.validationScore(attempt.id1, id).?;
+                        score2.* = e.validationScore(attempt.id2, id).?;
+                    }
+                    entry.subsample_ids = ids;
+                    entry.id1_subsample_scores = scores1;
+                    entry.id2_subsample_scores = scores2;
+                    entry.new_program_subsample_scores = try e.runScores(rows.runs);
+                }
                 if (sumScores(rows.runs) >= @max(sum1, sum2)) {
                     const parent_ids = try e.out.alloc(?usize, 2);
                     parent_ids[0] = attempt.id1;
@@ -2776,7 +2952,11 @@ pub const GEPA = struct {
             .front_score = try out.alloc(f64, valset.len),
             .fronts = fronts,
             .checkpoint = options.checkpoint,
+            .log_dir = options.log_dir,
         };
+        if (e.log_dir) |dir| {
+            if (dir.path.len == 0 or dir.max_file_bytes == 0) return error.InvalidGepaLogDirectory;
+        }
         if (self.track_best_outputs) {
             const outputs = try out.alloc(std.ArrayList(BestOutput), valset.len);
             @memset(outputs, .empty);
@@ -2796,13 +2976,19 @@ pub const GEPA = struct {
         }
         while (!(try e.shouldStop(if (started) e.i else null, max_calls))) {
             try e.saveCheckpoint(if (started) e.i else null);
+            try e.saveRunArtifacts();
             if (started) e.i = try std.math.add(usize, e.i, 1);
             started = true;
+            if (e.log_dir != null) try e.run_log.append(e.out, .{ .i = e.i });
+            const first = e.candidates.items.len;
             if (self.use_merge) {
                 if (e.merges_due > 0 and e.last_iter_found_new_program) {
                     const merged = try e.merge();
                     e.last_iter_found_new_program = false;
-                    if (merged) continue;
+                    if (merged) {
+                        try e.finishIterationLog(first);
+                        continue;
+                    }
                 }
                 e.last_iter_found_new_program = false;
             }
@@ -2810,8 +2996,10 @@ pub const GEPA = struct {
                 try e.reflect()
             else
                 try e.reflectBatch();
+            try e.finishIterationLog(first);
         }
         try e.saveCheckpoint(if (started) e.i else null);
+        try e.saveRunArtifacts();
         try e.validationDiagnostics(null, if (started) e.i else null);
 
         var best: usize = 0;
@@ -3466,6 +3654,52 @@ test "GEPA checkpoint refuses mismatched runs and does not publish oversized sta
     try std.testing.expectEqualSlices(f64, &.{1}, resumed.val_aggregate_scores);
     const retained = resumed.best_outputs_valset.?[0][0].prediction;
     try std.testing.expectEqualStrings("first", retained.get("answer").?.string);
+}
+
+test "GEPA log size failures leave the last complete candidate file intact" {
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const io = std.testing.io;
+    const path = try temporary.dir.realPathFileAlloc(io, ".", arena);
+    const P = predict.Predict(signature.Signature(struct {
+        pub const instructions = "Seed";
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: []const u8 };
+    }));
+    const Metric = struct {
+        fn score(
+            _: Allocator,
+            _: *const Example,
+            _: *const optimize.RecordPrediction,
+            _: ?*const Trace,
+            _: ?[]const u8,
+            _: ?*const Trace.Step,
+        ) value.ParseError!Feedback {
+            return .{ .score = 0 };
+        }
+    };
+    const data = [_]Example{try Example.fromJson(arena, "{\"question\":\"q\"}", &.{"question"})};
+    var model: @import("lm.zig").ScriptedLM = .{ .responses = &.{
+        "<answer>first</answer>",
+        "<answer>second</answer>",
+    } };
+    const ctx: Context = .{ .arena = arena, .lm = model.lm() };
+    const optimizer: GEPA = .{ .metric = Metric.score, .max_metric_calls = 0 };
+    var options: GEPA.Options = .{ .log_dir = .{ .io = io, .path = path } };
+    _ = try optimizer.compile(P, arena, ctx, .{}, &data, options);
+    try std.testing.expectError(error.FileNotFound, temporary.dir.access(io, "run_log.json", .{}));
+    options.log_dir.?.max_file_bytes = 4;
+    var second: P = .{};
+    second.state.instructions = "Another candidate";
+    try std.testing.expectError(
+        error.GepaLogTooLarge,
+        optimizer.compile(P, arena, ctx, second, &data, options),
+    );
+    const bytes = try temporary.dir.readFileAlloc(io, "candidates.json", arena, .limited(512));
+    try std.testing.expectEqualStrings("[{\"self\":\"Seed\"}]", bytes);
 }
 
 test "GEPA best outputs keep ties and replace an older frontier without extra evaluations" {

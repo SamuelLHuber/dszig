@@ -4023,7 +4023,19 @@ The following prevent a claim that DSZig can do everything DSPy can:
   iterations. Keep it private: it can contain instructions and predictions.
   Use one writer per path. Prediction data must be JSON-representable; opaque
   values and callback-owned state are not saved. The file does not import
-  Python pickle or replace DSPy's HTML and experiment logs.
+  Python pickle or generate DSPy's HTML candidate tree.
+  Set `GEPA.Options.log_dir = .{ .io = io, .path = path }` to write
+  `candidates.json` and, after the first iteration, `run_log.json`.
+  The records include selected parents, sampled row IDs, before/after scores,
+  and accepted candidates. Each file is individually bounded and atomically
+  replaced; the files are not a transactional bundle. Use a fresh, private
+  output directory per run, with one writer and no checkpoint file named
+  `candidates.json` or `run_log.json`. Keep logging enabled across restarts
+  to carry the earlier iterations forward from the checkpoint. These files
+  do not add model calls or invoke external experiment loggers.
+  Debug and ReleaseSafe matched the parsed candidate and run logs from DSPy
+  3.5.0 for three two-process restart workloads and a four-proposal iteration
+  with rejected proposals and reversed validation order.
   `proposal_options` configures the built-in reflection proposer: override its
   base instructions, supply additional guidance, select an adapter, or limit
   an instruction by Unicode character count. An oversized draft gets one
