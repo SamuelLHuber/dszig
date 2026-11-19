@@ -1246,6 +1246,21 @@ test "BootstrapFewShot zero rounds retains labeled demos and zero errors propaga
     optimizer.max_labeled_demos = 0;
     try testing.expectError(error.LMFailure, optimizer.compile(P, arena, testing.allocator, ctx, .{}, null, &trainset));
     try testing.expectEqual(@as(usize, 1), failing.calls);
+
+    // A teacher-local override must not leak to the outer failure handler.
+    var compile_ctx = ctx;
+    compile_ctx.max_errors = 2;
+    failing.calls = 0;
+    var inherited: dszig.BootstrapFewShot = .{
+        .max_labeled_demos = 0,
+        .teacher_settings = .{ .max_errors = 1 },
+    };
+    try testing.expectError(
+        error.LMFailure,
+        inherited.compile(P, arena, testing.allocator, compile_ctx, .{}, null, &trainset),
+    );
+    try testing.expectEqual(@as(usize, 2), inherited.error_count);
+    try testing.expectEqual(@as(usize, 2), failing.calls);
 }
 
 test "BootstrapFewShot zero threshold accepts a zero score while null rejects it" {

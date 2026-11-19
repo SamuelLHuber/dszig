@@ -540,10 +540,12 @@ pub const LabeledFewShot = struct {
 pub const TeacherSettings = struct {
     lm: ?@FieldType(Context, "lm") = null,
     adapter: ?@FieldType(Context, "adapter") = null,
+    max_errors: ?usize = null,
 
     pub fn apply(self: TeacherSettings, c: *Context) void {
         if (self.lm) |l| c.lm = l;
         if (self.adapter) |a| c.adapter = a;
+        if (self.max_errors) |limit| c.max_errors = limit;
     }
 };
 
@@ -554,8 +556,8 @@ pub const BootstrapFewShot = struct {
     max_bootstrapped_demos: usize = 4,
     max_labeled_demos: usize = 16,
     max_rounds: usize = 1,
-    /// DSPy `settings.max_errors` default.
-    max_errors: usize = 10,
+    /// Null inherits the compile context's limit, not the teacher's override.
+    max_errors: ?usize = null,
     teacher_settings: TeacherSettings = .{},
     /// Cumulative teacher and metric failures across serial compiles.
     error_count: usize = 0,
@@ -688,6 +690,8 @@ pub const BootstrapFewShot = struct {
         defer scratch.deinit();
         const arena = scratch.allocator();
         var trace: Trace = .{ .arena = arena };
+        // Source catches the failure after exiting the teacher settings scope.
+        const max_errors = self.max_errors orelse ctx.max_errors;
         var c = ctx;
         c.arena = arena;
         c.trace = &trace;
@@ -710,7 +714,7 @@ pub const BootstrapFewShot = struct {
             if (prediction) |_| {} else |err| {
                 // Source restores the snapshot only after the teacher returns.
                 // Keep filtered demos for later attempts, not for the caller's teacher.
-                if (err != error.OutOfMemory and self.error_count < self.max_errors -| 1) {
+                if (err != error.OutOfMemory and self.error_count < max_errors -| 1) {
                     for (teacher_preds, cached) |p, *cache| {
                         const filtered = p.param.predict.demos;
                         if (filtered.len < cache.len) {
@@ -734,7 +738,7 @@ pub const BootstrapFewShot = struct {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             errors.* +|= 1;
             self.error_count +|= 1;
-            if (self.error_count >= self.max_errors) return err;
+            if (self.error_count >= max_errors) return err;
             return false;
         };
         if (!accepted) return false;

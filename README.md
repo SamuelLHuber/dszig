@@ -1589,6 +1589,9 @@ and metric failures across calls; `report.errors` describes only the current
 successful compile. Reaching the budget propagates the triggering error, but
 does not prevent a later compile from succeeding without another failure.
 Out-of-memory propagates immediately without consuming this budget.
+When `BootstrapFewShot.max_errors` is null, the budget comes from the outer
+`Context.max_errors` (default 10), not from `teacher_settings.max_errors`.
+An explicit optimizer limit, including zero, takes precedence.
 Teacher signature matching follows DSPy's named field roles, descriptions,
 prefixes and instructions; annotation types and field order do not decide
 signature equality.

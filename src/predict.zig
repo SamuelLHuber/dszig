@@ -78,6 +78,8 @@ pub const Context = struct {
     status_sink: ?status.Sink = null,
     /// ChatAdapter and XMLAdapter retry once with JSONAdapter on parse failure.
     json_fallback: bool = true,
+    /// DSPy settings-level error budget, inherited by BootstrapFewShot.
+    max_errors: usize = 10,
     /// Implicit XML and JSON enable native History; explicit Chat opts in.
     use_native_function_calling: ?bool = null,
     /// Scoped adapter wrappers prepare a signature and kwargs before formatting.
