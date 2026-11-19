@@ -180,7 +180,7 @@ test "BootstrapFewShot RAG artifact is byte-identical to DSPy" {
     const retriever = rag.corpus.retriever();
     const ctx: dszig.Context = .{ .arena = out.allocator(), .lm = keyword.lm(), .retriever = retriever };
     const trainset = try rag.trainset(out.allocator());
-    const optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 2, .max_labeled_demos = 3 };
+    var optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 2, .max_labeled_demos = 3 };
     const result = try optimizer.compile(rag.RAG, out.allocator(), testing.allocator, ctx, .{}, null, trainset);
     try testing.expect(result.program.compiled);
     try testing.expectEqual(@as(usize, 2), result.report.bootstrapped);
@@ -199,7 +199,7 @@ test "BootstrapFewShot multi-hop artifact picks DSPy's same-predictor traces" {
     const retriever = rag.corpus.retriever();
     const ctx: dszig.Context = .{ .arena = out.allocator(), .lm = keyword.lm(), .retriever = retriever };
     const trainset = try rag.trainset(out.allocator());
-    const optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 4, .max_labeled_demos = 1 };
+    var optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 4, .max_labeled_demos = 1 };
     const result = try optimizer.compile(rag.MultiHop, out.allocator(), testing.allocator, ctx, .{}, null, trainset);
     try testing.expectEqual(@as(usize, 4), result.report.bootstrapped);
     const saved = try dszig.state.saveAlloc(out.allocator(), &result.program);

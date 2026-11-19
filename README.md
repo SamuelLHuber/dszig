@@ -1584,6 +1584,11 @@ prompt containing models, Code, Reasoning and History.
 `BootstrapFewShot` accepts zero rounds: no teacher attempts run, but labeled
 demos are still selected. A zero error budget propagates the first teacher
 failure instead of rejecting the option or swallowing that failure.
+Compile on a mutable optimizer instance. Its `error_count` accumulates teacher
+and metric failures across calls; `report.errors` describes only the current
+successful compile. Reaching the budget propagates the triggering error, but
+does not prevent a later compile from succeeding without another failure.
+Out-of-memory propagates immediately without consuming this budget.
 Teacher signature matching follows DSPy's named field roles, descriptions,
 prefixes and instructions; annotation types and field order do not decide
 signature equality.

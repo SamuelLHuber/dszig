@@ -557,10 +557,13 @@ pub const BootstrapFewShot = struct {
     /// DSPy `settings.max_errors` default.
     max_errors: usize = 10,
     teacher_settings: TeacherSettings = .{},
+    /// Cumulative teacher and metric failures across serial compiles.
+    error_count: usize = 0,
 
     pub const Report = struct {
         bootstrapped: usize,
         attempts: usize,
+        /// Failures during this compile only.
         errors: usize,
         validation: usize,
     };
@@ -572,7 +575,7 @@ pub const BootstrapFewShot = struct {
     /// Compile `student` (must be uncompiled). Result demos live in `out`;
     /// per-attempt scratch comes from `gpa` and is freed before returning.
     pub fn compile(
-        self: BootstrapFewShot,
+        self: *BootstrapFewShot,
         comptime P: type,
         out: Allocator,
         gpa: Allocator,
@@ -666,7 +669,7 @@ pub const BootstrapFewShot = struct {
     }
 
     fn bootstrapOne(
-        self: BootstrapFewShot,
+        self: *BootstrapFewShot,
         comptime P: type,
         out: Allocator,
         gpa: Allocator,
@@ -707,7 +710,7 @@ pub const BootstrapFewShot = struct {
             if (prediction) |_| {} else |err| {
                 // Source restores the snapshot only after the teacher returns.
                 // Keep filtered demos for later attempts, not for the caller's teacher.
-                if (err != error.OutOfMemory and errors.* < self.max_errors -| 1) {
+                if (err != error.OutOfMemory and self.error_count < self.max_errors -| 1) {
                     for (teacher_preds, cached) |p, *cache| {
                         const filtered = p.param.predict.demos;
                         if (filtered.len < cache.len) {
@@ -729,8 +732,9 @@ pub const BootstrapFewShot = struct {
         } else |err| err;
         const accepted = success catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
-            errors.* += 1;
-            if (errors.* >= self.max_errors) return err;
+            errors.* +|= 1;
+            self.error_count +|= 1;
+            if (self.error_count >= self.max_errors) return err;
             return false;
         };
         if (!accepted) return false;
@@ -954,7 +958,7 @@ pub const BootstrapFewShotWithRandomSearch = struct {
             var size_rng = pyrandom.Random.init(@intCast(seed));
             size = 1 + size_rng.randbelow(self.max_bootstrapped_demos);
         }
-        const optimizer: BootstrapFewShot = .{
+        var optimizer: BootstrapFewShot = .{
             .metric = self.metric,
             .metric_threshold = self.metric_threshold,
             .max_bootstrapped_demos = size,

@@ -107,7 +107,7 @@ pub const BootstrapFewShotWithOptuna = struct {
             try copyProgram(P, arena, arena, student_in, true);
         const val = if (valset) |given| if (given.len > 0) given else trainset else trainset;
 
-        const bootstrap: optimize.BootstrapFewShot = .{
+        var bootstrap: optimize.BootstrapFewShot = .{
             .metric = self.metric,
             .max_bootstrapped_demos = max_demos,
             .max_labeled_demos = self.max_labeled_demos,

@@ -222,7 +222,7 @@ pub const InferRules = struct {
         var bootstrap_arena: std.heap.ArenaAllocator = .init(gpa);
         defer bootstrap_arena.deinit();
         const bootstrap_out = bootstrap_arena.allocator();
-        const bootstrap: optimize.BootstrapFewShot = .{
+        var bootstrap: optimize.BootstrapFewShot = .{
             .metric = self.metric,
             .metric_threshold = self.metric_threshold,
             .max_bootstrapped_demos = self.max_bootstrapped_demos,

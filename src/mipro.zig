@@ -626,7 +626,7 @@ pub const MIPROv2 = struct {
                     if (max_bootstrapped < 1) return error.InvalidOptions;
                     size = rng.randint(1, max_bootstrapped);
                 }
-                const bootstrap: optimize.BootstrapFewShot = .{
+                var bootstrap: optimize.BootstrapFewShot = .{
                     .metric = self.metric,
                     .metric_threshold = self.metric_threshold,
                     .max_bootstrapped_demos = size,

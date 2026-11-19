@@ -316,8 +316,10 @@ fn pipeline(
     const search = @TypeOf(optimizer) == dszig.BootstrapFewShotWithRandomSearch;
     const compiled = if (search)
         try optimizer.compile(P, arena, gpa, ctx, student, null, trainset, null, .{ .restrict = null, .labeled_sample = true })
-    else
-        try optimizer.compile(P, arena, gpa, ctx, student, null, trainset);
+    else bootstrap: {
+        var instance = optimizer;
+        break :bootstrap try instance.compile(P, arena, gpa, ctx, student, null, trainset);
+    };
     const optimized = try dszig.optimize.evaluate(P, gpa, ctx, &compiled.program, devset, metric, 10);
     const candidates = if (search) summaries: {
         const rows = try arena.alloc(CandidateSummary, compiled.candidates.len);

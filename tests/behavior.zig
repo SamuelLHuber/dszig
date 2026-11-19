@@ -1135,17 +1135,36 @@ test "BootstrapFewShot counts metric failures with program failures after restor
     model.calls = 0;
     model.fail_first = true;
     Metric.expected_demos = 2;
-    optimizer.max_errors = 2;
+    optimizer.max_errors = optimizer.error_count + 2;
     try testing.expectError(error.ParseValue, optimizer.compile(P, arena, testing.allocator, ctx, .{}, teacher, &.{ trainset[1], trainset[0], trainset[2] }));
     try testing.expectEqual(@as(usize, 2), model.calls);
+
+    model.calls = 0;
+    model.fail_first = false;
+    Metric.expected_demos = 3;
+    const recovered = try optimizer.compile(
+        P,
+        arena,
+        testing.allocator,
+        ctx,
+        .{},
+        teacher,
+        &.{trainset[2]},
+    );
+    try testing.expectEqual(@as(usize, 1), recovered.report.bootstrapped);
+    try testing.expectEqual(@as(usize, 0), recovered.report.errors);
+    try testing.expectEqual(@as(usize, 1), model.calls);
+    try testing.expectEqual(@as(usize, 5), optimizer.error_count);
 
     const allocation_failure = try dszig.Example.fromJson(arena, "{\"question\":\"metric_oom\",\"answer\":\"ok\"}", &.{"question"});
     model.calls = 0;
     model.fail_first = false;
     Metric.expected_demos = 3;
     optimizer.max_errors = 100;
+    try testing.expectEqual(@as(usize, 5), optimizer.error_count);
     try testing.expectError(error.OutOfMemory, optimizer.compile(P, arena, testing.allocator, ctx, .{}, teacher, &.{ allocation_failure, trainset[1] }));
     try testing.expectEqual(@as(usize, 1), model.calls);
+    try testing.expectEqual(@as(usize, 5), optimizer.error_count);
 }
 
 test "BootstrapFewShot scores never drop across three generations" {
@@ -1154,7 +1173,7 @@ test "BootstrapFewShot scores never drop across three generations" {
     var learner: LearningLM = .{};
     const ctx: dszig.Context = .{ .arena = out.allocator(), .lm = learner.lm(), .retriever = rag.corpus.retriever() };
     const trainset = try rag.trainset(out.allocator());
-    const optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 4, .max_labeled_demos = 0 };
+    var optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 4, .max_labeled_demos = 0 };
 
     var teacher: rag.RAG = .{};
     var scores: [4]f64 = undefined;
@@ -1175,7 +1194,7 @@ test "teacher_settings runs bootstrapping under the teacher's LM" {
     var keyword = rag.keywordLM();
     const ctx: dszig.Context = .{ .arena = out.allocator(), .lm = silent.lm(), .retriever = rag.corpus.retriever() };
     const trainset = try rag.trainset(out.allocator());
-    const optimizer: dszig.BootstrapFewShot = .{
+    var optimizer: dszig.BootstrapFewShot = .{
         .metric = rag.keywordMetric,
         .max_bootstrapped_demos = 2,
         .max_labeled_demos = 0,
@@ -1271,7 +1290,7 @@ test "Evaluate matches DSPy scores for the RAG fixture" {
     const ctx: dszig.Context = .{ .arena = out.allocator(), .lm = keyword.lm(), .retriever = rag.corpus.retriever() };
     const trainset = try rag.trainset(out.allocator());
     const baseline = try dszig.optimize.evaluate(rag.RAG, testing.allocator, ctx, &rag.RAG{}, trainset, rag.keywordMetric, 10);
-    const optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 2, .max_labeled_demos = 3 };
+    var optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 2, .max_labeled_demos = 3 };
     const result = try optimizer.compile(rag.RAG, out.allocator(), testing.allocator, ctx, .{}, null, trainset);
     const optimized = try dszig.optimize.evaluate(rag.RAG, testing.allocator, ctx, &result.program, trainset, rag.keywordMetric, 10);
     try testing.expectEqual(expected.object.get("baseline").?.float, baseline.score);
@@ -1303,7 +1322,7 @@ test "compile is deterministic and does not mutate its inputs" {
     var keyword = rag.keywordLM();
     const ctx: dszig.Context = .{ .arena = out.allocator(), .lm = keyword.lm(), .retriever = rag.corpus.retriever() };
     const trainset = try rag.trainset(out.allocator());
-    const optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 2, .max_labeled_demos = 3 };
+    var optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 2, .max_labeled_demos = 3 };
     const student: rag.RAG = .{};
     const a = try optimizer.compile(rag.RAG, out.allocator(), testing.allocator, ctx, student, null, trainset);
     const b = try optimizer.compile(rag.RAG, out.allocator(), testing.allocator, ctx, student, null, trainset);
@@ -1340,7 +1359,7 @@ test "optimize, evaluate and save run in fixed buffers" {
     var keyword = rag.keywordLM();
     const ctx: dszig.Context = .{ .arena = out.allocator(), .lm = keyword.lm(), .retriever = rag.corpus.retriever() };
     const trainset = try rag.trainset(out.allocator());
-    const optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 2, .max_labeled_demos = 3 };
+    var optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 2, .max_labeled_demos = 3 };
     const result = try optimizer.compile(rag.RAG, out.allocator(), scratch.allocator(), ctx, .{}, null, trainset);
     // Per-attempt scratch is released after every example.
     try testing.expectEqual(@as(usize, 0), scratch.end_index);
@@ -1363,7 +1382,7 @@ fn compileAndSave(gpa: Allocator) !void {
     var keyword = rag.keywordLM();
     const ctx: dszig.Context = .{ .arena = out.allocator(), .lm = keyword.lm(), .retriever = rag.corpus.retriever() };
     const trainset = try rag.trainset(out.allocator());
-    const optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 2, .max_labeled_demos = 3 };
+    var optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 2, .max_labeled_demos = 3 };
     const result = try optimizer.compile(rag.RAG, out.allocator(), gpa, ctx, .{}, null, trainset);
     _ = try dszig.state.saveAlloc(out.allocator(), &result.program);
 }

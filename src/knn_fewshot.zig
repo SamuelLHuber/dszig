@@ -57,7 +57,10 @@ pub fn KNNFewShot(comptime P: type) type {
             pub fn forward(self: *const Program, ctx: Context, input: Input) anyerror!Output {
                 const kwargs = try value.toRecord(ctx.arena, Input, input);
                 const neighbors = try self.captured.optimizer.knn.call(ctx.arena, kwargs);
-                const result = try self.captured.optimizer.bootstrap.compile(
+                // DSPy creates a fresh BootstrapFewShot for each neighborhood.
+                var bootstrap = self.captured.optimizer.bootstrap;
+                bootstrap.error_count = 0;
+                const result = try bootstrap.compile(
                     P,
                     ctx.arena,
                     self.captured.gpa,
