@@ -3463,6 +3463,9 @@ has no DSPy thread option and stays serial.
 `InferRules` inherits the outer `Context.max_errors` for bootstrapping and
 candidate evaluation unless its own `max_errors` is set. Teacher settings do
 not replace that limit.
+`BetterTogether` uses the outer limit for baseline and candidate validation
+unless its `max_errors` option is set; this option does not override each
+nested optimizer's own limit.
 
 SIMBA's `num_threads` is `rollouts`: a `Parallel(SIMBA.Run, limits).runner()` and
 per-attempt contexts supplying LM and retriever pointees. Trajectory sampling,

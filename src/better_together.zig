@@ -44,7 +44,8 @@ pub const Options = struct {
     shuffle_trainset_between_steps: bool = true,
     strategy: []const u8 = "p -> w -> p",
     optimizer_compile_args: []const CompileArgs = &.{},
-    max_errors: usize = 10,
+    /// Null inherits the caller context for baseline and candidate validation.
+    max_errors: ?usize = null,
     concurrent_evaluation: ?optimize.ConcurrentEvaluation = null,
 };
 
@@ -395,11 +396,20 @@ pub const BetterTogether = struct {
     }
 
     fn candidate(self: *const BetterTogether, comptime P: type, request: *const optimizers.Request(P), program: P, strategy: []const u8, options: Options) !Candidate(P) {
-        const score: ?f64 = if (request.valset) |set| if (set.len > 0)
-            // Source eval_candidate_program catches Evaluate exceptions as zero.
-            (optimize.evaluateWith(P, options.concurrent_evaluation, request.gpa, request.ctx, &program, set, self.metric, options.max_errors) catch optimize.Evaluation{ .score = 0, .sum = 0, .total = set.len, .errors = set.len }).score
-        else
-            null else null;
+        const score: ?f64 = if (request.valset) |set| score: {
+            if (set.len == 0) break :score null;
+            const evaluation = optimize.evaluateWith(
+                P,
+                options.concurrent_evaluation,
+                request.gpa,
+                request.ctx,
+                &program,
+                set,
+                self.metric,
+                options.max_errors orelse request.ctx.max_errors,
+            ) catch break :score 0; // Source scores failed evaluations as zero.
+            break :score evaluation.score;
+        } else null;
         return .{
             .program = try copyProgram(P, request.out, program),
             .score = score,
@@ -715,6 +725,51 @@ test "BetterTogether retains first validation tie and distinct memoized LM snaps
     }
     model.model = "changed after compile";
     try testing.expectEqualStrings("base", result.program.first.state.lm.?.modelName().?);
+}
+
+test "BetterTogether inherits the validation error limit unless explicitly overridden" {
+    const Metric = struct {
+        fn score(
+            _: Allocator,
+            example: *const optimize.Example,
+            _: ?*const optimize.RecordPrediction,
+            _: ?*const predict.Trace,
+        ) value.ParseError!f64 {
+            if (std.mem.eql(u8, example.record.get("question").?.string, "fail"))
+                return error.ParseValue;
+            return 1;
+        }
+    };
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var model: lm.OpenAI = .{ .client = undefined, .base_url = "http://unused", .model = "base" };
+    const rows = [_]optimize.Example{
+        try optimize.Example.fromJson(out, "{\"question\":\"fail\"}", &.{"question"}),
+        try optimize.Example.fromJson(out, "{\"question\":\"pass\"}", &.{"question"}),
+    };
+    var meta = testOptimizer();
+    meta.metric = Metric.score;
+    for ([_]?usize{ null, 2 }) |limit| {
+        var student: TestProgram = .{};
+        try predict.setLM(out, &student, model.lm());
+        var improve: TestOptimizer = .{};
+        const result = try meta.compileWith(
+            TestProgram,
+            out,
+            testing.allocator,
+            testing.io,
+            .{ .arena = out, .max_errors = 1 },
+            &student,
+            rows[1..],
+            .{ .seed = 0, .strategy = "improve", .valset = &rows, .max_errors = limit },
+            .{ .improve = &improve },
+        );
+        try testing.expectEqual(@as(usize, 2), result.candidate_programs.len);
+        for (result.candidate_programs) |candidate| {
+            try testing.expectEqual(@as(?f64, if (limit == null) 0 else 50), candidate.score);
+        }
+    }
 }
 
 // A raw single-program override must reach the optimizer as that nominal
