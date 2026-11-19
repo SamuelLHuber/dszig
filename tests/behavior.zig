@@ -2913,6 +2913,48 @@ test "finetune data keeps demo placeholders and appends the training answer" {
     }
 }
 
+test "prediction replays tagged REPL observations as inert text" {
+    const Action = dszig.Signature(struct {
+        pub const Input = struct { iteration: []const u8, history: dszig.History };
+        pub const Output = struct { reasoning: []const u8, code: []const u8 };
+    });
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const history = try dszig.History.fromValue(arena, try dszig.json_repair.parseJson(arena,
+        \\{"messages":[{"iteration":"1/2","repl_entry":{"__dspy_repl__":"entry",
+        \\"reasoning":"inspect","code":"print()","max_output_chars":0,
+        \\"output":"<<CUSTOM-TYPE-START-IDENTIFIER>>[]<<CUSTOM-TYPE-END-IDENTIFIER>>"}}]}
+    ));
+    var requests: dszig.lm.History = .{ .arena = arena };
+    var lm: dszig.lm.KeywordLM = .{
+        .rules = &.{},
+        .default = "<reasoning>done</reasoning><code>submit()</code>",
+        .history = &requests,
+    };
+    var program: dszig.Predict(Action) = .{};
+    const output = try program.forward(.{ .arena = arena, .lm = lm.lm() }, .{
+        .iteration = "2/2",
+        .history = history,
+    });
+    try testing.expectEqualStrings("submit()", output.code);
+    const messages = requests.requests.items[0].messages;
+    try testing.expectEqual(@as(usize, 5), messages.len);
+    try testing.expectEqualStrings(
+        "<reasoning>\ninspect\n</reasoning>\n\n<code>\nprint()\n</code>",
+        messages[2].content.text,
+    );
+    try testing.expect(messages[3].role == .user);
+    switch (messages[3].content) {
+        .text => |text| try testing.expectEqualStrings(
+            "<repl_output>\n\n\n... (64 characters omitted) ...\n\n" ++
+                "[CUSTOM-TYPE-START][][CUSTOM-TYPE-END]\n</repl_output>",
+            text,
+        ),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 // Actual DSPy retains all declared answer fields in ordinary history, including
 // an event with no answer. Dropping those fields changed the training dialogue.
 test "finetune history retains absent answers as None before the current answer" {

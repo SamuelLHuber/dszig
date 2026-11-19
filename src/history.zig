@@ -1,8 +1,8 @@
 //! Reusable DSPy 3.5 structured conversation History. Events are ordered
 //! signature-field records, not flattened prompts. Values borrow their source
 //! storage; clone into a longer-lived allocator before releasing a call arena.
-//! Text/native function-tool replay includes per-call continuation. REPL events
-//! and media parts are outside this native JSON-value representation.
+//! Text/native function-tool replay includes per-call continuation. Tagged
+//! DSPy REPL entries can be replayed as text without executing their code.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -13,6 +13,7 @@ const value = @import("value.zig");
 const types = @import("types.zig");
 const tool = @import("tool.zig");
 const pyjson = @import("pyjson.zig");
+const message_content = @import("message_content.zig");
 const Record = value.Record;
 
 pub const History = struct {
@@ -62,6 +63,7 @@ pub const History = struct {
     pub fn format(self: History, selected_adapter: adapter.Adapter, arena: Allocator, view: adapter.View) adapter.Error![]adapter.Message {
         var messages: std.ArrayList(adapter.Message) = .empty;
         for (self.messages) |*event| {
+            if (try appendReplEvent(arena, selected_adapter, view, event, &messages)) continue;
             var main_request = false;
             for (view.inputs) |field| {
                 if (event.contains(field.name)) {
@@ -120,6 +122,194 @@ pub const History = struct {
         return messages.items;
     }
 };
+
+fn appendReplEvent(
+    arena: Allocator,
+    selected: adapter.Adapter,
+    view: adapter.View,
+    event: *const Record,
+    messages: *std.ArrayList(adapter.Message),
+) adapter.Error!bool {
+    const entry_index = event.getIndex("repl_entry") orelse return false;
+    const entry = event.values()[entry_index];
+    if (entry != .object) return false;
+    const tag = entry.object.get("__dspy_repl__") orelse return false;
+    if (tag != .string) return false;
+    if (std.mem.eql(u8, tag.string, "extract_fallback")) {
+        try appendReplFallback(arena, selected, event, entry_index + 1, messages);
+        return true;
+    }
+    if (!std.mem.eql(u8, tag.string, "entry")) return false;
+
+    const code = try replString(&entry.object, "code", null);
+    const output = try replString(&entry.object, "output", null);
+    const reasoning = try replString(&entry.object, "reasoning", "");
+    const limit = entry.object.get("max_output_chars") orelse Value{ .integer = 10_000 };
+    if (limit != .integer or limit.integer < 0) return error.AdapterParse;
+
+    var inputs: Record = .empty;
+    var main_request = false;
+    for (view.inputs) |field| {
+        const index = event.getIndex(field.name) orelse continue;
+        if (index >= entry_index) continue;
+        try inputs.put(arena, field.name, event.values()[index]);
+        main_request = true;
+    }
+    const user = try adapter.formatUser(selected, arena, view, &inputs, main_request);
+    if (user.len != 0) try messages.append(arena, .{
+        .role = .user,
+        .content = try adapter.renderedContent(arena, user),
+    });
+
+    var fields: [2]signature.Field = undefined;
+    var action: Record = .empty;
+    var count: usize = 0;
+    if (replReasoningName(view.outputs)) |name| {
+        fields[count] = replField(name);
+        count += 1;
+        try action.put(arena, name, .{ .string = reasoning });
+    }
+    fields[count] = replField("code");
+    try action.put(arena, "code", .{ .string = code });
+    const text = try adapter.formatAssistant(selected, arena, .{
+        .instructions = "",
+        .inputs = &.{},
+        .outputs = fields[0 .. count + 1],
+    }, &action);
+    try appendReplText(arena, messages, .assistant, text, false);
+
+    var observation: Record = .empty;
+    try observation.put(arena, "repl_output", .{
+        .string = try truncateReplOutput(arena, output, @intCast(limit.integer)),
+    });
+    const rendered = try adapter.formatUser(selected, arena, .{
+        .instructions = "",
+        .inputs = &.{replField("repl_output")},
+        .outputs = &.{},
+    }, &observation, false);
+    try appendReplText(arena, messages, .user, rendered, false);
+    return true;
+}
+
+fn replString(record: *const Record, name: []const u8, default: ?[]const u8) adapter.Error![]const u8 {
+    const item = record.get(name) orelse return default orelse error.AdapterParse;
+    if (item == .null) return default orelse error.AdapterParse;
+    if (item != .string) return error.AdapterParse;
+    return item.string;
+}
+
+fn replField(name: []const u8) signature.Field {
+    return .{ .name = name, .kind = .str, .type_name = "str", .desc = "", .prefix = "" };
+}
+
+fn replReasoningName(fields: []const signature.Field) ?[]const u8 {
+    for (fields) |field| {
+        if (field.reasoning_fallback != null) return field.name;
+    }
+    for (fields) |field| if (std.mem.eql(u8, field.name, "reasoning")) return "reasoning";
+    for (fields) |field| if (std.mem.eql(u8, field.name, "code")) return null;
+    return "reasoning";
+}
+
+fn appendReplFallback(
+    arena: Allocator,
+    selected: adapter.Adapter,
+    event: *const Record,
+    first: usize,
+    messages: *std.ArrayList(adapter.Message),
+) adapter.Error!void {
+    const names = event.keys()[first..];
+    if (names.len == 0) return;
+    const fields = try arena.alloc(signature.Field, names.len);
+    for (names, fields) |name, *field| field.* = replField(name);
+    const rendered = try adapter.formatAssistant(selected, arena, .{
+        .instructions = "",
+        .inputs = &.{},
+        .outputs = fields,
+    }, event);
+    try appendReplText(arena, messages, .assistant, rendered, true);
+}
+
+fn appendReplText(
+    arena: Allocator,
+    messages: *std.ArrayList(adapter.Message),
+    role: @FieldType(adapter.Message, "role"),
+    text: []const u8,
+    omit_media: bool,
+) adapter.Error!void {
+    // These turns are REPL text even if generated code prints a valid marker.
+    const escaped = try escapeReplText(arena, text, omit_media);
+    try messages.append(arena, .{ .role = role, .content = .{ .text = escaped } });
+}
+
+fn escapeReplText(arena: Allocator, text: []const u8, omit_media: bool) Allocator.Error![]const u8 {
+    const start = message_content.start_marker;
+    const end = message_content.end_marker;
+    var out: std.Io.Writer.Allocating = .init(arena);
+    var cursor: usize = 0;
+    var search_media_end = omit_media;
+    for (text, 0..) |byte, index| {
+        if (index < cursor or byte != '<') continue;
+        const rest = text[index..];
+        if (std.mem.startsWith(u8, rest, start)) {
+            out.writer.writeAll(text[cursor..index]) catch return error.OutOfMemory;
+            cursor = index + start.len;
+            if (search_media_end) {
+                if (std.mem.indexOf(u8, text[cursor..], end)) |offset| {
+                    out.writer.writeAll("<media omitted from replay>") catch
+                        return error.OutOfMemory;
+                    cursor += offset + end.len;
+                    continue;
+                }
+                // No later start can have a closing delimiter either.
+                search_media_end = false;
+            }
+            out.writer.writeAll("[CUSTOM-TYPE-START]") catch return error.OutOfMemory;
+        } else if (std.mem.startsWith(u8, rest, end)) {
+            out.writer.writeAll(text[cursor..index]) catch return error.OutOfMemory;
+            out.writer.writeAll("[CUSTOM-TYPE-END]") catch return error.OutOfMemory;
+            cursor = index + end.len;
+        }
+    }
+    if (cursor == 0) return text;
+    out.writer.writeAll(text[cursor..]) catch return error.OutOfMemory;
+    return out.written();
+}
+
+fn truncateReplOutput(arena: Allocator, text: []const u8, limit: u64) adapter.Error![]const u8 {
+    if (text.len <= limit) return text;
+    const utf8 = std.unicode.Utf8View.init(text) catch return error.AdapterParse;
+    const count = std.unicode.utf8CountCodepoints(text) catch return error.AdapterParse;
+    if (count <= limit) return text;
+    const head: usize = @intCast(limit / 2);
+    const tail: usize = @intCast(limit - head);
+    var iter = utf8.iterator();
+    for (0..head) |_| _ = iter.nextCodepointSlice().?;
+    const head_end = iter.i;
+    // Python's output[-0:] is the entire output.
+    if (tail != 0) for (head..count - tail) |_| {
+        _ = iter.nextCodepointSlice().?;
+    };
+    var digits_buffer: [32]u8 = undefined;
+    const digits = std.fmt.bufPrint(&digits_buffer, "{d}", .{count - limit}) catch unreachable;
+    var grouped_buffer: [48]u8 = undefined;
+    var grouped_len: usize = 0;
+    for (digits, 0..) |digit, index| {
+        if (index != 0 and (digits.len - index) % 3 == 0) {
+            grouped_buffer[grouped_len] = ',';
+            grouped_len += 1;
+        }
+        grouped_buffer[grouped_len] = digit;
+        grouped_len += 1;
+    }
+    return std.mem.concat(arena, u8, &.{
+        text[0..head_end],
+        "\n\n... (",
+        grouped_buffer[0..grouped_len],
+        " characters omitted) ...\n\n",
+        text[iter.i..],
+    });
+}
 
 fn appendNativeEvent(
     arena: Allocator,

@@ -3787,7 +3787,12 @@ The following prevent a claim that DSZig can do everything DSPy can:
   guest. A restricted expression evaluator is not an identical implementation.
   The separate Linux generated-Zig executor above compiles native programs and
   capability RPC; it does not claim arbitrary Python execution or full RLM/Flex
-  behavior.
+  behavior. A `History` loaded from tagged DSPy REPL JSON can replay recorded
+  action and observation turns through XML, Chat and JSON adapters without
+  executing code. Observation truncation counts Unicode characters, and
+  replayed code and observations cannot create provider media parts. This
+  supports persisted records with nonnegative observation limits, not
+  creation or resumption of an interpreter session.
 - **Other modules and optimizers:** bounded native Avatar/AvatarOptimizer follow
   Source methods, with broken Source constructors and the explicit native
   capacity, class-identity, callback-ownership and serial-execution boundaries
