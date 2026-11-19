@@ -826,6 +826,9 @@ pub const BootstrapFewShotWithRandomSearch = struct {
     /// DSPy `num_threads`; null evaluates candidates serially.
     concurrent_evaluation: ?ConcurrentEvaluation = null,
     teacher_settings: TeacherSettings = .{},
+    /// Borrow live settings across candidates and teacher attempts. The pointee
+    /// must outlive compile and must not be concurrently mutated.
+    teacher_settings_ref: ?*const TeacherSettings = null,
 
     /// `restrict` is a borrowed compile-local seed set. Duplicates and seeds
     /// outside the range are ignored; candidates always follow Source's
@@ -981,6 +984,7 @@ pub const BootstrapFewShotWithRandomSearch = struct {
             .max_rounds = self.max_rounds,
             .max_errors = self.max_errors,
             .teacher_settings = self.teacher_settings,
+            .teacher_settings_ref = self.teacher_settings_ref,
         };
         // Only bootstrap consumes the teacher. Earlier reset/labeled candidates
         // may satisfy stop_at_score before an invalid Source list is encountered.

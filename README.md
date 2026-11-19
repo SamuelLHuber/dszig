@@ -2948,12 +2948,14 @@ The reset, labeled and fixed bootstrap seeds permit zero bootstrapped demos;
 a consumed random seed instead returns `InvalidBootstrapRange`. Early stopping
 can avoid that failure. Teacher-list refusal is likewise deferred until a
 bootstrap candidate actually consumes the teacher.
+Like `BootstrapFewShot`, random search accepts a borrowed `teacher_settings_ref`.
+Each bootstrap attempt reads it, so settings updates carry across candidates.
 
 BetterTogether's `optimizers.LabeledFewShot` and `optimizers.RandomSearch`
 expose `compile_options`; `Defaults.prompt_compile_options` configures the
 default `"p"` step. These are typed native options, not arbitrary Python kwargs.
-Random-search candidate reports still contain seed and score, not the Source
-candidate programs and per-example subscores.
+Random search returns each runnable candidate with its seed, score, and
+per-example subscores, in stable descending score order.
 
 The Debug and ReleaseSafe public-API consumers each matched 203 value
 observations and 13 refusal
