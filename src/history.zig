@@ -330,23 +330,12 @@ pub fn truncateReplOutput(arena: Allocator, text: []const u8, limit: i64) adapte
     const head_byte = if (head_end <= tail_start) first else iter.i;
     const tail_byte = if (tail_start <= head_end) first else iter.i;
 
-    var digits_buffer: [32]u8 = undefined;
-    const omitted: u128 = @intCast(length - limit);
-    const digits = std.fmt.bufPrint(&digits_buffer, "{d}", .{omitted}) catch unreachable;
-    var grouped_buffer: [48]u8 = undefined;
-    var grouped_len: usize = 0;
-    for (digits, 0..) |digit, index| {
-        if (index != 0 and (digits.len - index) % 3 == 0) {
-            grouped_buffer[grouped_len] = ',';
-            grouped_len += 1;
-        }
-        grouped_buffer[grouped_len] = digit;
-        grouped_len += 1;
-    }
+    var grouped_buffer: [51]u8 = undefined;
+    const omitted = pyjson.groupedDecimal(&grouped_buffer, @intCast(length - limit));
     return std.mem.concat(arena, u8, &.{
         text[0..head_byte],
         "\n\n... (",
-        grouped_buffer[0..grouped_len],
+        omitted,
         " characters omitted) ...\n\n",
         text[tail_byte..],
     });

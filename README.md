@@ -3813,10 +3813,13 @@ The following prevent a claim that DSZig can do everything DSPy can:
   extraction at the iteration limit return outputs, tagged history, final
   reasoning, and the current trajectory. Recoverable execution failures become
   observations; runtime failures propagate. `forwardWithHistory` continues the
-  conversation, not the runtime state. An optional `history_processor` runs
-  before each action and can edit or trim a private draft, or supply a replacement
-  history that DSZig copies. `forwardWithOptions` can override the constructor
-  processor or the `interpreter_factory` for a single call. The factory override
+  conversation, not the runtime state. Variable previews count Unicode code
+  points, group the displayed count with commas, and show the first and last
+  500 code points when the rendered value exceeds 1,000. An optional
+  `history_processor` runs before each action and can edit or trim a private
+  draft, or supply a replacement history that DSZig copies. `forwardWithOptions`
+  can override the processor or the `interpreter_factory` for a single call.
+  The factory override
   does not change the configured action instructions. Callback errors in the
   history processor roll back edits, except allocation failure and cancellation,
   which propagate. Trimming prompt history does not

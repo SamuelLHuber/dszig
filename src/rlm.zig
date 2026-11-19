@@ -504,13 +504,42 @@ fn variableInfo(arena: Allocator, fields: []const Field, variables: *const Recor
             ""
         else
             try std.fmt.allocPrint(arena, "Description: {s}\n", .{field.desc});
+        var length_buffer: [51]u8 = undefined;
         items.appendAssumeCapacity(text(try std.fmt.allocPrint(
             arena,
-            "Variable: `{s}` (access it in your code)\nType: {s}\n{s}Total length: {d} characters\nPreview:\n```\n{s}\n```",
-            .{ field.name, field.type_name, description, length, preview },
+            "Variable: `{s}` (access it in your code)\nType: {s}\n{s}Total length: {s} characters\nPreview:\n```\n{s}\n```",
+            .{ field.name, field.type_name, description, pyjson.groupedDecimal(&length_buffer, length), preview },
         )));
     }
     return .{ .array = items };
+}
+
+test "RLM variable previews group Unicode counts and cut only beyond one thousand code points" {
+    var storage: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    const Sig = @import("signature.zig").Signature(struct {
+        pub const Input = struct { note: []const u8 };
+        pub const Output = struct { answer: i64 };
+    });
+    var input: [2000]u8 = undefined;
+    for (0..1000) |i| @memcpy(input[2 * i ..][0..2], "é");
+    const longer = try std.mem.concat(arena, u8, &.{ input[0..1000], "X", input[1000..] });
+    var vars: Record = .empty;
+    for ([_][]const u8{ &input, longer }, [_][]const u8{ "1,000", "1,001" }) |raw, count| {
+        try vars.put(arena, "note", text(raw));
+        const data = try variableInfo(arena, Sig.input_fields_list, &vars);
+        const expected = try std.mem.concat(arena, u8, &.{
+            "Variable: `note` (access it in your code)\nType: str\nTotal length: ",
+            count,
+            " characters\nPreview:\n```\n",
+            input[0..1000],
+            if (raw.len > input.len) "..." else "",
+            input[1000..],
+            "\n```",
+        });
+        try std.testing.expectEqualStrings(expected, data.array.items[0].string);
+    }
 }
 
 fn variableText(arena: Allocator, input: Value) ![]const u8 {

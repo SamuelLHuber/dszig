@@ -4004,8 +4004,8 @@ fn compactToolObservations(arena: Allocator, item: Value) value.ParseError!?Valu
         const prefix_len = iterator.i;
         if (prefix_len == text.len) continue;
         const cut = std.unicode.utf8CountCodepoints(text[prefix_len..]) catch unreachable;
-        var cut_buffer: [32]u8 = undefined;
-        var total_buffer: [32]u8 = undefined;
+        var cut_buffer: [51]u8 = undefined;
+        var total_buffer: [51]u8 = undefined;
         if (replacements == null) replacements = try arena.dupe(
             @import("tool.zig").ToolCallResult,
             results.tool_call_results,
@@ -4013,28 +4013,11 @@ fn compactToolObservations(arena: Allocator, item: Value) value.ParseError!?Valu
         replacements.?[index].value = .{ .string = try std.fmt.allocPrint(
             arena,
             "{s} [{s} of {s} characters cut]",
-            .{ text[0..prefix_len], groupedDecimal(&cut_buffer, cut), groupedDecimal(&total_buffer, cut + limit) },
+            .{ text[0..prefix_len], pyjson.groupedDecimal(&cut_buffer, cut), pyjson.groupedDecimal(&total_buffer, cut + limit) },
         ) };
     }
     calls.tool_call_results = .{ .tool_call_results = replacements orelse return null };
     return try calls.toValue(arena);
-}
-
-fn groupedDecimal(buffer: *[32]u8, number: usize) []const u8 {
-    var remaining = number;
-    var pos: usize = buffer.len;
-    var digits: usize = 0;
-    while (true) {
-        pos -= 1;
-        buffer[pos] = '0' + @as(u8, @intCast(remaining % 10));
-        remaining /= 10;
-        if (remaining == 0) return buffer[pos..];
-        digits += 1;
-        if (digits % 3 == 0) {
-            pos -= 1;
-            buffer[pos] = ',';
-        }
-    }
 }
 
 test "GEPA reflects truncated Unicode tool results without changing history" {

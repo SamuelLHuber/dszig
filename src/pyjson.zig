@@ -13,6 +13,25 @@ const Writer = std.Io.Writer;
 
 pub const Style = @import("runtime_value.zig").JsonStyle;
 
+/// Python's comma-separated decimal formatting for nonnegative metadata counts.
+/// The maximum u128 has 39 decimal digits and 12 separators.
+pub fn groupedDecimal(buffer: *[51]u8, count: u128) []const u8 {
+    var remaining = count;
+    var pos: usize = buffer.len;
+    var digits: usize = 0;
+    while (true) {
+        pos -= 1;
+        buffer[pos] = '0' + @as(u8, @intCast(remaining % 10));
+        remaining /= 10;
+        if (remaining == 0) return buffer[pos..];
+        digits += 1;
+        if (digits % 3 == 0) {
+            pos -= 1;
+            buffer[pos] = ',';
+        }
+    }
+}
+
 /// Containers nested deeper than this are rejected rather than recursed.
 pub const max_depth = 64;
 
