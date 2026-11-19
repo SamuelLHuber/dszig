@@ -3738,6 +3738,9 @@ The following prevent a claim that DSZig can do everything DSPy can:
   formats. Raw canonical requests then omit the format with an adaptation
   (or fail under `.refuse`), and typed predictors do not advertise native
   response schemas on those endpoints.
+  Set `cache_control = .none` for endpoints with implicit caching. Explicit
+  marks are omitted, unsupported long retention is reported, and references
+  to stored cache resources still fail before HTTP.
   For compatible Claude models, set `supports_reasoning = true` to advertise
   native reasoning to typed predictors. Canonical requests support manual
   budgets and adaptive effort; `max_tokens` is the visible budget on manual

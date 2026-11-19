@@ -36,6 +36,8 @@ pub const Anthropic = struct {
     parallel_tool_calls: enum { send, reject } = .send,
     /// Set to reject on endpoints that accept but ignore response schemas.
     structured_output: enum { send, reject } = .send,
+    /// Endpoints with implicit caching can opt out of explicit cache markers.
+    cache_control: enum { anthropic, none } = .anthropic,
     supports_reasoning: bool = false,
     supports_response_schema: bool = false,
     adaptations: enum { note, silent, refuse } = .note,
@@ -360,12 +362,23 @@ pub const Anthropic = struct {
         records: *std.ArrayList(sdk.Adaptation),
     ) Error!?Value {
         const cache = configured orelse return null;
-        if (cache.resource != null) return error.LMFailure;
-        if (cache.mode == .off) return null;
         if (cache.key) |key| {
             try self.adapt(arena, records, "config.cache.key", .dropped, "the Messages API has no cache affinity key (OpenAI's prompt_cache_key); " ++
                 "marks on blocks are its mechanism", str(key), .null);
         }
+        if (cache.retention == .long and self.cache_control == .none) {
+            try self.adapt(
+                arena,
+                records,
+                "config.cache.retention",
+                .dropped,
+                "this server caches implicitly and has no cache-control TTL",
+                str("long"),
+                .null,
+            );
+        }
+        if (cache.resource != null) return error.LMFailure;
+        if (cache.mode == .off or self.cache_control == .none) return null;
         var last_block: ?*Object = null;
         if (messages.items.len != 0 and
             (cache.prefix == .history or cache.prefix_until_index != .null))
@@ -1252,6 +1265,26 @@ test "Anthropic hosted blocks do not shift client calls, but citations do" {
     try std.testing.expectEqualStrings("Paris", parts[0].text.text);
     try std.testing.expectEqualStrings("https://example.org", parts[1].citation.url.?);
     try std.testing.expectEqualStrings("tool_2", parts[2].tool_call.id);
+}
+
+test "Anthropic implicit cache policy cannot drop a referenced prompt prefix" {
+    var backing: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer backing.deinit();
+    const arena = backing.allocator();
+    const request = try sdk.Request.fromFields(arena, &.{
+        .model = "fixture",
+        .messages = &.{.{ .role = .user, .parts = &.{.{ .text = .{ .text = "Next" } }} }},
+        .config = .{ .cache = .{ .resource = "stored-prefix" } },
+    });
+    defer request.release();
+    const provider: Anthropic = .{
+        .client = undefined,
+        .model = "fixture",
+        .cache_control = .none,
+        .adaptations = .silent,
+    };
+    var records: std.ArrayList(sdk.Adaptation) = .empty;
+    try std.testing.expectError(error.LMFailure, provider.requestBody(arena, request, &records, false));
 }
 
 test "Anthropic format rejection retains adaptive effort without advertising schemas" {
