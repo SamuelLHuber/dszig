@@ -2692,11 +2692,20 @@ try dszig.state.load(startup_arena, &program, saved_json, .{
 });
 ```
 
+`dszig.Anthropic.StateLoader` and `dszig.Gemini.StateLoader` use the same
+pattern. They save model settings but never save or restore the endpoint,
+credentials, HTTP client, or credential callback. The loader supplies those
+resources, even when `allow_unsafe_lm_state` is enabled. For Gemini Vertex or
+Express, supply the corresponding `door` and fully constructed `base_url`
+together. The runtime resources must outlive the loaded program. These are
+native provider records, not Python provider records or saved Live sessions.
+
 Use `.{}` when loading programs without bound models. A nonempty LM state
 without a loader fails with `error.MissingLMLoader`, never a fake restored model.
 By default, loading removes the top-level `api_base`, `base_url` and `model_list`
-routing keys and uses the explicitly injected endpoint. Preserve saved routing
-only with `.allow_unsafe_lm_state = true` for trusted files. Credentials always
+routing keys and uses the explicitly injected endpoint. Loaders that support
+saved routing, such as OpenAI's, can preserve it only with
+`.allow_unsafe_lm_state = true` for trusted files. Credentials always
 come from the loader. Native loaders use static class dispatch, not serialized
 function pointers or dynamic Python imports.
 
@@ -4196,10 +4205,10 @@ The following prevent a claim that DSZig can do everything DSPy can:
   Python string representations use the pinned CPython 3.11 Unicode 14 tables;
   classification can differ from other Python/Unicode releases.
 - **Persistence and errors:** cache files/key hashing are not DSPy's diskcache
-  format. Native OpenAI configuration and bound predictors support program
-  save/load with injected runtime resources; Python class reconstruction, all
-  native engine codecs, provider training state and complete DSPy LM save/load
-  remain unsupported.
+  format. Bound OpenAI, Anthropic and Gemini predictors support native
+  configuration save/load with injected runtime resources. Python class
+  reconstruction, other engine codecs, provider training state and complete
+  DSPy LM save/load remain unsupported.
   Python exception tracebacks are not reconstructed from native Zig errors.
 - **Upstream limits are not repaired silently:** stock DSPy 3.5.0 Retrieve still
   rejects the `json_mode` argument supplied by module state dumping. The RAG

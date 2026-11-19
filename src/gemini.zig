@@ -109,6 +109,41 @@ pub const Gemini = struct {
         };
     }
 
+    const State = lm_mod.ProviderState(Gemini, "dszig.lm.Gemini", .{
+        "model",      "max_tokens",         "max_response_bytes", "max_retries",        "retry_base_ms",
+        "timeout_ns", "connect_timeout_ns", "adaptations",        "supports_reasoning",
+    });
+
+    /// The caller chooses the endpoint and authentication protocol together.
+    /// For Vertex, supply the same routing fields used by initVertex.
+    pub const StateLoader = struct {
+        client: *std.http.Client,
+        base_url: []const u8,
+        door: @FieldType(Gemini, "door") = .developer,
+        api_key: ?[]const u8 = null,
+        header_provider: ?http.HeaderProvider = null,
+
+        pub fn loader(self: *StateLoader) lm_mod.LM.StateLoader {
+            return .{ .ptr = self, .restore_engine = restore };
+        }
+
+        fn restore(ptr: *anyopaque, arena: Allocator, input: @import("runtime_value.zig").Value) lm_mod.StateError!lm_mod.LM {
+            const self: *const StateLoader = @ptrCast(@alignCast(ptr));
+            var model: Gemini = .{
+                .client = self.client,
+                .base_url = self.base_url,
+                .door = self.door,
+                .model = "",
+                .api_key = self.api_key,
+                .header_provider = self.header_provider,
+            };
+            try State.decode(arena, input, &model);
+            const target = try arena.create(Gemini);
+            target.* = model;
+            return target.lm();
+        }
+    };
+
     pub fn lm(self: *Gemini) lm_mod.LM {
         return .{
             .ptr = self,
@@ -116,6 +151,7 @@ pub const Gemini = struct {
                 .complete = complete,
                 .complete_stream = completeStream,
                 .complete_canonical = canonical,
+                .dump_state = State.dump,
                 .clone = clone,
                 .model_name = modelName,
             },

@@ -140,6 +140,36 @@ pub fn load(arena: Allocator, program: anytype, json: []const u8, options: LoadO
     try loadState(arena, program, state, options);
 }
 
+test "native Google and Anthropic loaders never apply file-supplied routing or credentials" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var client: std.http.Client = .{ .allocator = testing.allocator, .io = testing.io };
+    defer client.deinit();
+
+    const A = @import("anthropic.zig").Anthropic;
+    const G = @import("gemini.zig").Gemini;
+    inline for (.{ A, G }, .{ "dszig.lm.Anthropic", "dszig.lm.Gemini" }) |Provider, class| {
+        var loader: Provider.StateLoader = .{
+            .client = &client,
+            .base_url = "https://trusted.invalid",
+            .api_key = "injected",
+        };
+        const saved = try std.json.parseFromSliceLeaky(Value, arena, "{\"__lm_class__\":\"" ++ class ++ "\",\"model\":\"fixture\"," ++
+            "\"base_url\":\"https://untrusted.invalid\",\"api_key\":\"untrusted\"," ++
+            "\"door\":\"vertex_express\"}", .{});
+        const restored = try loader.loader().restore(arena, saved);
+        const provider: *const Provider = @ptrCast(@alignCast(restored.ptr));
+        try testing.expectEqualStrings("https://trusted.invalid", provider.base_url);
+        try testing.expectEqualStrings("injected", provider.api_key.?);
+        if (Provider == G) try testing.expect(provider.door == .developer);
+        const serialized = try restored.dumpState(arena);
+        try testing.expect(!serialized.object.contains("base_url"));
+        try testing.expect(!serialized.object.contains("api_key"));
+        try testing.expect(!serialized.object.contains("door"));
+    }
+}
+
 test "OpenAI program state restores owned configuration without saved credentials or untrusted routing" {
     const Sig = @import("signature.zig").Signature(struct {
         pub const Input = struct { question: []const u8 };

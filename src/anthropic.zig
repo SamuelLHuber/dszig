@@ -98,6 +98,41 @@ pub const Anthropic = struct {
         self.reasoning_efforts = if (preset == .moonshotai) &.{ .low, .high, .max } else null;
     }
 
+    const State = lm_mod.ProviderState(Anthropic, "dszig.lm.Anthropic", .{
+        "model",           "api_version",         "max_tokens",         "max_response_bytes", "max_retries",
+        "retry_base_ms",   "timeout_ns",          "connect_timeout_ns", "system_prefix",      "model_prefixes",
+        "sampling_params", "parallel_tool_calls", "structured_output",  "cache_control",      "thinking_format",
+        "thinking_replay", "tool_result_media",   "reasoning_efforts",  "supports_reasoning", "supports_response_schema",
+        "adaptations",
+    });
+
+    /// Routing and credentials are supplied by the application, never the file.
+    pub const StateLoader = struct {
+        client: *std.http.Client,
+        base_url: []const u8,
+        api_key: ?[]const u8 = null,
+        header_provider: ?http.HeaderProvider = null,
+
+        pub fn loader(self: *StateLoader) lm_mod.LM.StateLoader {
+            return .{ .ptr = self, .restore_engine = restore };
+        }
+
+        fn restore(ptr: *anyopaque, arena: Allocator, input: @import("runtime_value.zig").Value) lm_mod.StateError!lm_mod.LM {
+            const self: *const StateLoader = @ptrCast(@alignCast(ptr));
+            var model: Anthropic = .{
+                .client = self.client,
+                .base_url = self.base_url,
+                .model = "",
+                .api_key = self.api_key,
+                .header_provider = self.header_provider,
+            };
+            try State.decode(arena, input, &model);
+            const target = try arena.create(Anthropic);
+            target.* = model;
+            return target.lm();
+        }
+    };
+
     pub fn lm(self: *Anthropic) lm_mod.LM {
         const supports_schema = self.supports_response_schema and self.structured_output == .send;
         return .{
@@ -106,6 +141,7 @@ pub const Anthropic = struct {
                 .complete = complete,
                 .complete_stream = completeStream,
                 .complete_canonical = canonical,
+                .dump_state = State.dump,
                 .model_name = modelName,
                 .clone = clone,
             },

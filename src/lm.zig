@@ -135,6 +135,55 @@ pub const AccountingFailure = struct {
 /// Persistent configuration is separate from transport clients and credentials.
 pub const StateError = error{ InvalidLMState, UnsupportedLMState, MissingLMLoader } || Allocator.Error;
 
+/// Shared by native provider codecs. Only explicitly listed settings may
+/// cross the persistence boundary; runtime routing and auth are injected.
+pub fn ProviderState(comptime Provider: type, comptime class_name: []const u8, comptime fields: anytype) type {
+    return struct {
+        const Value = @import("runtime_value.zig").Value;
+        const value = @import("value.zig");
+
+        pub fn dump(ptr: *anyopaque, arena: Allocator) StateError!Value {
+            const self: *const Provider = @ptrCast(@alignCast(ptr));
+            var state: @import("runtime_value.zig").ObjectMap = .empty;
+            try state.ensureTotalCapacity(arena, fields.len + 1);
+            state.putAssumeCapacity("__lm_class__", .{ .string = class_name });
+            inline for (fields) |field| {
+                const encoded = try value.toValue(arena, @FieldType(Provider, field), @field(self, field));
+                state.putAssumeCapacity(field, encoded);
+            }
+            return .{ .object = state };
+        }
+
+        pub fn decode(arena: Allocator, input: Value, target: *Provider) StateError!void {
+            if (input != .object) return error.InvalidLMState;
+            const class = input.object.get("__lm_class__") orelse return error.InvalidLMState;
+            if (class != .string) return error.InvalidLMState;
+            if (!std.mem.eql(u8, class.string, class_name)) return error.UnsupportedLMState;
+            const model = input.object.get("model") orelse return error.InvalidLMState;
+            if (model != .string) return error.InvalidLMState;
+            inline for (fields) |field| {
+                if (input.object.get(field)) |encoded| {
+                    @field(target, field) = try ownField(arena, @FieldType(Provider, field), encoded);
+                }
+            }
+        }
+
+        fn ownField(arena: Allocator, comptime T: type, encoded: Value) StateError!T {
+            const decoded = value.fromValue(arena, T, encoded) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.InvalidLMState,
+            };
+            if (comptime T == []const u8) return arena.dupe(u8, decoded);
+            if (comptime T == ?[]const []const u8) {
+                const prefixes = decoded orelse return null;
+                // fromValue allocated the slice; it still borrows its elements.
+                for (@constCast(prefixes)) |*prefix| prefix.* = try arena.dupe(u8, prefix.*);
+            }
+            return decoded;
+        }
+    };
+}
+
 fn jsonPayload(arena: Allocator, input: @import("runtime_value.zig").Value) Error!sdk.JsonValue {
     return sdk.JsonValue.fromBorrowedValue(arena, input) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
