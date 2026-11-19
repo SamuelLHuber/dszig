@@ -4042,6 +4042,8 @@ The following prevent a claim that DSZig can do everything DSPy can:
   A standalone `Predict` saves its fields at the JSON root, like DSPy.
   Standalone DSZig snapshots from the older format can be converted by moving
   the fields from `self` to the root alongside `metadata`.
+  MIPROv2 returns `InvalidOptions` if its trial schedule or evaluation count
+  exceeds the native counter range.
   `view_data_batch_size = 0` summarizes an empty initial view without
   refinement, matching DSPy rather than disabling the data-aware proposer.
   MIPROv2 compile options can override both demo limits without changing the

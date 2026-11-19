@@ -837,7 +837,17 @@ pub const MIPROv2 = struct {
         }
 
         const steps = options.minibatch_full_eval_steps;
-        const adjusted = if (minibatch) num_trials + num_trials / steps + 1 + @intFromBool(num_trials % steps != 0) else num_trials;
+        const interval = if (minibatch)
+            std.math.add(usize, steps, 1) catch return error.InvalidOptions
+        else
+            0;
+        // Include the baseline in the trial numbering even without minibatching.
+        const base_count = std.math.add(usize, num_trials, 1) catch return error.InvalidOptions;
+        const program_limit = if (minibatch) count: {
+            const full_evals = num_trials / steps + @intFromBool(num_trials % steps != 0);
+            break :count std.math.add(usize, base_count, full_evals) catch
+                return error.InvalidOptions;
+        } else base_count;
 
         var scratch: std.heap.ArenaAllocator = .init(gpa);
         defer scratch.deinit();
@@ -847,13 +857,7 @@ pub const MIPROv2 = struct {
         try history.append(out, .{ .params = try zeros(out, params.items.len), .value = default_score });
         var logs: std.ArrayList(TrialLog) = .empty;
         var programs: std.ArrayList(P) = .empty;
-        if (self.track_stats) {
-            const program_limit = if (minibatch)
-                adjusted
-            else
-                std.math.add(usize, num_trials, 1) catch return error.InvalidOptions;
-            try programs.ensureTotalCapacity(out, program_limit);
-        }
+        if (self.track_stats) try programs.ensureTotalCapacity(out, program_limit);
         var total_eval_calls = valset.len;
         try logs.append(out, .{
             .number = 1,
@@ -904,7 +908,8 @@ pub const MIPROv2 = struct {
                 full_count += 1;
                 if (!self.track_stats) try full_scores.append(out, s);
             }
-            total_eval_calls += batch;
+            total_eval_calls = std.math.add(usize, total_eval_calls, batch) catch
+                return error.InvalidOptions;
             try logs.append(out, .{
                 .number = trial_num,
                 .params = chosen,
@@ -931,7 +936,7 @@ pub const MIPROv2 = struct {
             combo.total += s;
             combo.count += 1;
 
-            if (minibatch and (trial_num % (steps + 1) == 0 or trial_num == adjusted - 1)) {
+            if (minibatch and (trial_num % interval == 0 or trial_num == program_limit - 1)) {
                 var pick: ?*Combo = null;
                 var pick_mean: f64 = 0;
                 for (combos.items) |*c| {
@@ -947,7 +952,8 @@ pub const MIPROv2 = struct {
                 full_count += 1;
                 if (!self.track_stats) try full_scores.append(out, full_score);
                 try history.append(out, .{ .params = target.params, .value = full_score });
-                total_eval_calls += valset.len;
+                total_eval_calls = std.math.add(usize, total_eval_calls, valset.len) catch
+                    return error.InvalidOptions;
                 try logs.append(out, .{
                     .number = trial_num + 1,
                     .params = null,
@@ -1139,6 +1145,45 @@ test "MIPRO compile demo overrides select zero-shot and seed zero samples indepe
         const actual = request.messages[request.messages.len - 1].content.text;
         const expected = try std.fmt.allocPrint(arena, "<question>\n{s}\n</question>", .{first_sample});
         try testing.expect(std.mem.indexOf(u8, actual, expected) != null);
+    }
+
+    // Even with valid candidate proposals, an unrepresentable schedule must
+    // refuse rather than panic or start evaluating the validation rows.
+    for ([_]struct { trials: usize, steps: usize, minibatch: bool }{
+        .{ .trials = std.math.maxInt(usize) - 1, .steps = 2, .minibatch = true },
+        .{ .trials = 3, .steps = std.math.maxInt(usize), .minibatch = true },
+        .{ .trials = std.math.maxInt(usize), .steps = 2, .minibatch = false },
+    }) |case| {
+        var history: lm_mod.History = .{ .arena = arena };
+        var task: lm_mod.ScriptedLM = .{ .responses = &answers, .history = &history };
+        var prompt: lm_mod.ScriptedLM = .{ .responses = &proposals };
+        try testing.expectError(error.InvalidOptions, optimizer.compile(
+            P,
+            arena,
+            arena,
+            .{ .arena = arena, .lm = task.lm() },
+            .{ .arena = arena, .lm = prompt.lm() },
+            student,
+            student,
+            rows[0..2],
+            .{
+                .valset = &rows,
+                .num_trials = case.trials,
+                .max_bootstrapped_demos = 0,
+                .max_labeled_demos = 0,
+                .minibatch = case.minibatch,
+                .minibatch_size = 2,
+                .minibatch_full_eval_steps = case.steps,
+                .program_aware_proposer = false,
+                .data_aware_proposer = false,
+                .fewshot_aware_proposer = false,
+                .tip_aware_proposer = false,
+            },
+        ));
+        for (history.requests.items) |request| {
+            const input = request.messages[request.messages.len - 1].content.text;
+            try testing.expect(std.mem.indexOf(u8, input, "<question>\n2\n</question>") == null);
+        }
     }
 }
 
