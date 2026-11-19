@@ -4087,6 +4087,9 @@ The following prevent a claim that DSZig can do everything DSPy can:
   `Result.stats`. `best` summarizes up to ten retained instruction/prefix
   pairs; `latest` includes repeat evaluations and accumulates the newest
   batches across predictors within the same depth, as in DSPy 3.5.
+  `Result.candidate_programs` pairs each score-ordered candidate with its runnable
+  program snapshot. Equal-scoring candidates with identical prompt text can
+  remain separate, as in DSPy; native custom pointers retain Zig copy semantics.
   Tracking does not add evaluations.
   MIPROv2 `track_stats` retains native program values in trial order with
   stable score-ranked full and minibatch indices in `Result.tracked_programs`.

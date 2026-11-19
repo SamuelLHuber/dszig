@@ -84,8 +84,12 @@ pub const COPRO = struct {
     pub fn Result(comptime P: type) type {
         return struct {
             program: P,
-            /// Sorted by score, descending, stable, duplicates dropped.
+            /// Sorted by score, descending and stable.
             candidates: []const Candidate,
+            /// Runnable snapshots in the same order as `candidates`. Signature
+            /// updates do not change earlier snapshots. Like the winner, custom
+            /// pointers in P keep their normal Zig copy and lifetime semantics.
+            candidate_programs: []const CandidateProgram(P),
             total_calls: usize,
             /// Present only with `track_stats`, in named predictor order.
             stats: ?[]const PredictorStats = null,
@@ -124,7 +128,7 @@ pub const COPRO = struct {
         }
     };
 
-    fn bestStats(comptime P: type, evaluated: []const Evaluated(P)) DepthStats {
+    fn bestStats(comptime P: type, evaluated: []const CandidateProgram(P)) DepthStats {
         assert(evaluated.len > 0);
         var top: [10]f64 = undefined;
         var count: usize = 0;
@@ -142,7 +146,7 @@ pub const COPRO = struct {
         return stats.finish();
     }
 
-    fn Evaluated(comptime P: type) type {
+    pub fn CandidateProgram(comptime P: type) type {
         return struct {
             candidate: Candidate,
             program: P,
@@ -168,7 +172,7 @@ pub const COPRO = struct {
         assert(self.breadth > 1);
         assert(self.depth > 0);
         assert(trainset.len > 0);
-        const E = Evaluated(P);
+        const E = CandidateProgram(P);
         var clone = student;
         const preds = try predict.namedPredictors(out, &clone);
         assert(preds.len > 0);
@@ -235,7 +239,10 @@ pub const COPRO = struct {
         var flat: std.ArrayList(E) = .empty;
         for (evaluated) |e| try flat.appendSlice(out, e.items);
         std.sort.insertion(E, flat.items, {}, E.greater);
-        const kept = try dropDuplicates(P, out, flat.items);
+        // DSPy's final duplicate check compares last-field objects by identity.
+        // Every scored signature update creates a fresh last field, so distinct
+        // retained evaluations cannot match, even when their prompt text does.
+        const kept = flat.items;
         const candidates = try out.alloc(Candidate, kept.len);
         for (candidates, kept) |*c, e| c.* = e.candidate;
         const stats = if (best_stats) |best| tracked: {
@@ -249,7 +256,14 @@ pub const COPRO = struct {
             }
             break :tracked items;
         } else null;
-        return .{ .program = kept[0].program, .candidates = candidates, .total_calls = total_calls, .stats = stats };
+        assert(kept.len > 0);
+        return .{
+            .program = kept[0].program,
+            .candidates = candidates,
+            .candidate_programs = kept,
+            .total_calls = total_calls,
+            .stats = stats,
+        };
     }
 
     /// `Predict(Sig, n=n, temperature=init_temperature)(**inputs).completions`.
@@ -304,48 +318,6 @@ pub const COPRO = struct {
         try state.forkSignatureClass(out);
         state.instructions = instruction;
         state.prefixes = prefixes;
-    }
-
-    /// `_drop_duplicates`: among consecutive equal scores, drop a program
-    /// whose instructions and last fields equal an earlier kept one's.
-    fn dropDuplicates(comptime P: type, out: Allocator, sorted: []const Evaluated(P)) ![]const Evaluated(P) {
-        var kept: std.ArrayList(Evaluated(P)) = .empty;
-        var batch: std.ArrayList(P) = .empty;
-        var batch_score: f64 = -1;
-        for (sorted) |e| {
-            var repeat = false;
-            if (e.candidate.score == batch_score) {
-                for (batch.items) |b| {
-                    if (try samePrompts(P, out, e.program, b)) {
-                        repeat = true;
-                        break;
-                    }
-                }
-                if (!repeat) try batch.append(out, e.program);
-            } else {
-                batch.clearRetainingCapacity();
-                try batch.append(out, e.program);
-                batch_score = e.candidate.score;
-            }
-            if (!repeat) try kept.append(out, e);
-        }
-        return kept.items;
-    }
-
-    fn samePrompts(comptime P: type, out: Allocator, a_in: P, b_in: P) !bool {
-        var a = a_in;
-        var b = b_in;
-        const pa = try predict.namedPredictors(out, &a);
-        const pb = try predict.namedPredictors(out, &b);
-        for (pa, pb) |x, y| {
-            const sx = x.param.predict;
-            const sy = y.param.predict;
-            if (!std.mem.eql(u8, sx.instructions, sy.instructions)) return false;
-            const last = sx.fields.len - 1;
-            if (!std.mem.eql(u8, sx.prefixes[last], sy.prefixes[last])) return false;
-            if (!std.mem.eql(u8, sx.descs[last], sy.descs[last])) return false;
-        }
-        return true;
     }
 };
 
@@ -408,4 +380,56 @@ test "COPRO climbs from the basic instruction to the best proposal" {
     try testing.expectEqual(@as(f64, 0), tracked.stats.?[0].latest[1].stddev);
     try testing.expectApproxEqAbs(@as(f64, 100.0 / 3.0), tracked.stats.?[0].best[1].average, 1e-12);
     try testing.expectApproxEqAbs(@as(f64, 47.14045207910317), tracked.stats.?[0].best[1].stddev, 1e-12);
+}
+
+test "COPRO keeps and runs tied snapshots with identical prompt text from different coordinates" {
+    const Pair = struct {
+        first: predict.Predict(TestQA) = .{},
+        second: predict.Predict(TestQA) = .{},
+
+        pub const Input = TestQA.Input;
+        pub const Output = TestQA.Output;
+
+        pub fn forward(self: *const @This(), ctx: Context, input: Input) predict.Error!Output {
+            const first = try self.first.forward(ctx, input);
+            return self.second.forward(ctx, .{ .question = first.answer });
+        }
+    };
+
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var model: lm_mod.KeywordLM = .{
+        .rules = &.{
+            .{ .needle = "increasing order", .scope = .any, .response = "<proposed_instruction>\nBest instruction.\n</proposed_instruction>\n\n" ++
+                "<proposed_prefix_for_output_field>\nBest:\n</proposed_prefix_for_output_field>" },
+            .{ .needle = "``signature``", .scope = .any, .response = "<proposed_instruction>\nTry instruction.\n</proposed_instruction>\n\n" ++
+                "<proposed_prefix_for_output_field>\nTry:\n</proposed_prefix_for_output_field>" },
+            .{ .needle = "Best instruction.", .scope = .any, .response = "<answer>\nyes\n</answer>" },
+        },
+        .default = "<answer>\nno\n</answer>",
+    };
+    const ctx: Context = .{ .arena = arena, .lm = model.lm() };
+    const train = [_]Example{
+        try Example.fromJson(arena, "{\"question\":\"ok?\",\"answer\":\"yes\"}", &.{"question"}),
+    };
+    const optimizer: COPRO = .{ .metric = yesMetric, .breadth = 3, .depth = 2 };
+    const result = try optimizer.compile(Pair, arena, testing.allocator, ctx, null, .{}, &train);
+    // DSPy retains both occurrences of (Try, initial), despite equal scores
+    // and equal visible predictor signatures. The winner is (Try, Best).
+    const candidates = result.candidate_programs;
+    try testing.expectEqual(@as(usize, 6), candidates.len);
+    try testing.expectEqualStrings("yes", (try candidates[0].program.forward(ctx, .{
+        .question = "held out",
+    })).answer);
+    for ([_]usize{ 1, 5 }, [_]usize{ 0, 1 }) |index, coordinate| {
+        const entry = &candidates[index];
+        try testing.expectEqual(coordinate, entry.candidate.predictor);
+        try testing.expectEqual(@as(f64, 0), entry.candidate.score);
+        try testing.expectEqualStrings("Try:", entry.program.first.state.prefixes[1]);
+        try testing.expectEqualStrings("Answer:", entry.program.second.state.prefixes[1]);
+        try testing.expectEqualStrings("no", (try entry.program.forward(ctx, .{
+            .question = "held out",
+        })).answer);
+    }
 }
