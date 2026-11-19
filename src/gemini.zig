@@ -25,6 +25,8 @@ pub const Gemini = struct {
     adaptations: enum { note, silent, refuse } = .note,
     supports_reasoning: bool = false,
 
+    pub const LiveSession = GeminiLiveSession;
+
     pub fn lm(self: *Gemini) lm_mod.LM {
         return .{
             .ptr = self,
@@ -173,6 +175,41 @@ pub const Gemini = struct {
         return state.outcome;
     }
 
+    /// Opens a persistent connection. Do not move `session` until closed.
+    pub fn live(self: *const Gemini, session: *LiveSession, options: LiveSession.Options) !void {
+        if (self.header_provider != null) return error.LMFailure;
+        const allocator = self.client.allocator;
+        session.* = .{
+            .timed = self.liveTimeouts(),
+            .connection_arena = .init(allocator),
+            .scratch = .init(allocator),
+            .max_bytes = self.max_response_bytes,
+            .audio_native = liveAudioNative(self.model),
+        };
+        errdefer session.connection_arena.deinit();
+        errdefer session.scratch.deinit();
+        errdefer session.buffer.deinit(allocator);
+        const uri = try liveEndpoint(session.connection_arena.allocator(), self.base_url, self.api_key);
+        session.client = try http.isolatedClient(self.client, session.timed.io());
+        errdefer session.client.deinit();
+        session.socket = try @import("websocket.zig").open(&session.client, uri);
+        errdefer session.socket.deinit();
+        const arena = session.scratch.allocator();
+        try session.socket.sendText(try session.setupFrame(arena, self.model, &options));
+        var remaining = session.max_bytes;
+        try waitLiveSetup(&session.socket, &session.scratch, &session.buffer, &remaining);
+        session.open = true;
+    }
+
+    fn liveTimeouts(self: *const Gemini) @import("timed_io.zig") {
+        return .{
+            .inner = self.client.io,
+            .timeout_ns = self.timeout_ns orelse 600 * std.time.ns_per_s,
+            .connect_timeout_ns = self.connect_timeout_ns orelse self.timeout_ns orelse
+                5 * std.time.ns_per_s,
+        };
+    }
+
     fn runLive(
         self: *const Gemini,
         arena: Allocator,
@@ -183,12 +220,7 @@ pub const Gemini = struct {
         if (self.header_provider != null) return error.LMFailure;
         const uri = try liveEndpoint(arena, self.base_url, self.api_key);
         const payloads = try livePayloads(arena, fields, extensions);
-        var timed: @import("timed_io.zig") = .{
-            .inner = self.client.io,
-            .timeout_ns = self.timeout_ns orelse 600 * std.time.ns_per_s,
-            .connect_timeout_ns = self.connect_timeout_ns orelse self.timeout_ns orelse
-                5 * std.time.ns_per_s,
-        };
+        var timed = self.liveTimeouts();
         var client = try http.isolatedClient(self.client, timed.io());
         defer client.deinit();
         var socket = try @import("websocket.zig").open(&client, uri);
@@ -200,12 +232,7 @@ pub const Gemini = struct {
         var scratch: std.heap.ArenaAllocator = .init(client.allocator);
         defer scratch.deinit();
         var remaining = self.max_response_bytes;
-        for (0..8192) |_| {
-            const value = try receiveLive(&socket, &scratch, &buffer, &remaining);
-            if (value != .object) continue;
-            if (value.object.contains("setupComplete")) break;
-            if (value.object.contains("error")) return error.LMFailure;
-        } else return error.LMFailure;
+        try waitLiveSetup(&socket, &scratch, &buffer, &remaining);
 
         for (payloads.input) |payload| try socket.sendText(payload);
         try state.start();
@@ -301,6 +328,203 @@ fn liveEndpoint(arena: Allocator, base_url: []const u8, key: ?[]const u8) !std.U
     return uri;
 }
 
+const GeminiLiveSession = struct {
+    timed: @import("timed_io.zig"),
+    client: std.http.Client = undefined,
+    socket: @import("websocket.zig") = undefined,
+    connection_arena: std.heap.ArenaAllocator,
+    scratch: std.heap.ArenaAllocator,
+    buffer: std.ArrayList(u8) = .empty,
+    pending: []const Event = &.{},
+    max_bytes: usize,
+    audio_native: bool,
+    open: bool = false,
+
+    pub const Options = struct {
+        system: ?sdk.SystemContent = null,
+        tools: []const sdk.RequestTool = &.{},
+        voice: ?[]const u8 = null,
+        audio_output: bool = false,
+        extensions: ?sdk.JsonValue = null,
+    };
+
+    pub const Input = union(enum) {
+        text: []const u8,
+        turn: struct { parts: []const sdk.Part, complete: bool = true },
+        audio: struct { data: []const u8, media_type: []const u8 = "audio/pcm;rate=16000" },
+        image: struct { data: []const u8, media_type: []const u8 = "image/jpeg" },
+        tool_result: struct { id: []const u8, parts: []const sdk.Part },
+        interrupt,
+        end_audio,
+    };
+
+    pub const Event = union(enum) {
+        text: []const u8,
+        audio: struct { data: []const u8, media_type: []const u8 },
+        tool_call: struct { id: []const u8, name: []const u8, input: Value },
+        usage: sdk.Usage,
+        interrupted,
+        turn_end: ?sdk.Usage,
+        provider_error: GenerateStream.stream.ErrorDetail,
+    };
+
+    fn setupFrame(self: *const GeminiLiveSession, arena: Allocator, model: []const u8, options: *const Options) ![]const u8 {
+        var setup = try liveSetupFields(arena, model, options.system, options.tools);
+        var generation: Object = .empty;
+        if (self.audio_native or options.audio_output)
+            try generation.put(arena, "responseModalities", try singleton(arena, str("AUDIO")));
+        if (options.voice) |voice| if (voice.len != 0) {
+            const name = try wrapped(arena, "voiceName", str(voice));
+            const prebuilt = try wrapped(arena, "prebuiltVoiceConfig", name);
+            try generation.put(arena, "speechConfig", try wrapped(arena, "voiceConfig", prebuilt));
+        };
+        if (generation.count() != 0)
+            try setup.put(arena, "generationConfig", .{ .object = generation });
+        if (options.extensions) |extensions| {
+            const value = try extensions.toValue(arena);
+            if (value != .object) return error.LMFailure;
+            for (value.object.keys(), value.object.values()) |key, item| try setup.put(arena, key, item);
+        }
+        if (self.audio_native) try setup.put(arena, "outputAudioTranscription", .{ .object = .empty });
+        return liveJson(arena, try wrapped(arena, "setup", .{ .object = setup }));
+    }
+
+    pub fn close(self: *GeminiLiveSession) void {
+        if (!self.open) return;
+        self.open = false;
+        self.socket.finish() catch {};
+        self.socket.deinit();
+        self.buffer.deinit(self.client.allocator);
+        self.scratch.deinit();
+        self.client.deinit();
+        self.connection_arena.deinit();
+    }
+
+    pub fn send(self: *GeminiLiveSession, input: Input) !void {
+        if (!self.open) return error.SessionClosed;
+        var scratch: std.heap.ArenaAllocator = .init(self.client.allocator);
+        defer scratch.deinit();
+        const payload = try self.inputFrame(scratch.allocator(), input);
+        try self.socket.sendText(payload);
+    }
+
+    fn inputFrame(self: *const GeminiLiveSession, arena: Allocator, input: Input) ![]const u8 {
+        const names: std.StringHashMapUnmanaged([]const u8) = .empty;
+        switch (input) {
+            .text => |bytes| {
+                if (self.audio_native) return liveFrame(arena, "realtimeInput", "text", str(bytes));
+                return sessionTurn(arena, try singleton(arena, try textPart(arena, bytes)), true);
+            },
+            .turn => |turn| {
+                var parts: runtime.Array = .init(arena);
+                try parts.ensureTotalCapacity(turn.parts.len);
+                for (turn.parts) |part| parts.appendAssumeCapacity(try encodePart(arena, part, &names));
+                return sessionTurn(arena, .{ .array = parts }, turn.complete);
+            },
+            .audio => |item| return sessionMedia(arena, "audio", item.media_type, item.data),
+            .image => |item| return sessionMedia(arena, "video", item.media_type, item.data),
+            .tool_result => |item| {
+                const bytes = try content.partsText(arena, item.parts, null);
+                const output = try singleton(arena, try textPart(arena, bytes));
+                var result: Object = .empty;
+                try result.put(arena, "id", str(item.id));
+                try result.put(arena, "response", try wrapped(arena, "output", output));
+                const results = try singleton(arena, .{ .object = result });
+                return liveFrame(arena, "toolResponse", "functionResponses", results);
+            },
+            .interrupt => return liveFrame(arena, "clientContent", "turnComplete", .{ .bool = true }),
+            .end_audio => return liveFrame(arena, "realtimeInput", "audioStreamEnd", .{ .bool = true }),
+        }
+    }
+
+    /// An event borrows session storage until the next recv or close.
+    /// The caller serializes all operations on the session.
+    pub fn recv(self: *GeminiLiveSession) !Event {
+        if (!self.open) return error.SessionClosed;
+        var remaining = self.max_bytes;
+        if (self.pending.len == 0) {
+            for (0..8192) |_| {
+                const value = try receiveLive(&self.socket, &self.scratch, &self.buffer, &remaining);
+                if (value != .object) continue;
+                self.pending = try sessionEvents(self.scratch.allocator(), value);
+                if (self.pending.len != 0) break;
+            } else return error.LMFailure;
+        }
+        const event = self.pending[0];
+        self.pending = self.pending[1..];
+        return event;
+    }
+};
+
+fn sessionMedia(arena: Allocator, key: []const u8, mime: []const u8, bytes: []const u8) ![]const u8 {
+    var row: Object = .empty;
+    try row.put(arena, "mimeType", str(mime));
+    try row.put(arena, "data", str(bytes));
+    return liveFrame(arena, "realtimeInput", key, .{ .object = row });
+}
+
+fn sessionTurn(arena: Allocator, parts: Value, complete: bool) ![]const u8 {
+    var row: Object = .empty;
+    try row.put(arena, "role", str("user"));
+    try row.put(arena, "parts", parts);
+    const turns = try singleton(arena, .{ .object = row });
+    return liveContentFrame(arena, turns.array, complete);
+}
+
+fn sessionEvents(arena: Allocator, value: Value) ![]const GeminiLiveSession.Event {
+    const Event = GeminiLiveSession.Event;
+    var events: std.ArrayList(Event) = .empty;
+    if (value.object.get("error")) |detail| {
+        try events.append(arena, .{ .provider_error = try streamError(arena, detail) });
+        return events.items;
+    }
+    for (elems(get(get(value, "toolCall"), "functionCalls"))) |call| {
+        if (call == .object) try events.append(arena, try sessionTool(arena, call));
+    }
+    const server = get(value, "serverContent");
+    if (server != .object) return events.items;
+    for (elems(get(get(server, "modelTurn"), "parts"))) |part| {
+        if (part != .object) continue;
+        if (part.object.get("text")) |raw| {
+            try events.append(arena, .{ .text = (try truthyText(arena, raw)) orelse "" });
+        } else if (get(part, "inlineData") == .object) {
+            const inline_data = get(part, "inlineData");
+            const mime = text(get(inline_data, "mimeType"));
+            if (std.mem.startsWith(u8, mime, "audio/")) try events.append(arena, .{ .audio = .{
+                .data = text(get(inline_data, "data")),
+                .media_type = mime,
+            } });
+        } else if (get(part, "functionCall") == .object) {
+            try events.append(arena, try sessionTool(arena, get(part, "functionCall")));
+        }
+    }
+    if (try truthyText(arena, get(get(server, "outputTranscription"), "text"))) |bytes|
+        try events.append(arena, .{ .text = bytes });
+    const complete = try lm_mod.OpenAI.responseTruthy(get(server, "turnComplete"));
+    const usage = try liveUsage(arena, value, server);
+    if (!complete and usage != null) try events.append(arena, .{ .usage = usage.? });
+    if (try lm_mod.OpenAI.responseTruthy(get(server, "interrupted")))
+        try events.append(arena, .interrupted);
+    if (complete) try events.append(arena, .{ .turn_end = if (usage) |counts|
+        if (counts.isKnown()) counts else null
+    else
+        null });
+    return events.items;
+}
+
+fn sessionTool(arena: Allocator, call: Value) !GeminiLiveSession.Event {
+    const args = get(call, "args");
+    return .{ .tool_call = .{
+        .id = (try truthyText(arena, get(call, "id"))) orelse "fc_0",
+        .name = (try truthyText(arena, get(call, "name"))) orelse "tool",
+        .input = if (args == .object) args else .{ .object = .empty },
+    } };
+}
+
+fn liveAudioNative(model: []const u8) bool {
+    return hasPhrase(model, "live-preview") or hasPhrase(model, "native-audio");
+}
+
 const LivePayloads = struct { setup: []const u8, input: []const []const u8 };
 
 fn livePayloads(
@@ -309,8 +533,7 @@ fn livePayloads(
     extensions: Value,
 ) !LivePayloads {
     if (extensions != .object and extensions != .null) return error.LMFailure;
-    const audio_native = hasPhrase(fields.model, "live-preview") or
-        hasPhrase(fields.model, "native-audio");
+    const audio_native = liveAudioNative(fields.model);
     const output = text(get(extensions, "output"));
     const audio = audio_native or std.mem.eql(u8, output, "audio");
     const image = std.mem.eql(u8, output, "image");
@@ -321,27 +544,7 @@ fn livePayloads(
         };
     }
 
-    var setup: Object = .empty;
-    const model = fields.model;
-    try setup.put(arena, "model", str(if (std.mem.startsWith(u8, model, "models/"))
-        model
-    else
-        try std.fmt.allocPrint(arena, "models/{s}", .{model})));
-    if (fields.system) |system| {
-        const bytes = switch (system) {
-            .text => |value| value,
-            .parts => |parts| try content.partsText(arena, parts, null),
-        };
-        if (bytes.len != 0) {
-            const parts = try singleton(arena, try textPart(arena, bytes));
-            try setup.put(arena, "systemInstruction", try wrapped(arena, "parts", parts));
-        }
-    }
-    const declarations = try functionDeclarations(arena, fields.tools);
-    if (declarations.items.len != 0) {
-        const group = try wrapped(arena, "functionDeclarations", .{ .array = declarations });
-        try setup.put(arena, "tools", try singleton(arena, group));
-    }
+    var setup = try liveSetupFields(arena, fields.model, fields.system, fields.tools);
     if (extensions == .object) {
         var entries = extensions.object.iterator();
         while (entries.next()) |entry| {
@@ -360,6 +563,35 @@ fn livePayloads(
         else
             try liveTurnFrames(arena, fields.messages),
     };
+}
+
+fn liveSetupFields(
+    arena: Allocator,
+    model: []const u8,
+    system_content: ?sdk.SystemContent,
+    tools: []const sdk.RequestTool,
+) !Object {
+    var setup: Object = .empty;
+    try setup.put(arena, "model", str(if (std.mem.startsWith(u8, model, "models/"))
+        model
+    else
+        try std.fmt.allocPrint(arena, "models/{s}", .{model})));
+    if (system_content) |system| {
+        const bytes = switch (system) {
+            .text => |value| value,
+            .parts => |parts| try content.partsText(arena, parts, null),
+        };
+        if (bytes.len != 0) {
+            const parts = try singleton(arena, try textPart(arena, bytes));
+            try setup.put(arena, "systemInstruction", try wrapped(arena, "parts", parts));
+        }
+    }
+    const declarations = try functionDeclarations(arena, tools);
+    if (declarations.items.len != 0) {
+        const group = try wrapped(arena, "functionDeclarations", .{ .array = declarations });
+        try setup.put(arena, "tools", try singleton(arena, group));
+    }
+    return setup;
 }
 
 fn liveSetupModalities(
@@ -525,6 +757,21 @@ fn liveJson(arena: Allocator, value: Value) ![]const u8 {
     return output.toOwnedSlice();
 }
 
+fn waitLiveSetup(
+    socket: *@import("websocket.zig"),
+    scratch: *std.heap.ArenaAllocator,
+    buffer: *std.ArrayList(u8),
+    remaining: *usize,
+) !void {
+    for (0..8192) |_| {
+        const value = try receiveLive(socket, scratch, buffer, remaining);
+        if (value != .object) continue;
+        if (value.object.contains("setupComplete")) return;
+        if (value.object.contains("error")) return error.LMFailure;
+    }
+    return error.LMFailure;
+}
+
 fn receiveLive(
     socket: *@import("websocket.zig"),
     scratch: *std.heap.ArenaAllocator,
@@ -564,18 +811,12 @@ fn dispatchLive(
         if (state.outcome == .stopped) return true;
     }
     const server = get(value, "serverContent");
-    const top_usage = get(value, "usageMetadata");
-    const counts = if (top_usage == .object) top_usage else get(server, "usageMetadata");
-    if (counts == .object and counts.object.count() != 0) {
-        var live_counts = counts;
-        if (counts.object.get("responseTokenCount")) |output| {
-            live_counts = .{ .object = try counts.object.clone(scratch) };
-            try live_counts.object.put(scratch, "candidatesTokenCount", output);
+    if (try liveUsage(scratch, value, server)) |parsed| {
+        if (parsed.isKnown()) {
+            const replacement = try parsed.clone(usage_allocator);
+            usage.free(usage_allocator);
+            usage.* = replacement;
         }
-        const parsed = try readUsage(scratch, live_counts);
-        const replacement = try parsed.clone(usage_allocator);
-        usage.free(usage_allocator);
-        usage.* = replacement;
     }
     for (elems(get(get(server, "modelTurn"), "parts")), 0..) |part, index| {
         const call = get(part, "functionCall");
@@ -605,6 +846,18 @@ fn dispatchLive(
         .provider_data = null,
     } });
     return true;
+}
+
+fn liveUsage(arena: Allocator, value: Value, server: Value) !?sdk.Usage {
+    const top_usage = get(value, "usageMetadata");
+    const counts = if (top_usage == .object) top_usage else get(server, "usageMetadata");
+    if (counts != .object) return null;
+    if (counts.object.get("responseTokenCount")) |output| {
+        var alias = try counts.object.clone(arena);
+        try alias.put(arena, "candidatesTokenCount", output);
+        return try readUsage(arena, .{ .object = alias });
+    }
+    return try readUsage(arena, counts);
 }
 
 fn emitLiveTool(
