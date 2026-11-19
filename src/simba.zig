@@ -256,9 +256,10 @@ pub const SIMBA = struct {
     ) !Result(P) {
         if ((self.metric == null) == (self.feedback_metric == null))
             return error.InvalidMetricConfiguration;
-        assert(self.bsize > 0);
-        assert(self.num_candidates > 0);
-        assert(trainset.len >= self.bsize);
+        if (trainset.len < self.bsize) return error.InvalidOptions;
+        if (self.max_steps > 0) {
+            if (self.bsize == 0 or self.num_candidates == 0) return error.InvalidOptions;
+        }
         var rng = pyrandom.Random.init(options.seed);
         var rng_np = nprandom.Generator.init(options.seed);
         var st: State(P) = .{};
@@ -383,7 +384,9 @@ pub const SIMBA = struct {
         }
 
         const m = winning.items.len - 1;
-        const n = self.num_candidates + 1;
+        // With no winning step, the source's repeated baseline indices
+        // collapse to one candidate, even when num_candidates is zero.
+        const n = if (m == 0) 1 else try std.math.add(usize, self.num_candidates, 1);
         var idxs: std.ArrayList(usize) = .empty;
         for (0..n) |i| {
             const idx: usize = if (m < 1) 0 else @intFromFloat(roundHalfEven(@as(f64, @floatFromInt(i * m)) / @as(f64, @floatFromInt(n - 1))));
@@ -453,6 +456,7 @@ pub const SIMBA = struct {
     /// DSPy `dspy.Parallel(...)(exec_pairs)`: ordered results.
     fn runAll(self: *const SIMBA, comptime P: type, out: Allocator, jobs: []const Job(P), runs: []Run) !void {
         assert(jobs.len == runs.len);
+        if (jobs.len == 0) return;
         const rollouts = self.rollouts orelse {
             for (jobs, runs) |job, *run| run.* = try self.wrap(P, out, job.ctx, job.program, job.example);
             return;
@@ -624,6 +628,7 @@ pub const SIMBA = struct {
 };
 
 fn mean(list: []const f64) f64 {
+    if (list.len == 0) return 0;
     var sum: f64 = 0;
     for (list) |x| sum += x;
     return sum / @as(f64, @floatFromInt(list.len));
@@ -853,6 +858,49 @@ test "SIMBA lets metrics score missing predictions after program failure" {
     try std.testing.expectEqual(@as(f64, 0.375), run.score.?);
     try std.testing.expectEqual(@as(usize, 0), run.steps.len);
     try std.testing.expectEqual(@as(usize, 0), script.index);
+}
+
+test "SIMBA scores only the baseline when no search steps are requested" {
+    const Sig = signature.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: []const u8 };
+    });
+    const P = predict.Predict(Sig);
+    const MetricCheck = struct {
+        fn score(_: Allocator, _: *const Example, result: ?*const optimize.RecordPrediction, _: ?*const predict.Trace) value.ParseError!f64 {
+            const answer = (result orelse return 0).get("answer") orelse return 0;
+            return if (std.mem.eql(u8, answer.string, "yes")) 1 else 0;
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var script: @import("lm.zig").ScriptedLM = .{ .responses = &.{"<answer>yes</answer>"} };
+    const ctx: Context = .{ .arena = arena, .lm = script.lm() };
+    const train = [_]Example{
+        try Example.fromJson(arena, "{\"question\":\"ok?\",\"answer\":\"yes\"}", &.{"question"}),
+    };
+
+    var optimizer: SIMBA = .{
+        .metric = MetricCheck.score,
+        .max_steps = 0,
+        .num_candidates = 0,
+        .bsize = 1,
+    };
+    const scored = try optimizer.compile(P, arena, ctx, .{}, &train, .{});
+    try std.testing.expectEqualSlices(f64, &.{1}, scored.scores);
+    try std.testing.expectEqual(@as(usize, 1), script.index);
+    optimizer.bsize = 0;
+    optimizer.num_candidates = 1;
+    const empty = try optimizer.compile(P, arena, ctx, .{}, &.{}, .{});
+    try std.testing.expectEqualSlices(f64, &.{0}, empty.scores);
+    try std.testing.expectEqual(@as(usize, 1), script.index);
+
+    optimizer.max_steps = 1;
+    try std.testing.expectError(error.InvalidOptions, optimizer.compile(P, arena, ctx, .{}, &.{}, .{}));
+    optimizer.bsize = 1;
+    optimizer.num_candidates = 0;
+    try std.testing.expectError(error.InvalidOptions, optimizer.compile(P, arena, ctx, .{}, &train, .{}));
 }
 
 test "roundHalfEven matches Python round" {

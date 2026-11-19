@@ -4123,6 +4123,10 @@ The following prevent a claim that DSZig can do everything DSPy can:
   SIMBA `Result.candidate_programs` retains the final native program values
   alongside their full-trainset scores, descending and stable across ties.
   It reuses the final evaluations and does not deep-copy opaque program state.
+  With `max_steps = 0`, SIMBA evaluates only the baseline, including when
+  `num_candidates = 0`. An empty training set requires `bsize = 0` and gives
+  that baseline a score of zero. Positive-step searches require nonzero
+  `bsize` and `num_candidates`; invalid configurations return `InvalidOptions`.
   Set `feedback_metric` instead of `metric` to return a numeric score with
   additional fields for the rule writer. The metadata is masked and rendered
   in the better/worse reward inputs; it does not participate in ranking.
