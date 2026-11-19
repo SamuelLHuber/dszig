@@ -32,6 +32,8 @@ pub const Anthropic = struct {
     model_prefixes: ?[]const []const u8 = null,
     /// Set to reject on endpoints whose model sampling is fixed.
     sampling_params: enum { send, reject } = .send,
+    /// Set to reject on endpoints that ignore disable_parallel_tool_use.
+    parallel_tool_calls: enum { send, reject } = .send,
     supports_reasoning: bool = false,
     supports_response_schema: bool = false,
     adaptations: enum { note, silent, refuse } = .note,
@@ -511,8 +513,22 @@ pub const Anthropic = struct {
                 .none => "none",
             }));
             if (force) try row.put(arena, "name", str(choice.allowed[0]));
-            if (choice.parallel == false and choice.mode != .none)
-                try row.put(arena, "disable_parallel_tool_use", .{ .bool = true });
+            if (choice.parallel) |parallel| {
+                if (self.parallel_tool_calls == .reject) {
+                    try self.adapt(
+                        arena,
+                        records,
+                        "config.tool_choice.parallel",
+                        .dropped,
+                        "this server accepts disable_parallel_tool_use and does not apply it " ++
+                            "(guide--anthropic-api.md); the model may return several calls",
+                        .{ .bool = parallel },
+                        .null,
+                    );
+                } else if (!parallel and choice.mode != .none) {
+                    try row.put(arena, "disable_parallel_tool_use", .{ .bool = true });
+                }
+            }
             try body.put(arena, "tool_choice", .{ .object = row });
         }
     }
@@ -1204,6 +1220,32 @@ test "Anthropic hosted blocks do not shift client calls, but citations do" {
     try std.testing.expectEqualStrings("Paris", parts[0].text.text);
     try std.testing.expectEqualStrings("https://example.org", parts[1].citation.url.?);
     try std.testing.expectEqualStrings("tool_2", parts[2].tool_call.id);
+}
+
+test "Anthropic parallel-tool rejection preserves forced tool selection" {
+    var backing: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer backing.deinit();
+    const arena = backing.allocator();
+    const parse = @import("json_repair.zig").parseJson;
+    const request = try sdk.Request.fromValue(arena, try parse(arena,
+        \\{"model":"fixture","messages":[{"role":"user","parts":[{"type":"text","text":"Next"}]}],
+        \\"tools":[{"type":"function","name":"lookup","parameters":{"type":"object"}}],
+        \\"config":{"max_tokens":16,"tool_choice":{"mode":"required","allowed":["lookup"],"parallel":false}}}
+    ));
+    defer request.release();
+    var provider: Anthropic = .{
+        .client = undefined,
+        .model = "fixture",
+        .parallel_tool_calls = .reject,
+    };
+    var records: std.ArrayList(sdk.Adaptation) = .empty;
+    const body = try parse(arena, try provider.requestBody(arena, request, &records, true));
+    const choice = get(body, "tool_choice");
+    try std.testing.expectEqualStrings("tool", text(get(choice, "type")));
+    try std.testing.expectEqualStrings("lookup", text(get(choice, "name")));
+    try std.testing.expect(get(choice, "disable_parallel_tool_use") == .null);
+    provider.adaptations = .refuse;
+    try std.testing.expectError(error.LMFailure, provider.requestBody(arena, request, &records, true));
 }
 
 test "Anthropic fixed sampling omits explicit zero and refuses under strict policy" {

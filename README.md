@@ -3731,6 +3731,9 @@ The following prevent a claim that DSZig can do everything DSPy can:
   Set `sampling_params = .reject` for servers that ignore temperature, top-p,
   and top-k. These canonical settings are omitted with an adaptation, or
   refused before HTTP under the `.refuse` adaptation policy.
+  Use `parallel_tool_calls = .reject` for servers that ignore the parallel-tool
+  control. An explicit parallel preference is then omitted and reported, or
+  refused in strict mode; the tool choice and declarations still apply.
   For compatible Claude models, set `supports_reasoning = true` to advertise
   native reasoning to typed predictors. Canonical requests support manual
   budgets and adaptive effort; `max_tokens` is the visible budget on manual
