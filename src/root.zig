@@ -58,6 +58,7 @@ test {
     _ = @import("async_stream.zig");
 }
 pub const Context = predict.Context;
+pub const PredictConfig = predict.PredictConfig;
 pub const TwoStepAdapter = predict.TwoStepAdapter;
 pub const Trace = predict.Trace;
 pub const Predict = predict.Predict;

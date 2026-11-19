@@ -2676,6 +2676,15 @@ stored demonstrations without changing the program. Use `&.{}` for a zero-shot
 call or `null` to use the stored demonstrations. In a composed program, pass
 the override only to the child calls that should receive it.
 
+For DSPy-style predictor configuration, set `predictor.state.config` to a
+borrowed, immutable `PredictConfig`. Its supplied fields override
+`Context.lm_options`. Set `Context.predict_config` on an individual call to
+override selected fields again, without modifying the predictor. An omitted
+field inherits; for nullable fields use a typed null (e.g.
+`@as(?dszig.Value, null)` for `rollout_id`) to clear an inherited setting.
+Configuration lives in the program definition and is not included in
+state-only snapshots.
+
 For OpenAI inference, set `Context.lm_options.prediction` to the predicted-output
 object. A record-based `Predict` call also moves a `prediction` argument with
 `type: "content"` and a `content` key into the LM options, overriding an

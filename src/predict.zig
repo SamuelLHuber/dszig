@@ -27,7 +27,7 @@ const Field = signature.Field;
 const Record = value.Record;
 
 pub const Error = adapter_mod.Error || lm_mod.Error || value.ConvertError ||
-    @import("decision_state.zig").Error || stream.Error || error{NoRetriever};
+    @import("decision_state.zig").Error || stream.Error || error{ NoRetriever, InvalidCompletionCount };
 
 /// The final failed completion parse of one predictor call, as DSPy's
 /// AdapterParseError exposes it. Contents borrow the call's arena.
@@ -53,6 +53,27 @@ pub const ParseFailure = struct {
     }
 };
 
+/// A partial configuration of native generation options. For nullable
+/// options the outer null means inherit; a present inner null clears the value.
+pub const PredictConfig = struct {
+    temperature: ??f64 = null,
+    rollout_id: ??@import("runtime_value.zig").Value = null,
+    response_format: ??lm_mod.ResponseFormat = null,
+    tool_choice: ??lm_mod.ToolChoice = null,
+    parallel_tool_calls: ??bool = null,
+    logprobs: ?@import("runtime_value.zig").Value = null,
+    n: ?u32 = null,
+    reasoning_effort: ??[]const u8 = null,
+    prediction: ??@import("runtime_value.zig").Value = null,
+
+    fn apply(config: *const PredictConfig, options: *lm_mod.Options) void {
+        inline for (@typeInfo(PredictConfig).@"struct".field_names) |name| {
+            if (@field(config.*, name)) |setting| @field(options.*, name) = setting;
+        }
+        if (config.reasoning_effort != null) options.reasoning_effort_present = true;
+    }
+};
+
 pub const Context = struct {
     /// Per-call scratch: prompts, completions, parsed outputs.
     arena: Allocator,
@@ -70,6 +91,8 @@ pub const Context = struct {
     trace: ?*Trace = null,
     retriever: ?Retriever = null,
     lm_options: lm_mod.Options = .{},
+    /// Borrowed overrides for a predictor invocation, after its stored config.
+    predict_config: ?*const PredictConfig = null,
     /// Synchronous raw events from physical adapter generations. Cache hits
     /// and non-streaming engines emit none. Concurrent calls need disjoint or
     /// synchronized sinks. A stop aborts the active prediction.
@@ -271,6 +294,8 @@ pub const PredictState = struct {
     descs: []const []const u8,
     prefixes: []const []const u8,
     demos: []const Record = &.{},
+    /// Borrowed immutable config, retained across resets and program copies.
+    config: ?*const PredictConfig = null,
     /// Borrowed model identity survives program copies; reset clears it.
     lm: ?lm_mod.LM = null,
     /// Persisted Predict.fields overrides, distinct from signature metadata.
@@ -349,7 +374,7 @@ pub const PredictState = struct {
 
     /// Run one LM call: format, complete, parse (with JSON fallback), trace.
     pub fn call(state: *const PredictState, ctx_in: Context, inputs: *const Record) Error!Record {
-        return (try state.callMany(ctx_in, inputs, ctx_in.lm_options.n))[0];
+        return (try state.callConfigured(ctx_in, inputs, null))[0];
     }
 
     /// `Predict(..., n=n)`: one LM call for `n` completions, all parsed with
@@ -357,10 +382,19 @@ pub const PredictState = struct {
     /// DSPy, a temperature that is unset or at most 0.15 becomes 0.7.
     pub fn callMany(state: *const PredictState, ctx_in: Context, inputs: *const Record, n: u32) Error![]const Record {
         assert(n >= 1);
+        return state.callConfigured(ctx_in, inputs, n);
+    }
+
+    fn callConfigured(state: *const PredictState, ctx_in: Context, inputs: *const Record, count: ?u32) Error![]const Record {
         if (ctx_in.parse_failure) |capture| capture.* = .{};
         var ctx = try state.resolveContext(ctx_in);
-        ctx.lm_options.n = n;
-        if (n > 1 and (ctx.lm_options.temperature orelse 0) <= 0.15) ctx.lm_options.temperature = 0.7;
+        if (state.config) |config| config.apply(&ctx.lm_options);
+        if (ctx.predict_config) |config| config.apply(&ctx.lm_options);
+        if (count) |n| ctx.lm_options.n = n;
+        if (ctx.lm_options.n == 0) return error.InvalidCompletionCount;
+        const temperature = ctx.lm_options.temperature orelse 0;
+        const sampling_temperature = if (temperature == 0) ctx_in.lm_options.temperature orelse 0 else temperature;
+        if (ctx.lm_options.n > 1 and sampling_temperature <= 0.15) ctx.lm_options.temperature = 0.7;
         var defaulted_inputs: Record = undefined;
         const prepared = try state.prepare(&ctx, inputs, &defaulted_inputs);
         const outputs = try runPredict(state, ctx, prepared);
@@ -995,11 +1029,11 @@ pub fn Predict(comptime Sig: type) type {
         }
 
         /// `forward` as a genuine Prediction retaining every parsed completion
-        /// of the one public LM call (`ctx.lm_options.n`). No Module-call
+        /// of the one public LM call (the resolved `n`). No Module-call
         /// scope: usage stays unset, like a direct Source `forward`.
         pub fn forwardPrediction(self: *const Self, ctx: Context, input: Input) Error!Prediction(Output) {
             const inputs = try value.toRecord(ctx.arena, Input, input);
-            const records = try self.state.callMany(ctx, &inputs, ctx.lm_options.n);
+            const records = try self.state.callConfigured(ctx, &inputs, null);
             const outputs = try ctx.arena.alloc(Output, records.len);
             for (records, outputs) |*record, *output| output.* = try value.fromRecord(ctx.arena, Output, record);
             return Prediction(Output).fromCompletions(ctx.arena, outputs);
@@ -1600,6 +1634,34 @@ pub fn getLM(arena: Allocator, program: anytype) (Allocator.Error || error{Multi
 }
 
 const testing = std.testing;
+
+test "per-call candidate count overrides configured fanout without leaking into later calls" {
+    const Sig = signature.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: []const u8 };
+    });
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var history: lm_mod.History = .{ .arena = arena };
+    var model: lm_mod.KeywordLM = .{
+        .rules = &.{},
+        .default = "<answer>Paris</answer>",
+        .history = &history,
+    };
+    var program: Predict(Sig) = .{};
+    program.state.config = &.{ .n = 2, .temperature = 0.1 };
+    var ctx: Context = .{ .arena = arena, .lm = model.lm(), .predict_config = &.{ .n = 1 } };
+    const input: Sig.Input = .{ .question = "Capital of France?" };
+    _ = try program.forwardPrediction(ctx, input);
+    try testing.expectEqual(@as(usize, 1), history.requests.items.len);
+    try testing.expectEqual(@as(?f64, 0.1), history.requests.items[0].options.temperature);
+    ctx.predict_config = null;
+    _ = try program.forwardPrediction(ctx, input);
+    try testing.expectEqual(@as(usize, 3), history.requests.items.len);
+    for (history.requests.items[1..]) |request|
+        try testing.expectEqual(@as(?f64, 0.7), request.options.temperature);
+}
 
 test "a zero-shot predictor invocation does not discard stored demos" {
     const Sig = signature.Signature(struct {
