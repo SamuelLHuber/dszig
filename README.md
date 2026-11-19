@@ -3806,9 +3806,11 @@ The following prevent a claim that DSZig can do everything DSPy can:
   streaming supports `AsyncProgram` field listeners, final predictions, and
   cancellation. Canonical streaming can run a Gemini Live WebSocket turn
   (`config.extensions.transport = "live"`) with text or conversation history,
-  inline audio/video input for audio-native models, and text, audio, and image
-  deltas. It uses the configured Gemini API key. Persistent Live sessions,
-  Live tools, Vertex AI, local path reads, and file uploads are not supported.
+  inline audio/video input for audio-native models, function declarations, and
+  text, audio, image, and function-call deltas. Non-audio conversation history
+  can include earlier function calls and results. It uses the configured Gemini
+  API key. Persistent Live sessions, Vertex AI, local path reads, and file
+  uploads are not supported.
   Native File construction, adapter/typed prediction
   handling, File tool-result markers and bounded Responses document translation
   are implemented as described above. There is still no complete lm15 provider

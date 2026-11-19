@@ -212,11 +212,12 @@ pub const Gemini = struct {
         const usage_allocator = if (state.assembler == null) client.allocator else arena;
         var usage: sdk.Usage = .{};
         defer if (state.assembler == null) usage.free(usage_allocator);
+        var saw_tool = false;
         for (0..8192) |_| {
             if (state.outcome == .stopped) return;
             const value = try receiveLive(&socket, &scratch, &buffer, &remaining);
             if (value != .object) continue;
-            if (try dispatchLive(scratch.allocator(), usage_allocator, state, value, &usage)) {
+            if (try dispatchLive(scratch.allocator(), usage_allocator, state, value, &usage, &saw_tool)) {
                 if (state.outcome != .stopped) socket.finish() catch {
                     // The terminal event already committed the completed turn.
                 };
@@ -307,7 +308,6 @@ fn livePayloads(
     fields: *const sdk.RequestFields,
     extensions: Value,
 ) !LivePayloads {
-    if (fields.tools.len != 0) return error.LMFailure;
     if (extensions != .object and extensions != .null) return error.LMFailure;
     const audio_native = hasPhrase(fields.model, "live-preview") or
         hasPhrase(fields.model, "native-audio");
@@ -336,6 +336,11 @@ fn livePayloads(
             const parts = try singleton(arena, try textPart(arena, bytes));
             try setup.put(arena, "systemInstruction", try wrapped(arena, "parts", parts));
         }
+    }
+    const declarations = try functionDeclarations(arena, fields.tools);
+    if (declarations.items.len != 0) {
+        const group = try wrapped(arena, "functionDeclarations", .{ .array = declarations });
+        try setup.put(arena, "tools", try singleton(arena, group));
     }
     if (extensions == .object) {
         var entries = extensions.object.iterator();
@@ -393,13 +398,14 @@ fn liveTurnFrames(arena: Allocator, messages: []const sdk.Message) ![]const []co
         return payloads;
     }
     var turns: runtime.Array = .init(arena);
-    const names: std.StringHashMapUnmanaged([]const u8) = .empty;
+    var names: std.StringHashMapUnmanaged([]const u8) = .empty;
+    defer names.deinit(arena);
+    for (messages) |message| for (message.parts) |part| {
+        if (part == .tool_call) try names.put(arena, part.tool_call.id, part.tool_call.name);
+    };
     for (messages) |message| {
         var parts: runtime.Array = .init(arena);
-        for (message.parts) |part| {
-            if (part == .tool_call or part == .tool_result) return error.LMFailure;
-            try parts.append(try encodePart(arena, part, &names));
-        }
+        for (message.parts) |part| try parts.append(try encodePart(arena, part, &names));
         var turn: Object = .empty;
         try turn.put(arena, "role", str(if (message.role == .assistant) "model" else "user"));
         try turn.put(arena, "parts", .{ .array = parts });
@@ -540,10 +546,22 @@ fn dispatchLive(
     state: *GenerateStream,
     value: Value,
     usage: *sdk.Usage,
+    saw_tool: *bool,
 ) !bool {
     if (value.object.get("error")) |detail| {
         try state.emit(.{ .provider_error = try streamError(scratch, detail) });
         return true;
+    }
+    const calls = get(get(value, "toolCall"), "functionCalls");
+    for (elems(calls), 0..) |call, index| {
+        if (call != .object) continue;
+        const fallback = if (try truthyText(scratch, get(call, "id"))) |id|
+            id
+        else
+            try std.fmt.allocPrint(scratch, "fc_{d}", .{index});
+        try emitLiveTool(scratch, usage_allocator, state, call, index, fallback);
+        saw_tool.* = true;
+        if (state.outcome == .stopped) return true;
     }
     const server = get(value, "serverContent");
     const top_usage = get(value, "usageMetadata");
@@ -560,6 +578,14 @@ fn dispatchLive(
         usage.* = replacement;
     }
     for (elems(get(get(server, "modelTurn"), "parts")), 0..) |part, index| {
+        const call = get(part, "functionCall");
+        if (call == .object and !part.object.contains("text")) {
+            const id = (try truthyText(scratch, get(call, "id"))) orelse "fc_0";
+            try emitLiveTool(scratch, usage_allocator, state, call, index, id);
+            saw_tool.* = true;
+            if (state.outcome == .stopped) return true;
+            continue;
+        }
         const data = (try decodeLivePart(scratch, usage_allocator, state, part)) orelse continue;
         var key_buffer: [24]u8 = undefined;
         const key = std.fmt.bufPrint(&key_buffer, "{d}", .{index}) catch unreachable;
@@ -574,11 +600,38 @@ fn dispatchLive(
     const complete = get(server, "turnComplete");
     if (!(lm_mod.OpenAI.responseTruthy(complete) catch |err| return codecError(err))) return false;
     try state.emit(.{ .end = .{
-        .finish_reason = .stop,
-        .usage = usage.*,
+        .finish_reason = if (saw_tool.*) .tool_call else .stop,
+        .usage = if (usage.isKnown()) usage.* else null,
         .provider_data = null,
     } });
     return true;
+}
+
+fn emitLiveTool(
+    scratch: Allocator,
+    retained: Allocator,
+    state: *GenerateStream,
+    call: Value,
+    index: usize,
+    id: []const u8,
+) !void {
+    const payload_arena = if (state.assembler != null) retained else scratch;
+    const args = call.object.get("args") orelse Value{ .object = .empty };
+    var output: std.Io.Writer.Allocating = .init(payload_arena);
+    errdefer output.deinit();
+    try @import("pyjson.zig").writeJsonAscii(&output.writer, args);
+    const input = try output.toOwnedSlice();
+    const name = (try truthyText(scratch, get(call, "name"))) orelse "tool";
+    var key_buffer: [24]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buffer, "{d}", .{index}) catch unreachable;
+    try state.emit(.{ .delta = .{
+        .part_index = key,
+        .data = .{ .tool_call = .{
+            .id = if (state.assembler != null) try retained.dupe(u8, id) else id,
+            .name = if (state.assembler != null) try retained.dupe(u8, name) else name,
+            .input = input,
+        } },
+    } });
 }
 
 fn decodeLivePart(
@@ -593,7 +646,6 @@ fn decodeLivePart(
         const bytes = (try truthyText(scratch, value)) orelse "";
         return .{ .text = .{ .text = if (retain) try retained.dupe(u8, bytes) else bytes } };
     }
-    if (part.object.contains("functionCall")) return error.LMFailure;
     const inline_data = get(part, "inlineData");
     const mime = text(get(inline_data, "mimeType"));
     const audio = std.mem.startsWith(u8, mime, "audio/");
@@ -1341,23 +1393,8 @@ fn encodeToolResult(
 }
 
 fn addTools(arena: Allocator, body: *Object, fields: *const sdk.RequestFields, policy: @FieldType(Gemini, "adaptations"), records: *std.ArrayList(sdk.Adaptation)) Error!void {
-    var declarations: runtime.Array = .init(arena);
+    const declarations = try functionDeclarations(arena, fields.tools);
     var tools: runtime.Array = .init(arena);
-    for (fields.tools) |tool| switch (tool) {
-        .function => |function| {
-            const schema: Value = if (function.parameters) |params|
-                params.toValue(arena) catch |err| return codecError(err)
-            else
-                .{ .object = .empty };
-            var row: Object = .empty;
-            try row.put(arena, "name", str(function.name));
-            if (function.description) |description| if (description.len != 0)
-                try row.put(arena, "description", str(description));
-            try row.put(arena, if (try openApi(arena, schema)) "parameters" else "parametersJsonSchema", schema);
-            try declarations.append(.{ .object = row });
-        },
-        .builtin => {},
-    };
     if (declarations.items.len != 0) try tools.append(try wrapped(arena, "functionDeclarations", .{ .array = declarations }));
     for (fields.tools) |tool| if (tool == .builtin) {
         const builtin = tool.builtin;
@@ -1395,6 +1432,26 @@ fn addTools(arena: Allocator, body: *Object, fields: *const sdk.RequestFields, p
         try row.put(arena, "allowedFunctionNames", .{ .array = allowed });
     }
     try body.put(arena, "toolConfig", try wrapped(arena, "functionCallingConfig", .{ .object = row }));
+}
+
+fn functionDeclarations(arena: Allocator, tools: []const sdk.RequestTool) Error!runtime.Array {
+    var declarations: runtime.Array = .init(arena);
+    for (tools) |tool| {
+        if (tool != .function) continue;
+        const function = tool.function;
+        const schema: Value = if (function.parameters) |params|
+            params.toValue(arena) catch |err| return codecError(err)
+        else
+            .{ .object = .empty };
+        var row: Object = .empty;
+        try row.put(arena, "name", str(function.name));
+        if (function.description) |description| if (description.len != 0)
+            try row.put(arena, "description", str(description));
+        const schema_key = if (try openApi(arena, schema)) "parameters" else "parametersJsonSchema";
+        try row.put(arena, schema_key, schema);
+        try declarations.append(.{ .object = row });
+    }
+    return declarations;
 }
 
 fn wrapped(arena: Allocator, key: []const u8, value: Value) Error!Value {
