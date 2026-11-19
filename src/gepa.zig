@@ -284,7 +284,7 @@ pub const GEPA = struct {
     max_metric_calls: ?usize = null,
     /// Checked in caller order after seed evaluation and between iterations.
     stop_callbacks: []const StopCallback = &.{},
-    /// Defaults to three with the built-in sampler; leave null with `batch_sampler`.
+    /// Null and zero use three with the built-in sampler. Leave null with `batch_sampler`.
     reflection_minibatch_size: ?usize = null,
     batch_sampler: ?BatchSampler = null,
     val_evaluation_policy: ?ValidationPolicy = null,
@@ -348,6 +348,11 @@ pub const GEPA = struct {
             try destination.replace(dir.io);
         }
     };
+
+    fn epochMinibatchSize(self: GEPA) usize {
+        const configured = self.reflection_minibatch_size orelse 0;
+        return if (configured == 0) 3 else configured;
+    }
 
     pub const Rollouts = parallel.Rollouts(Run);
 
@@ -1462,8 +1467,7 @@ pub const GEPA = struct {
                     for (ids) |id| if (id >= e.trainset.len) return error.InvalidBatchSample;
                     return ids;
                 }
-                const mb = e.gepa.reflection_minibatch_size orelse 3;
-                assert(mb > 0);
+                const mb = e.gepa.epochMinibatchSize();
                 // Padding makes each epoch a whole number of batches. Work
                 // in batch units until slicing, so an iteration need not fit
                 // in a usize after multiplication by the minibatch size.
@@ -1494,7 +1498,7 @@ pub const GEPA = struct {
 
             fn reshuffle(e: *Self) Allocator.Error!void {
                 const n = e.trainset.len;
-                const mb = e.gepa.reflection_minibatch_size orelse 3;
+                const mb = e.gepa.epochMinibatchSize();
                 e.shuffled = .empty;
                 for (0..n) |k| try e.shuffled.append(e.out, k);
                 e.rng.shuffle(usize, e.shuffled.items);
@@ -2363,8 +2367,6 @@ pub const GEPA = struct {
         if (self.batch_sampler) |sampler| {
             if (self.reflection_minibatch_size != null or sampler.max_batch_size == 0)
                 return error.InvalidBatchSamplerConfiguration;
-        } else {
-            assert((self.reflection_minibatch_size orelse 3) > 0);
         }
         if (self.instruction_proposer == null and self.proposal_options.max_chars == 0)
             return error.InvalidInstructionLimit;
@@ -3001,7 +3003,7 @@ test "GEPA epoch sampler pads and rotates whole minibatches at full-width iterat
     const train: [5]Example = @splat(example);
     const student: struct { placeholder: bool = false } = .{};
     var engine: GEPA.Engine(@TypeOf(student)) = .{
-        .gepa = .{ .metric = Metric.score, .reflection_minibatch_size = 3 },
+        .gepa = .{ .metric = Metric.score, .reflection_minibatch_size = 0 },
         .out = arena,
         .ctx = context,
         .reflection = context,

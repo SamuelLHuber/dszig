@@ -3978,9 +3978,9 @@ The following prevent a claim that DSZig can do everything DSPy can:
   reflection minibatch, and leave `reflection_minibatch_size` unset. Repeated
   indices are evaluated in order; empty, out-of-range, and over-capacity
   batches are rejected before rollout.
-  The default epoch sampler pads to whole minibatches and cycles through
-  them on repeated proposals in an iteration, preserving DSPy's batch order
-  without multiplying the iteration number by the minibatch size.
+  The default epoch sampler uses size three if `reflection_minibatch_size`
+  is unset or zero. It pads to whole minibatches and cycles through them on
+  repeated proposals in an iteration.
   Set `val_evaluation_policy` to choose an ordered subset of validation rows
   for each accepted candidate. The seed still uses all rows unless the policy
   supplies `seed_batch`. With a custom policy, `result.val_ids` pairs each
