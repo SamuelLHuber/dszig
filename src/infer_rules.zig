@@ -118,7 +118,8 @@ pub const InferRules = struct {
         max_bootstrapped_demos: usize = 4,
         max_labeled_demos: usize = 16,
         max_rounds: usize = 1,
-        max_errors: usize = 10,
+        /// Null inherits the outer context for bootstrap and candidate evaluation.
+        max_errors: ?usize = null,
         failure_classifier: ?FailureClassifier = null,
     };
 
@@ -133,7 +134,7 @@ pub const InferRules = struct {
     max_bootstrapped_demos: usize,
     max_labeled_demos: usize,
     max_rounds: usize,
-    max_errors: usize,
+    max_errors: ?usize,
     failure_classifier: ?FailureClassifier,
     /// Cause of the source-equivalent assertion/context-window failure.
     last_induction_failure: ?anyerror = null,
@@ -330,11 +331,11 @@ pub const InferRules = struct {
         program: *const P,
         dataset: []const Example,
     ) !f64 {
-        // Evaluate checks this after induction, not at compile entry. Avoid the
-        // existing sequential evaluator's nonempty-devset assertion.
+        // Evaluate checks this after induction, not at compile entry.
         if (dataset.len == 0) return error.EmptyValidationSet;
+        const max_errors = self.max_errors orelse ctx.max_errors;
         if (self.metric) |metric| {
-            return (try optimize.evaluateWith(P, self.concurrent_evaluation, gpa, ctx, program, dataset, metric, self.max_errors)).score;
+            return (try optimize.evaluateWith(P, self.concurrent_evaluation, gpa, ctx, program, dataset, metric, max_errors)).score;
         }
         // Source allows metric=None at construction. It still runs the program
         // for each example, then fails calling the missing metric; failed items
@@ -349,7 +350,7 @@ pub const InferRules = struct {
             }
         };
         const wrapper: MissingMetric = .{ .program = program };
-        return (try optimize.evaluate(MissingMetric, gpa, ctx, &wrapper, dataset, unusedMetric, self.max_errors)).score;
+        return (try optimize.evaluate(MissingMetric, gpa, ctx, &wrapper, dataset, unusedMetric, max_errors)).score;
     }
 };
 
@@ -1003,14 +1004,14 @@ test "InferRules missing metric runs prediction before evaluation errors" {
     const a = memory.allocator();
     var state: TestState = .{ .history = .{ .arena = a } };
     var model: TestLM = .{ .state = &state };
-    const ctx: Context = .{ .arena = a, .lm = model.lm() };
+    const ctx: Context = .{ .arena = a, .lm = model.lm(), .max_errors = 1 };
     const student: TestProgram = .{};
     var optimizer = try InferRules.init(a, .{});
-    const dataset = try testExamples(a, 1);
-    try testing.expectEqual(@as(f64, 0), try optimizer.evaluateProgram(TestProgram, testing.allocator, ctx, &student, dataset));
-    try testing.expectEqual(@as(usize, 2), state.history.requests.items.len);
-    optimizer.max_errors = 1;
+    const dataset = try testExamples(a, 2);
     try testing.expectError(error.MissingMetric, optimizer.evaluateProgram(TestProgram, testing.allocator, ctx, &student, dataset));
-    try testing.expectEqual(@as(usize, 4), state.history.requests.items.len);
+    try testing.expectEqual(@as(usize, 2), state.history.requests.items.len);
+    optimizer.max_errors = 3;
+    try testing.expectEqual(@as(f64, 0), try optimizer.evaluateProgram(TestProgram, testing.allocator, ctx, &student, dataset));
+    try testing.expectEqual(@as(usize, 6), state.history.requests.items.len);
     try testing.expectError(error.EmptyValidationSet, optimizer.evaluateProgram(TestProgram, testing.allocator, ctx, &student, &.{}));
 }

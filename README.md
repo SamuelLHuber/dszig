@@ -3460,6 +3460,9 @@ program-type mismatch returns `error.ProgramTypeMismatch`, and null keeps serial
 `optimize.evaluate`. Candidate evaluation is sequential between candidates, as in
 DSPy; only examples within one evaluation run concurrently. `BootstrapFewShot`
 has no DSPy thread option and stays serial.
+`InferRules` inherits the outer `Context.max_errors` for bootstrapping and
+candidate evaluation unless its own `max_errors` is set. Teacher settings do
+not replace that limit.
 
 SIMBA's `num_threads` is `rollouts`: a `Parallel(SIMBA.Run, limits).runner()` and
 per-attempt contexts supplying LM and retriever pointees. Trajectory sampling,
