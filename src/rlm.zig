@@ -4,6 +4,7 @@ const std = @import("std");
 const adapter = @import("adapter.zig");
 const history_mod = @import("history.zig");
 const predict = @import("predict.zig");
+const lm = @import("lm.zig");
 const value = @import("value.zig");
 const runtime_value = @import("runtime_value.zig");
 const pyjson = @import("pyjson.zig");
@@ -15,8 +16,29 @@ const History = history_mod.History;
 
 pub const Runtime = struct {
     ptr: *anyopaque,
-    execute: *const fn (*anyopaque, []const u8, *const Record) anyerror!Result,
+    /// Execution is borrowed for this serial callback only.
+    execute: *const fn (*anyopaque, []const u8, *Execution) anyerror!Result,
     close: *const fn (*anyopaque) void,
+
+    pub const Execution = struct {
+        variables: *const Record,
+        model: lm.LM,
+        ctx: *const predict.Context,
+        calls_remaining: u32,
+
+        /// Dispatch one raw text prompt. A dispatched failure still consumes a call.
+        /// The returned text is owned by the invocation arena.
+        pub fn query(self: *Execution, prompt: []const u8) ![]const u8 {
+            if (prompt.len == 0) return error.EmptySubModelPrompt;
+            if (self.calls_remaining == 0) return error.SubModelCallLimit;
+            self.calls_remaining -= 1;
+            return self.model.complete(self.ctx.arena, .{
+                .messages = &.{.{ .role = .user, .content = .{ .text = prompt } }},
+                .usage_tracker = self.ctx.usage_tracker,
+                .usage_failure = self.ctx.usage_failure,
+            });
+        }
+    };
 
     /// Result data must survive until the next execute or close, whichever is first.
     pub const Result = union(enum) {
@@ -117,6 +139,8 @@ pub const Options = struct {
     /// Full action objective for the supplied runtime and its capabilities.
     action_instructions: []const u8,
     max_iters: u32 = 20,
+    max_llm_calls: u32 = 50,
+    sub_lm: ?lm.LM = null,
     max_output_chars: i64 = 10_000,
     history_processor: ?HistoryProcessor = null,
 };
@@ -155,6 +179,8 @@ pub fn CustomRLM(comptime Sig: type) type {
         extract: predict.PredictFields(&extract_fields, 2, extract_instructions) = .{},
         factory: Factory,
         max_iters: u32,
+        max_llm_calls: u32,
+        sub_lm: ?lm.LM,
         max_output_chars: i64,
         history_processor: ?HistoryProcessor,
         compiled: bool = false,
@@ -170,6 +196,8 @@ pub fn CustomRLM(comptime Sig: type) type {
                 .generate_action = .{},
                 .factory = factory,
                 .max_iters = options.max_iters,
+                .max_llm_calls = options.max_llm_calls,
+                .sub_lm = options.sub_lm,
                 .max_output_chars = options.max_output_chars,
                 .history_processor = options.history_processor,
             };
@@ -200,6 +228,12 @@ pub fn CustomRLM(comptime Sig: type) type {
             const entries = try arena.alloc(Entry, self.max_iters);
             var history = try TurnHistory.clone(arena, options.history, entries.len + 1);
             const processor = options.history_processor orelse self.history_processor;
+            var execution: Runtime.Execution = .{
+                .variables = &variables,
+                .model = self.sub_lm orelse ctx.lm,
+                .ctx = &ctx,
+                .calls_remaining = self.max_llm_calls,
+            };
             const runtime = try self.factory.open(self.factory.ptr);
             defer runtime.close(runtime.ptr);
 
@@ -218,7 +252,7 @@ pub fn CustomRLM(comptime Sig: type) type {
                     .output = undefined,
                     .max_output_chars = self.max_output_chars,
                 };
-                const result = try executeAction(arena, runtime, &variables, entry);
+                const result = try executeAction(arena, runtime, &execution, entry);
                 const final = try processResult(arena, Sig.output_fields_list, result, entry);
                 var event = if (index == 0) try variables.clone(arena) else Record.empty;
                 try event.put(arena, "variables_info", info);
@@ -320,7 +354,12 @@ fn variablePreview(arena: Allocator, rendered: []const u8, length: usize) ![]con
     return std.mem.concat(arena, u8, &.{ rendered[0..head_end], "...", rendered[chars.i..] });
 }
 
-fn executeAction(arena: Allocator, runtime: Runtime, variables: *const Record, entry: *Entry) !Runtime.Result {
+fn executeAction(
+    arena: Allocator,
+    runtime: Runtime,
+    execution: *Runtime.Execution,
+    entry: *Entry,
+) !Runtime.Result {
     const whitespace = " \t\n\r\x0b\x0c";
     const trimmed = std.mem.trim(u8, entry.code, whitespace);
     entry.code = trimmed;
@@ -341,7 +380,7 @@ fn executeAction(arena: Allocator, runtime: Runtime, variables: *const Record, e
             entry.code = std.mem.trim(u8, body[0 .. std.mem.indexOf(u8, body, "```") orelse body.len], whitespace);
         }
     }
-    return runtime.execute(runtime.ptr, entry.code, variables);
+    return runtime.execute(runtime.ptr, entry.code, execution);
 }
 
 fn processResult(arena: Allocator, fields: []const Field, result: Runtime.Result, entry: *Entry) !?Record {

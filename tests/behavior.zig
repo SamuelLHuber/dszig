@@ -24,11 +24,12 @@ test "custom RLM retains observations across runtime buffer reuse and closes on 
         fn execute(
             ptr: *anyopaque,
             code: []const u8,
-            _: *const dszig.value.Record,
+            execution: *dszig.rlm.Runtime.Execution,
         ) !dszig.rlm.Runtime.Result {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
             if (self.fail) return error.RuntimeDisconnected;
+            try testing.expectError(error.SubModelCallLimit, execution.query("unavailable"));
             if (self.calls == 1) {
                 try testing.expectEqualStrings("inspect()", code);
             } else {
@@ -55,7 +56,11 @@ test "custom RLM retains observations across runtime buffer reuse and closes on 
     const program = try dszig.CustomRLM(Sig).init(
         arena,
         .{ .ptr = &runtime, .open = Runtime.open },
-        .{ .max_iters = 2, .action_instructions = "Check the order with the supplied runtime." },
+        .{
+            .max_iters = 2,
+            .max_llm_calls = 0,
+            .action_instructions = "Check the order with the supplied runtime.",
+        },
     );
     var model: dszig.lm.ScriptedLM = .{
         .responses = &.{

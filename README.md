@@ -3806,9 +3806,14 @@ The following prevent a claim that DSZig can do everything DSPy can:
   processor for a single call. Callback errors roll back edits, except allocation
   failure and cancellation, which propagate. Trimming prompt history does not
   change the returned trajectory or the trajectory supplied to extraction.
-  The loop does not execute arbitrary
-  Python, provide guest DSPy, call sub-LMs on the runtime's behalf, or sandbox
-  runtime callbacks. The caller must enforce any runtime time and memory limits.
+  A runtime callback receives a borrowed `Runtime.Execution`: read the input
+  record through `variables` and call `query` to dispatch a text-only sub-LM
+  request. It uses `sub_lm` when configured, otherwise the context LM.
+  `max_llm_calls` is shared across that invocation's actions; empty prompts do
+  not consume it, but failed dispatched calls do. The loop does not provide
+  batched or multimodal sub-LM queries, execute arbitrary Python, provide guest
+  DSPy, or sandbox runtime callbacks. The caller must enforce runtime time and
+  memory limits.
 - **Other modules and optimizers:** bounded native Avatar/AvatarOptimizer follow
   Source methods, with broken Source constructors and the explicit native
   capacity, class-identity, callback-ownership and serial-execution boundaries
