@@ -60,6 +60,41 @@ pub const Request = struct {
     }
 };
 
+/// Preserve configured TLS trust while keeping scoped I/O out of the caller's pool.
+pub fn isolatedClient(client: *std.http.Client, io: std.Io) !std.http.Client {
+    var isolated: std.http.Client = .{
+        .allocator = client.allocator,
+        .io = io,
+        .tls_buffer_size = client.tls_buffer_size,
+        .ssl_key_log = client.ssl_key_log,
+        .read_buffer_size = client.read_buffer_size,
+        .write_buffer_size = client.write_buffer_size,
+        .http_proxy = client.http_proxy,
+        .https_proxy = client.https_proxy,
+    };
+    errdefer isolated.deinit();
+    if (std.http.Client.disable_tls) return isolated;
+    try client.ca_bundle_lock.lockShared(client.io);
+    defer client.ca_bundle_lock.unlockShared(client.io);
+    isolated.now = client.now;
+    if (client.now == null) return isolated;
+    try isolated.ca_bundle.bytes.appendSlice(isolated.allocator, client.ca_bundle.bytes.items);
+    try isolated.ca_bundle.map.ensureTotalCapacityContext(
+        isolated.allocator,
+        client.ca_bundle.map.count(),
+        .{ .cb = &isolated.ca_bundle },
+    );
+    var entries = client.ca_bundle.map.iterator();
+    while (entries.next()) |entry| {
+        isolated.ca_bundle.map.putAssumeCapacityContext(
+            entry.key_ptr.*,
+            entry.value_ptr.*,
+            .{ .cb = &isolated.ca_bundle },
+        );
+    }
+    return isolated;
+}
+
 pub const Transport = struct {
     client: *std.http.Client,
     max_response_bytes: usize = 4 * 1024 * 1024,
@@ -87,30 +122,8 @@ pub const Transport = struct {
         };
         // Connections retain their Io. The isolated client closes before this
         // stack adapter expires, without changing the caller's connection pool.
-        var isolated: std.http.Client = .{
-            .allocator = self.client.allocator,
-            .io = timed.io(),
-            .tls_buffer_size = self.client.tls_buffer_size,
-            .ssl_key_log = self.client.ssl_key_log,
-            .read_buffer_size = self.client.read_buffer_size,
-            .write_buffer_size = self.client.write_buffer_size,
-            .http_proxy = self.client.http_proxy,
-            .https_proxy = self.client.https_proxy,
-        };
+        var isolated = try isolatedClient(self.client, timed.io());
         defer isolated.deinit();
-        if (!std.http.Client.disable_tls) {
-            try self.client.ca_bundle_lock.lockShared(self.client.io);
-            defer self.client.ca_bundle_lock.unlockShared(self.client.io);
-            isolated.now = self.client.now;
-            if (self.client.now != null) {
-                try isolated.ca_bundle.bytes.appendSlice(isolated.allocator, self.client.ca_bundle.bytes.items);
-                try isolated.ca_bundle.map.ensureTotalCapacityContext(isolated.allocator, self.client.ca_bundle.map.count(), .{ .cb = &isolated.ca_bundle });
-                var entries = self.client.ca_bundle.map.iterator();
-                while (entries.next()) |entry| {
-                    isolated.ca_bundle.map.putAssumeCapacityContext(entry.key_ptr.*, entry.value_ptr.*, .{ .cb = &isolated.ca_bundle });
-                }
-            }
-        }
         var scoped = self.*;
         scoped.client = &isolated;
         return scoped.sendRetried(arena, input, &timed);

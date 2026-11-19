@@ -147,14 +147,23 @@ pub const Gemini = struct {
         sink: StreamSink,
         assembler: ?*lm_mod.OpenAI.OpenAIStream,
     ) Error!StreamOutcome {
+        const extensions = if (fields.config.extensions) |value|
+            value.toValue(arena) catch |err| return codecError(err)
+        else
+            Value.null;
         var records: std.ArrayList(sdk.Adaptation) = .empty;
-        const body = try requestBody(arena, fields, mode, self.adaptations, &records);
         var state: GenerateStream = .{
             .model = fields.model,
-            .adaptations = records.items,
+            .adaptations = &.{},
             .sink = sink,
             .assembler = assembler,
         };
+        if (usesLive(fields.model, extensions)) {
+            self.runLive(arena, fields, extensions, &state) catch |err| return codecError(err);
+            return state.outcome;
+        }
+        const body = try requestBody(arena, fields, mode, self.adaptations, &records);
+        state.adaptations = records.items;
         var consumer: http.ResponseConsumer = .{
             .context = &state,
             .consume = GenerateStream.consume,
@@ -162,6 +171,59 @@ pub const Gemini = struct {
         const reply = try self.send(arena, fields.model, body, &consumer);
         defer self.client.allocator.free(reply.body);
         return state.outcome;
+    }
+
+    fn runLive(
+        self: *const Gemini,
+        arena: Allocator,
+        fields: *const sdk.RequestFields,
+        extensions: Value,
+        state: *GenerateStream,
+    ) !void {
+        if (self.header_provider != null) return error.LMFailure;
+        const uri = try liveEndpoint(arena, self.base_url, self.api_key);
+        const payloads = try liveTextPayloads(arena, fields, extensions);
+        var timed: @import("timed_io.zig") = .{
+            .inner = self.client.io,
+            .timeout_ns = self.timeout_ns orelse 600 * std.time.ns_per_s,
+            .connect_timeout_ns = self.connect_timeout_ns orelse self.timeout_ns orelse
+                5 * std.time.ns_per_s,
+        };
+        var client = try http.isolatedClient(self.client, timed.io());
+        defer client.deinit();
+        var socket = try @import("websocket.zig").open(&client, uri);
+        defer socket.deinit();
+        try socket.sendText(payloads[0]);
+
+        var buffer: std.ArrayList(u8) = .empty;
+        defer buffer.deinit(client.allocator);
+        var scratch: std.heap.ArenaAllocator = .init(client.allocator);
+        defer scratch.deinit();
+        var remaining = self.max_response_bytes;
+        for (0..8192) |_| {
+            const value = try receiveLive(&socket, &scratch, &buffer, &remaining);
+            if (value != .object) continue;
+            if (value.object.contains("setupComplete")) break;
+            if (value.object.contains("error")) return error.LMFailure;
+        } else return error.LMFailure;
+
+        try socket.sendText(payloads[1]);
+        try state.start();
+        const usage_allocator = if (state.assembler == null) client.allocator else arena;
+        var usage: sdk.Usage = .{};
+        defer if (state.assembler == null) usage.free(usage_allocator);
+        for (0..8192) |_| {
+            if (state.outcome == .stopped) return;
+            const value = try receiveLive(&socket, &scratch, &buffer, &remaining);
+            if (value != .object) continue;
+            if (try dispatchLive(scratch.allocator(), usage_allocator, state, value, &usage)) {
+                if (state.outcome != .stopped) socket.finish() catch {
+                    // The terminal event already committed the completed turn.
+                };
+                return;
+            }
+        }
+        return error.LMFailure;
     }
 
     fn send(
@@ -201,6 +263,179 @@ pub const Gemini = struct {
         }) catch |err| return codecError(err);
     }
 };
+
+fn usesLive(model: []const u8, extensions: Value) bool {
+    const transport = text(get(extensions, "transport"));
+    for ([_][]const u8{ "live", "websocket", "ws" }) |name| {
+        if (std.ascii.eqlIgnoreCase(transport, name)) return true;
+    }
+    return hasPhrase(model, "-live") or
+        (model.len >= 4 and std.ascii.eqlIgnoreCase(model[model.len - 4 ..], "live"));
+}
+
+fn liveEndpoint(arena: Allocator, base_url: []const u8, key: ?[]const u8) !std.Uri {
+    var uri = try std.Uri.parse(base_url);
+    if (!contains(&.{ "http", "https" }, uri.scheme)) return error.LMFailure;
+    if (uri.user != null or uri.password != null) return error.LMFailure;
+    uri.fragment = null;
+    uri.path = .{ .percent_encoded = "/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent" };
+    uri.query = null;
+    if (key) |bytes| {
+        if (bytes.len == 0) return error.LMFailure;
+        var query: std.Io.Writer.Allocating = .init(arena);
+        errdefer query.deinit();
+        try query.writer.writeAll("key=");
+        const hex = "0123456789ABCDEF";
+        for (bytes) |byte| {
+            if (std.ascii.isAlphanumeric(byte) or std.mem.indexOfScalar(u8, "-._~", byte) != null) {
+                try query.writer.writeByte(byte);
+            } else if (byte == ' ') {
+                try query.writer.writeByte('+');
+            } else {
+                try query.writer.writeAll(&.{ '%', hex[byte >> 4], hex[byte & 15] });
+            }
+        }
+        uri.query = .{ .percent_encoded = try query.toOwnedSlice() };
+    }
+    return uri;
+}
+
+fn liveTextPayloads(
+    arena: Allocator,
+    fields: *const sdk.RequestFields,
+    extensions: Value,
+) ![2][]const u8 {
+    if (hasPhrase(fields.model, "live-preview") or hasPhrase(fields.model, "native-audio")) {
+        return error.LMFailure;
+    }
+    if (fields.tools.len != 0 or fields.messages.len != 1) return error.LMFailure;
+    if (extensions != .object and extensions != .null) return error.LMFailure;
+    if (text(get(extensions, "output")).len != 0) return error.LMFailure;
+    const message = fields.messages[0];
+    if (message.role != .user) return error.LMFailure;
+    for (message.parts) |part| if (part != .text) return error.LMFailure;
+
+    var setup: Object = .empty;
+    const model = fields.model;
+    try setup.put(arena, "model", str(if (std.mem.startsWith(u8, model, "models/"))
+        model
+    else
+        try std.fmt.allocPrint(arena, "models/{s}", .{model})));
+    if (fields.system) |system| {
+        const bytes = switch (system) {
+            .text => |value| value,
+            .parts => |parts| try content.partsText(arena, parts, null),
+        };
+        if (bytes.len != 0) {
+            const parts = try singleton(arena, try textPart(arena, bytes));
+            try setup.put(arena, "systemInstruction", try liveField(arena, "parts", parts));
+        }
+    }
+    if (extensions == .object) {
+        var entries = extensions.object.iterator();
+        while (entries.next()) |entry| {
+            if (contains(&.{ "transport", "prompt_caching", "output" }, entry.key_ptr.*)) continue;
+            try setup.put(arena, entry.key_ptr.*, entry.value_ptr.*);
+        }
+    }
+    const generation = try setup.getOrPut(arena, "generationConfig");
+    if (!generation.found_existing) generation.value_ptr.* = .{ .object = .empty };
+    if (generation.value_ptr.* != .object) return error.LMFailure;
+    const existing_modalities = generation.value_ptr.object.get("responseModalities");
+    if (existing_modalities) |modalities| {
+        const items = elems(modalities);
+        if (items.len != 1 or !std.mem.eql(u8, text(items[0]), "TEXT")) return error.LMFailure;
+    } else {
+        var generation_copy = try generation.value_ptr.object.clone(arena);
+        try generation_copy.put(arena, "responseModalities", try singleton(arena, str("TEXT")));
+        generation.value_ptr.* = .{ .object = generation_copy };
+    }
+    const question = try content.partsText(arena, message.parts, null);
+    return .{
+        try liveJson(arena, try liveField(arena, "setup", .{ .object = setup })),
+        try liveJson(arena, try liveField(arena, "realtimeInput", try textPart(arena, question))),
+    };
+}
+
+fn liveField(arena: Allocator, name: []const u8, value: Value) !Value {
+    var object: Object = .empty;
+    try object.put(arena, name, value);
+    return .{ .object = object };
+}
+
+fn liveJson(arena: Allocator, value: Value) ![]const u8 {
+    var output: std.Io.Writer.Allocating = .init(arena);
+    errdefer output.deinit();
+    try @import("pyjson.zig").writeJson(&output.writer, value, .minified);
+    return output.toOwnedSlice();
+}
+
+fn receiveLive(
+    socket: *@import("websocket.zig"),
+    scratch: *std.heap.ArenaAllocator,
+    buffer: *std.ArrayList(u8),
+    remaining: *usize,
+) !Value {
+    _ = scratch.reset(.retain_capacity);
+    const bytes = try socket.receive(scratch.child_allocator, buffer, remaining.*);
+    remaining.* -= bytes.len;
+    return @import("json_repair.zig").parseJson(scratch.allocator(), bytes) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return .null;
+    };
+}
+
+fn dispatchLive(
+    scratch: Allocator,
+    usage_allocator: Allocator,
+    state: *GenerateStream,
+    value: Value,
+    usage: *sdk.Usage,
+) !bool {
+    if (value.object.get("error")) |detail| {
+        try state.emit(.{ .provider_error = try streamError(scratch, detail) });
+        return true;
+    }
+    const server = get(value, "serverContent");
+    const top_usage = get(value, "usageMetadata");
+    const counts = if (top_usage == .object) top_usage else get(server, "usageMetadata");
+    if (counts == .object and counts.object.count() != 0) {
+        var live_counts = counts;
+        if (counts.object.get("responseTokenCount")) |output| {
+            live_counts = .{ .object = try counts.object.clone(scratch) };
+            try live_counts.object.put(scratch, "candidatesTokenCount", output);
+        }
+        const parsed = try readUsage(scratch, live_counts);
+        const replacement = try parsed.clone(usage_allocator);
+        usage.free(usage_allocator);
+        usage.* = replacement;
+    }
+    for (elems(get(get(server, "modelTurn"), "parts")), 0..) |part, index| {
+        if (part != .object or !part.object.contains("text")) return error.LMFailure;
+        const bytes = (try truthyText(scratch, get(part, "text"))) orelse "";
+        const retained = if (state.assembler != null) try usage_allocator.dupe(u8, bytes) else bytes;
+        var key_buffer: [24]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buffer, "{d}", .{index}) catch unreachable;
+        try state.emit(.{ .delta = .{
+            .part_index = key,
+            .data = .{ .text = .{ .text = retained } },
+        } });
+        if (state.outcome == .stopped) return true;
+    }
+    if (try truthyText(scratch, get(get(server, "outputTranscription"), "text"))) |bytes| {
+        const retained = if (state.assembler != null) try usage_allocator.dupe(u8, bytes) else bytes;
+        try state.emit(.{ .delta = .{ .part_index = null, .data = .{ .text = .{ .text = retained } } } });
+        if (state.outcome == .stopped) return true;
+    }
+    const complete = get(server, "turnComplete");
+    if (!(lm_mod.OpenAI.responseTruthy(complete) catch |err| return codecError(err))) return false;
+    try state.emit(.{ .end = .{
+        .finish_reason = .stop,
+        .usage = usage.*,
+        .provider_data = null,
+    } });
+    return true;
+}
 
 fn endpoint(arena: Allocator, base_url: []const u8, model: []const u8, stream: bool) Error![]const u8 {
     // Match urllib.quote(safe="/:@") on the model, not on the configured origin.

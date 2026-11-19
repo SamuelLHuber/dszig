@@ -3804,7 +3804,10 @@ The following prevent a claim that DSZig can do everything DSPy can:
   errors preserve Gemini diagnostics and distinguish model and context-length
   failures from generic provider errors. Typed Gemini
   streaming supports `AsyncProgram` field listeners, final predictions, and
-  cancellation. Gemini Live WebSockets, Vertex AI, local path reads, and file
+  cancellation. Canonical streaming also supports a Gemini Live WebSocket text
+  turn with one user message (`config.extensions.transport = "live"`), using
+  the configured Gemini API key. Multi-turn Live sessions, Live audio/video
+  input, Live tools, Vertex AI, local path reads, and file
   uploads are not supported.
   Native File construction, adapter/typed prediction
   handling, File tool-result markers and bounded Responses document translation
