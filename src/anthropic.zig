@@ -10,6 +10,7 @@ const Error = lm_mod.Error;
 const Value = runtime.Value;
 const Object = runtime.ObjectMap;
 const ThinkingReplay = enum { signed, unsigned };
+const ToolResultMedia = enum { native, images, reject };
 fn str(bytes: []const u8) Value {
     return .{ .string = bytes };
 }
@@ -41,6 +42,7 @@ pub const Anthropic = struct {
     cache_control: enum { anthropic, none } = .anthropic,
     thinking_format: enum { anthropic, deepseek, adaptive, effort } = .anthropic,
     thinking_replay: ThinkingReplay = .signed,
+    tool_result_media: ToolResultMedia = .native,
     /// Borrowed endpoint effort levels, in their declared order for diagnostics.
     reasoning_efforts: ?[]const sdk.ReasoningEffort = null,
     supports_reasoning: bool = false,
@@ -281,7 +283,10 @@ pub const Anthropic = struct {
         }
         const config = &fields.config;
         var body: Object = .empty;
-        var messages = try encodeMessages(arena, fields.messages, self.thinking_replay);
+        var messages = try encodeMessages(arena, fields.messages, .{
+            .replay = self.thinking_replay,
+            .tool_result_media = self.tool_result_media,
+        });
         const system_text: ?[]const u8 = if (fields.system) |system| switch (system) {
             .text => |value| if (value.len != 0) value else null,
             .parts => |parts| if (parts.len != 0)
@@ -913,7 +918,12 @@ fn adaptiveModel(model: []const u8) bool {
     return false;
 }
 
-fn encodeMessages(arena: Allocator, messages: []const sdk.Message, replay: ThinkingReplay) Error!Value {
+const MessagePolicy = struct {
+    replay: ThinkingReplay = .signed,
+    tool_result_media: ToolResultMedia = .native,
+};
+
+fn encodeMessages(arena: Allocator, messages: []const sdk.Message, policy: MessagePolicy) Error!Value {
     var rows: runtime.Array = .init(arena);
     for (messages) |message| {
         var blocks: runtime.Array = .init(arena);
@@ -921,7 +931,7 @@ fn encodeMessages(arena: Allocator, messages: []const sdk.Message, replay: Think
             const rendered = try content_codec.partsText(arena, message.parts, "[developer]");
             try blocks.append(try textBlock(arena, rendered));
         } else {
-            for (message.parts) |part| try blocks.append(try encodeBlock(arena, part, replay));
+            for (message.parts) |part| try blocks.append(try encodeBlock(arena, part, policy));
         }
         var row: Object = .empty;
         try row.put(arena, "role", str(if (message.role == .assistant) "assistant" else "user"));
@@ -931,14 +941,14 @@ fn encodeMessages(arena: Allocator, messages: []const sdk.Message, replay: Think
     return .{ .array = rows };
 }
 
-fn encodeBlock(arena: Allocator, part: sdk.Part, replay: ThinkingReplay) Error!Value {
+fn encodeBlock(arena: Allocator, part: sdk.Part, policy: MessagePolicy) Error!Value {
     var block: Object = .empty;
     switch (part) {
         .text => |item| return textBlock(arena, item.text),
         .data => |item| return textBlock(arena, try content_codec.dataText(arena, item.value)),
         .image => |item| return encodeMedia(arena, "image", &item),
         .document => |item| return encodeMedia(arena, "document", &item),
-        .thinking => |item| return encodeThinking(arena, &item, replay),
+        .thinking => |item| return encodeThinking(arena, &item, policy.replay),
         .tool_call => |item| {
             try block.put(arena, "type", str("tool_use"));
             try block.put(arena, "id", str(item.id));
@@ -960,8 +970,14 @@ fn encodeBlock(arena: Allocator, part: sdk.Part, replay: ThinkingReplay) Error!V
                     const content = switch (child) {
                         .text => |text_part| try textBlock(arena, text_part.text),
                         .data => |data| try textBlock(arena, try content_codec.dataText(arena, data.value)),
-                        .image => |media| try encodeMedia(arena, "image", &media),
-                        .document => |media| try encodeMedia(arena, "document", &media),
+                        .image => |media| if (policy.tool_result_media != .reject)
+                            try encodeMedia(arena, "image", &media)
+                        else
+                            return error.LMFailure,
+                        .document => |media| if (policy.tool_result_media == .native)
+                            try encodeMedia(arena, "document", &media)
+                        else
+                            return error.LMFailure,
                         else => return error.LMFailure,
                     };
                     blocks.appendAssumeCapacity(content);
@@ -1309,10 +1325,10 @@ test "Anthropic reasoning replays signed and redacted blocks without showing eit
     try std.testing.expectEqualStrings("Paris", result.text.?);
     try std.testing.expectEqualStrings("private summary", result.reasoning.?);
     const message = result.message.?;
-    const signed = try encodeBlock(arena, message.parts[0], .signed);
+    const signed = try encodeBlock(arena, message.parts[0], .{});
     try std.testing.expectEqualStrings("thinking", text(get(signed, "type")));
     try std.testing.expectEqualStrings("opaque", text(get(signed, "signature")));
-    const hidden = try encodeBlock(arena, message.parts[1], .signed);
+    const hidden = try encodeBlock(arena, message.parts[1], .{});
     try std.testing.expectEqualStrings("redacted_thinking", text(get(hidden, "type")));
     try std.testing.expectEqualStrings("hidden", text(get(hidden, "data")));
 }
@@ -1561,7 +1577,7 @@ test "Anthropic sends a single data tool result as compact JSON text" {
     const parsed = try @import("json_repair.zig").parseJson(arena, raw);
     const part = try sdk.Part.fromValue(arena, parsed);
     defer part.free(arena);
-    const wire = try encodeBlock(arena, part, .signed);
+    const wire = try encodeBlock(arena, part, .{});
     try std.testing.expectEqualStrings(
         "{\"city\":\"Zürich\",\"count\":9007199254740993}",
         text(get(wire, "content")),

@@ -3753,7 +3753,10 @@ The following prevent a claim that DSZig can do everything DSPy can:
   Canonical assistant
   messages preserve signed and redacted thinking for subsequent requests.
   The Messages implementation has been compared against DSPy over loopback,
-  not against a hosted Claude model. `Anthropic.streamRequest` emits
+  not against a hosted Claude model. `tool_result_media = .images` admits
+  images but not documents in tool results; `.reject` admits neither.
+  Both policies fail before HTTP for unsupported attachments, without
+  changing normal user-message media. `Anthropic.streamRequest` emits
   callback-borrowed canonical SSE events with early cancellation, including
   tool fragments and reasoning continuation. Use `Anthropic.lm()` with the
   regular program streaming APIs to route typed fields and get a final
