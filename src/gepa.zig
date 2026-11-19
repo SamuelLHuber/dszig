@@ -1463,21 +1463,33 @@ pub const GEPA = struct {
                     return ids;
                 }
                 const mb = e.gepa.reflection_minibatch_size orelse 3;
+                assert(mb > 0);
+                // Padding makes each epoch a whole number of batches. Work
+                // in batch units until slicing, so an iteration need not fit
+                // in a usize after multiplication by the minibatch size.
+                const previous_batches = e.shuffled.items.len / mb;
+                const curr_epoch = if (previous_batches == 0) 0 else e.i / previous_batches;
+                if (e.epoch == null or curr_epoch > e.epoch.?) {
+                    try e.reshuffle();
+                    e.epoch = curr_epoch;
+                }
+                assert(e.shuffled.items.len >= mb and e.shuffled.items.len % mb == 0);
+                const batches = e.shuffled.items.len / mb;
                 if (e.sampler_iteration == e.i) {
-                    e.calls_in_iteration += 1;
+                    assert(e.calls_in_iteration < batches);
+                    e.calls_in_iteration = if (e.calls_in_iteration == batches - 1) 0 else e.calls_in_iteration + 1;
                 } else {
                     e.sampler_iteration = e.i;
                     e.calls_in_iteration = 0;
                 }
-                var base = e.i * mb;
-                const curr_epoch: usize = if (e.epoch == null) 0 else base / @max(e.shuffled.items.len, 1);
-                if (e.shuffled.items.len == 0 or e.epoch == null or curr_epoch > e.epoch.?) {
-                    e.epoch = curr_epoch;
-                    try e.reshuffle();
-                }
-                base = (base + e.calls_in_iteration * mb) % e.shuffled.items.len;
-                const end = @min(base + mb, e.shuffled.items.len);
-                return e.shuffled.items[base..end];
+                const base = e.i % batches;
+                const remaining = batches - base;
+                const batch = if (e.calls_in_iteration < remaining)
+                    base + e.calls_in_iteration
+                else
+                    e.calls_in_iteration - remaining;
+                const offset = batch * mb;
+                return e.shuffled.items[offset..][0..mb];
             }
 
             fn reshuffle(e: *Self) Allocator.Error!void {
@@ -2972,6 +2984,46 @@ test "GEPA stops after seed evaluation before reflecting or calling later stoppe
     }, .{}, &.{example}, .{});
     try std.testing.expectEqual(@as(usize, 1), script.index);
     try std.testing.expectEqual(@as(usize, 1), result.total_metric_calls);
+}
+
+test "GEPA epoch sampler pads and rotates whole minibatches at full-width iteration indices" {
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const Metric = struct {
+        fn score(_: Allocator, _: *const Example, _: *const optimize.RecordPrediction, _: ?*const Trace, _: ?[]const u8, _: ?*const Trace.Step) value.ParseError!Feedback {
+            return .{ .score = 0 };
+        }
+    };
+    var script: @import("lm.zig").ScriptedLM = .{ .responses = &.{} };
+    const context: Context = .{ .arena = arena, .lm = script.lm() };
+    const example = try Example.fromJson(arena, "{\"question\":\"q\"}", &.{"question"});
+    const train: [5]Example = @splat(example);
+    const student: struct { placeholder: bool = false } = .{};
+    var engine: GEPA.Engine(@TypeOf(student)) = .{
+        .gepa = .{ .metric = Metric.score, .reflection_minibatch_size = 3 },
+        .out = arena,
+        .ctx = context,
+        .reflection = context,
+        .student = &student,
+        .names = &.{},
+        .trainset = &train,
+        .valset = &.{},
+        .rng = .init(0),
+        .adapter_rng = .init(0),
+        .front_score = &.{},
+        .fronts = &.{},
+    };
+    const end = std.math.maxInt(usize);
+    const iterations = [_]usize{ 0, 0, 1, 1, 1, 2, 3, 3, end, end };
+    const expected = [_][3]usize{
+        .{ 2, 1, 0 }, .{ 4, 3, 3 }, .{ 4, 3, 3 }, .{ 2, 1, 0 }, .{ 4, 3, 3 },
+        .{ 0, 2, 1 }, .{ 3, 4, 4 }, .{ 0, 2, 1 }, .{ 2, 3, 3 }, .{ 1, 0, 4 },
+    };
+    for (iterations, expected) |iteration, row| {
+        engine.i = iteration;
+        try std.testing.expectEqualSlices(usize, &row, try engine.nextMinibatch(0));
+    }
 }
 
 test "GEPA best outputs keep ties and replace an older frontier without extra evaluations" {
