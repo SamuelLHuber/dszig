@@ -1,4 +1,4 @@
-//! Gemini Developer API generateContent transport for text and structured text.
+//! Gemini Developer API and Vertex AI generateContent transport.
 const std = @import("std");
 const lm_mod = @import("lm.zig");
 const http = @import("http.zig");
@@ -24,8 +24,90 @@ pub const Gemini = struct {
     header_provider: ?http.HeaderProvider = null,
     adaptations: enum { note, silent, refuse } = .note,
     supports_reasoning: bool = false,
+    door: enum { developer, vertex, vertex_express } = .developer,
 
     pub const LiveSession = GeminiLiveSession;
+
+    pub const VertexOptions = struct {
+        project: []const u8,
+        location: []const u8 = "global",
+        model: []const u8,
+        credential: union(enum) {
+            api_key: []const u8,
+            oauth: http.HeaderProvider,
+        },
+        /// Trusted endpoint root, optionally with a gateway prefix.
+        endpoint: ?[]const u8 = null,
+    };
+
+    /// `arena` owns the base URL. The model and credential state are borrowed.
+    /// OAuth callers provide an Authorization header, refreshed per attempt.
+    pub fn initVertex(arena: Allocator, client: *std.http.Client, options: VertexOptions) Error!Gemini {
+        if (options.project.len == 0 or options.project.len > 256 or
+            std.mem.eql(u8, options.project, ".") or std.mem.eql(u8, options.project, ".."))
+            return error.LMFailure;
+        const location = options.location;
+        if (location.len == 0 or location.len > 63) return error.LMFailure;
+        for (location) |byte| {
+            if (!std.ascii.isAlphanumeric(byte) and byte != '-') return error.LMFailure;
+        }
+        var base: std.Io.Writer.Allocating = .init(arena);
+        errdefer base.deinit();
+        const out = &base.writer;
+        if (options.endpoint) |root| {
+            try writeVertexRoot(out, root);
+        } else if (std.mem.eql(u8, location, "global")) {
+            try vertexWrite(out, "https://aiplatform.googleapis.com");
+        } else if (contains(&.{ "us", "eu" }, location)) {
+            out.print("https://aiplatform.{s}.rep.googleapis.com", .{location}) catch
+                return error.OutOfMemory;
+        } else {
+            out.print("https://{s}-aiplatform.googleapis.com", .{location}) catch
+                return error.OutOfMemory;
+        }
+        try vertexWrite(out, "/v1/projects/");
+        writeEscaped(out, options.project, .segment) catch return error.OutOfMemory;
+        out.print("/locations/{s}/publishers/google", .{location}) catch return error.OutOfMemory;
+        return .{
+            .client = client,
+            .model = options.model,
+            .base_url = try base.toOwnedSlice(),
+            .door = .vertex,
+            .api_key = switch (options.credential) {
+                .api_key => |key| key,
+                .oauth => null,
+            },
+            .header_provider = switch (options.credential) {
+                .api_key => null,
+                .oauth => |provider| provider,
+            },
+        };
+    }
+
+    pub const VertexExpressOptions = struct {
+        model: []const u8,
+        api_key: []const u8,
+        endpoint: ?[]const u8 = null,
+    };
+
+    /// Express requires no project or location. The key is sent in the query.
+    pub fn initVertexExpress(
+        arena: Allocator,
+        client: *std.http.Client,
+        options: VertexExpressOptions,
+    ) Error!Gemini {
+        var base: std.Io.Writer.Allocating = .init(arena);
+        errdefer base.deinit();
+        try writeVertexRoot(&base.writer, options.endpoint orelse "https://aiplatform.googleapis.com");
+        try vertexWrite(&base.writer, "/v1/publishers/google");
+        return .{
+            .client = client,
+            .model = options.model,
+            .base_url = try base.toOwnedSlice(),
+            .door = .vertex_express,
+            .api_key = options.api_key,
+        };
+    }
 
     pub fn lm(self: *Gemini) lm_mod.LM {
         return .{
@@ -177,7 +259,7 @@ pub const Gemini = struct {
 
     /// Opens a persistent connection. Do not move `session` until closed.
     pub fn live(self: *const Gemini, session: *LiveSession, options: LiveSession.Options) !void {
-        if (self.header_provider != null) return error.LMFailure;
+        if (self.door != .developer or self.header_provider != null) return error.LMFailure;
         const allocator = self.client.allocator;
         session.* = .{
             .timed = self.liveTimeouts(),
@@ -217,7 +299,7 @@ pub const Gemini = struct {
         extensions: Value,
         state: *GenerateStream,
     ) !void {
-        if (self.header_provider != null) return error.LMFailure;
+        if (self.door != .developer or self.header_provider != null) return error.LMFailure;
         const uri = try liveEndpoint(arena, self.base_url, self.api_key);
         const payloads = try livePayloads(arena, fields, extensions);
         var timed = self.liveTimeouts();
@@ -261,14 +343,20 @@ pub const Gemini = struct {
         body: []const u8,
         consumer: ?*http.ResponseConsumer,
     ) Error!http.Response {
-        const url = try endpoint(arena, self.base_url, model, consumer != null);
         var headers: [1]std.http.Header = undefined;
         var headers_len: usize = 0;
+        const express_key = if (self.door == .vertex_express)
+            self.api_key orelse return error.LMFailure
+        else
+            null;
         if (self.api_key) |key| {
             if (key.len == 0 or std.mem.indexOfAny(u8, key, "\r\n") != null) return error.LMFailure;
-            headers[0] = .{ .name = "x-goog-api-key", .value = key };
-            headers_len = 1;
+            if (express_key == null) {
+                headers[0] = .{ .name = "x-goog-api-key", .value = key };
+                headers_len = 1;
+            }
         }
+        const url = try endpoint(arena, self.base_url, model, consumer != null, express_key);
         const transport: http.Transport = .{
             .client = self.client,
             .max_response_bytes = self.max_response_bytes,
@@ -292,6 +380,35 @@ pub const Gemini = struct {
     }
 };
 
+fn vertexWrite(out: *std.Io.Writer, value: []const u8) Error!void {
+    out.writeAll(value) catch return error.OutOfMemory;
+}
+
+fn writeVertexRoot(out: *std.Io.Writer, root: []const u8) Error!void {
+    const uri = std.Uri.parse(root) catch return error.LMFailure;
+    if (!contains(&.{ "http", "https" }, uri.scheme)) return error.LMFailure;
+    if (uri.host == null or uri.user != null or uri.password != null or
+        uri.query != null or uri.fragment != null) return error.LMFailure;
+    try vertexWrite(out, std.mem.trimEnd(u8, root, "/"));
+}
+
+const Escape = enum { segment, form, model };
+
+fn writeEscaped(out: *std.Io.Writer, bytes: []const u8, mode: Escape) std.Io.Writer.Error!void {
+    const hex = "0123456789ABCDEF";
+    for (bytes) |byte| {
+        if (std.ascii.isAlphanumeric(byte) or std.mem.indexOfScalar(u8, "-._~", byte) != null or
+            (mode == .model and std.mem.indexOfScalar(u8, "/:@", byte) != null))
+        {
+            try out.writeByte(byte);
+        } else if (mode == .form and byte == ' ') {
+            try out.writeByte('+');
+        } else {
+            try out.writeAll(&.{ '%', hex[byte >> 4], hex[byte & 15] });
+        }
+    }
+}
+
 fn usesLive(model: []const u8, extensions: Value) bool {
     const transport = text(get(extensions, "transport"));
     for ([_][]const u8{ "live", "websocket", "ws" }) |name| {
@@ -313,16 +430,7 @@ fn liveEndpoint(arena: Allocator, base_url: []const u8, key: ?[]const u8) !std.U
         var query: std.Io.Writer.Allocating = .init(arena);
         errdefer query.deinit();
         try query.writer.writeAll("key=");
-        const hex = "0123456789ABCDEF";
-        for (bytes) |byte| {
-            if (std.ascii.isAlphanumeric(byte) or std.mem.indexOfScalar(u8, "-._~", byte) != null) {
-                try query.writer.writeByte(byte);
-            } else if (byte == ' ') {
-                try query.writer.writeByte('+');
-            } else {
-                try query.writer.writeAll(&.{ '%', hex[byte >> 4], hex[byte & 15] });
-            }
-        }
+        try writeEscaped(&query.writer, bytes, .form);
         uri.query = .{ .percent_encoded = try query.toOwnedSlice() };
     }
     return uri;
@@ -911,24 +1019,61 @@ fn decodeLivePart(
     return if (audio) .{ .audio = media } else .{ .image = media };
 }
 
-fn endpoint(arena: Allocator, base_url: []const u8, model: []const u8, stream: bool) Error![]const u8 {
+fn endpoint(
+    arena: Allocator,
+    base_url: []const u8,
+    model: []const u8,
+    stream: bool,
+    query_key: ?[]const u8,
+) Error![]const u8 {
     // Match urllib.quote(safe="/:@") on the model, not on the configured origin.
     var writer: std.Io.Writer.Allocating = .init(arena);
     const out = &writer.writer;
     out.writeAll(std.mem.trimEnd(u8, base_url, "/")) catch return error.OutOfMemory;
     out.writeByte('/') catch return error.OutOfMemory;
     if (!std.mem.startsWith(u8, model, "models/")) out.writeAll("models/") catch return error.OutOfMemory;
-    const hex = "0123456789ABCDEF";
-    for (model) |byte| {
-        if (std.ascii.isAlphanumeric(byte) or std.mem.indexOfScalar(u8, "-._~/:@", byte) != null) {
-            out.writeByte(byte) catch return error.OutOfMemory;
-        } else {
-            out.writeAll(&.{ '%', hex[byte >> 4], hex[byte & 15] }) catch return error.OutOfMemory;
-        }
+    writeEscaped(out, model, .model) catch return error.OutOfMemory;
+    try vertexWrite(out, if (stream) ":streamGenerateContent?alt=sse" else ":generateContent");
+    if (query_key) |key| {
+        try vertexWrite(out, if (stream) "&key=" else "?key=");
+        writeEscaped(out, key, .form) catch return error.OutOfMemory;
     }
-    out.writeAll(if (stream) ":streamGenerateContent?alt=sse" else ":generateContent") catch
-        return error.OutOfMemory;
     return writer.written();
+}
+
+test "Vertex chooses the residency host and isolates Express query credentials" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var client: std.http.Client = .{ .allocator = std.testing.allocator, .io = std.testing.io };
+    defer client.deinit();
+    const options: Gemini.VertexOptions = .{
+        .project = "billing:project",
+        .location = "eu",
+        .model = "gemini-2.5-flash",
+        .credential = .{ .api_key = "fixture" },
+    };
+    const provider = try Gemini.initVertex(arena, &client, options);
+    try std.testing.expectEqualStrings(
+        "https://aiplatform.eu.rep.googleapis.com/v1/projects/billing%3Aproject/locations/eu/publishers/google",
+        provider.base_url,
+    );
+    var invalid = options;
+    invalid.location = "eu/path";
+    try std.testing.expectError(error.LMFailure, Gemini.initVertex(arena, &client, invalid));
+    invalid = options;
+    invalid.endpoint = "https://example.invalid?credential=";
+    try std.testing.expectError(error.LMFailure, Gemini.initVertex(arena, &client, invalid));
+
+    const express = try Gemini.initVertexExpress(arena, &client, .{
+        .model = "models/gemini-2.5-flash",
+        .api_key = "fixture +/&",
+    });
+    const url = try endpoint(arena, express.base_url, express.model, true, express.api_key);
+    try std.testing.expectEqualStrings(
+        "https://aiplatform.googleapis.com/v1/publishers/google/models/gemini-2.5-flash:streamGenerateContent?alt=sse&key=fixture+%2B%2F%26",
+        url,
+    );
 }
 
 const GenerateStream = struct {

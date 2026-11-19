@@ -3789,7 +3789,16 @@ The following prevent a claim that DSZig can do everything DSPy can:
   `Gemini.lm()` and `Gemini.completeRequest` support nonstreaming text,
   JSON/schema-constrained generation, and function calls with text results
   on the Gemini Developer API, with `x-goog-api-key` authentication and
-  canonical token accounting. Gemini converts judgment branches to enum
+  canonical token accounting. `Gemini.initVertex` also supports project-scoped
+  Vertex AI generation and SSE. Pass `.project`, `.model`, and either an API
+  key or an OAuth header provider; `.location` defaults to `global`. The OAuth
+  callback supplies `Authorization: Bearer …` on each attempt. Use
+  `Gemini.initVertexExpress` for projectless, query-key authentication.
+  Both constructors accept a trusted endpoint root or gateway prefix.
+  Use HTTPS outside local tests, and redact Express query strings in proxy
+  logs. Native credential discovery and hosted Vertex authentication have
+  not been verified.
+  Gemini converts judgment branches to enum
   constraints and folds labels into the schema description. A buffered answer
   with one JSON-object text part becomes a canonical data part. Gemini
   returns the pick, not a distribution over judgment keys: `if_available`
@@ -3824,7 +3833,7 @@ The following prevent a claim that DSZig can do everything DSPy can:
   for text, turns, inline base64 audio/image, and function results. Use `send`
   and `recv` serially, keep the session at a stable address, and call `close`
   when finished. Received events borrow storage until the next `recv` or
-  `close`. Vertex AI, local path reads, and file uploads are not supported.
+  `close`. Vertex Live, local path reads, and file uploads are not supported.
   Native File construction, adapter/typed prediction
   handling, File tool-result markers and bounded Responses document translation
   are implemented as described above. There is still no complete lm15 provider
