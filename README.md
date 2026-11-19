@@ -4001,6 +4001,14 @@ The following prevent a claim that DSZig can do everything DSPy can:
   complete iterations. Native callbacks see a borrowed, read-only state and
   run in caller order until one returns true, before the metric-budget check.
   They do not interrupt an in-flight evaluation or replace the metric budget.
+  Set `GEPA.validation_output_dir = .{ .io = io, .path = path }` to save
+  successful seed validation predictions under
+  `generated_best_outputs_valset/task_<row>/iter_0_prog_0.json`.
+  With `track_best_outputs`, later strict per-row improvements also save
+  predictions with their iteration and candidate number. Ties remain in
+  memory without writing new files. Writes are atomic and do not add model
+  calls; use a dedicated trusted directory for each run. This covers
+  validation artifacts, not DSPy `log_dir` checkpoint resume or pickle files.
   `proposal_options` configures the built-in reflection proposer: override its
   base instructions, supply additional guidance, select an adapter, or limit
   an instruction by Unicode character count. An oversized draft gets one

@@ -8,7 +8,7 @@
 //! Python's `random.Random(seed)` is ported (one stream for the engine, one
 //! for the DSPy adapter), so the same LM answers give the same program.
 //!
-//! Not supported: `dspy.Flex` code components or `log_dir`.
+//! Not supported: `dspy.Flex` code components or checkpoint resume.
 //! DSPy `num_threads` maps to
 //! `rollouts`: each minibatch/valset evaluation then runs on a native pool,
 //! results in example order. CPython iterates small-int sets in ascending
@@ -307,6 +307,9 @@ pub const GEPA = struct {
     seed: u32 = 0,
     /// Retain the predictions attaining the best score for each validation row.
     track_best_outputs: bool = false,
+    /// Save validation predictions under a dedicated, caller-trusted directory.
+    /// This is the output artifact portion of DSPy's log_dir, not a checkpoint.
+    validation_output_dir: ?ValidationOutputDir = null,
     /// Warn once per compile if predictor and program scores disagree.
     warn_on_score_mismatch: bool = true,
     /// DSPy `num_threads`: a `parallel.Parallel(GEPA.Run, limits).runner()`
@@ -314,6 +317,37 @@ pub const GEPA = struct {
     /// `out`, which retains predictions and traces, must then be thread-safe
     /// (an ArenaAllocator over a thread-safe child is). null runs serially.
     rollouts: ?Rollouts = null,
+
+    pub const ValidationOutputDir = struct {
+        io: std.Io,
+        path: []const u8,
+
+        fn save(
+            dir: ValidationOutputDir,
+            row: usize,
+            iteration: usize,
+            candidate: usize,
+            prediction: optimize.RecordPrediction,
+        ) !void {
+            const sep = std.fs.path.sep_str;
+            var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const path = std.fmt.bufPrint(
+                &path_buffer,
+                "{s}" ++ sep ++ "generated_best_outputs_valset" ++ sep ++ "task_{d}" ++ sep ++ "iter_{d}_prog_{d}.json",
+                .{ if (dir.path.len == 0) "." else dir.path, row, iteration, candidate },
+            ) catch return error.NameTooLong;
+            var destination = try std.Io.Dir.cwd().createFileAtomic(dir.io, path, .{
+                .make_path = true,
+                .replace = true,
+            });
+            defer destination.deinit(dir.io);
+            var buffer: [4096]u8 = undefined;
+            var writer = destination.file.writer(dir.io, &buffer);
+            try std.json.Stringify.value(Value{ .object = prediction.fields().* }, .{ .whitespace = .indent_4 }, &writer.interface);
+            try writer.flush();
+            try destination.replace(dir.io);
+        }
+    };
 
     pub const Rollouts = parallel.Rollouts(Run);
 
@@ -1185,6 +1219,15 @@ pub const GEPA = struct {
                 for (runs, ids) |run, k| {
                     const first = e.fronts[k].items.len == 0;
                     const improves = first or run.score > e.front_score[k];
+                    if (e.gepa.validation_output_dir) |dir| {
+                        const incumbent = if (first) -std.math.inf(f64) else e.front_score[k];
+                        if (idx == 0 or (e.gepa.track_best_outputs and run.score > incumbent)) {
+                            if (run.prediction) |prediction| {
+                                const iteration = if (idx == 0) 0 else try std.math.add(usize, e.i, 1);
+                                try dir.save(k, iteration, idx, prediction);
+                            }
+                        }
+                    }
                     if (first and sparse) try e.val_front_order.append(e.out, k);
                     if (!improves and run.score != e.front_score[k]) continue;
                     if (improves) {
@@ -2935,6 +2978,9 @@ test "GEPA best outputs keep ties and replace an older frontier without extra ev
     var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer memory.deinit();
     const arena = memory.allocator();
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const output_path = try temporary.dir.realPathFileAlloc(std.testing.io, ".", arena);
     const P = predict.Predict(signature.Signature(struct {
         pub const Input = struct { question: []const u8 };
         pub const Output = struct { answer: []const u8 };
@@ -2959,7 +3005,11 @@ test "GEPA best outputs keep ties and replace an older frontier without extra ev
     var fronts: [2]std.ArrayList(usize) = @splat(.empty);
     var outputs: [2]std.ArrayList(GEPA.BestOutput) = @splat(.empty);
     var engine: GEPA.Engine(P) = .{
-        .gepa = .{ .metric = Metric.score, .track_best_outputs = true },
+        .gepa = .{
+            .metric = Metric.score,
+            .track_best_outputs = true,
+            .validation_output_dir = .{ .io = std.testing.io, .path = output_path },
+        },
         .out = arena,
         .ctx = ctx,
         .reflection = ctx,
@@ -2976,6 +3026,7 @@ test "GEPA best outputs keep ties and replace an older frontier without extra ev
     };
     try engine.addProgram(&.{"first"}, &.{null});
     try engine.addProgram(&.{"second"}, &.{0});
+    engine.i = 1;
     try engine.addProgram(&.{"third"}, &.{1});
     const expected = [_][]const usize{ &.{ 1, 2 }, &.{ 0, 1 } };
     const answers = [_][]const []const u8{ &.{ "high1", "high2" }, &.{ "high0", "high1" } };
@@ -2988,6 +3039,22 @@ test "GEPA best outputs keep ties and replace an older frontier without extra ev
         }
     }
     try std.testing.expectEqual(@as(usize, 6), script.index);
+
+    const Artifact = struct { path: []const u8, answer: []const u8 };
+    for ([_]Artifact{
+        .{ .path = "task_0/iter_0_prog_0.json", .answer = "low0" },
+        .{ .path = "task_1/iter_0_prog_0.json", .answer = "high0" },
+        .{ .path = "task_0/iter_1_prog_1.json", .answer = "high1" },
+    }) |artifact| {
+        const path = try std.fs.path.join(arena, &.{ "generated_best_outputs_valset", artifact.path });
+        const bytes = try temporary.dir.readFileAlloc(std.testing.io, path, arena, .limited(4096));
+        const parsed = try std.json.parseFromSliceLeaky(struct { answer: []const u8 }, arena, bytes, .{});
+        try std.testing.expectEqualStrings(artifact.answer, parsed.answer);
+    }
+    for ([_][]const u8{ "task_1/iter_1_prog_1.json", "task_0/iter_2_prog_2.json", "task_1/iter_2_prog_2.json" }) |name| {
+        const path = try std.fs.path.join(arena, &.{ "generated_best_outputs_valset", name });
+        try std.testing.expectError(error.FileNotFound, temporary.dir.access(std.testing.io, path, .{}));
+    }
 }
 
 test "GEPA custom dataset separates History and stringifies ordinary values" {
