@@ -4033,6 +4033,14 @@ The following prevent a claim that DSZig can do everything DSPy can:
   logging mode from a batch that covered the whole validation set. Tracking
   makes no extra evaluations. This is not Python object deepcopy or LM-call
   counter parity; opaque program state can still be borrowed.
+  Set `MIPROv2.log_dir = .{ .io = io, .path = path }` to write state-only JSON
+  for the baseline, each trial, and periodic full evaluations under
+  `evaluated_programs/`. `TrialLog.program_path` identifies the file even
+  when `track_stats` is disabled. Use a caller-trusted directory dedicated to
+  the run; matching filenames are atomically replaced, and previous snapshots
+  remain if a later evaluation or write fails.
+  The snapshots use DSZig's `state` format, including its `self` key for a
+  standalone predictor; DSPy writes that predictor's fields at the root.
   `view_data_batch_size = 0` summarizes an empty initial view without
   refinement, matching DSPy rather than disabling the data-aware proposer.
   MIPROv2 compile options can override both demo limits without changing the

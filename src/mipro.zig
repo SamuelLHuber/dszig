@@ -1,4 +1,4 @@
-//! `dspy.MIPROv2` (DSPy 3.4.1): bootstrap few-shot candidate sets, propose
+//! `dspy.MIPROv2` (DSPy 3.5.0): bootstrap few-shot candidate sets, propose
 //! instructions grounded in a dataset summary, the predictor's demos and a
 //! random prompting tip, then search instruction × demo-set combinations with
 //! Optuna's TPE sampler (src/tpe.zig), on minibatches with periodic full
@@ -8,7 +8,7 @@
 //! The program-aware proposer needs the program's code, which DSPy reads with
 //! `inspect.getsource`; DSZig takes it as `Options.program_code` and runs
 //! without it, like `program_aware_proposer=False`, when none is given.
-//! Not supported: Python object deepcopy, LM call counters, and `log_dir`.
+//! Not supported: Python object deepcopy and LM call counters.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -20,6 +20,7 @@ const predict = @import("predict.zig");
 const pyjson = @import("pyjson.zig");
 const pyrandom = @import("pyrandom.zig");
 const signature = @import("signature.zig");
+const program_state = @import("state.zig");
 const tpe = @import("tpe.zig");
 const unicode = @import("unicode.zig");
 const value = @import("value.zig");
@@ -370,8 +371,54 @@ pub const MIPROv2 = struct {
     init_temperature: f64 = 1.0,
     /// Retain the evaluated native program values and their ranking.
     track_stats: bool = true,
+    /// Optional state-only JSON snapshots in a caller-trusted directory.
+    log_dir: ?LogDir = null,
     /// Used while bootstrapping demo candidates.
     teacher_settings: optimize.TeacherSettings = .{},
+
+    pub const LogDir = struct {
+        io: std.Io,
+        path: []const u8,
+    };
+
+    const Artifact = union(enum) {
+        baseline,
+        trial: usize,
+        full_eval: usize,
+    };
+
+    fn saveCandidate(
+        destination: ?LogDir,
+        out: Allocator,
+        scratch: Allocator,
+        program: anytype,
+        artifact: Artifact,
+    ) !?[]const u8 {
+        const dir = destination orelse return null;
+        const filename = switch (artifact) {
+            .baseline => "program_-1.json",
+            .trial => |number| try std.fmt.allocPrint(scratch, "program_{d}.json", .{number}),
+            .full_eval => |number| try std.fmt.allocPrint(
+                scratch,
+                "program_{d}_full_eval.json",
+                .{number},
+            ),
+        };
+        const path = try std.fs.path.join(out, &.{ dir.path, "evaluated_programs", filename });
+        errdefer out.free(path);
+
+        var file = try std.Io.Dir.cwd().createFileAtomic(dir.io, path, .{
+            .make_path = true,
+            .replace = true,
+        });
+        defer file.deinit(dir.io);
+        var buffer: [4096]u8 = undefined;
+        var writer = file.file.writer(dir.io, &buffer);
+        try program_state.save(scratch, program, &writer.interface);
+        try writer.flush();
+        try file.replace(dir.io);
+        return path;
+    }
 
     pub const Auto = enum {
         light,
@@ -427,6 +474,8 @@ pub const MIPROv2 = struct {
         /// Trial logging mode, distinct from whether the batch covered the valset.
         minibatch_log: bool = false,
         total_eval_calls_so_far: usize = 0,
+        /// Path to the state snapshot, when `log_dir` is configured.
+        program_path: ?[]const u8 = null,
     };
 
     pub fn TrackedPrograms(comptime P: type) type {
@@ -790,6 +839,9 @@ pub const MIPROv2 = struct {
         const steps = options.minibatch_full_eval_steps;
         const adjusted = if (minibatch) num_trials + num_trials / steps + 1 + @intFromBool(num_trials % steps != 0) else num_trials;
 
+        var scratch: std.heap.ArenaAllocator = .init(gpa);
+        defer scratch.deinit();
+
         const default_score = try self.score(P, out, gpa, ctx, &program, valset, valset.len, rng);
         var history: std.ArrayList(tpe.Trial) = .empty;
         try history.append(out, .{ .params = try zeros(out, params.items.len), .value = default_score });
@@ -809,6 +861,7 @@ pub const MIPROv2 = struct {
             .score = default_score,
             .full_eval = true,
             .total_eval_calls_so_far = total_eval_calls,
+            .program_path = try saveCandidate(self.log_dir, out, scratch.allocator(), &program, .baseline),
         });
         if (self.track_stats) try programs.append(out, program);
         var full_scores: std.ArrayList(f64) = .empty;
@@ -821,8 +874,6 @@ pub const MIPROv2 = struct {
         var combos: std.ArrayList(Combo) = .empty;
 
         var sampler: tpe.Sampler = .init(seed);
-        var scratch: std.heap.ArenaAllocator = .init(gpa);
-        defer scratch.deinit();
 
         if (num_trials > 0) {
             for (params.items) |param| {
@@ -861,6 +912,13 @@ pub const MIPROv2 = struct {
                 .full_eval = full,
                 .minibatch_log = minibatch,
                 .total_eval_calls_so_far = total_eval_calls,
+                .program_path = try saveCandidate(
+                    self.log_dir,
+                    out,
+                    scratch.allocator(),
+                    &candidate,
+                    .{ .trial = trial_num },
+                ),
             });
             if (self.track_stats) try programs.append(out, candidate);
             try history.append(out, .{ .params = chosen, .value = s });
@@ -896,6 +954,13 @@ pub const MIPROv2 = struct {
                     .score = full_score,
                     .full_eval = true,
                     .total_eval_calls_so_far = total_eval_calls,
+                    .program_path = try saveCandidate(
+                        self.log_dir,
+                        out,
+                        scratch.allocator(),
+                        &target.program,
+                        .{ .full_eval = trial_num + 1 },
+                    ),
                 });
                 if (self.track_stats) try programs.append(out, target.program);
                 target.evaluated = true;
@@ -1131,6 +1196,38 @@ test "MIPRO refuses empty candidate spaces without indexing or sampling them" {
             },
         ));
     }
+}
+
+test "MIPRO snapshot serialization failure preserves the previous artifact" {
+    const P = predict.Predict(signature.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: i64 };
+    }));
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var temporary = testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const destination: MIPROv2.LogDir = .{
+        .io = testing.io,
+        .path = try temporary.dir.realPathFileAlloc(testing.io, ".", arena),
+    };
+
+    var program: P = .{};
+    program.state.instructions = "original";
+    const artifact: MIPROv2.Artifact = .{ .full_eval = 4 };
+    const path = (try MIPROv2.saveCandidate(destination, arena, arena, &program, artifact)).?;
+    var model: @import("lm.zig").ScriptedLM = .{ .responses = &.{} };
+    program.state.lm = model.lm();
+    try testing.expectError(
+        error.UnsupportedLMState,
+        MIPROv2.saveCandidate(destination, arena, arena, &program, artifact),
+    );
+
+    const saved = try std.Io.Dir.cwd().readFileAlloc(testing.io, path, arena, .limited(4096));
+    var restored: P = .{};
+    try program_state.load(arena, &restored, saved, .{});
+    try testing.expectEqualStrings("original", restored.state.instructions);
 }
 
 test "MIPRO ranks full-set minibatch trials as full candidates and preserves ties" {
