@@ -3757,14 +3757,16 @@ devenv auto-loads a root manifest into every shell):
 
 ```sh
 secretspec --file tools/live/secretspec.toml set OPENAI_API_KEY --profile live --reason "dszig live inference"
-# Optional: OPENAI_BASE_URL, DSZIG_LIVE_MODEL, DSZIG_LIVE_API (chat_completions|responses)
+# Optional: DSZIG_LIVE_MODEL, DSZIG_LIVE_API (chat_completions|responses)
 devenv shell -- dz-live-smoke   # one real native CoT request
 devenv shell -- dz-live         # DSPy and DSZig recordings, cross-replayed
 ```
 
-The DSPy recorder (`tools/dspy_reference/live.py`) reads the same variables,
-passing `OPENAI_BASE_URL` as `api_base` and mapping `chat_completions` to DSPy's
-`chat` model type.
+Both managed commands use `OPENAI_API_KEY` and pin `OPENAI_BASE_URL` to
+`https://api.openai.com/v1`, regardless of inherited endpoint settings.
+The DSPy recorder (`tools/dspy_reference/live.py`) passes that URL as
+`api_base` and maps `chat_completions` to DSPy's `chat` model type.
+Direct `zig build live` invocations can still select a compatible endpoint.
 
 For an OpenAI-compatible Responses endpoint:
 

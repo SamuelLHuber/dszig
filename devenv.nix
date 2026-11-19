@@ -64,22 +64,24 @@ in
     # (tools/live, not the root: devenv auto-loads a root secretspec.toml):
     #   secretspec --file tools/live/secretspec.toml set OPENAI_API_KEY --profile live
     dz-live.exec = ''
-      set -euo pipefail
-      if [ -z "''${DZ_LIVE_SECRETS:-}" ]; then
-        exec env DZ_LIVE_SECRETS=1 secretspec --file "$DEVENV_ROOT/tools/live/secretspec.toml" run \
-          --profile live --reason "dszig live inference recording" -- dz-live "$@"
-      fi
-      (cd tools/dspy_reference && uv run --locked live.py \
-        ../../tests/fixtures/live/dspy_3.5.0.json "openai/''${DSZIG_LIVE_MODEL:-gpt-4o-mini}")
-      zig build replay -- tests/fixtures/live/dspy_3.5.0.json
-      zig build live -- tests/fixtures/live/dszig_3.5.0.json
-      (cd tools/dspy_reference && uv run --locked check_live.py ../../tests/fixtures/live/dszig_3.5.0.json)
-      tools/dspy_reference/check.sh
+      exec secretspec --file "$DEVENV_ROOT/tools/live/secretspec.toml" run \
+        --profile live --reason "dszig live inference recording" -- \
+        env -u CODEX_LB_API_KEY OPENAI_BASE_URL=https://api.openai.com/v1 \
+        bash -euo pipefail -c '
+          : "''${OPENAI_API_KEY:?OPENAI_API_KEY is required for live inference}"
+          (cd tools/dspy_reference && uv run --locked live.py \
+            ../../tests/fixtures/live/dspy_3.5.0.json "openai/''${DSZIG_LIVE_MODEL:-gpt-4o-mini}")
+          zig build replay -- tests/fixtures/live/dspy_3.5.0.json
+          zig build live -- tests/fixtures/live/dszig_3.5.0.json
+          (cd tools/dspy_reference && uv run --locked check_live.py ../../tests/fixtures/live/dszig_3.5.0.json)
+          tools/dspy_reference/check.sh
+        '
     '';
     # One real CoT request (2 + 2) through the native LM, via SecretSpec.
     dz-live-smoke.exec = ''
       exec secretspec --file "$DEVENV_ROOT/tools/live/secretspec.toml" run \
-        --profile live --reason "dszig live inference smoke" -- zig build live -- --smoke "$@"
+        --profile live --reason "dszig live inference smoke" -- \
+        env -u CODEX_LB_API_KEY OPENAI_BASE_URL=https://api.openai.com/v1 zig build live -- --smoke "$@"
     '';
     dz-check.exec = ''
       set -euo pipefail
