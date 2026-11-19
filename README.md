@@ -3809,8 +3809,11 @@ The following prevent a claim that DSZig can do everything DSPy can:
   inline audio/video input for audio-native models, function declarations, and
   text, audio, image, and function-call deltas. Non-audio conversation history
   can include earlier function calls and results. It uses the configured Gemini
-  API key. Persistent Live sessions, Vertex AI, local path reads, and file
-  uploads are not supported.
+  API key. `Gemini.live(&session, options)` opens a persistent `Gemini.LiveSession`
+  for text, turns, inline base64 audio/image, and function results. Use `send`
+  and `recv` serially, keep the session at a stable address, and call `close`
+  when finished. Received events borrow storage until the next `recv` or
+  `close`. Vertex AI, local path reads, and file uploads are not supported.
   Native File construction, adapter/typed prediction
   handling, File tool-result markers and bounded Responses document translation
   are implemented as described above. There is still no complete lm15 provider
@@ -4030,16 +4033,21 @@ The following prevent a claim that DSZig can do everything DSPy can:
   iterations. Keep it private: it can contain instructions and predictions.
   Use one writer per path. Prediction data must be JSON-representable; opaque
   values and callback-owned state are not saved. The file does not import
-  Python pickle or generate DSPy's HTML candidate tree.
+  Python pickle.
   Set `GEPA.Options.log_dir = .{ .io = io, .path = path }` to write
-  `candidates.json` and, after the first iteration, `run_log.json`.
+  `candidates.json` and, after the first iteration, `run_log.json`. When the
+  run finds a new candidate, it also writes `candidate_tree.html`: an offline
+  lineage report with linked parents, validation scores, frontier roles, and
+  escaped instructions. It does not load scripts, a CDN, or a graph renderer.
+  Failure to write this optional report warns without aborting optimization.
   The records include selected parents, sampled row IDs, before/after scores,
   and accepted candidates. Each file is individually bounded and atomically
   replaced; the files are not a transactional bundle. Use a fresh, private
   output directory per run, with one writer and no checkpoint file named
-  `candidates.json` or `run_log.json`. Keep logging enabled across restarts
-  to carry the earlier iterations forward from the checkpoint. These files
-  do not add model calls or invoke external experiment loggers.
+  `candidates.json`, `run_log.json`, or `candidate_tree.html`. Keep logging
+  enabled across restarts to carry the earlier iterations forward from the
+  checkpoint. These files do not add model calls or invoke external
+  experiment loggers.
   Debug and ReleaseSafe matched the parsed candidate and run logs from DSPy
   3.5.0 for three two-process restart workloads and a four-proposal iteration
   with rejected proposals and reversed validation order.

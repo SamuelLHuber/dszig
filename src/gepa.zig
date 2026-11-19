@@ -8,7 +8,7 @@
 //! Python's `random.Random(seed)` is ported (one stream for the engine, one
 //! for the DSPy adapter), so the same LM answers give the same program.
 //!
-//! Not supported: `dspy.Flex` code components or checkpoint resume.
+//! Not supported: `dspy.Flex` code components.
 //! DSPy `num_threads` maps to
 //! `rollouts`: each minibatch/valset evaluation then runs on a native pool,
 //! results in example order. CPython iterates small-int sets in ascending
@@ -37,6 +37,49 @@ const History = @import("history.zig").History;
 
 pub const ObjectiveScore = struct { name: []const u8, score: f64 };
 pub const ObjectiveLeaders = struct { name: []const u8, candidates: []const usize };
+
+fn writeHtmlText(writer: *Writer, text: []const u8) Writer.Error!void {
+    var start: usize = 0;
+    for (text, 0..) |byte, i| {
+        const entity = switch (byte) {
+            '&' => "&amp;",
+            '<' => "&lt;",
+            '>' => "&gt;",
+            else => continue,
+        };
+        try writer.writeAll(text[start..i]);
+        try writer.writeAll(entity);
+        start = i + 1;
+    }
+    try writer.writeAll(text[start..]);
+}
+
+fn reduceFronts(programs: []usize, scores: []const f64, fronts: []const []const usize, retained: []bool) void {
+    std.sort.insertion(usize, programs, scores, struct {
+        fn less(s: []const f64, a: usize, b: usize) bool {
+            return s[a] < s[b];
+        }
+    }.less);
+    // Removing candidates never makes a previously indispensable candidate
+    // removable. A single ascending pass is equivalent to restarting.
+    for (programs) |index| {
+        for (fronts) |front| {
+            if (std.mem.indexOfScalar(usize, front, index) == null) continue;
+            for (front) |other| {
+                if (index != other and retained[other]) break;
+            } else break;
+        } else retained[index] = false;
+    }
+}
+
+test "GEPA lineage removes covered candidates but keeps a sole remaining row leader" {
+    var order = [_]usize{ 0, 1, 2, 3 };
+    var retained = [_]bool{ true, true, true, true };
+    const scores = [_]f64{ 0.1, 0.2, 0.3, 0.4 };
+    const fronts = [_][]const usize{ &.{ 0, 1 }, &.{ 1, 2 }, &.{ 2, 3 } };
+    reduceFronts(&order, &scores, &fronts, &retained);
+    try std.testing.expectEqualSlices(bool, &.{ false, true, false, true }, &retained);
+}
 
 /// What a GEPA metric returns: DSPy's score, feedback and named objectives.
 pub const Feedback = struct {
@@ -1072,6 +1115,7 @@ pub const GEPA = struct {
             checkpoint_runs: std.ArrayList([]const Run) = .empty,
             log_dir: ?LogDirectory = null,
             run_log: std.ArrayList(IterationLog) = .empty,
+            logged_tree_size: usize = 1,
 
             fn currentLog(e: *Self) ?*IterationLog {
                 if (e.log_dir == null) return null;
@@ -1081,7 +1125,7 @@ pub const GEPA = struct {
                 return entry;
             }
 
-            fn saveRunArtifacts(e: *const Self) !void {
+            fn saveRunArtifacts(e: *Self) !void {
                 const dir = e.log_dir orelse return;
                 var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
                 defer scratch.deinit();
@@ -1093,6 +1137,94 @@ pub const GEPA = struct {
                 const path = try std.fs.path.join(arena, &.{ dir.path, "candidates.json" });
                 const candidates: CandidateLog = .{ .names = e.names, .candidates = e.candidates.items };
                 try writeBoundedJson(dir.io, path, dir.max_file_bytes, candidates, .run_log);
+                if (e.candidates.items.len > e.logged_tree_size) {
+                    if (e.saveCandidateTree(arena, dir)) |_| {
+                        e.logged_tree_size = e.candidates.items.len;
+                    } else |err| {
+                        std.log.scoped(.gepa).warn("Could not save candidate lineage: {t}", .{err});
+                    }
+                }
+            }
+
+            fn saveCandidateTree(e: *const Self, arena: Allocator, dir: LogDirectory) !void {
+                const scores = try arena.alloc(f64, e.candidates.items.len);
+                var best: usize = 0;
+                for (scores, 0..) |*score, index| {
+                    score.* = e.average(index);
+                    if (score.* > scores[best]) best = index;
+                }
+                const fronts = try arena.alloc([]const usize, e.instanceFrontCount());
+                for (fronts, 0..) |*front, index| front.* = e.instanceFront(index);
+                const leaders = try arena.alloc(bool, scores.len);
+                @memset(leaders, false);
+                var programs: std.ArrayList(usize) = .empty;
+                for (fronts) |front| for (front) |index| {
+                    if (leaders[index]) continue;
+                    leaders[index] = true;
+                    try programs.append(arena, index);
+                };
+                reduceFronts(programs.items, scores, fronts, leaders);
+
+                const order = try arena.alloc(usize, e.names.len);
+                for (order, 0..) |*index, i| index.* = i;
+                std.sort.insertion(usize, order, e.names, struct {
+                    fn less(names: []const []const u8, a: usize, b: usize) bool {
+                        return std.mem.lessThan(u8, names[a], names[b]);
+                    }
+                }.less);
+                const path = try std.fs.path.join(arena, &.{ dir.path, "candidate_tree.html" });
+                var target = try std.Io.Dir.cwd().createFileAtomic(dir.io, path, .{
+                    .make_path = true,
+                    .replace = true,
+                });
+                defer target.deinit(dir.io);
+                var buffer: [4096]u8 = undefined;
+                var writer = target.file.writer(dir.io, &buffer);
+                var limited: CheckpointWriter = .{ .sink = &writer.interface, .remaining = dir.max_file_bytes };
+                e.renderCandidateTree(&limited.writer, scores, best, leaders, order) catch |err| {
+                    if (limited.too_large) return error.GepaLogTooLarge;
+                    return err;
+                };
+                try writer.interface.flush();
+                try target.file.sync(dir.io);
+                try target.replace(dir.io);
+            }
+
+            fn renderCandidateTree(
+                e: *const Self,
+                writer: *Writer,
+                scores: []const f64,
+                best: usize,
+                leaders: []const bool,
+                order: []const usize,
+            ) Writer.Error!void {
+                try writer.writeAll(
+                    "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">" ++
+                        "<title>GEPA Candidate Lineage</title><h1>GEPA Candidate Lineage</h1>\n",
+                );
+                for (e.candidates.items, e.parents.items, scores, leaders, 0..) |candidate, parents, score, leader, i| {
+                    const role = if (i == best) "Best" else if (leader) "Pareto Front" else if (i == 0) "Seed" else "";
+                    try writer.print("<section id=\"candidate-{d}\"><h2>Candidate {d}</h2>", .{ i, i });
+                    try writer.print("<p>Score: <span class=\"score\">{d:.4}</span> ", .{score});
+                    try writer.print("<span class=\"role\">{s}</span></p><p>Parents: <span class=\"parents\">", .{role});
+                    var count: usize = 0;
+                    for (parents) |maybe| if (maybe) |parent| {
+                        if (count != 0) try writer.writeAll(", ");
+                        try writer.print("<a href=\"#candidate-{d}\">{d}</a>", .{ parent, parent });
+                        count += 1;
+                    };
+                    if (count == 0) try writer.writeAll("seed");
+                    try writer.writeAll("</span></p><dl>");
+                    for (order) |index| {
+                        try writer.writeAll("<dt>");
+                        try writeHtmlText(writer, e.names[index]);
+                        try writer.writeAll("</dt><dd><pre>");
+                        try writeHtmlText(writer, candidate[index]);
+                        try writer.writeAll("</pre></dd>");
+                    }
+                    try writer.writeAll("</dl></section>\n");
+                }
+                try writer.writeAll("</html>\n");
             }
 
             fn writeBoundedJson(
