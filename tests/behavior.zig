@@ -1075,12 +1075,20 @@ test "BootstrapFewShot counts metric failures with program failures after restor
         }
     };
     const Metric = struct {
+        var expected_demos: usize = 3;
+
         fn run(_: Allocator, example: *const dszig.Example, _: ?*const dszig.optimize.RecordPrediction, trace: ?*const dszig.Trace) dszig.value.ParseError!f64 {
             const steps = trace.?.steps.items;
-            // A successful metric must see the teacher's full, restored demos,
-            // not the per-example filtered slice used during prediction.
-            if (steps.len != 1 or steps[0].predictor.demos.len != 3) return error.ParseValue;
+            // The current example is restored before the metric, but a prior
+            // failed teacher call has already pruned its own example.
+            testing.expectEqual(@as(usize, 1), steps.len) catch unreachable;
+            const demos = steps[0].predictor.demos;
             const question = example.record.get("question").?.string;
+            testing.expectEqual(expected_demos, demos.len) catch unreachable;
+            if (expected_demos == 2) {
+                testing.expectEqualStrings("metric_fail", demos[0].get("question").?.string) catch unreachable;
+                testing.expectEqualStrings("good2", demos[1].get("question").?.string) catch unreachable;
+            }
             if (std.mem.eql(u8, question, "metric_fail")) return error.ParseValue;
             if (std.mem.eql(u8, question, "metric_oom")) return error.OutOfMemory;
             return 1;
@@ -1126,6 +1134,7 @@ test "BootstrapFewShot counts metric failures with program failures after restor
 
     model.calls = 0;
     model.fail_first = true;
+    Metric.expected_demos = 2;
     optimizer.max_errors = 2;
     try testing.expectError(error.ParseValue, optimizer.compile(P, arena, testing.allocator, ctx, .{}, teacher, &.{ trainset[1], trainset[0], trainset[2] }));
     try testing.expectEqual(@as(usize, 2), model.calls);
@@ -1133,6 +1142,7 @@ test "BootstrapFewShot counts metric failures with program failures after restor
     const allocation_failure = try dszig.Example.fromJson(arena, "{\"question\":\"metric_oom\",\"answer\":\"ok\"}", &.{"question"});
     model.calls = 0;
     model.fail_first = false;
+    Metric.expected_demos = 3;
     optimizer.max_errors = 100;
     try testing.expectError(error.OutOfMemory, optimizer.compile(P, arena, testing.allocator, ctx, .{}, teacher, &.{ allocation_failure, trainset[1] }));
     try testing.expectEqual(@as(usize, 1), model.calls);

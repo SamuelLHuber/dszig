@@ -1649,8 +1649,11 @@ This is not a whole-runtime allocator-free proof.
 
 `optimize.Metric` and GEPA feedback callbacks can return `ParseValue` or
 `OutOfMemory`. Evaluate and bootstrap apply their existing error budgets to
-metric failures as well as program failures; bootstrap restores temporary
-teacher demos before scoring. SIMBA retains a successful prediction and trace
+metric failures as well as program failures. Bootstrap restores temporary
+teacher demos before scoring a successful teacher call. When the teacher call
+fails and the error budget permits continuing, the compile-local teacher keeps
+the filtered demos for the next attempt, matching DSPy 3.5; the caller's teacher
+is unchanged. SIMBA retains a successful prediction and trace
 when scoring fails, with a zero score. GEPA uses its configured failure score,
 with an empty prediction when trace capture is disabled versus no prediction
 or trajectory when capture is enabled. Reflective feedback failures propagate.

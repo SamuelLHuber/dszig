@@ -610,13 +610,29 @@ pub const BootstrapFewShot = struct {
         try storage.init();
         var state: RecordPrediction.State = .{ .output = storage.record };
         var output: P.Output = undefined;
+        var teacher_memory: std.heap.ArenaAllocator = .init(gpa);
+        defer teacher_memory.deinit();
 
         for (trainset, 0..) |*example, example_idx| {
             if (n_bootstrapped >= self.max_bootstrapped_demos) break;
             var round_idx: usize = 0;
             while (round_idx < self.max_rounds) : (round_idx += 1) {
                 attempts += 1;
-                const ok = try self.bootstrapOne(P, out, gpa, ctx, &teacher, teacher_preds, example, round_idx, name2traces, &errors, &output, &state);
+                const ok = try self.bootstrapOne(
+                    P,
+                    out,
+                    gpa,
+                    teacher_memory.allocator(),
+                    ctx,
+                    &teacher,
+                    teacher_preds,
+                    example,
+                    round_idx,
+                    name2traces,
+                    &errors,
+                    &output,
+                    &state,
+                );
                 if (ok) {
                     bootstrapped[example_idx] = true;
                     n_bootstrapped += 1;
@@ -654,6 +670,7 @@ pub const BootstrapFewShot = struct {
         comptime P: type,
         out: Allocator,
         gpa: Allocator,
+        teacher_arena: Allocator,
         ctx: Context,
         teacher: *P,
         teacher_preds: []const predict.NamedParam,
@@ -684,13 +701,22 @@ pub const BootstrapFewShot = struct {
                 for (teacher_preds, cached) |p, cache| p.param.predict.demos = cache;
             }
             for (teacher_preds, cached) |p, cache| {
-                var kept: std.ArrayList(Record) = .empty;
-                for (cache) |*demo| {
-                    if (!(try value.recordEqual(demo, &example.record))) try kept.append(arena, demo.*);
-                }
-                p.param.predict.demos = kept.items;
+                p.param.predict.demos = try filterTeacherDemos(arena, cache, &example.record);
             }
-            break :blk runProgramInto(P, c, teacher, example, output, state);
+            const prediction = runProgramInto(P, c, teacher, example, output, state);
+            if (prediction) |_| {} else |err| {
+                // Source restores the snapshot only after the teacher returns.
+                // Keep filtered demos for later attempts, not for the caller's teacher.
+                if (err != error.OutOfMemory and errors.* < self.max_errors -| 1) {
+                    for (teacher_preds, cached) |p, *cache| {
+                        const filtered = p.param.predict.demos;
+                        if (filtered.len < cache.len) {
+                            cache.* = try teacher_arena.dupe(Record, filtered);
+                        }
+                    }
+                }
+            }
+            break :blk prediction;
         };
         // The Prediction borrows this attempt's scratch. Demos are built from
         // trace steps, so only output fields are ever retained.
@@ -733,6 +759,19 @@ pub const BootstrapFewShot = struct {
         return true;
     }
 };
+
+fn filterTeacherDemos(arena: Allocator, demos: []const Record, example: *const Record) ![]const Record {
+    const first = for (demos, 0..) |*demo, index| {
+        if (try value.recordEqual(demo, example)) break index;
+    } else return demos;
+    var kept: std.ArrayList(Record) = .empty;
+    try kept.ensureTotalCapacity(arena, demos.len - 1);
+    kept.appendSliceAssumeCapacity(demos[0..first]);
+    for (demos[first + 1 ..]) |*demo| {
+        if (!(try value.recordEqual(demo, example))) kept.appendAssumeCapacity(demo.*);
+    }
+    return kept.items;
+}
 
 /// Select one multi-use predictor trace exactly as DSPy 3.5 does.
 pub fn tracePick(arena: Allocator, predictor_name: []const u8, prior_count: usize, count: usize) Allocator.Error!usize {
