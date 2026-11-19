@@ -2926,6 +2926,9 @@ and feedback-instruction Predicts. It applies instructions only on a strict
 improvement and returns the newly proposed instruction without evaluating that
 proposal again. Reports use raw mean scores, not Evaluate percentages.
 Failed examples score zero except allocation failure, which propagates.
+A zero-iteration compile preserves the actor as-is, even after a failed call.
+For positive iterations, an evolved actor returns `error.AvatarActorEvolved`;
+call `reset()` before training it again.
 Returned metadata/instructions live in `out`; tool callbacks remain borrowed.
 
 DSPy 3.5's original Avatar and AvatarOptimizer constructors fail because they

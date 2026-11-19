@@ -135,9 +135,10 @@ pub const AvatarOptimizer = struct {
         trainset: []const Example,
     ) !Result(P) {
         comptime assert(@hasDecl(P, "is_dszig_avatar"));
-        assert(!student.evolved());
+        if (self.max_iters <= 0) return .{ .program = student, .iterations = &.{} };
+        // Training copies must be callable. Failed actors require an explicit reset.
+        if (student.evolved()) return error.AvatarActorEvolved;
         var best = student;
-        if (self.max_iters <= 0) return .{ .program = best, .iterations = &.{} };
         if (trainset.len == 0) return error.AvatarEmptyTrainset;
 
         const iterations_max: usize = std.math.cast(usize, self.max_iters) orelse std.math.maxInt(usize);
@@ -350,6 +351,35 @@ test "AvatarOptimizer scores failures zero and needs both example classes" {
     try testing.expectEqual(@as(usize, 4), script.index);
     script = .{ .responses = &.{ test_finish, "<answer>x</answer>", test_finish, "<answer>y</answer>" } };
     try testing.expectError(error.AvatarNoPositiveExamples, optimizer.compile(P, arena, testing.allocator, ctx, &rng, student, &trainset));
+}
+
+test "AvatarOptimizer preserves a failed actor for idle compile and requires reset for training" {
+    const testing = std.testing;
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const P = avatar.Avatar(TestQA);
+    var student = try P.init(arena, &.{});
+    var script: @import("lm.zig").ScriptedLM = .{ .responses = &.{test_finish} };
+    const ctx: Context = .{ .arena = arena, .lm = script.lm() };
+    try testing.expectError(error.ScriptExhausted, student.call(ctx, .{ .question = "q1" }, .{}));
+
+    var rng: pyrandom.Random = .init(0);
+    const idle: AvatarOptimizer = .{ .metric = testMetric, .max_iters = 0 };
+    const active: AvatarOptimizer = .{ .metric = testMetric, .max_iters = 1 };
+    const trainset = try testTrainset(arena);
+    var copy = (try idle.compile(P, arena, testing.allocator, ctx, &rng, student, &.{})).program;
+    try testing.expectError(error.AvatarActorEvolved, copy.call(ctx, .{ .question = "q1" }, .{}));
+    try testing.expectError(
+        error.AvatarActorEvolved,
+        active.compile(P, arena, testing.allocator, ctx, &rng, student, &trainset),
+    );
+
+    copy.reset();
+    script = .{ .responses = &.{ test_finish, "<answer>a</answer>" } };
+    const prediction = try copy.call(ctx, .{ .question = "q1" }, .{});
+    try testing.expectEqualStrings("a", prediction.answer);
+    try testing.expect(student.evolved());
 }
 
 test "AvatarOptimizer samples positives before negatives from one generator" {
