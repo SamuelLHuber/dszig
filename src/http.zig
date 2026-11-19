@@ -43,6 +43,9 @@ pub const Request = struct {
     body: ?[]const u8 = null,
     body_provider: ?BodyProvider = null,
     response_consumer: ?*ResponseConsumer = null,
+    /// Classifies a rejected status after the bounded body has been read.
+    /// A recognized rejection is terminal, even on an otherwise retryable status.
+    classify_failure: ?*const fn (Allocator, std.http.Status, []const u8) ?anyerror = null,
     capture_content_type: bool = false,
     content_type: ?[]const u8 = null,
     authorization: ?[]const u8 = null,
@@ -159,7 +162,10 @@ pub const Transport = struct {
             const status: ?std.http.Status = if (response) |r| r.status else null;
             if (response) |r| {
                 if (self.success == .any or r.status == .ok) return r;
-                self.client.allocator.free(r.body);
+                defer self.client.allocator.free(r.body);
+                if (prepared.classify_failure) |classify| {
+                    if (classify(self.client.allocator, r.status, r.body)) |err| return err;
+                }
             }
             if (!retryable(status) or attempt >= self.max_retries) return last_error;
             const delay_ms = @as(i64, self.retry_base_ms) << @as(u6, @intCast(@min(attempt, 31)));

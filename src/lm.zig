@@ -139,7 +139,14 @@ pub fn decisionFromValue(arena: Allocator, input: @import("runtime_value.zig").V
     });
 }
 
-pub const Error = error{ NoLM, LMFailure, ScriptExhausted, MissingUsageModel, StreamStopped } ||
+pub const Error = error{
+    NoLM,
+    LMFailure,
+    ContextWindowExceeded,
+    ScriptExhausted,
+    MissingUsageModel,
+    StreamStopped,
+} ||
     @import("runtime_value.zig").CustomError || accounting.Error || @import("call_result.zig").Error;
 
 pub const AccountingFailure = struct {
@@ -2371,6 +2378,7 @@ pub const OpenAI = struct {
             .method = .POST,
             .body_provider = .{ .context = &wire, .prepare = wire_module.Prepared.prepareBody },
             .response_consumer = &consumer,
+            .classify_failure = classifyGenerationFailure,
             .content_type = "application/json",
             .authorization = auth,
         }) catch |err| return sdkCodecError(err);
@@ -2699,8 +2707,27 @@ pub const OpenAI = struct {
     fn sdkCodecError(err: anyerror) Error {
         return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
+            error.ContextWindowExceeded => error.ContextWindowExceeded,
             else => error.LMFailure,
         };
+    }
+
+    fn classifyGenerationFailure(
+        allocator: Allocator,
+        status: std.http.Status,
+        body: []const u8,
+    ) ?anyerror {
+        if (status != .bad_request) return null;
+        const Envelope = struct {
+            @"error": struct { code: []const u8 },
+        };
+        const parsed = std.json.parseFromSlice(Envelope, allocator, body, .{
+            .ignore_unknown_fields = true,
+        }) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else null;
+        defer parsed.deinit();
+        if (std.mem.eql(u8, parsed.value.@"error".code, "context_length_exceeded"))
+            return error.ContextWindowExceeded;
+        return null;
     }
 
     /// Shared provider encoding for HTTP requests and native training records.
@@ -2801,6 +2828,7 @@ pub const OpenAI = struct {
             .url = url,
             .method = .POST,
             .body_provider = .{ .context = &wire, .prepare = @import("openai_request.zig").Prepared.prepareBody },
+            .classify_failure = classifyGenerationFailure,
             .content_type = "application/json",
             .authorization = auth,
         };
@@ -4103,6 +4131,22 @@ fn testNestedConfig(arena: Allocator, tag: []const u8) !@import("runtime_value.z
     var outer: @import("runtime_value.zig").ObjectMap = .empty;
     try outer.put(arena, try arena.dupe(u8, "hyperparameters"), .{ .object = inner });
     return .{ .object = outer };
+}
+
+test "OpenAI distinguishes explicit context overflow from ordinary bad requests" {
+    const exact = "{\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"too long\"}}";
+    try testing.expectEqual(
+        @as(?anyerror, error.ContextWindowExceeded),
+        OpenAI.classifyGenerationFailure(testing.allocator, .bad_request, exact),
+    );
+    try testing.expect(OpenAI.classifyGenerationFailure(testing.allocator, .unauthorized, exact) == null);
+    for ([_][]const u8{
+        "{\"error\":{\"code\":\"invalid_request_error\",\"message\":\"context_length_exceeded\"}}",
+        "{\"error\":{\"type\":\"context_length_exceeded\",\"code\":null}}",
+        "{\"error\":{\"code\":\"context_length_exceeded\"}",
+    }) |body| {
+        try testing.expect(OpenAI.classifyGenerationFailure(testing.allocator, .bad_request, body) == null);
+    }
 }
 
 test "OpenAI provider configuration survives destruction of the source arena" {

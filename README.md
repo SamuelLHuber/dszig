@@ -1743,7 +1743,13 @@ advice. A two-agent native run matched DSPy's complete prediction and feedback,
 including all five exact prompts and independently assigned hints.
 
 Typed `ReAct.forward` returns the signature's outputs plus `History` and
-`termination_reason`, including forced-submit results. A reproduced Refine/ReAct
+`termination_reason`, including forced-submit results. If OpenAI generation
+returns HTTP 400 with `error.code` set to `context_length_exceeded`, ReAct
+keeps its history and tries one forced submit. If that call also exceeds the
+window, `error.ContextWindowExceeded` is returned. An ordinary HTTP 400 does
+not trigger recovery. This is not a general provider error taxonomy.
+
+A reproduced Refine/ReAct
 regression verifies that feedback masks History, Tool and ToolCalls objects
 while retaining the original structured traces. An actual native executable
 matched DSPy's complete final prediction, all nine feedback inputs and all three

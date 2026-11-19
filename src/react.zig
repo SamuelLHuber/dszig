@@ -1,9 +1,9 @@
 //! DSPy 3.5 ReAct's text-tool path: one discoverable predictor, reusable
 //! structured History, batched tool calls/results, and a typed `submit` tool.
-//! Exhausted turns, malformed responses, and empty calls get one final submit
-//! attempt, not a separate extraction predictor. All tools remain native Zig
-//! callbacks. Async execution, JSON repair, context-window error classification,
-//! and Python traceback text are not supported.
+//! Exhausted turns, malformed responses, empty calls, and context-window errors
+//! get one final submit attempt, not a separate extraction predictor. All tools
+//! remain native Zig callbacks. Async execution, JSON repair, and Python
+//! traceback text are not supported.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -271,7 +271,7 @@ pub fn ReActIters(comptime Sig: type, comptime user_tools: []const Tool, comptim
                 const turn_inputs = try withBudget(ctx.arena, &pending, try turnBudget(ctx.arena, turn_index, max_iters));
                 const step_inputs = try callInputs(ctx.arena, history.*, catalog, &turn_inputs);
                 const pred = self.react.state.call(ctx, &step_inputs) catch |err| switch (err) {
-                    error.AdapterParse => break :turns, // parse_error -> one final submit attempt.
+                    error.AdapterParse, error.ContextWindowExceeded => break :turns,
                     else => return err,
                 };
                 var calls = ToolCalls.fromValue(ctx.arena, pred.get("tool_calls") orelse .null) catch |err| switch (err) {
@@ -291,7 +291,7 @@ pub fn ReActIters(comptime Sig: type, comptime user_tools: []const Tool, comptim
                     .termination_reason = .submit,
                 };
             }
-            // max_iters, parse_error, and empty_tool_calls all use this path.
+            // Recovery retains history and the as-yet-unpublished inputs.
             return self.forcedSubmit(ctx, history, &events, &pending, catalog, max_iters, &trace_history);
         }
 
