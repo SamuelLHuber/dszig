@@ -52,7 +52,8 @@ pub const COPRO = struct {
     depth: usize = 3,
     init_temperature: f64 = 1.4,
     track_stats: bool = false,
-    max_errors: usize = 10,
+    /// Null inherits the caller context. A non-null value is a native override.
+    max_errors: ?usize = null,
     /// DSPy `eval_kwargs.num_threads`; null evaluates serially.
     concurrent_evaluation: ?optimize.ConcurrentEvaluation = null,
 
@@ -170,6 +171,7 @@ pub const COPRO = struct {
         trainset: []const Example,
     ) !Result(P) {
         if (self.breadth <= 1) return error.InvalidBreadth;
+        const max_errors = self.max_errors orelse ctx.max_errors;
         const E = CandidateProgram(P);
         var clone = student;
         const preds = try predict.namedPredictors(out, &clone);
@@ -200,7 +202,16 @@ pub const COPRO = struct {
                     const instruction = value.pyStrip(std.mem.trim(u8, c.instruction, "\""));
                     const prefix = value.pyStrip(std.mem.trim(u8, c.prefix, "\""));
                     try setSignature(out, p.param.predict, instruction, prefix);
-                    const score = (try optimize.evaluateWith(P, self.concurrent_evaluation, gpa, ctx, &clone, trainset, self.metric, self.max_errors)).score;
+                    const score = (try optimize.evaluateWith(
+                        P,
+                        self.concurrent_evaluation,
+                        gpa,
+                        ctx,
+                        &clone,
+                        trainset,
+                        self.metric,
+                        max_errors,
+                    )).score;
                     total_calls += 1;
                     if (self.track_stats and c_i >= latest_start) recent.add(score);
                     const entry: E = .{
@@ -376,6 +387,55 @@ test "COPRO returns input errors at the proposal and evaluation boundaries" {
     optimizer.depth = 1;
     try testing.expectError(error.EmptyDevset, optimizer.compile(TestProgram, a, testing.allocator, ctx, null, .{}, &.{}));
     try testing.expectEqual(@as(usize, 2), history.requests.items.len);
+}
+
+test "COPRO stops candidate evaluation at the caller's error limit" {
+    const MetricFailure = struct {
+        fn score(
+            _: Allocator,
+            example: *const Example,
+            _: ?*const optimize.RecordPrediction,
+            _: ?*const predict.Trace,
+        ) value.ParseError!f64 {
+            if (std.mem.eql(u8, example.record.get("question").?.string, "fail"))
+                return error.ParseValue;
+            return 1;
+        }
+    };
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var history: lm_mod.History = .{ .arena = a };
+    var model: lm_mod.KeywordLM = .{
+        .history = &history,
+        .rules = &.{.{
+            .needle = "`proposed_instruction`",
+            .scope = .any,
+            .response = "<proposed_instruction>Try.</proposed_instruction>" ++
+                "<proposed_prefix_for_output_field>Try:</proposed_prefix_for_output_field>",
+        }},
+        .default = "<answer>yes</answer>",
+    };
+    const rows = [_]Example{
+        try Example.fromJson(a, "{\"question\":\"fail\"}", &.{"question"}),
+        try Example.fromJson(a, "{\"question\":\"pass\"}", &.{"question"}),
+    };
+    const ctx: Context = .{ .arena = a, .lm = model.lm(), .max_errors = 1 };
+    var opt: COPRO = .{ .metric = MetricFailure.score, .breadth = 2, .depth = 1 };
+    try testing.expectError(error.ParseValue, opt.compile(
+        predict.Predict(TestQA),
+        a,
+        testing.allocator,
+        ctx,
+        null,
+        .{},
+        &rows,
+    ));
+    try testing.expectEqual(@as(usize, 2), history.requests.items.len);
+    opt.max_errors = 2;
+    const result = try opt.compile(predict.Predict(TestQA), a, testing.allocator, ctx, null, .{}, &rows);
+    try testing.expectEqual(@as(usize, 2), result.total_calls);
+    try testing.expectEqual(@as(f64, 50), result.candidates[0].score);
 }
 
 test "COPRO climbs from the basic instruction to the best proposal" {

@@ -3466,6 +3466,9 @@ not replace that limit.
 `BetterTogether` uses the outer limit for baseline and candidate validation
 unless its `max_errors` option is set; this option does not override each
 nested optimizer's own limit.
+`COPRO` inherits the caller context's limit for candidate evaluation. Setting
+`COPRO.max_errors` is a native override, not a translation of DSPy's
+`eval_kwargs["max_errors"]`, which DSPy 3.5 rejects during evaluation.
 
 SIMBA's `num_threads` is `rollouts`: a `Parallel(SIMBA.Run, limits).runner()` and
 per-attempt contexts supplying LM and retriever pointees. Trajectory sampling,
