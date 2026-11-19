@@ -28,6 +28,11 @@ pub fn writeJsonAscii(w: *Writer, v: Value) Error!void {
     try writeJsonDepth(w, v, .compact, 0, true);
 }
 
+/// Python json.dumps(value, indent=2), including default ASCII escaping.
+pub fn writeJsonAsciiIndented(w: *Writer, v: Value) Error!void {
+    try writeJsonDepth(w, v, .indent2, 0, true);
+}
+
 test "Python repr treats a WTF8 surrogate as one nonprintable code point" {
     var buffer: [32]u8 = undefined;
     var writer: Writer = .fixed(&buffer);

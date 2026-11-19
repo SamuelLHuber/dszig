@@ -3793,6 +3793,16 @@ The following prevent a claim that DSZig can do everything DSPy can:
   replayed code and observations cannot create provider media parts. This
   preserves DSPy's slicing for zero and negative signed 64-bit observation
   limits. Replay does not create or resume an interpreter session.
+  `CustomRLM(Sig)` adds a synchronous action/observation loop for a trusted,
+  caller-supplied runtime factory. Give it an action objective describing what
+  the runtime supports. Each call opens one fresh session, passes model actions
+  to it serially, and closes it on success or failure. Typed submissions and
+  extraction at the iteration limit return outputs, tagged history, final
+  reasoning, and the current trajectory. Recoverable execution failures become
+  observations; runtime failures propagate. `forwardWithHistory` continues the
+  conversation, not the runtime state. The loop does not execute arbitrary
+  Python, provide guest DSPy, call sub-LMs on the runtime's behalf, or sandbox
+  runtime callbacks. The caller must enforce any runtime time and memory limits.
 - **Other modules and optimizers:** bounded native Avatar/AvatarOptimizer follow
   Source methods, with broken Source constructors and the explicit native
   capacity, class-identity, callback-ownership and serial-execution boundaries

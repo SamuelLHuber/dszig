@@ -7,6 +7,77 @@ const rag = @import("rag_program");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 
+test "custom RLM retains observations across runtime buffer reuse and closes on failure" {
+    const Runtime = struct {
+        buffer: [5]u8 = "first".*,
+        calls: u32 = 0,
+        closes: u32 = 0,
+        fail: bool = false,
+
+        fn open(ptr: *anyopaque) !dszig.rlm.Runtime {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls = 0;
+            self.buffer = "first".*;
+            return .{ .ptr = ptr, .execute = execute, .close = close };
+        }
+
+        fn execute(
+            ptr: *anyopaque,
+            code: []const u8,
+            _: *const dszig.value.Record,
+        ) !dszig.rlm.Runtime.Result {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.fail) return error.RuntimeDisconnected;
+            if (self.calls == 1) {
+                try testing.expectEqualStrings("inspect()", code);
+            } else {
+                try testing.expectEqualStrings("verify()", code);
+                self.buffer = "later".*;
+            }
+            return .{ .observation = &self.buffer };
+        }
+
+        fn close(ptr: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.closes += 1;
+            self.buffer = "ended".*;
+        }
+    };
+    const Sig = dszig.Signature(struct {
+        pub const Input = struct { order: i64 };
+        pub const Output = struct { answer: i64 };
+    });
+    var backing: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer backing.deinit();
+    const arena = backing.allocator();
+    var runtime: Runtime = .{};
+    const program = try dszig.CustomRLM(Sig).init(
+        arena,
+        .{ .ptr = &runtime, .open = Runtime.open },
+        .{ .max_iters = 2, .action_instructions = "Check the order with the supplied runtime." },
+    );
+    var model: dszig.lm.ScriptedLM = .{
+        .responses = &.{
+            "<plan>Inspect.</plan><code>```python\ninspect()\n```</code>",
+            "<plan>Verify.</plan><code>verify()</code>",
+            "<answer>17</answer>",
+        },
+    };
+    const ctx: dszig.Context = .{ .arena = arena, .lm = model.lm() };
+    const result = try program.forward(ctx, .{ .order = 10 });
+    try testing.expectEqual(@as(i64, 17), result.outputs.answer);
+    try testing.expectEqualStrings("first", result.trajectory[0].output);
+    try testing.expectEqualStrings("later", result.trajectory[1].output);
+    try testing.expectEqual(@as(u32, 1), runtime.closes);
+
+    runtime.fail = true;
+    model.index = 0;
+    try testing.expectError(error.RuntimeDisconnected, program.forward(ctx, .{ .order = 10 }));
+    try testing.expectEqual(@as(usize, 1), model.index);
+    try testing.expectEqual(@as(u32, 2), runtime.closes);
+}
+
 const BootstrapTraceSignature = dszig.Signature(struct {
     pub const Input = struct { token: []const u8 };
     pub const Output = struct { first: i64, second: i64, third: i64 = 9 };

@@ -242,7 +242,7 @@ fn appendReplText(
     try messages.append(arena, .{ .role = role, .content = .{ .text = escaped } });
 }
 
-fn escapeReplText(arena: Allocator, text: []const u8, omit_media: bool) Allocator.Error![]const u8 {
+pub fn escapeReplText(arena: Allocator, text: []const u8, omit_media: bool) Allocator.Error![]const u8 {
     const start = message_content.start_marker;
     const end = message_content.end_marker;
     var out: std.Io.Writer.Allocating = .init(arena);
@@ -276,7 +276,7 @@ fn escapeReplText(arena: Allocator, text: []const u8, omit_media: bool) Allocato
     return out.written();
 }
 
-fn truncateReplOutput(arena: Allocator, text: []const u8, limit: i64) adapter.Error![]const u8 {
+pub fn truncateReplOutput(arena: Allocator, text: []const u8, limit: i64) adapter.Error![]const u8 {
     if (limit >= 0 and text.len <= @as(u64, @intCast(limit))) return text;
     const utf8 = std.unicode.Utf8View.init(text) catch return error.AdapterParse;
     const count = std.unicode.utf8CountCodepoints(text) catch return error.AdapterParse;
