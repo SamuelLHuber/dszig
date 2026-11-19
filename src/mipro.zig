@@ -364,7 +364,8 @@ pub const MIPROv2 = struct {
     num_instruct_candidates: ?usize = null,
     /// Manual-mode demo-set budget. Null inherits `num_candidates`.
     num_fewshot_candidates: ?usize = null,
-    max_errors: usize = 10,
+    /// Null inherits the compile context for demo generation and evaluation.
+    max_errors: ?usize = null,
     /// DSPy `num_threads` for trial evaluation; null evaluates serially.
     concurrent_evaluation: ?optimize.ConcurrentEvaluation = null,
     seed: u32 = 9,
@@ -1037,7 +1038,8 @@ pub const MIPROv2 = struct {
     /// `batch_size` covers `valset`; any failure scores 0.0, as in DSPy.
     fn score(self: MIPROv2, comptime P: type, out: Allocator, gpa: Allocator, ctx: Context, program: *const P, valset: []const Example, batch_size: usize, rng: *pyrandom.Random) Allocator.Error!f64 {
         const devset = if (batch_size >= valset.len) valset else try createMinibatch(out, rng, valset, batch_size);
-        const result = optimize.evaluateWith(P, self.concurrent_evaluation, gpa, ctx, program, devset, self.metric, self.max_errors) catch |err| switch (err) {
+        const max_errors = self.max_errors orelse ctx.max_errors;
+        const result = optimize.evaluateWith(P, self.concurrent_evaluation, gpa, ctx, program, devset, self.metric, max_errors) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return 0.0,
         };
@@ -1183,6 +1185,77 @@ test "MIPRO compile demo overrides select zero-shot and seed zero samples indepe
         for (history.requests.items) |request| {
             const input = request.messages[request.messages.len - 1].content.text;
             try testing.expect(std.mem.indexOf(u8, input, "<question>\n2\n</question>") == null);
+        }
+    }
+}
+
+test "MIPRO inherits the compile context error limit for demos and trial evaluation" {
+    const P = predict.Predict(signature.Signature(struct {
+        pub const instructions = "base";
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: i64 };
+    }));
+    const FailingMetric = struct {
+        fn score(_: Allocator, example: *const Example, _: ?*const optimize.RecordPrediction, _: ?*const predict.Trace) @import("value.zig").ParseError!f64 {
+            if (std.mem.eql(u8, example.record.get("question").?.string, "fail"))
+                return error.ParseValue;
+            return 1;
+        }
+    };
+    var backing: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer backing.deinit();
+    const arena = backing.allocator();
+    const lm = @import("lm.zig");
+    const rows = [_]Example{
+        try Example.fromJson(arena, "{\"question\":\"fail\",\"answer\":1}", &.{"question"}),
+        try Example.fromJson(arena, "{\"question\":\"pass\",\"answer\":1}", &.{"question"}),
+    };
+    for ([_]bool{ false, true }) |bootstrap| {
+        for ([_]?usize{ null, 2 }) |explicit| {
+            var task: lm.ScriptedLM = .{ .responses = &(@as([8][]const u8, @splat("<answer>1</answer>"))) };
+            var prompt: lm.ScriptedLM = .{ .responses = &.{
+                "<proposed_instruction>alpha</proposed_instruction>",
+                "<proposed_instruction>beta</proposed_instruction>",
+                "<proposed_instruction>gamma</proposed_instruction>",
+            } };
+            const optimizer: MIPROv2 = .{
+                .metric = FailingMetric.score,
+                .auto = null,
+                .num_candidates = 3,
+                .max_bootstrapped_demos = @intFromBool(bootstrap),
+                .max_labeled_demos = @intFromBool(bootstrap),
+                .max_errors = explicit,
+                .teacher_settings = .{ .max_errors = 9 },
+            };
+            const compiled = optimizer.compile(
+                P,
+                arena,
+                testing.allocator,
+                .{ .arena = arena, .lm = task.lm(), .max_errors = 1 },
+                .{ .arena = arena, .lm = prompt.lm() },
+                .{},
+                @as(P, .{}),
+                if (bootstrap) &rows else rows[1..],
+                .{
+                    .valset = if (bootstrap) rows[1..] else &rows,
+                    .num_trials = 2,
+                    .minibatch = false,
+                    .program_aware_proposer = false,
+                    .data_aware_proposer = false,
+                    .tip_aware_proposer = false,
+                    .fewshot_aware_proposer = false,
+                },
+            );
+            if (bootstrap and explicit == null) {
+                try testing.expectError(error.ParseValue, compiled);
+                try testing.expectEqual(@as(usize, 1), task.index);
+                continue;
+            }
+            const result = try compiled;
+            const score: f64 = if (bootstrap) 100 else if (explicit != null) 50 else 0;
+            try testing.expectEqual(score, result.score);
+            for (result.trials) |trial| try testing.expectEqual(score, trial.score);
+            try testing.expectEqual(@as(usize, if (!bootstrap and explicit != null) 8 else 5), task.index);
         }
     }
 }

@@ -3455,7 +3455,7 @@ nominal program type, per-attempt contexts and options. A different program type
 is rejected before invocation, even when generic type display names collide.
 `BootstrapFewShotWithRandomSearch`,
 `BootstrapFewShotWithOptuna`, `MIPROv2`, `COPRO` and `InferRules` then evaluate
-candidates through it, each call using the optimizer's own `max_errors`; a
+candidates through it, each call using the optimizer's effective `max_errors`; a
 program-type mismatch returns `error.ProgramTypeMismatch`, and null keeps serial
 `optimize.evaluate`. Candidate evaluation is sequential between candidates, as in
 DSPy; only examples within one evaluation run concurrently. `BootstrapFewShot`
@@ -4185,6 +4185,10 @@ The following prevent a claim that DSZig can do everything DSPy can:
   refinement, matching DSPy rather than disabling the data-aware proposer.
   MIPROv2 compile options can override both demo limits without changing the
   optimizer defaults. A zero seed is explicit; only null inherits the default.
+  An unset `MIPROv2.max_errors` inherits `Context.max_errors` for both
+  demo bootstrapping and trial evaluation; an explicit limit overrides it.
+  Exhausting the limit aborts demo bootstrapping, but scores the affected
+  trial evaluation as zero.
   In manual mode (`auto = null`), `num_instruct_candidates` and
   `num_fewshot_candidates` independently override the `num_candidates` budget.
   Automatic presets keep their own budgets.
