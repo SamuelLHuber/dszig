@@ -3816,8 +3816,10 @@ The following prevent a claim that DSZig can do everything DSPy can:
   conversation, not the runtime state. An optional `history_processor` runs
   before each action and can edit or trim a private draft, or supply a replacement
   history that DSZig copies. `forwardWithOptions` can override the constructor
-  processor for a single call. Callback errors roll back edits, except allocation
-  failure and cancellation, which propagate. Trimming prompt history does not
+  processor or the `interpreter_factory` for a single call. The factory override
+  does not change the configured action instructions. Callback errors in the
+  history processor roll back edits, except allocation failure and cancellation,
+  which propagate. Trimming prompt history does not
   change the returned trajectory or the trajectory supplied to extraction.
   A runtime callback receives a borrowed `Runtime.Execution`: read the input
   record through `variables` and call `query` to dispatch a text-only sub-LM

@@ -264,6 +264,8 @@ pub const HistoryProcessor = struct {
 pub const ForwardOptions = struct {
     history: History = .{},
     history_processor: ?HistoryProcessor = null,
+    /// Use this factory for this invocation only, without changing the action objective.
+    interpreter_factory: ?Factory = null,
 };
 
 const TurnHistory = struct {
@@ -411,7 +413,8 @@ pub fn CustomRLM(comptime Sig: type) type {
                 .ctx = &ctx,
                 .calls_remaining = self.max_llm_calls,
             };
-            const runtime = try self.factory.open(self.factory.ptr);
+            const factory = options.interpreter_factory orelse self.factory;
+            const runtime = try factory.open(factory.ptr);
             defer runtime.close(runtime.ptr);
 
             for (entries, 0..) |*entry, index| {
