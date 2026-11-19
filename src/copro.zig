@@ -169,13 +169,11 @@ pub const COPRO = struct {
         student: P,
         trainset: []const Example,
     ) !Result(P) {
-        assert(self.breadth > 1);
-        assert(self.depth > 0);
-        assert(trainset.len > 0);
+        if (self.breadth <= 1) return error.InvalidBreadth;
         const E = CandidateProgram(P);
         var clone = student;
         const preds = try predict.namedPredictors(out, &clone);
-        assert(preds.len > 0);
+        if (preds.len == 0) return error.NoCandidates;
         const all = try out.alloc(std.ArrayList(Proposed), preds.len);
         const latest = try out.alloc([]const Proposed, preds.len);
         const evaluated = try out.alloc(std.ArrayList(E), preds.len);
@@ -238,6 +236,8 @@ pub const COPRO = struct {
 
         var flat: std.ArrayList(E) = .empty;
         for (evaluated) |e| try flat.appendSlice(out, e.items);
+        // Zero depth still generates initial proposals, but scores none.
+        if (flat.items.len == 0) return error.NoCandidates;
         std.sort.insertion(E, flat.items, {}, E.greater);
         // DSPy's final duplicate check compares last-field objects by identity.
         // Every scored signature update creates a fresh last field, so distinct
@@ -256,7 +256,6 @@ pub const COPRO = struct {
             }
             break :tracked items;
         } else null;
-        assert(kept.len > 0);
         return .{
             .program = kept[0].program,
             .candidates = candidates,
@@ -344,6 +343,39 @@ fn yesMetric(_: Allocator, _: *const Example, maybe_prediction: ?*const optimize
     const prediction = maybe_prediction orelse return error.ParseValue;
     const answer = prediction.get("answer") orelse return 0;
     return if (answer == .string and std.mem.eql(u8, answer.string, "yes")) 1 else 0;
+}
+
+test "COPRO returns input errors at the proposal and evaluation boundaries" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var history: lm_mod.History = .{ .arena = a };
+    var keyword: lm_mod.KeywordLM = .{
+        .history = &history,
+        .rules = &.{},
+        .default = "<proposed_instruction>\nTry.\n</proposed_instruction>\n\n<proposed_prefix_for_output_field>\nTry:\n</proposed_prefix_for_output_field>",
+    };
+    const ctx: Context = .{ .arena = a, .lm = keyword.lm() };
+    const train = [_]Example{try Example.fromJson(a, "{\"question\":\"x\",\"answer\":\"x\"}", &.{"question"})};
+    const Plain = struct {
+        pub const Input = TestQA.Input;
+        pub const Output = TestQA.Output;
+
+        pub fn forward(_: *const @This(), _: Context, input: Input) error{}!Output {
+            return .{ .answer = input.question };
+        }
+    };
+    var optimizer: COPRO = .{ .metric = yesMetric, .breadth = 1, .depth = 1 };
+    try testing.expectError(error.InvalidBreadth, optimizer.compile(TestProgram, a, testing.allocator, ctx, null, .{}, &train));
+    optimizer.breadth = 2;
+    try testing.expectError(error.NoCandidates, optimizer.compile(Plain, a, testing.allocator, ctx, null, .{}, &train));
+    try testing.expectEqual(@as(usize, 0), history.requests.items.len);
+    optimizer.depth = 0;
+    try testing.expectError(error.NoCandidates, optimizer.compile(TestProgram, a, testing.allocator, ctx, null, .{}, &train));
+    try testing.expectEqual(@as(usize, 1), history.requests.items.len);
+    optimizer.depth = 1;
+    try testing.expectError(error.EmptyDevset, optimizer.compile(TestProgram, a, testing.allocator, ctx, null, .{}, &.{}));
+    try testing.expectEqual(@as(usize, 2), history.requests.items.len);
 }
 
 test "COPRO climbs from the basic instruction to the best proposal" {

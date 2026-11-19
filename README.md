@@ -4114,6 +4114,10 @@ The following prevent a claim that DSZig can do everything DSPy can:
   `Result.candidate_programs` pairs each score-ordered candidate with its runnable
   program snapshot. Equal-scoring candidates with identical prompt text can
   remain separate, as in DSPy; native custom pointers retain Zig copy semantics.
+  Invalid breadth and programs without predictors fail before model calls.
+  With zero depth, COPRO generates initial proposals then returns
+  `error.NoCandidates`. With an empty training set at positive depth it
+  generates initial proposals, then the first evaluation returns `error.EmptyDevset`.
   Tracking does not add evaluations.
   `BootstrapFewShotWithRandomSearch.Result.candidates` retains runnable
   programs and their per-validation-example scores in original example order.
