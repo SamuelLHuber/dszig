@@ -4037,6 +4037,9 @@ The following prevent a claim that DSZig can do everything DSPy can:
   refinement, matching DSPy rather than disabling the data-aware proposer.
   MIPROv2 compile options can override both demo limits without changing the
   optimizer defaults. A zero seed is explicit; only null inherits the default.
+  In manual mode (`auto = null`), `num_instruct_candidates` and
+  `num_fewshot_candidates` independently override the `num_candidates` budget.
+  Automatic presets keep their own budgets.
   A zero instruction-candidate count with a nonempty predictor graph returns
   `error.InvalidOptions` rather than starting trial evaluation.
   SIMBA `Result.candidate_programs` retains the final native program values

@@ -359,6 +359,10 @@ pub const MIPROv2 = struct {
     max_labeled_demos: usize = 4,
     auto: ?Auto = .light,
     num_candidates: ?usize = null,
+    /// Manual-mode instruction budget. Null inherits `num_candidates`.
+    num_instruct_candidates: ?usize = null,
+    /// Manual-mode demo-set budget. Null inherits `num_candidates`.
+    num_fewshot_candidates: ?usize = null,
     max_errors: usize = 10,
     /// DSPy `num_threads` for trial evaluation; null evaluates serially.
     concurrent_evaluation: ?optimize.ConcurrentEvaluation = null,
@@ -504,8 +508,8 @@ pub const MIPROv2 = struct {
             n_fewshot = auto.n();
             num_trials = trialsFromCandidates(n_preds, zeroshot, auto.n());
         } else {
-            n_instruct = self.num_candidates.?;
-            n_fewshot = self.num_candidates.?;
+            n_instruct = self.num_instruct_candidates orelse self.num_candidates.?;
+            n_fewshot = self.num_fewshot_candidates orelse self.num_candidates.?;
             num_trials = options.num_trials.?;
         }
         if (minibatch and options.minibatch_size > valset.len) return error.MinibatchTooLarge;
