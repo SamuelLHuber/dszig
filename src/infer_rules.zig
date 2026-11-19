@@ -111,8 +111,8 @@ pub const InferRules = struct {
         /// Bind an actual mutable settings object to model Python dictionary
         /// aliasing. The pointee must outlive this optimizer. Value settings are
         /// captured by value instead; they do not pretend to be shared dicts.
-        /// Rules dereference this object for every call; the existing bootstrap
-        /// API receives its current value once at compile entry.
+        /// Rules read their captured binding on every induction call.
+        /// Bootstrap reads the optimizer's current binding on each attempt.
         teacher_settings_ref: ?*const optimize.TeacherSettings = null,
         metric_threshold: ?f64 = null,
         max_bootstrapped_demos: usize = 4,
@@ -230,7 +230,8 @@ pub const InferRules = struct {
             .max_labeled_demos = self.max_labeled_demos,
             .max_rounds = self.max_rounds,
             .max_errors = self.max_errors,
-            .teacher_settings = if (self.teacher_settings_ref) |bound| bound.* else self.teacher_settings,
+            .teacher_settings = self.teacher_settings,
+            .teacher_settings_ref = self.teacher_settings_ref,
         };
         const bootstrapped = try bootstrap.compile(P, bootstrap_out, gpa, ctx, student_in.*, if (teacher_in) |t| t.* else null, trainset);
         const original = try out.create(P);

@@ -1459,6 +1459,71 @@ test "BootstrapFewShot zero threshold accepts a zero score while null rejects it
     try testing.expectEqual(@as(usize, 0), rejected.program.generate_answer.predict.state.demos.len);
 }
 
+test "BootstrapFewShot reads borrowed settings for retries and later examples" {
+    const Sig = dszig.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: []const u8 };
+    });
+    const Program = struct {
+        pub const Input = Sig.Input;
+        pub const Output = Sig.Output;
+        compiled: bool = false,
+        predict: dszig.Predict(Sig) = .{},
+
+        pub fn forward(self: *const @This(), ctx: dszig.Context, input: Input) !Output {
+            return self.predict.forward(ctx, input);
+        }
+    };
+    const Metric = struct {
+        threadlocal var settings: *dszig.optimize.TeacherSettings = undefined;
+        threadlocal var next: dszig.lm.LM = undefined;
+
+        fn score(
+            _: std.mem.Allocator,
+            _: *const dszig.Example,
+            prediction: ?*const dszig.optimize.RecordPrediction,
+            _: ?*const dszig.Trace,
+        ) dszig.value.ParseError!f64 {
+            const answer = prediction.?.get("answer").?.string;
+            if (std.mem.eql(u8, answer, "retry")) {
+                settings.lm = next;
+                return 0;
+            }
+            if (std.mem.eql(u8, answer, "accepted")) settings.* = .{};
+            return 1;
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var initial: dszig.lm.ScriptedLM = .{ .responses = &.{"<answer>retry</answer>"} };
+    var retry: dszig.lm.ScriptedLM = .{ .responses = &.{"<answer>accepted</answer>"} };
+    var outer: dszig.lm.ScriptedLM = .{ .responses = &.{"<answer>inherited</answer>"} };
+    var settings: dszig.optimize.TeacherSettings = .{ .lm = initial.lm() };
+    Metric.settings = &settings;
+    Metric.next = retry.lm();
+    const ctx: dszig.Context = .{ .arena = arena, .lm = outer.lm() };
+    var optimizer: dszig.BootstrapFewShot = .{
+        .metric = Metric.score,
+        .max_rounds = 2,
+        .max_labeled_demos = 0,
+        .teacher_settings_ref = &settings,
+    };
+    const train = [_]dszig.Example{
+        try .fromJson(arena, "{\"question\":\"one\",\"answer\":\"label\"}", &.{"question"}),
+        try .fromJson(arena, "{\"question\":\"two\",\"answer\":\"label\"}", &.{"question"}),
+    };
+    const result = try optimizer.compile(Program, arena, testing.allocator, ctx, .{}, null, &train);
+    try testing.expectEqual(@as(usize, 3), result.report.attempts);
+    try testing.expectEqual(@as(usize, 0), result.report.errors);
+    const demos = result.program.predict.state.demos;
+    try testing.expectEqual(@as(usize, 2), demos.len);
+    try testing.expectEqualStrings("one", demos[0].get("question").?.string);
+    try testing.expectEqualStrings("accepted", demos[0].get("answer").?.string);
+    try testing.expectEqualStrings("two", demos[1].get("question").?.string);
+    try testing.expectEqualStrings("inherited", demos[1].get("answer").?.string);
+}
+
 test "Evaluate matches DSPy scores for the RAG fixture" {
     var out: std.heap.ArenaAllocator = .init(testing.allocator);
     defer out.deinit();

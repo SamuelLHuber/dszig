@@ -1592,6 +1592,11 @@ Out-of-memory propagates immediately without consuming this budget.
 When `BootstrapFewShot.max_errors` is null, the budget comes from the outer
 `Context.max_errors` (default 10), not from `teacher_settings.max_errors`.
 An explicit optimizer limit, including zero, takes precedence.
+Set `teacher_settings_ref` to share a live settings object. Bootstrap reads it
+at the start of each attempt, so an update in a teacher or metric callback
+affects the next attempt, including a retry. Clearing an override restores the
+outer context's setting on the next attempt. The object must remain alive
+through compile and must not be mutated concurrently.
 Teacher signature matching follows DSPy's named field roles, descriptions,
 prefixes and instructions; annotation types and field order do not decide
 signature equality.
@@ -1690,7 +1695,9 @@ evaluates rule candidates and returns an optional winning program; all-NaN or
 negative-infinity scores can leave it null. Its induction RNG, instruction
 metadata and teacher-settings binding persist across calls. An explicit borrowed
 `teacher_settings_ref` models shared settings mutation; value settings are
-captured by value. Candidate evaluation snapshots are independent, while
+captured by value. Bootstrap reads the current binding each attempt; the
+induction program reads the object it captured at initialization each time it
+generates rules. Candidate evaluation snapshots are independent, while
 instruction mutations propagate across matching native signature-class identities
 in the reachable caller/teacher/candidate graph, including an earlier winning
 program. Class identity survives program copies and remains distinct from
@@ -3838,9 +3845,7 @@ The following prevent a claim that DSZig can do everything DSPy can:
 - **Optimizer execution and shared identity:** InferRules' signature-alias propagation does not update arbitrary external
   instances outside the reachable program graph. Canonical Zig signature/Code
   types and default CoT construction do not reproduce every fresh dynamic Python
-  class identity; Refine shares this boundary. Mid-bootstrap mutation of a
-  borrowed teacher-settings object is not reflected after Bootstrap's entry
-  snapshot.
+  class identity; Refine shares this boundary.
 - **Runtime model identity:** Code, File, Image, Audio, Reasoning, BoundingBox,
   Citations, Noul/Score/Choice and generated decision evidence have genuine boxed classes,
   not a complete Python object runtime. Other model

@@ -564,6 +564,9 @@ pub const BootstrapFewShot = struct {
     /// Null inherits the compile context's limit, not the teacher's override.
     max_errors: ?usize = null,
     teacher_settings: TeacherSettings = .{},
+    /// When set, overrides value settings. Read once per attempt, including retries.
+    /// The pointee must outlive compile and must not be concurrently mutated.
+    teacher_settings_ref: ?*const TeacherSettings = null,
     /// Cumulative teacher and metric failures across serial compiles.
     error_count: usize = 0,
 
@@ -700,7 +703,8 @@ pub const BootstrapFewShot = struct {
         var c = ctx;
         c.arena = arena;
         c.trace = &trace;
-        self.teacher_settings.apply(&c);
+        const settings = if (self.teacher_settings_ref) |bound| bound.* else self.teacher_settings;
+        settings.apply(&c);
         if (round_idx > 0) {
             c.lm_options.temperature = 1.0;
             c.lm_options.rollout_id = .{ .integer = @intCast(round_idx) };
