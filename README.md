@@ -3800,7 +3800,9 @@ The following prevent a claim that DSZig can do everything DSPy can:
   existing `cachedContents` resources; it does not create or manage those
   resources. `Gemini.streamRequest` delivers canonical SSE events
   with text, thought signatures, function calls, and inline image/audio deltas,
-  and can stop reading without waiting for the response tail. Typed Gemini
+  and can stop reading without waiting for the response tail. Raw stream
+  errors preserve Gemini diagnostics and distinguish model and context-length
+  failures from generic provider errors. Typed Gemini
   streaming supports `AsyncProgram` field listeners, final predictions, and
   cancellation. Gemini Live WebSockets, Vertex AI, local path reads, and file
   uploads are not supported.

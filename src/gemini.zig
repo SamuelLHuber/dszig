@@ -283,25 +283,12 @@ const GenerateStream = struct {
         const candidates = elems(get(value, "candidates"));
         const candidate = if (candidates.len == 0) .null else candidates[0];
         const finish = text(get(candidate, "finishReason"));
-        const block = text(get(get(value, "promptFeedback"), "blockReason"));
-        if (get(value, "error") != .null) {
-            const detail = get(value, "error");
-            const status = nonempty(get(detail, "status")) orelse "provider";
-            try self.emit(.{ .provider_error = .{
-                .code = providerError(status),
-                .provider_code = status,
-                .message = nonempty(get(detail, "message")) orelse status,
-            } });
+        if (value.object.get("error")) |detail| {
+            try self.emit(.{ .provider_error = try streamError(arena, detail) });
             return true;
         }
-        if (invalidFinish(finish) or (block.len != 0 and
-            !std.mem.eql(u8, block, "BLOCK_REASON_UNSPECIFIED")))
-        {
-            try self.emit(.{ .provider_error = .{
-                .code = .invalid_request,
-                .provider_code = "inband_finish_reason",
-                .message = if (block.len != 0) block else finish,
-            } });
+        if (try blockedStreamError(arena, value, candidate)) |detail| {
+            try self.emit(.{ .provider_error = detail });
             return true;
         }
         var saw_tool = false;
@@ -380,7 +367,79 @@ const GenerateStream = struct {
     }
 };
 
-fn providerError(code: []const u8) @FieldType(@import("openai_stream.zig").ErrorDetail, "code") {
+const StreamError = @import("openai_stream.zig").ErrorDetail;
+
+fn truthyText(arena: Allocator, value: Value) Error!?[]const u8 {
+    const truthy = lm_mod.OpenAI.responseTruthy(value) catch |err| return codecError(err);
+    if (!truthy) return null;
+    if (value == .string) return value.string;
+    var output: std.Io.Writer.Allocating = .init(arena);
+    errdefer output.deinit();
+    @import("pyjson.zig").writeStr(&output.writer, value) catch |err| return codecError(err);
+    return try output.toOwnedSlice();
+}
+
+fn streamError(arena: Allocator, detail: Value) Error!StreamError {
+    const status = try truthyText(arena, get(detail, "status")) orelse
+        try truthyText(arena, get(detail, "code")) orelse "provider";
+    const message = try truthyText(arena, get(detail, "message")) orelse status;
+    return .{
+        .code = providerError(status, message),
+        .provider_code = status,
+        .message = message,
+    };
+}
+
+fn blockedStreamError(arena: Allocator, frame: Value, candidate: Value) Error!?StreamError {
+    const block = try truthyText(arena, get(get(frame, "promptFeedback"), "blockReason"));
+    const message = message: {
+        if (block) |reason| {
+            if (!std.mem.eql(u8, reason, "BLOCK_REASON_UNSPECIFIED")) {
+                break :message try std.fmt.allocPrint(
+                    arena,
+                    "Prompt blocked: {s} (gemini)",
+                    .{reason},
+                );
+            }
+        }
+        const finish = text(get(candidate, "finishReason"));
+        if (!invalidFinish(finish)) return null;
+        if (try truthyText(arena, get(candidate, "finishMessage"))) |detail| {
+            break :message try std.fmt.allocPrint(arena, "{s} (gemini)", .{detail});
+        }
+        break :message try std.fmt.allocPrint(arena, "Candidate blocked: {s} (gemini)", .{finish});
+    };
+    return .{
+        .code = .invalid_request,
+        .provider_code = "inband_finish_reason",
+        .message = message,
+    };
+}
+
+fn hasPhrase(haystack: []const u8, comptime needle: []const u8) bool {
+    comptime std.debug.assert(needle.len != 0);
+    if (haystack.len < needle.len) return false;
+    for (0..haystack.len - needle.len + 1) |i| {
+        if (std.ascii.eqlIgnoreCase(haystack[i..][0..needle.len], needle)) return true;
+    }
+    return false;
+}
+
+fn providerError(code: []const u8, message: []const u8) @FieldType(StreamError, "code") {
+    if (hasPhrase(message, "token")) {
+        if (hasPhrase(message, "limit") or hasPhrase(message, "exceed")) return .context_length;
+    }
+    if (hasPhrase(message, "too long") or hasPhrase(message, "context length")) {
+        return .context_length;
+    }
+    if (std.mem.eql(u8, code, "NOT_FOUND") and hasPhrase(message, "model")) {
+        inline for (.{
+            "not found",   "not exist",     "not supported",
+            "unsupported", "not available", "unknown",
+        }) |marker| {
+            if (hasPhrase(message, marker)) return .unsupported_model;
+        }
+    }
     if (contains(&.{ "INVALID_ARGUMENT", "NOT_FOUND" }, code)) return .invalid_request;
     if (contains(&.{ "PERMISSION_DENIED", "UNAUTHENTICATED" }, code)) return .auth;
     if (contains(&.{ "INTERNAL", "UNAVAILABLE" }, code)) return .server;
@@ -1397,6 +1456,61 @@ test "Gemini ignores empty media before assigning a synthetic tool ID" {
     const parts = result.message.?.parts;
     try std.testing.expectEqualStrings("gs://bucket/audio", parts[0].audio.url.?);
     try std.testing.expectEqualStrings("tool_call_1", parts[1].tool_call.id);
+}
+
+test "Gemini SSE preserves diagnostic precedence and emits no successful terminal event" {
+    const Capture = struct {
+        detail: ?StreamError = null,
+        event_count: usize = 0,
+
+        fn onEvent(context: *anyopaque, event: Gemini.StreamEvent) Gemini.StreamSink.Action {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.event_count += 1;
+            if (event == .provider_error) self.detail = event.provider_error;
+            return .proceed;
+        }
+    };
+    const cases = [_]struct { frame: []const u8, expected: StreamError }{
+        .{
+            .frame = "{\"error\":{\"status\":\"RESOURCE_EXHAUSTED\",\"message\":\"Token LIMIT\"}}",
+            .expected = .{
+                .code = .context_length,
+                .provider_code = "RESOURCE_EXHAUSTED",
+                .message = "Token LIMIT",
+            },
+        },
+        .{
+            .frame = "{\"error\":null,\"promptFeedback\":{\"blockReason\":\"SAFETY\"}}",
+            .expected = .{
+                .code = .provider,
+                .provider_code = "provider",
+                .message = "provider",
+            },
+        },
+        .{
+            .frame = "{\"candidates\":[{\"finishReason\":\"SAFETY\",\"finishMessage\":\"Blocked\"}]}",
+            .expected = .{
+                .code = .invalid_request,
+                .provider_code = "inband_finish_reason",
+                .message = "Blocked (gemini)",
+            },
+        },
+    };
+    for (cases) |case| {
+        var scratch: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer scratch.deinit();
+        const arena = scratch.allocator();
+        var capture: Capture = .{};
+        var state: GenerateStream = .{
+            .model = "fixture",
+            .adaptations = &.{},
+            .sink = .{ .context = &capture, .on_event = Capture.onEvent },
+        };
+        const frame = try @import("json_repair.zig").parseJson(arena, case.frame);
+        try std.testing.expect(try state.dispatch(arena, frame));
+        try std.testing.expectEqual(1, capture.event_count);
+        try std.testing.expectEqualDeep(case.expected, capture.detail.?);
+    }
 }
 
 test "Gemini SSE joins split text without merging parallel tool calls" {
