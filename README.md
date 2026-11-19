@@ -3825,6 +3825,8 @@ The following prevent a claim that DSZig can do everything DSPy can:
   points, group the displayed count with commas, and show the first and last
   500 code points when the rendered value exceeds 1,000. List and dictionary
   previews use `list` and `dict` rather than their parameterized annotations.
+  Optional inputs display `NoneType` or the present value's type; scalar
+  literals display their scalar type rather than the `Literal` annotation.
   An optional `history_processor` runs before each action and can edit or trim a private
   draft, or supply a replacement history that DSZig copies. `forwardWithOptions`
   can override the processor or the `interpreter_factory` for a single call.

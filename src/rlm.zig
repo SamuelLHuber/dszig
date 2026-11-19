@@ -498,23 +498,37 @@ fn reasoningText(reason: Value) ![]const u8 {
 
 fn variableInfo(comptime Sig: type, arena: Allocator, variables: *const Record) !Value {
     const fields = Sig.input_fields_list;
-    const dict_fields = comptime blk: {
-        var flags: [fields.len]bool = undefined;
+    const preview_types = comptime blk: {
+        var metadata: [fields.len]struct {
+            name: []const u8,
+            dict: bool,
+            literal: bool,
+        } = undefined;
         for (fields, 0..) |field, index| {
             const T = @FieldType(Sig.Input, field.name);
             const Base = if (@typeInfo(T) == .optional) @typeInfo(T).optional.child else T;
-            flags[index] = Base == signature.StrDict or Base == runtime_value.ObjectMap or types.isDict(Base);
+            metadata[index] = .{
+                .name = if (Base == T) field.type_name else types.pyName(Base),
+                .dict = Base == signature.StrDict or Base == runtime_value.ObjectMap or types.isDict(Base),
+                .literal = @typeInfo(Base) == .@"enum" or @import("literal.zig").isLiteral(Base),
+            };
         }
-        break :blk flags;
+        break :blk metadata;
     };
     var items = runtime_value.Array.init(arena);
     try items.ensureTotalCapacity(fields.len);
-    for (fields, dict_fields) |field, is_dict| {
+    for (fields, preview_types) |field, preview_type| {
         const val = variables.get(field.name) orelse return error.MissingField;
+        // REPLVariable describes the current value, not its signature annotation.
         const type_name = switch (val) {
+            .null => "NoneType",
             .array => "list",
-            .object => if (is_dict) "dict" else field.type_name,
-            else => field.type_name,
+            .object => if (preview_type.dict) "dict" else preview_type.name,
+            .string => if (preview_type.literal) "str" else preview_type.name,
+            .integer, .number_string => if (preview_type.literal) "int" else preview_type.name,
+            .float => if (preview_type.literal) "float" else preview_type.name,
+            .bool => if (preview_type.literal) "bool" else preview_type.name,
+            else => preview_type.name,
         };
         const rendered = try variableText(arena, val);
         const length = try std.unicode.utf8CountCodepoints(rendered);
@@ -577,6 +591,29 @@ test "RLM distinguishes dictionary values from model records in variable preview
     const info = try variableInfo(Sig, arena, &vars);
     try std.testing.expect(std.mem.indexOf(u8, info.array.items[0].string, "\nType: dict\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, info.array.items[1].string, "\nType: Count\n") != null);
+}
+
+test "RLM variable previews describe optional and literal input values" {
+    var storage: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    const Sig = signature.Signature(struct {
+        pub const Input = struct { maybe: ?i64, label: enum { A, B }, enabled: bool };
+        pub const Output = struct { answer: i64 };
+    });
+    const expected = [_][]const u8{
+        "Variable: `maybe` (access it in your code)\nType: NoneType\nTotal length: 4 characters\nPreview:\n```\nNone\n```",
+        "Variable: `maybe` (access it in your code)\nType: int\nTotal length: 2 characters\nPreview:\n```\n12\n```",
+    };
+    for ([_]?i64{ null, 12 }, expected) |maybe, preview| {
+        const vars = try value.toRecord(arena, Sig.Input, .{ .maybe = maybe, .label = .A, .enabled = false });
+        const info = try variableInfo(Sig, arena, &vars);
+        try std.testing.expectEqualStrings(preview, info.array.items[0].string);
+        try std.testing.expectEqualStrings(
+            "Variable: `label` (access it in your code)\nType: str\nTotal length: 1 characters\nPreview:\n```\nA\n```",
+            info.array.items[1].string,
+        );
+    }
 }
 
 fn variableText(arena: Allocator, input: Value) ![]const u8 {
