@@ -177,7 +177,8 @@ fn writeCsvCell(writer: *std.Io.Writer, cell: []const u8, only_column: bool) !vo
 }
 
 pub const EvaluationOptions = struct {
-    max_errors: usize = 10,
+    /// Null inherits the evaluation context. Explicit zero aborts on the first error.
+    max_errors: ?usize = null,
     failure_score: f64 = 0,
 };
 
@@ -242,6 +243,7 @@ fn evaluateScores(
     var output: P.Output = undefined;
     var sum: f64 = 0;
     var errors: usize = 0;
+    const max_errors = options.max_errors orelse ctx.max_errors;
     for (devset, 0..) |*example, index| {
         var scratch: std.heap.ArenaAllocator = .init(gpa);
         defer scratch.deinit();
@@ -255,7 +257,7 @@ fn evaluateScores(
             err) catch |err| blk: {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             errors += 1;
-            if (errors >= options.max_errors) return err;
+            if (errors >= max_errors) return err;
             break :blk null;
         };
         const score = scored orelse options.failure_score;

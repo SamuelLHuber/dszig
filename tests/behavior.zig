@@ -1457,11 +1457,22 @@ test "detailed evaluation preserves successful predictions after scratch reuse" 
         try dszig.Example.fromJson(arena, "{\"question\":\"metric_error\"}", inputs),
         try dszig.Example.fromJson(arena, "{\"question\":\"last\"}", inputs),
     };
+    const ctx: dszig.Context = .{ .arena = arena, .lm = undefined, .max_errors = 2 };
+    try testing.expectError(error.ParseValue, dszig.optimize.evaluateDetailed(
+        P,
+        arena,
+        testing.allocator,
+        ctx,
+        &.{},
+        &devset,
+        P.metric,
+        .{ .failure_score = -0.25 },
+    ));
     const result = try dszig.optimize.evaluateDetailed(
         P,
         arena,
         testing.allocator,
-        .{ .arena = arena, .lm = undefined },
+        ctx,
         &.{},
         &devset,
         P.metric,
@@ -1486,7 +1497,6 @@ test "detailed evaluation preserves successful predictions after scratch reuse" 
         try evaluator.init(testing.io, .{}, &backing);
         defer evaluator.deinit();
         evaluator.failure_score = -0.25;
-        const ctx: dszig.Context = .{ .arena = arena, .lm = undefined };
         break :blk try evaluator.evaluateDetailed(arena, &@as(
             [limits.attempts]dszig.Context,
             @splat(ctx),

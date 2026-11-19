@@ -3471,6 +3471,8 @@ nested optimizer's own limit.
 `eval_kwargs["max_errors"]`, which DSPy 3.5 rejects during evaluation.
 `BootstrapFewShotWithOptuna` inherits the same caller setting for both
 bootstrap and trial evaluation; its explicit `max_errors` is a native override.
+For standalone serial `optimize.evaluateDetailed`, a null
+`EvaluationOptions.max_errors` also inherits the caller context.
 
 SIMBA's `num_threads` is `rollouts`: a `Parallel(SIMBA.Run, limits).runner()` and
 per-attempt contexts supplying LM and retriever pointees. Trajectory sampling,
