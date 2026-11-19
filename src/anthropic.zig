@@ -38,6 +38,7 @@ pub const Anthropic = struct {
     structured_output: enum { send, reject } = .send,
     /// Endpoints with implicit caching can opt out of explicit cache markers.
     cache_control: enum { anthropic, none } = .anthropic,
+    thinking_format: enum { anthropic, deepseek, adaptive, effort } = .anthropic,
     supports_reasoning: bool = false,
     supports_response_schema: bool = false,
     adaptations: enum { note, silent, refuse } = .note,
@@ -412,32 +413,49 @@ pub const Anthropic = struct {
     ) Error!Value {
         const reasoning = fields.config.reasoning orelse return .null;
         const effort = reasoning.effort orelse return error.LMFailure;
-        if (effort == .off) return .null;
+        if (effort == .off) {
+            if (self.thinking_format != .anthropic) {
+                try putThinking(arena, body, "disabled", false, .null);
+            }
+            return .null;
+        }
         if (reasoning.summary) |summary| if (summary != .auto) {
             try self.adapt(arena, records, "config.reasoning.summary", .substituted, "the Messages API has no summary detail levels; it returns one summary of the " ++
                 "thinking, which is 'auto'", str(@tagName(summary)), str("auto"));
         };
-        var thinking: Object = .empty;
-        const adaptive = adaptiveModel(fields.model);
-        try thinking.put(arena, "type", str(if (adaptive) "adaptive" else "enabled"));
-        if (reasoning.summary != null) try thinking.put(arena, "display", str("summarized"));
+        const adaptive = self.thinking_format != .anthropic or adaptiveModel(fields.model);
+        const display = self.thinking_format == .anthropic and reasoning.summary != null;
         var budget = reasoning.thinking_budget;
         if (adaptive) {
             if (budget != .null) {
-                const reason = try std.fmt.allocPrint(arena, "{s} takes thinking.type 'adaptive' with output_config.effort; " ++
-                    "budget_tokens is rejected by the API (live 2026-09-02). Thinking is bounded only " ++
-                    "by max_tokens, which covers thinking and answer together: lower the effort or " ++
-                    "raise max_tokens", .{fields.model});
+                const reason = switch (self.thinking_format) {
+                    .deepseek => "this server ignores budget_tokens; effort is the dial",
+                    .adaptive => "this server accepts budget_tokens without translating it; " ++
+                        "effort is the dial (protocols--messages.md)",
+                    .anthropic, .effort => try std.fmt.allocPrint(
+                        arena,
+                        "{s} takes thinking.type 'adaptive' with output_config.effort; " ++
+                            "budget_tokens is rejected by the API (live 2026-09-02). " ++
+                            "Thinking is bounded only by max_tokens, which covers thinking and " ++
+                            "answer together: lower the effort or raise max_tokens",
+                        .{fields.model},
+                    ),
+                };
                 try self.adapt(arena, records, "config.reasoning.thinking_budget", .dropped, reason, budget, .null);
                 budget = .null;
             }
-            if (effort == .minimal) {
+            const clamp_minimal = effort == .minimal and self.thinking_format == .anthropic;
+            if (clamp_minimal) {
                 try self.adapt(arena, records, "config.reasoning.effort", .clamped, "this model class has no 'minimal' level (output_config.effort is " ++
                     "low|medium|high|xhigh|max); 'low' is the floor", str("minimal"), str("low"));
             }
             var output: Object = .empty;
-            try output.put(arena, "effort", str(if (effort == .minimal) "low" else @tagName(effort)));
+            try output.put(arena, "effort", str(if (clamp_minimal) "low" else @tagName(effort)));
             try body.put(arena, "output_config", .{ .object = output });
+            if (self.thinking_format != .effort) {
+                const kind = if (self.thinking_format == .deepseek) "enabled" else "adaptive";
+                try putThinking(arena, body, kind, display, .null);
+            }
         } else {
             if (budget == .null) budget = .{ .integer = switch (effort) {
                 .off => unreachable,
@@ -448,10 +466,17 @@ pub const Anthropic = struct {
                 .xhigh => 24576,
                 .max => 32768,
             } };
-            try thinking.put(arena, "budget_tokens", budget);
+            try putThinking(arena, body, "enabled", display, budget);
         }
-        try body.put(arena, "thinking", .{ .object = thinking });
         return budget;
+    }
+
+    fn putThinking(arena: Allocator, body: *Object, kind: []const u8, display: bool, budget: Value) Error!void {
+        var thinking: Object = .empty;
+        try thinking.put(arena, "type", str(kind));
+        if (display) try thinking.put(arena, "display", str("summarized"));
+        if (budget != .null) try thinking.put(arena, "budget_tokens", budget);
+        try body.put(arena, "thinking", .{ .object = thinking });
     }
 
     fn addSampling(self: *const Anthropic, arena: Allocator, body: *Object, config: *const sdk.Config, records: *std.ArrayList(sdk.Adaptation)) Error!void {
@@ -1265,6 +1290,34 @@ test "Anthropic hosted blocks do not shift client calls, but citations do" {
     try std.testing.expectEqualStrings("Paris", parts[0].text.text);
     try std.testing.expectEqualStrings("https://example.org", parts[1].citation.url.?);
     try std.testing.expectEqualStrings("tool_2", parts[2].tool_call.id);
+}
+
+test "Anthropic alternate thinking distinguishes an absent request from off" {
+    var backing: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer backing.deinit();
+    const arena = backing.allocator();
+    const parse = @import("json_repair.zig").parseJson;
+    const provider: Anthropic = .{
+        .client = undefined,
+        .model = "deepseek-fixture",
+        .thinking_format = .deepseek,
+    };
+    var records: std.ArrayList(sdk.Adaptation) = .empty;
+    for ([_]?sdk.Reasoning{ null, .{ .effort = .off } }) |reasoning| {
+        const request = try sdk.Request.fromFields(arena, &.{
+            .model = provider.model,
+            .messages = &.{.{ .role = .user, .parts = &.{.{ .text = .{ .text = "Next" } }} }},
+            .config = .{ .reasoning = reasoning, .max_tokens = .{ .integer = 16 } },
+        });
+        defer request.release();
+        const body = try parse(arena, try provider.requestBody(arena, request, &records, false));
+        const thinking = get(body, "thinking");
+        if (reasoning == null) {
+            try std.testing.expect(thinking == .null);
+        } else {
+            try std.testing.expectEqualStrings("disabled", text(get(thinking, "type")));
+        }
+    }
 }
 
 test "Anthropic implicit cache policy cannot drop a referenced prompt prefix" {
