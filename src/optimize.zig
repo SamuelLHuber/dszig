@@ -453,16 +453,19 @@ pub fn forwardProgram(
     return predict.forwardScoped(program, ctx, try exampleInput(P, ctx.arena, example), usage);
 }
 
-/// `example.inputs()` as the program's typed keyword arguments: only declared
-/// input roles are decoded, directly from borrowed training storage.
+/// Decode typed keyword arguments directly from Example input roles.
+/// Omitted arguments take the program input struct's declared defaults.
 pub fn exampleInput(comptime P: type, arena: Allocator, example: *const Example) !P.Input {
     // Interleave role checks and conversion to preserve declaration-order failures.
     var input: P.Input = undefined;
     const fields = @typeInfo(P.Input).@"struct";
-    inline for (fields.field_names, fields.field_types) |name, T| {
-        if (!example.isInput(name)) return error.MissingField;
-        const item = example.record.get(name) orelse return error.MissingField;
-        @field(input, name) = try value.fromValue(arena, T, item);
+    inline for (fields.field_names, fields.field_types, fields.field_attrs) |name, T, attrs| {
+        const item = if (example.isInput(name)) example.record.get(name) else null;
+        if (item) |arg| {
+            @field(input, name) = try value.fromValue(arena, T, arg);
+        } else if (comptime attrs.default_value_ptr) |default| {
+            @field(input, name) = @as(*const T, @ptrCast(@alignCast(default))).*;
+        } else return error.MissingField;
     }
     return input;
 }

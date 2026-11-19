@@ -480,11 +480,11 @@ test "Evaluate uses Python decimal ties-to-even without intermediate rounding or
 test "native input decoding needs no projection allocation and never admits labels" {
     const P = struct {
         product: *i64,
-        pub const Input = struct { number: i64, text: []const u8 };
+        pub const Input = struct { number: i64, text: []const u8, scale: i64 = 2 };
         pub const Output = struct {};
 
         pub fn forward(self: *const @This(), _: dszig.Context, input: Input) !Output {
-            self.product.* = input.number * @as(i64, @intCast(input.text.len));
+            self.product.* = input.number * @as(i64, @intCast(input.text.len)) * input.scale;
             return .{};
         }
     };
@@ -493,7 +493,7 @@ test "native input decoding needs no projection allocation and never admits labe
     const arena = memory.allocator();
     var example = try dszig.Example.fromJson(
         arena,
-        "{\"number\":7,\"text\":\"abc\",\"answer\":\"private\"}",
+        "{\"number\":7,\"text\":\"abc\",\"scale\":5,\"answer\":\"private\"}",
         &.{ "text", "unknown", "number", "text" },
     );
     var unused: dszig.lm.ScriptedLM = .{ .responses = &.{} };
@@ -502,7 +502,10 @@ test "native input decoding needs no projection allocation and never admits labe
     const program: P = .{ .product = &product };
     // Input decoding itself allocates nothing; a retained Prediction would.
     _ = try dszig.optimize.forwardProgram(P, ctx, &program, &example, null);
-    try testing.expectEqual(@as(i64, 21), product);
+    try testing.expectEqual(@as(i64, 42), product);
+    example.input_keys = &.{ "text", "number", "scale" };
+    _ = try dszig.optimize.forwardProgram(P, ctx, &program, &example, null);
+    try testing.expectEqual(@as(i64, 105), product);
 
     // An existing training label is not an input just because the program asks for it.
     example.input_keys = &.{"number"};

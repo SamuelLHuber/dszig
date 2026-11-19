@@ -2667,6 +2667,9 @@ Program value copies retain model identity without owning the model.
 When calling `PredictState.call` or `callMany` with a record, omitted input
 fields use their declared signature defaults in the prompt and trace. An
 explicit `null` stays `null`; the caller's record is not modified.
+Typed programs run from an `Example` also use declared input defaults for
+omitted arguments. Fields not marked as inputs are not passed to the program,
+even if a label has the same name as an input.
 
 Program save/dump now stores a bound LM's configuration rather than silently
 writing null. `lm.OpenAI` supports native configuration persistence, including
