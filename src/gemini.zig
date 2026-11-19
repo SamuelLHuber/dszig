@@ -182,7 +182,7 @@ pub const Gemini = struct {
     ) !void {
         if (self.header_provider != null) return error.LMFailure;
         const uri = try liveEndpoint(arena, self.base_url, self.api_key);
-        const payloads = try liveTextPayloads(arena, fields, extensions);
+        const payloads = try livePayloads(arena, fields, extensions);
         var timed: @import("timed_io.zig") = .{
             .inner = self.client.io,
             .timeout_ns = self.timeout_ns orelse 600 * std.time.ns_per_s,
@@ -193,7 +193,7 @@ pub const Gemini = struct {
         defer client.deinit();
         var socket = try @import("websocket.zig").open(&client, uri);
         defer socket.deinit();
-        try socket.sendText(payloads[0]);
+        try socket.sendText(payloads.setup);
 
         var buffer: std.ArrayList(u8) = .empty;
         defer buffer.deinit(client.allocator);
@@ -207,7 +207,7 @@ pub const Gemini = struct {
             if (value.object.contains("error")) return error.LMFailure;
         } else return error.LMFailure;
 
-        try socket.sendText(payloads[1]);
+        for (payloads.input) |payload| try socket.sendText(payload);
         try state.start();
         const usage_allocator = if (state.assembler == null) client.allocator else arena;
         var usage: sdk.Usage = .{};
@@ -300,20 +300,26 @@ fn liveEndpoint(arena: Allocator, base_url: []const u8, key: ?[]const u8) !std.U
     return uri;
 }
 
-fn liveTextPayloads(
+const LivePayloads = struct { setup: []const u8, input: []const []const u8 };
+
+fn livePayloads(
     arena: Allocator,
     fields: *const sdk.RequestFields,
     extensions: Value,
-) ![2][]const u8 {
-    if (hasPhrase(fields.model, "live-preview") or hasPhrase(fields.model, "native-audio")) {
-        return error.LMFailure;
-    }
-    if (fields.tools.len != 0 or fields.messages.len != 1) return error.LMFailure;
+) !LivePayloads {
+    if (fields.tools.len != 0) return error.LMFailure;
     if (extensions != .object and extensions != .null) return error.LMFailure;
-    if (text(get(extensions, "output")).len != 0) return error.LMFailure;
-    const message = fields.messages[0];
-    if (message.role != .user) return error.LMFailure;
-    for (message.parts) |part| if (part != .text) return error.LMFailure;
+    const audio_native = hasPhrase(fields.model, "live-preview") or
+        hasPhrase(fields.model, "native-audio");
+    const output = text(get(extensions, "output"));
+    const audio = audio_native or std.mem.eql(u8, output, "audio");
+    const image = std.mem.eql(u8, output, "image");
+    var has_activity = false;
+    if (audio_native) {
+        for (fields.messages) |message| for (message.parts) |part| {
+            if (part == .audio or part == .video) has_activity = true;
+        };
+    }
 
     var setup: Object = .empty;
     const model = fields.model;
@@ -328,7 +334,7 @@ fn liveTextPayloads(
         };
         if (bytes.len != 0) {
             const parts = try singleton(arena, try textPart(arena, bytes));
-            try setup.put(arena, "systemInstruction", try liveField(arena, "parts", parts));
+            try setup.put(arena, "systemInstruction", try wrapped(arena, "parts", parts));
         }
     }
     if (extensions == .object) {
@@ -338,29 +344,172 @@ fn liveTextPayloads(
             try setup.put(arena, entry.key_ptr.*, entry.value_ptr.*);
         }
     }
-    const generation = try setup.getOrPut(arena, "generationConfig");
-    if (!generation.found_existing) generation.value_ptr.* = .{ .object = .empty };
-    if (generation.value_ptr.* != .object) return error.LMFailure;
-    const existing_modalities = generation.value_ptr.object.get("responseModalities");
-    if (existing_modalities) |modalities| {
-        const items = elems(modalities);
-        if (items.len != 1 or !std.mem.eql(u8, text(items[0]), "TEXT")) return error.LMFailure;
-    } else {
-        var generation_copy = try generation.value_ptr.object.clone(arena);
-        try generation_copy.put(arena, "responseModalities", try singleton(arena, str("TEXT")));
-        generation.value_ptr.* = .{ .object = generation_copy };
+    try liveSetupModalities(arena, &setup, audio, image, has_activity);
+    if (audio and !std.mem.eql(u8, output, "audio")) {
+        try setup.put(arena, "outputAudioTranscription", .{ .object = .empty });
     }
-    const question = try content.partsText(arena, message.parts, null);
     return .{
-        try liveJson(arena, try liveField(arena, "setup", .{ .object = setup })),
-        try liveJson(arena, try liveField(arena, "realtimeInput", try textPart(arena, question))),
+        .setup = try liveJson(arena, try wrapped(arena, "setup", .{ .object = setup })),
+        .input = if (audio_native)
+            try liveRealtimeFrames(arena, fields.messages, has_activity)
+        else
+            try liveTurnFrames(arena, fields.messages),
     };
 }
 
-fn liveField(arena: Allocator, name: []const u8, value: Value) !Value {
+fn liveSetupModalities(
+    arena: Allocator,
+    setup: *Object,
+    audio: bool,
+    image: bool,
+    activity: bool,
+) !void {
+    var generation = try liveObjectCopy(arena, setup.get("generationConfig"));
+    if (audio or image or !generation.contains("responseModalities")) {
+        const modality_name = if (audio) "AUDIO" else if (image) "IMAGE" else "TEXT";
+        try generation.put(arena, "responseModalities", try singleton(arena, str(modality_name)));
+    }
+    try setup.put(arena, "generationConfig", .{ .object = generation });
+    if (!activity) return;
+    var realtime = try liveObjectCopy(arena, setup.get("realtimeInputConfig"));
+    var detection = try liveObjectCopy(arena, realtime.get("automaticActivityDetection"));
+    try detection.put(arena, "disabled", .{ .bool = true });
+    try realtime.put(arena, "automaticActivityDetection", .{ .object = detection });
+    try setup.put(arena, "realtimeInputConfig", .{ .object = realtime });
+}
+
+fn liveObjectCopy(arena: Allocator, item: ?Value) !Object {
+    const value = item orelse return .empty;
+    if (value != .object) return error.LMFailure;
+    return value.object.clone(arena);
+}
+
+fn liveTurnFrames(arena: Allocator, messages: []const sdk.Message) ![]const []const u8 {
+    const payloads = try arena.alloc([]const u8, 1);
+    if (messages.len == 1 and messages[0].role == .user) text_only: {
+        for (messages[0].parts) |part| if (part != .text) break :text_only;
+        const bytes = try content.partsText(arena, messages[0].parts, null);
+        payloads[0] = try liveFrame(arena, "realtimeInput", "text", str(bytes));
+        return payloads;
+    }
+    var turns: runtime.Array = .init(arena);
+    const names: std.StringHashMapUnmanaged([]const u8) = .empty;
+    for (messages) |message| {
+        var parts: runtime.Array = .init(arena);
+        for (message.parts) |part| {
+            if (part == .tool_call or part == .tool_result) return error.LMFailure;
+            try parts.append(try encodePart(arena, part, &names));
+        }
+        var turn: Object = .empty;
+        try turn.put(arena, "role", str(if (message.role == .assistant) "model" else "user"));
+        try turn.put(arena, "parts", .{ .array = parts });
+        try turns.append(.{ .object = turn });
+    }
+    payloads[0] = try liveContentFrame(arena, turns, true);
+    return payloads;
+}
+
+fn liveContentFrame(arena: Allocator, turns: runtime.Array, complete: bool) ![]const u8 {
     var object: Object = .empty;
-    try object.put(arena, name, value);
-    return .{ .object = object };
+    try object.put(arena, "turns", .{ .array = turns });
+    try object.put(arena, "turnComplete", .{ .bool = complete });
+    return liveJson(arena, try wrapped(arena, "clientContent", .{ .object = object }));
+}
+
+fn liveFrame(arena: Allocator, outer: []const u8, inner: []const u8, value: Value) ![]const u8 {
+    return liveJson(arena, try wrapped(arena, outer, try wrapped(arena, inner, value)));
+}
+
+fn liveRealtimeFrames(
+    arena: Allocator,
+    messages: []const sdk.Message,
+    activity: bool,
+) ![]const []const u8 {
+    var parts: runtime.Array = .init(arena);
+    var texts: std.ArrayList([]const u8) = .empty;
+    var media: std.ArrayList([]const u8) = .empty;
+    const names: std.StringHashMapUnmanaged([]const u8) = .empty;
+    for (messages) |message| for (message.parts) |part| switch (part) {
+        .text => |item| {
+            if (item.text.len != 0) try texts.append(
+                arena,
+                try liveFrame(arena, "realtimeInput", "text", str(item.text)),
+            );
+        },
+        .audio, .video => |item| try media.append(
+            arena,
+            try liveMediaFrame(arena, if (part == .audio) "audio" else "video", &item),
+        ),
+        .image, .document, .binary => try parts.append(try encodePart(arena, part, &names)),
+        else => return error.LMFailure,
+    };
+    var frames: std.ArrayList([]const u8) = .empty;
+    if (activity) try frames.append(
+        arena,
+        try liveFrame(arena, "realtimeInput", "activityStart", .{ .object = .empty }),
+    );
+    if (parts.items.len != 0) {
+        var turn: Object = .empty;
+        try turn.put(arena, "role", str("user"));
+        try turn.put(arena, "parts", .{ .array = parts });
+        const turns = try singleton(arena, .{ .object = turn });
+        try frames.append(arena, try liveContentFrame(arena, turns.array, false));
+    }
+    try frames.appendSlice(arena, texts.items);
+    try frames.appendSlice(arena, media.items);
+    if (activity) try frames.append(
+        arena,
+        try liveFrame(arena, "realtimeInput", "activityEnd", .{ .object = .empty }),
+    );
+    if (frames.items.len == 0) try frames.append(
+        arena,
+        try liveFrame(arena, "realtimeInput", "text", str("")),
+    );
+    return frames.toOwnedSlice(arena);
+}
+
+fn liveMediaFrame(arena: Allocator, name: []const u8, media: *const sdk.MediaPart) ![]const u8 {
+    if (media.path != null) return error.LMFailure;
+    var bytes = media.data orelse return error.LMFailure;
+    var mime = media.media_type;
+    const audio = std.mem.eql(u8, name, "audio");
+    if (mime.len == 0) mime = if (audio) "audio/pcm" else "video/mp4";
+    if (audio and (std.mem.find(u8, mime, "wav") != null or
+        std.mem.find(u8, mime, "wave") != null))
+    {
+        const decoder = std.base64.standard.Decoder;
+        const raw = try arena.alloc(u8, try decoder.calcSizeForSlice(bytes));
+        try decoder.decode(raw, bytes);
+        const pcm = liveWave(raw);
+        const encoder = std.base64.standard.Encoder;
+        bytes = encoder.encode(try arena.alloc(u8, encoder.calcSize(pcm.bytes.len)), pcm.bytes);
+        mime = try std.fmt.allocPrint(arena, "audio/pcm;rate={d}", .{pcm.rate});
+    }
+    var media_value: Object = .empty;
+    try media_value.put(arena, "mimeType", str(mime));
+    try media_value.put(arena, "data", str(bytes));
+    return liveFrame(arena, "realtimeInput", name, .{ .object = media_value });
+}
+
+fn liveWave(raw: []const u8) struct { bytes: []const u8, rate: u32 } {
+    if (raw.len < 44 or !std.mem.eql(u8, raw[0..4], "RIFF") or
+        !std.mem.eql(u8, raw[8..12], "WAVE"))
+    {
+        return .{ .bytes = raw, .rate = 16000 };
+    }
+    const rate = std.mem.readInt(u32, raw[24..28], .little);
+    var offset: usize = 12;
+    while (raw.len - offset >= 8) {
+        const id = raw[offset..][0..4];
+        const size = std.mem.readInt(u32, raw[offset + 4 ..][0..4], .little);
+        offset += 8;
+        if (std.mem.eql(u8, id, "data")) {
+            return .{ .bytes = raw[offset..][0..@min(size, raw.len - offset)], .rate = rate };
+        }
+        if (size > raw.len - offset) break;
+        offset += size;
+    }
+    return .{ .bytes = raw[44..], .rate = rate };
 }
 
 fn liveJson(arena: Allocator, value: Value) ![]const u8 {
@@ -411,15 +560,10 @@ fn dispatchLive(
         usage.* = replacement;
     }
     for (elems(get(get(server, "modelTurn"), "parts")), 0..) |part, index| {
-        if (part != .object or !part.object.contains("text")) return error.LMFailure;
-        const bytes = (try truthyText(scratch, get(part, "text"))) orelse "";
-        const retained = if (state.assembler != null) try usage_allocator.dupe(u8, bytes) else bytes;
+        const data = (try decodeLivePart(scratch, usage_allocator, state, part)) orelse continue;
         var key_buffer: [24]u8 = undefined;
         const key = std.fmt.bufPrint(&key_buffer, "{d}", .{index}) catch unreachable;
-        try state.emit(.{ .delta = .{
-            .part_index = key,
-            .data = .{ .text = .{ .text = retained } },
-        } });
+        try state.emit(.{ .delta = .{ .part_index = key, .data = data } });
         if (state.outcome == .stopped) return true;
     }
     if (try truthyText(scratch, get(get(server, "outputTranscription"), "text"))) |bytes| {
@@ -435,6 +579,31 @@ fn dispatchLive(
         .provider_data = null,
     } });
     return true;
+}
+
+fn decodeLivePart(
+    scratch: Allocator,
+    retained: Allocator,
+    state: *const GenerateStream,
+    part: Value,
+) !?GenerateStream.stream.DeltaData {
+    if (part != .object) return null;
+    const retain = state.assembler != null;
+    if (part.object.get("text")) |value| {
+        const bytes = (try truthyText(scratch, value)) orelse "";
+        return .{ .text = .{ .text = if (retain) try retained.dupe(u8, bytes) else bytes } };
+    }
+    if (part.object.contains("functionCall")) return error.LMFailure;
+    const inline_data = get(part, "inlineData");
+    const mime = text(get(inline_data, "mimeType"));
+    const audio = std.mem.startsWith(u8, mime, "audio/");
+    if (!audio and !std.mem.startsWith(u8, mime, "image/")) return null;
+    const bytes = text(get(inline_data, "data"));
+    const media: GenerateStream.stream.Media = .{
+        .data = if (retain) try retained.dupe(u8, bytes) else bytes,
+        .media_type = if (retain) try retained.dupe(u8, mime) else mime,
+    };
+    return if (audio) .{ .audio = media } else .{ .image = media };
 }
 
 fn endpoint(arena: Allocator, base_url: []const u8, model: []const u8, stream: bool) Error![]const u8 {
@@ -1691,6 +1860,15 @@ test "Gemini ignores empty media before assigning a synthetic tool ID" {
     const parts = result.message.?.parts;
     try std.testing.expectEqualStrings("gs://bucket/audio", parts[0].audio.url.?);
     try std.testing.expectEqualStrings("tool_call_1", parts[1].tool_call.id);
+}
+
+test "Gemini Live clips a truncated WAV data chunk to the available samples" {
+    const header = "RIFF\x26\x00\x00\x00WAVEfmt \x10\x00\x00\x00" ++
+        "\x01\x00\x01\x00\x22\x56\x00\x00\x44\xac\x00\x00\x02\x00\x10\x00";
+    const raw = header ++ "data\xff\xff\xff\xff\x01\x02";
+    const pcm = liveWave(raw);
+    try std.testing.expectEqual(22050, pcm.rate);
+    try std.testing.expectEqualStrings("\x01\x02", pcm.bytes);
 }
 
 test "Gemini SSE preserves diagnostic precedence and emits no successful terminal event" {
