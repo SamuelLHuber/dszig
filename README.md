@@ -2948,8 +2948,9 @@ The reset, labeled and fixed bootstrap seeds permit zero bootstrapped demos;
 a consumed random seed instead returns `InvalidBootstrapRange`. Early stopping
 can avoid that failure. Teacher-list refusal is likewise deferred until a
 bootstrap candidate actually consumes the teacher.
-Like `BootstrapFewShot`, random search accepts a borrowed `teacher_settings_ref`.
-Each bootstrap attempt reads it, so settings updates carry across candidates.
+Like `BootstrapFewShot`, random search and `BootstrapFewShotWithOptuna`
+accept a borrowed `teacher_settings_ref`. Each bootstrap attempt reads it,
+so updates carry across attempts and across random-search candidates.
 
 BetterTogether's `optimizers.LabeledFewShot` and `optimizers.RandomSearch`
 expose `compile_options`; `Defaults.prompt_compile_options` configures the

@@ -1542,6 +1542,22 @@ test "BootstrapFewShot reads borrowed settings for retries and later examples" {
     const ranked = try search.compile(Program, arena, testing.allocator, ctx, .{}, null, &train, train[0..1], .{ .restrict = &.{ -1, 0 } });
     try testing.expectEqualStrings("accepted", ranked.candidates[0].program.predict.state.demos[0].get("answer").?.string);
     try testing.expectEqualStrings("inherited", ranked.candidates[1].program.predict.state.demos[0].get("answer").?.string);
+
+    initial.index = 0;
+    retry.index = 0;
+    outer.index = 0;
+    settings.lm = initial.lm();
+    const optuna: dszig.BootstrapFewShotWithOptuna = .{
+        .metric = Metric.score,
+        .max_rounds = 2,
+        .max_labeled_demos = 0,
+        .num_candidate_programs = 1,
+        .seed = 1,
+        .teacher_settings_ref = &settings,
+    };
+    const sampled = try optuna.compile(Program, arena, testing.allocator, testing.io, ctx, .{}, null, 2, &train, train[0..1]);
+    try testing.expectEqual(@as(i64, 1), sampled.parameters[0].high);
+    try testing.expectEqualStrings("accepted", sampled.program.predict.state.demos[0].get("answer").?.string);
 }
 
 test "Evaluate matches DSPy scores for the RAG fixture" {

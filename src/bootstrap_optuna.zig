@@ -51,6 +51,9 @@ const Example = optimize.Example;
 pub const BootstrapFewShotWithOptuna = struct {
     metric: optimize.Metric,
     teacher_settings: optimize.TeacherSettings = .{},
+    /// When present, takes precedence over value settings and is read by each
+    /// bootstrap attempt. The pointee must outlive compile.
+    teacher_settings_ref: ?*const optimize.TeacherSettings = null,
     /// Source constructor metadata; compile(max_demos) overrides this value.
     max_bootstrapped_demos: usize = 4,
     max_labeled_demos: usize = 16,
@@ -114,6 +117,7 @@ pub const BootstrapFewShotWithOptuna = struct {
             .max_rounds = self.max_rounds,
             .max_errors = self.max_errors,
             .teacher_settings = self.teacher_settings,
+            .teacher_settings_ref = self.teacher_settings_ref,
         };
         var compiled = try bootstrap.compile(P, arena, gpa, ctx, student, teacher, trainset);
         const compiled_predictors = try predict.namedPredictors(arena, &compiled.program);
