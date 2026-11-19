@@ -3964,8 +3964,9 @@ The following prevent a claim that DSZig can do everything DSPy can:
   validation and merge. As in DSPy, training and validation share numeric
   row IDs for these lookups even if the datasets differ. Traced reflection
   still runs fresh and updates the cache; only misses in validation and merge
-  consume the metric budget. The cache is per compile, independent of the LM
-  cache, and not persisted. Read `Result.val_ids` for score order when enabled.
+  consume the metric budget. The cache is independent of the LM cache and is
+  retained across compiles only with a GEPA checkpoint. Read `Result.val_ids`
+  for score order when enabled.
   Candidate selection supports `pareto`, `current_best`,
   `epsilon_greedy` (epsilon 0.1), and `top_k_pareto` (top five). Top-five
   selection restricts the validation frontiers before removing dominated
@@ -4010,8 +4011,19 @@ The following prevent a claim that DSZig can do everything DSPy can:
   With `track_best_outputs`, later strict per-row improvements also save
   predictions with their iteration and candidate number. Ties remain in
   memory without writing new files. Writes are atomic and do not add model
-  calls; use a dedicated trusted directory for each run. This covers
-  validation artifacts, not DSPy `log_dir` checkpoint resume or pickle files.
+  calls; use a dedicated trusted directory for each run.
+  To resume a GEPA compile in a new process, set `GEPA.Options.checkpoint` to
+  `.{ .io = io, .path = checkpoint_path, .revision = "experiment-1" }` and
+  compile again with the same student, ordered datasets, and scoring options.
+  Change the revision when any of those inputs change; use a new checkpoint
+  path when starting over. The metric budget can increase. The seed validation
+  runs again on restart, but its scores and calls do not replace the archived
+  scores or count against the resumed budget.
+  The bounded, versioned native JSON file is atomically replaced between
+  iterations. Keep it private: it can contain instructions and predictions.
+  Use one writer per path. Prediction data must be JSON-representable; opaque
+  values and callback-owned state are not saved. The file does not import
+  Python pickle or replace DSPy's HTML and experiment logs.
   `proposal_options` configures the built-in reflection proposer: override its
   base instructions, supply additional guidance, select an adapter, or limit
   an instruction by Unicode character count. An oversized draft gets one
