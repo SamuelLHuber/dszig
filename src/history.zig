@@ -144,8 +144,7 @@ fn appendReplEvent(
     const code = try replString(&entry.object, "code", null);
     const output = try replString(&entry.object, "output", null);
     const reasoning = try replString(&entry.object, "reasoning", "");
-    const limit = entry.object.get("max_output_chars") orelse Value{ .integer = 10_000 };
-    if (limit != .integer) return error.AdapterParse;
+    const limit = try replOutputLimit(&entry.object);
 
     var inputs: Record = .empty;
     var main_request = false;
@@ -180,7 +179,7 @@ fn appendReplEvent(
 
     var observation: Record = .empty;
     try observation.put(arena, "repl_output", .{
-        .string = try truncateReplOutput(arena, output, limit.integer),
+        .string = try truncateReplOutput(arena, output, limit),
     });
     const rendered = try adapter.formatUser(selected, arena, .{
         .instructions = "",
@@ -189,6 +188,35 @@ fn appendReplEvent(
     }, &observation, false);
     try appendReplText(arena, messages, .user, rendered, false);
     return true;
+}
+
+/// Compact a tagged entry for a reflection record. Keep its original rendering
+/// limit: DSPy changes the stored observation here, not the replay setting.
+pub fn compactReplEntry(
+    arena: Allocator,
+    entry: *const Record,
+    max_chars: i64,
+) value.ParseError!?Value {
+    const tag = entry.get("__dspy_repl__").?;
+    std.debug.assert(tag == .string);
+    std.debug.assert(std.mem.eql(u8, tag.string, "entry"));
+    const output = replString(entry, "output", null) catch return error.ParseValue;
+    const limit = replOutputLimit(entry) catch return error.ParseValue;
+    const compacted = truncateReplOutput(arena, output, @min(limit, max_chars)) catch |err|
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.ParseValue,
+        };
+    if (compacted.len == output.len and compacted.ptr == output.ptr) return null;
+    var record = try entry.clone(arena);
+    try record.put(arena, "output", .{ .string = compacted });
+    return .{ .object = record };
+}
+
+fn replOutputLimit(entry: *const Record) adapter.Error!i64 {
+    const limit = entry.get("max_output_chars") orelse return 10_000;
+    if (limit != .integer) return error.AdapterParse;
+    return limit.integer;
 }
 
 fn replString(record: *const Record, name: []const u8, default: ?[]const u8) adapter.Error![]const u8 {

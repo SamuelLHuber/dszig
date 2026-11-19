@@ -4226,8 +4226,11 @@ The following prevent a claim that DSZig can do everything DSPy can:
   shorten recorded tool-result values after 500 Unicode characters, preserving
   the original History and leaving ordinary JSON fields alone. For standalone
   proposal records, call `prepareHistory` before inserting a typed History.
-  This does not compact REPL observations or History models erased inside
-  arbitrary JSON containers.
+  Tagged REPL observations in a typed History retain their head and tail
+  under the smaller of 500 Unicode characters and the entry's own limit.
+  Compaction changes the stored observation but not the entry's replay limit.
+  Standalone `REPLHistory` model values and History models erased inside
+  arbitrary JSON containers are not compacted.
   `add_format_failure_as_feedback = true` includes captured predictor response
   parse failures in the reflection dataset, with the completion text and the
   active adapter's output structure. Such rollouts keep the configured failure

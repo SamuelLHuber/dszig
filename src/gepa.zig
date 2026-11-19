@@ -33,7 +33,8 @@ const Record = value.Record;
 const Trace = predict.Trace;
 const Value = @import("runtime_value.zig").Value;
 const Graph = @import("json_graph.zig");
-const History = @import("history.zig").History;
+const history_mod = @import("history.zig");
+const History = history_mod.History;
 
 pub const ObjectiveScore = struct { name: []const u8, score: f64 };
 pub const ObjectiveLeaders = struct { name: []const u8, candidates: []const usize };
@@ -151,7 +152,7 @@ pub const ConfiguredInstructionProposer = struct {
     additional_instructions: []const u8 = "",
     skills: []const ReflectionSkill = &.{},
     max_chars: ?u32 = null,
-    /// Compact tool observations in typed History fields, not ordinary JSON records.
+    /// Compact tool and REPL observations in typed History fields.
     truncate_history_outputs: bool = false,
     adapter: @import("adapter.zig").Adapter = .json,
 
@@ -167,9 +168,7 @@ pub const ConfiguredInstructionProposer = struct {
         for (history.messages, 0..) |message, index| {
             var copied = false;
             for (message.keys(), message.values()) |name, item| {
-                if (item != .object or !item.object.contains("tool_calls") or
-                    !item.object.contains("tool_call_results")) continue;
-                const compacted = try compactToolObservations(arena, item) orelse continue;
+                const compacted = try compactHistoryItem(arena, name, item) orelse continue;
                 if (messages == null) messages = try arena.dupe(Record, history.messages);
                 const output = &messages.?[index];
                 if (!copied) output.* = try message.clone(arena);
@@ -3976,6 +3975,20 @@ fn invokeProposer(
     };
 }
 
+fn compactHistoryItem(arena: Allocator, name: []const u8, item: Value) value.ParseError!?Value {
+    if (item != .object) return null;
+    if (std.mem.eql(u8, name, "repl_entry")) {
+        if (item.object.get("__dspy_repl__")) |tag| {
+            if (tag == .string and std.mem.eql(u8, tag.string, "entry")) {
+                return history_mod.compactReplEntry(arena, &item.object, 500);
+            }
+        }
+    }
+    if (!item.object.contains("tool_calls")) return null;
+    if (!item.object.contains("tool_call_results")) return null;
+    return compactToolObservations(arena, item);
+}
+
 fn compactToolObservations(arena: Allocator, item: Value) value.ParseError!?Value {
     const ToolCalls = @import("tool.zig").ToolCalls;
     var calls = try ToolCalls.fromValue(arena, item);
@@ -4054,6 +4067,32 @@ test "GEPA reflects truncated Unicode tool results without changing history" {
     try std.testing.expectEqualStrings(text[0..1000], observations[1].value.string);
     try std.testing.expectEqualStrings(text, prepared.messages[0].get("notes").?.string);
     try std.testing.expectEqualStrings(text, original.tool_call_results.?.tool_call_results[0].value.string);
+}
+
+test "GEPA keeps the REPL replay limit and compacts only the tagged observation" {
+    var storage: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    const history = try History.fromValue(arena, try @import("json_repair.zig").parseJson(arena,
+        \\{"messages":[{"repl_entry":{"__dspy_repl__":"entry","code":"show()","output":"雪雪雪雪🙂🙂🙂🙂","max_output_chars":4}},
+        \\{"repl_entry":{"output":"plain text","max_output_chars":2}}]}
+    ));
+    const options: ConfiguredInstructionProposer = .{ .truncate_history_outputs = true };
+    const prepared = try History.fromValue(arena, try options.prepareHistory(arena, history));
+    const entry = prepared.messages[0].get("repl_entry").?.object;
+    try std.testing.expectEqualStrings(
+        "雪雪\n\n... (4 characters omitted) ...\n\n🙂🙂",
+        entry.get("output").?.string,
+    );
+    try std.testing.expectEqual(@as(i64, 4), entry.get("max_output_chars").?.integer);
+    try std.testing.expectEqualStrings(
+        "plain text",
+        prepared.messages[1].get("repl_entry").?.object.get("output").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "雪雪雪雪🙂🙂🙂🙂",
+        history.messages[0].get("repl_entry").?.object.get("output").?.string,
+    );
 }
 
 fn isHistory(field: signature.Field) bool {
