@@ -3800,7 +3800,13 @@ The following prevent a claim that DSZig can do everything DSPy can:
   extraction at the iteration limit return outputs, tagged history, final
   reasoning, and the current trajectory. Recoverable execution failures become
   observations; runtime failures propagate. `forwardWithHistory` continues the
-  conversation, not the runtime state. The loop does not execute arbitrary
+  conversation, not the runtime state. An optional `history_processor` runs
+  before each action and can edit or trim a private draft, or supply a replacement
+  history that DSZig copies. `forwardWithOptions` can override the constructor
+  processor for a single call. Callback errors roll back edits, except allocation
+  failure and cancellation, which propagate. Trimming prompt history does not
+  change the returned trajectory or the trajectory supplied to extraction.
+  The loop does not execute arbitrary
   Python, provide guest DSPy, call sub-LMs on the runtime's behalf, or sandbox
   runtime callbacks. The caller must enforce any runtime time and memory limits.
 - **Other modules and optimizers:** bounded native Avatar/AvatarOptimizer follow

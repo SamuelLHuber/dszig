@@ -49,11 +49,76 @@ pub const Entry = struct {
     }
 };
 
+pub const HistoryProcessor = struct {
+    ptr: *anyopaque,
+    /// Draft records are private to this invocation and must not escape the callback.
+    /// Replacement records must remain readable until copied just after return.
+    process: *const fn (*anyopaque, Allocator, []Record) anyerror!Edit,
+
+    pub const Edit = union(enum) {
+        keep,
+        truncate: usize,
+        replace: History,
+    };
+};
+
+pub const ForwardOptions = struct {
+    history: History = .{},
+    history_processor: ?HistoryProcessor = null,
+};
+
+const TurnHistory = struct {
+    storage: []Record,
+    len: usize,
+
+    fn clone(arena: Allocator, source: History, spare: usize) !TurnHistory {
+        const count = try std.math.add(usize, source.messages.len, spare);
+        const storage = try arena.alloc(Record, count);
+        for (source.messages, storage[0..source.messages.len]) |*event, *copy| {
+            copy.* = try value.cloneRecord(arena, event);
+        }
+        return .{ .storage = storage, .len = source.messages.len };
+    }
+
+    fn view(self: TurnHistory) History {
+        return .{ .messages = self.storage[0..self.len] };
+    }
+
+    fn append(self: *TurnHistory, event: Record) void {
+        std.debug.assert(self.len < self.storage.len);
+        self.storage[self.len] = event;
+        self.len += 1;
+    }
+
+    fn apply(self: *TurnHistory, arena: Allocator, processor: HistoryProcessor) !void {
+        // Allow this turn's event and a possible extraction event after it.
+        const spare = 2;
+        var candidate = try clone(arena, self.view(), spare);
+        const edit = processor.process(processor.ptr, arena, candidate.storage[0..candidate.len]) catch |err| switch (err) {
+            error.OutOfMemory, error.Canceled => return err,
+            else => {
+                std.log.scoped(.dszig_rlm).warn("History processor rolled back: {s}", .{@errorName(err)});
+                return;
+            },
+        };
+        switch (edit) {
+            .keep => {},
+            .truncate => |len| {
+                if (len > candidate.len) return error.InvalidHistoryLength;
+                candidate.len = len;
+            },
+            .replace => |replacement| candidate = try clone(arena, replacement, spare),
+        }
+        self.* = candidate;
+    }
+};
+
 pub const Options = struct {
     /// Full action objective for the supplied runtime and its capabilities.
     action_instructions: []const u8,
     max_iters: u32 = 20,
     max_output_chars: i64 = 10_000,
+    history_processor: ?HistoryProcessor = null,
 };
 
 /// Bounds history preallocation and the number of model-driven executions.
@@ -91,6 +156,7 @@ pub fn CustomRLM(comptime Sig: type) type {
         factory: Factory,
         max_iters: u32,
         max_output_chars: i64,
+        history_processor: ?HistoryProcessor,
         compiled: bool = false,
 
         pub fn init(arena: Allocator, factory: Factory, options: Options) !Self {
@@ -105,6 +171,7 @@ pub fn CustomRLM(comptime Sig: type) type {
                 .factory = factory,
                 .max_iters = options.max_iters,
                 .max_output_chars = options.max_output_chars,
+                .history_processor = options.history_processor,
             };
             try self.generate_action.state.forkSignatureClass(arena);
             try self.extract.state.forkSignatureClass(arena);
@@ -117,24 +184,30 @@ pub fn CustomRLM(comptime Sig: type) type {
         }
 
         pub fn forwardWithHistory(self: *const Self, ctx: predict.Context, input: Input, prior: History) anyerror!Output {
+            return self.forwardWithOptions(ctx, input, .{ .history = prior });
+        }
+
+        pub fn forwardWithOptions(
+            self: *const Self,
+            ctx: predict.Context,
+            input: Input,
+            options: ForwardOptions,
+        ) anyerror!Output {
             const arena = ctx.arena;
+            if (self.max_iters > iterations_max) return error.TooManyIterations;
             const variables = try value.toRecord(arena, Input, input);
             const info = try variableInfo(arena, Sig.input_fields_list, &variables);
-            if (self.max_iters > iterations_max) return error.TooManyIterations;
-            const count = try std.math.add(usize, prior.messages.len, @as(usize, self.max_iters) + 1);
-            const messages = try arena.alloc(Record, count);
             const entries = try arena.alloc(Entry, self.max_iters);
-            for (prior.messages, messages[0..prior.messages.len]) |*event, *copy| {
-                copy.* = try value.cloneRecord(arena, event);
-            }
+            var history = try TurnHistory.clone(arena, options.history, entries.len + 1);
+            const processor = options.history_processor orelse self.history_processor;
             const runtime = try self.factory.open(self.factory.ptr);
             defer runtime.close(runtime.ptr);
 
             for (entries, 0..) |*entry, index| {
-                const offset = prior.messages.len + index;
+                if (processor) |hook| try history.apply(arena, hook);
                 const iteration = text(try std.fmt.allocPrint(arena, "{d}/{d}", .{ index + 1, self.max_iters }));
                 var action_inputs: Record = .empty;
-                try action_inputs.put(arena, "history", try (History{ .messages = messages[0..offset] }).toValue(arena));
+                try action_inputs.put(arena, "history", try history.view().toValue(arena));
                 try action_inputs.put(arena, "variables_info", info);
                 try action_inputs.put(arena, "iteration", iteration);
                 const action = try self.generate_action.state.call(ctx, &action_inputs);
@@ -147,24 +220,26 @@ pub fn CustomRLM(comptime Sig: type) type {
                 };
                 const result = try executeAction(arena, runtime, &variables, entry);
                 const final = try processResult(arena, Sig.output_fields_list, result, entry);
-                messages[offset] = if (index == 0) try variables.clone(arena) else .empty;
-                try messages[offset].put(arena, "variables_info", info);
-                try messages[offset].put(arena, "iteration", iteration);
-                try messages[offset].put(arena, "repl_entry", try entry.tagged(arena));
+                var event = if (index == 0) try variables.clone(arena) else Record.empty;
+                try event.put(arena, "variables_info", info);
+                try event.put(arena, "iteration", iteration);
+                try event.put(arena, "repl_entry", try entry.tagged(arena));
                 if (final) |outputs| {
-                    try appendOutputs(arena, &messages[offset], &outputs);
+                    try appendOutputs(arena, &event, &outputs);
+                    history.append(event);
                     return .{
                         .outputs = try value.fromRecord(arena, Sig.Output, &outputs),
-                        .history = .{ .messages = messages[0 .. offset + 1] },
+                        .history = history.view(),
                         .final_reasoning = entry.reasoning,
                         .trajectory = entries[0 .. index + 1],
                     };
                 }
+                history.append(event);
             }
-            return self.extractFinal(ctx, info, messages, entries);
+            return self.extractFinal(ctx, info, &history, entries);
         }
 
-        fn extractFinal(self: *const Self, ctx: predict.Context, info: Value, messages: []Record, entries: []const Entry) !Output {
+        fn extractFinal(self: *const Self, ctx: predict.Context, info: Value, history: *TurnHistory, entries: []const Entry) !Output {
             const arena = ctx.arena;
             var inputs: Record = .empty;
             try inputs.put(arena, "variables_info", info);
@@ -172,13 +247,13 @@ pub fn CustomRLM(comptime Sig: type) type {
             const outputs = try self.extract.state.call(ctx, &inputs);
             var tag: Record = .empty;
             try tag.put(arena, "__dspy_repl__", text("extract_fallback"));
-            const last = &messages[messages.len - 1];
-            last.* = .empty;
-            try last.put(arena, "repl_entry", .{ .object = tag });
-            try appendOutputs(arena, last, &outputs);
+            var event: Record = .empty;
+            try event.put(arena, "repl_entry", .{ .object = tag });
+            try appendOutputs(arena, &event, &outputs);
+            history.append(event);
             return .{
                 .outputs = try value.fromRecord(arena, Sig.Output, &outputs),
-                .history = .{ .messages = messages },
+                .history = history.view(),
                 .final_reasoning = "Extract forced final output",
                 .trajectory = entries,
             };

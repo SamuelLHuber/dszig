@@ -65,8 +65,20 @@ test "custom RLM retains observations across runtime buffer reuse and closes on 
         },
     };
     const ctx: dszig.Context = .{ .arena = arena, .lm = model.lm() };
-    const result = try program.forward(ctx, .{ .order = 10 });
+    const Processor = struct {
+        fn trim(_: *anyopaque, _: Allocator, draft: []dszig.value.Record) !dszig.rlm.HistoryProcessor.Edit {
+            if (draft.len == 0) return .keep;
+            return .{ .truncate = 0 };
+        }
+    };
+    const result = try program.forwardWithOptions(ctx, .{ .order = 10 }, .{
+        .history_processor = .{ .ptr = &runtime, .process = Processor.trim },
+    });
     try testing.expectEqual(@as(i64, 17), result.outputs.answer);
+    try testing.expectEqual(@as(usize, 2), result.history.messages.len);
+    try testing.expectEqualStrings("2/2", result.history.messages[0].get("iteration").?.string);
+    const fallback = result.history.messages[1].get("repl_entry").?.object;
+    try testing.expectEqualStrings("extract_fallback", fallback.get("__dspy_repl__").?.string);
     try testing.expectEqualStrings("first", result.trajectory[0].output);
     try testing.expectEqualStrings("later", result.trajectory[1].output);
     try testing.expectEqual(@as(u32, 1), runtime.closes);
