@@ -76,7 +76,105 @@ pub const EvaluationRow = struct {
 pub const DetailedEvaluation = struct {
     summary: Evaluation,
     rows: []const EvaluationRow,
+
+    /// Write the DSPy evaluation table as plain JSON. The caller supplies the
+    /// metric's column name and owns the destination and its flushing.
+    pub fn writeJson(
+        self: DetailedEvaluation,
+        gpa: Allocator,
+        writer: *std.Io.Writer,
+        metric_name: []const u8,
+    ) !void {
+        var scratch: std.heap.ArenaAllocator = .init(gpa);
+        defer scratch.deinit();
+        try writer.writeByte('[');
+        for (self.rows, 0..) |row, index| {
+            if (index != 0) try writer.writeAll(", ");
+            _ = scratch.reset(.retain_capacity);
+            const record = try evaluationOutput(scratch.allocator(), row, metric_name);
+            try @import("pyjson.zig").writeJsonDepth(writer, .{ .object = record }, .compact, 1, true);
+        }
+        try writer.writeByte(']');
+    }
+
+    /// Write a CSV table, with columns in first-seen order across all rows.
+    pub fn writeCsv(
+        self: DetailedEvaluation,
+        gpa: Allocator,
+        writer: *std.Io.Writer,
+        metric_name: []const u8,
+    ) !void {
+        var table: std.heap.ArenaAllocator = .init(gpa);
+        defer table.deinit();
+        const arena = table.allocator();
+        const records = try arena.alloc(Record, self.rows.len);
+        var columns: Record = .empty;
+        for (self.rows, records) |row, *record| {
+            record.* = try evaluationOutput(arena, row, metric_name);
+            for (record.keys()) |key| try columns.put(arena, key, .null);
+        }
+        for (columns.keys(), 0..) |key, index| {
+            if (index != 0) try writer.writeByte(',');
+            try writeCsvCell(writer, key, columns.count() == 1);
+        }
+        try writer.writeAll("\r\n");
+        var cell: std.Io.Writer.Allocating = .init(gpa);
+        defer cell.deinit();
+        for (records) |*record| {
+            for (columns.keys(), 0..) |key, index| {
+                if (index != 0) try writer.writeByte(',');
+                const item = record.get(key) orelse .null;
+                const text = switch (item) {
+                    .null => "",
+                    .string => |text| text,
+                    else => blk: {
+                        cell.clearRetainingCapacity();
+                        try @import("pyjson.zig").writeStr(&cell.writer, item);
+                        break :blk cell.written();
+                    },
+                };
+                try writeCsvCell(writer, text, columns.count() == 1);
+            }
+            try writer.writeAll("\r\n");
+        }
+    }
 };
+
+fn evaluationOutput(arena: Allocator, row: EvaluationRow, metric_name: []const u8) !Record {
+    const example = &row.example.record;
+    const prediction = if (row.prediction) |pred| pred.fields() else &Record.empty;
+    var result: Record = .empty;
+    for (example.keys(), example.values()) |key, item| {
+        const name = if (prediction.contains(key))
+            try std.fmt.allocPrint(arena, "example_{s}", .{key})
+        else
+            key;
+        try result.put(arena, name, item);
+    }
+    for (prediction.keys(), prediction.values()) |key, item| {
+        const name = if (example.contains(key))
+            try std.fmt.allocPrint(arena, "pred_{s}", .{key})
+        else
+            key;
+        try result.put(arena, name, item);
+    }
+    try result.put(arena, metric_name, .{ .float = row.score });
+    return result;
+}
+
+fn writeCsvCell(writer: *std.Io.Writer, cell: []const u8, only_column: bool) !void {
+    if ((cell.len != 0 or !only_column) and std.mem.indexOfAny(u8, cell, ",\"\r\n") == null)
+        return writer.writeAll(cell);
+    try writer.writeByte('"');
+    var start: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, cell, start, '"')) |index| {
+        try writer.writeAll(cell[start .. index + 1]);
+        try writer.writeByte('"');
+        start = index + 1;
+    }
+    try writer.writeAll(cell[start..]);
+    try writer.writeByte('"');
+}
 
 pub const EvaluationOptions = struct {
     max_errors: usize = 10,

@@ -3283,6 +3283,12 @@ predictions in the output arena; a recoverable program or metric error
 produces a row with no prediction and the configured score. Rows borrow the
 original examples. The aggregate-only evaluator does not retain predictions.
 
+`DetailedEvaluation.writeJson` and `.writeCsv` write the evaluation table to a
+caller-owned writer. Supply the metric column name explicitly. Both preserve
+example order and prefix overlapping fields with `example_` and `pred_`; CSV
+orders columns by first appearance. JSON accepts plain JSON-serializable
+values; it does not dispatch Python model serialization methods.
+
 ### Trace bootstrapping
 
 `bootstrapTraceData(P, out, ctx, &program, dataset, options)` is the native

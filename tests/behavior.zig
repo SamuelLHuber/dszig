@@ -1431,6 +1431,17 @@ test "detailed evaluation preserves successful predictions after scratch reuse" 
         try testing.expect(row.prediction == null);
         try testing.expectEqual(@as(f64, -0.25), row.score);
     }
+    var bytes: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer bytes.deinit();
+    try result.writeCsv(testing.allocator, &bytes.writer, "reward");
+    try testing.expectEqualStrings(
+        "question,answer,reward\r\n" ++
+            "first,first,1.0\r\n" ++
+            "program_error,,-0.25\r\n" ++
+            "metric_error,,-0.25\r\n" ++
+            "last,last,1.0\r\n",
+        bytes.written(),
+    );
 }
 
 test "random search with concurrent evaluation ranks the same candidates as serial evaluation" {
