@@ -13,12 +13,16 @@ streaming parity. See [Compatibility limits](#compatibility-limits).
 
 ## Install
 
-Use the repository-pinned Zig 0.17.0 toolchain. From a Zig project with a
-`build.zig.zon`, add the release as a dependency:
+Use the repository-pinned Zig 0.17.0 toolchain. From your Zig project,
+check out the release using Git credentials with access to this repository:
 
 ```sh
-zig fetch --save=dszig 'https://github.com/samuellhuber/dszig/archive/refs/tags/v3.5.0%2Bdszig.1.tar.gz'
+git clone --depth 1 --branch 'v3.5.0+dszig.1' https://github.com/SamuelLHuber/dszig.git vendor/dszig
 ```
+
+Add `.dszig = .{ .path = "vendor/dszig" },` to `.dependencies` in
+`build.zig.zon`. For a shared project, vendor the checked-out files or pin
+the same commit as a Git submodule.
 
 In `build.zig`, import the dependency's `dszig` module:
 
@@ -1831,8 +1835,9 @@ test and examples build (896 tests, 40 steps) and the locked offline DSPy gate.
 A fresh Zig project also fetched the versioned package from a local release
 archive and ran an exact-match metric through the exported `dszig` module.
 No hosted requests were made. Authenticated Gemini Live remains unverified
-and is not a release requirement. The next release check is CI on the
-candidate commit, rather than another provider parity pass.
+and is not a release requirement. GitHub-hosted jobs did not start because
+of an account billing or spending-limit issue. Clear that issue and run the
+Linux and macOS matrix before merging; the local pass does not replace it.
 
 ## DSPy 3.5 contracts
 
