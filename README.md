@@ -4609,7 +4609,7 @@ Regenerate this table with
 |---|---|---|---|---|
 | `dspy.Adapter` (`adapters/base.py`) | partial | `adapter.zig` | format_cases.json, xml.json, dspy_3_5_0_mock_suite.json | cases: 23 ms → 0.16 ms |
 | `dspy.AdapterParseError` (`utils/exceptions.py`) | partial | `adapter.zig` | error.AdapterParse outcome compared in suite cases | – |
-| `dspy.Audio` (`adapters/types/audio.py`) | missing | – | – | – |
+| `dspy.Audio` (`adapters/types/audio.py`) | partial | `audio.zig`, `media_download.zig` | native unit tests in audio.zig; encoded audio only (no decoding/transcoding); no committed DSPy oracle | – |
 | `dspy.AvatarOptimizer` (`teleprompt/avatar_optimizer.py`) | partial | `avatar_optimizer.zig`, `avatar.zig` | native unit tests in avatar.zig/avatar_optimizer.zig; no committed DSPy oracle (DSPy 3.5 constructor calls removed TypedPredictor) | – |
 | `dspy.BaseLM` (`clients/base_lm.py`) | partial | `lm.zig` | lm_response_oracle.py, request_schema_oracle.py | – |
 | `dspy.BaseModule` (`primitives/base_module.py`) | partial | `predict.zig` | named predictor discovery tests | – |
@@ -4643,14 +4643,14 @@ Regenerate this table with
 | `dspy.Flex` (`predict/flex/flex.py`) | missing | – | – | – |
 | `dspy.GEPA` (`teleprompt/gepa/gepa.py`) | partial | `gepa.zig` | gepa.json, gepa_merge.json (serial and native-pool rollouts), suite replay | dates_gepa: 264 ms → 1.64 ms |
 | `dspy.History` (`adapters/types/history.py`) | native | `history.zig` | react.json | – |
-| `dspy.Image` (`adapters/types/image.py`) | missing | – | – | – |
+| `dspy.Image` (`adapters/types/image.py`) | partial | `image.zig`, `media_download.zig` | native unit tests in image.zig; no committed DSPy oracle | – |
 | `dspy.InferRules` (`teleprompt/infer_rules.py`) | native | `infer_rules.zig` | infer_rules_oracle.py | – |
 | `dspy.InputField` (`signatures/field.py`) | partial | `signature.zig` | compile-fail cases, format_cases.json | – |
 | `dspy.InterpreterPool` (`primitives/interpreter_pool.py`) | missing | – | – | – |
 | `dspy.JSONAdapter` (`adapters/json_adapter.py`) | native | `adapter.zig`, `json_repair.zig` | format_cases.json, xml.json, dspy_3_5_0_mock_suite.json, adapter_repair_oracle.py | cases: 23 ms → 0.16 ms |
 | `dspy.KNN` (`predict/knn.py`) | native | `knn.zig` | knn_oracle.py | – |
 | `dspy.KNNFewShot` (`teleprompt/knn_fewshot.py`) | native | `knn_fewshot.zig` | knn_oracle.py | – |
-| `dspy.LM` (`clients/lm.py`) | partial | `lm.zig`, `http.zig` | lm_response_oracle.py, live transcripts (Chat Completions/Responses only) | – |
+| `dspy.LM` (`clients/lm.py`) | partial | `lm.zig`, `http.zig`, `anthropic.zig`, `gemini.zig` | lm_response_oracle.py, live transcripts (OpenAI Chat Completions/Responses only); Anthropic/Gemini covered by native loopback tests, no hosted recordings | – |
 | `dspy.LMAuthError` (`utils/exceptions.py`) | partial | `lm.zig` | Zig error set, not Python exception classes | – |
 | `dspy.LMBillingError` (`utils/exceptions.py`) | partial | `lm.zig` | Zig error set, not Python exception classes | – |
 | `dspy.LMCollectionLimitError` (`utils/exceptions.py`) | partial | `lm.zig` | Zig error set, not Python exception classes | – |
@@ -4682,7 +4682,7 @@ Regenerate this table with
 | `dspy.Prediction` (`primitives/prediction.py`) | partial | `predict.zig` | suite replay | – |
 | `dspy.Provider` (`clients/provider.py`) | missing | – | – | – |
 | `dspy.PythonInterpreter` (`primitives/python_interpreter.py`) | missing | – | – | – |
-| `dspy.RLM` (`predict/rlm.py`) | missing | – | – | – |
+| `dspy.RLM` (`predict/rlm.py`) | partial | `rlm.zig`, `bounded_python.zig`, `bounded_python_rlm.zig` | native unit tests in rlm.zig/bounded_python*.zig; caller-supplied runtime or a narrow bounded Python profile, not a general Python interpreter; no committed DSPy oracle | – |
 | `dspy.ReAct` (`predict/react.py`) | native | `react.zig`, `tool.zig` | react.json, refine_react_oracle.py, suite replay | rag_react: 161 ms → 1.48 ms |
 | `dspy.ReActV2` (`predict/react_v2.py`) | missing | – | – | – |
 | `dspy.Reasoning` (`adapters/types/reasoning.py`) | native | `reasoning.zig` | reasoning_identity_oracle.py | – |
@@ -4719,9 +4719,9 @@ Regenerate this table with
 | `dspy.make_signature` (`signatures/signature.py`) | partial | `signature.zig` | comptime | – |
 | `dspy.resolve_interpreter_factory` (`primitives/code_interpreter.py`) | missing | – | – | – |
 | `dspy.settings` (–) | partial | `predict.zig` | explicit Context | – |
-| `dspy.streamify` (`streaming/streamify.py`) | missing | – | – | – |
+| `dspy.streamify` (`streaming/streamify.py`) | partial | `predict_stream.zig`, `async_stream.zig`, `openai_stream.zig`, `chat_stream_listener.zig`, `json_stream_listener.zig`, `xml_stream_listener.zig`, `stream_status.zig` | native unit tests in predict_stream.zig/async_stream.zig and the stream listeners; no committed DSPy oracle | – |
 | `dspy.syncify` (`utils/syncify.py`) | missing | – | – | – |
-| `dspy.track_usage` (–) | missing | – | – | – |
+| `dspy.track_usage` (–) | partial | `usage_tracker.zig`, `lm_usage.zig` | native unit tests in usage_tracker.zig; no committed DSPy oracle | – |
 
 
 ## Native LM bindings and program state

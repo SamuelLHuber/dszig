@@ -67,5 +67,4 @@ fi
 for transcript in "${live_transcripts[@]}"; do
   (cd "$root" && zig build replay -- "$transcript")
   uv run --locked check_live.py "$transcript"
-  (cd "$root" && zig build replay -- "$transcript")
 done

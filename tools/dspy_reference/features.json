@@ -32,9 +32,12 @@
   },
   {
    "name": "Audio",
-   "status": "missing",
-   "dszig": [],
-   "checks": "",
+   "status": "partial",
+   "dszig": [
+    "audio.zig",
+    "media_download.zig"
+   ],
+   "checks": "native unit tests in audio.zig; encoded audio only (no decoding/transcoding); no committed DSPy oracle",
    "bench": [],
    "upstream": "adapters/types/audio.py",
    "sha256": "4969bbedcd0513f0a947b9919b5d547d9d0aaf5b1a0fc82bf978cdf4b9d9a59f"
@@ -419,9 +422,12 @@
   },
   {
    "name": "Image",
-   "status": "missing",
-   "dszig": [],
-   "checks": "",
+   "status": "partial",
+   "dszig": [
+    "image.zig",
+    "media_download.zig"
+   ],
+   "checks": "native unit tests in image.zig; no committed DSPy oracle",
    "bench": [],
    "upstream": "adapters/types/image.py",
    "sha256": "eff7604a76e19ec274b78d34c79e7047c317b99100a7d7bd80a283ddff649ff1"
@@ -498,9 +504,11 @@
    "status": "partial",
    "dszig": [
     "lm.zig",
-    "http.zig"
+    "http.zig",
+    "anthropic.zig",
+    "gemini.zig"
    ],
-   "checks": "lm_response_oracle.py, live transcripts (Chat Completions/Responses only)",
+   "checks": "lm_response_oracle.py, live transcripts (OpenAI Chat Completions/Responses only); Anthropic/Gemini covered by native loopback tests, no hosted recordings",
    "bench": [],
    "upstream": "clients/lm.py",
    "sha256": "315245e58d7d20bd33c90a613cd5aaade97be622148e64e88315ae9494348f8e"
@@ -843,9 +851,13 @@
   },
   {
    "name": "RLM",
-   "status": "missing",
-   "dszig": [],
-   "checks": "",
+   "status": "partial",
+   "dszig": [
+    "rlm.zig",
+    "bounded_python.zig",
+    "bounded_python_rlm.zig"
+   ],
+   "checks": "native unit tests in rlm.zig/bounded_python*.zig; caller-supplied runtime or a narrow bounded Python profile, not a general Python interpreter; no committed DSPy oracle",
    "bench": [],
    "upstream": "predict/rlm.py",
    "sha256": "dbdc472b62e661efbfb15fecab6dd1da08b41dfab220b2961f593175eea10453"
@@ -1238,9 +1250,17 @@
   },
   {
    "name": "streamify",
-   "status": "missing",
-   "dszig": [],
-   "checks": "",
+   "status": "partial",
+   "dszig": [
+    "predict_stream.zig",
+    "async_stream.zig",
+    "openai_stream.zig",
+    "chat_stream_listener.zig",
+    "json_stream_listener.zig",
+    "xml_stream_listener.zig",
+    "stream_status.zig"
+   ],
+   "checks": "native unit tests in predict_stream.zig/async_stream.zig and the stream listeners; no committed DSPy oracle",
    "bench": [],
    "upstream": "streaming/streamify.py",
    "sha256": "c51b289119337dedd442ed666b2117051b2bc379ff0484471fc21f413cf48ad0"
@@ -1256,9 +1276,12 @@
   },
   {
    "name": "track_usage",
-   "status": "missing",
-   "dszig": [],
-   "checks": "",
+   "status": "partial",
+   "dszig": [
+    "usage_tracker.zig",
+    "lm_usage.zig"
+   ],
+   "checks": "native unit tests in usage_tracker.zig; no committed DSPy oracle",
    "bench": [],
    "upstream": null,
    "sha256": null

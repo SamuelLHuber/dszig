@@ -1802,7 +1802,8 @@ test "SDK tool and continuation construction clone and public output unwind allo
             try std.testing.expect(result.responses[0] == independent);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    var stable: std.testing.FailingAllocator = .init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(stable.allocator(), Check.run, .{});
 }
 
 test "SDK request ownership preserves input aliases and independent exact config clones" {
