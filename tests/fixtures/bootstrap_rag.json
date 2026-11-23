@@ -1,0 +1,64 @@
+{
+  "retrieve": {
+    "k": 2
+  },
+  "generate_answer.predict": {
+    "traces": [],
+    "train": [],
+    "demos": [
+      {
+        "augmented": true,
+        "context": [
+          "Paris is the capital of France.",
+          "Berlin is the capital of Germany."
+        ],
+        "question": "What is the capital of France?",
+        "reasoning": "The context says Paris is the capital of France.",
+        "answer": "Paris"
+      },
+      {
+        "augmented": true,
+        "context": [
+          "Mount Everest is the highest mountain on Earth.",
+          "Paris is the capital of France."
+        ],
+        "question": "What is the highest mountain?",
+        "reasoning": "Everest is the highest mountain.",
+        "answer": "Mount Everest"
+      },
+      {
+        "question": "At what temperature does water boil?",
+        "answer": "100 degrees"
+      }
+    ],
+    "signature": {
+      "instructions": "Answer questions with short factoid answers.",
+      "fields": [
+        {
+          "prefix": "Context:",
+          "description": "may contain relevant facts"
+        },
+        {
+          "prefix": "Question:",
+          "description": "${question}"
+        },
+        {
+          "prefix": "Reasoning:",
+          "description": "A short plan for solving the task."
+        },
+        {
+          "prefix": "Answer:",
+          "description": "often between 1 and 5 words"
+        }
+      ]
+    },
+    "lm": null
+  },
+  "metadata": {
+    "dependency_versions": {
+      "python": "3.11",
+      "dspy": "3.5.0",
+      "cloudpickle": "3.1"
+    }
+  }
+}

@@ -1,0 +1,1290 @@
+{
+ "dspy": "3.5.0",
+ "statuses": {
+  "native": "implemented and compared against DSPy-generated fixtures or oracles",
+  "partial": "implemented with documented limits (README: Compatibility limits)",
+  "missing": "not implemented"
+ },
+ "features": [
+  {
+   "name": "Adapter",
+   "status": "partial",
+   "dszig": [
+    "adapter.zig"
+   ],
+   "checks": "format_cases.json, xml.json, dspy_3_5_0_mock_suite.json",
+   "bench": [
+    "cases"
+   ],
+   "upstream": "adapters/base.py",
+   "sha256": "4e20ca50ade5398425e5786fcc0b4f9bfd34f7c81b3caa3463291ae3416fc56a"
+  },
+  {
+   "name": "AdapterParseError",
+   "status": "partial",
+   "dszig": [
+    "adapter.zig"
+   ],
+   "checks": "error.AdapterParse outcome compared in suite cases",
+   "bench": [],
+   "upstream": "utils/exceptions.py",
+   "sha256": "7a519f5188aface7725c65963b82edb951dc41b0cb2d8eab3d1c69947605ca34"
+  },
+  {
+   "name": "Audio",
+   "status": "partial",
+   "dszig": [
+    "audio.zig",
+    "media_download.zig"
+   ],
+   "checks": "native unit tests in audio.zig; encoded audio only (no decoding/transcoding); no committed DSPy oracle",
+   "bench": [],
+   "upstream": "adapters/types/audio.py",
+   "sha256": "4969bbedcd0513f0a947b9919b5d547d9d0aaf5b1a0fc82bf978cdf4b9d9a59f"
+  },
+  {
+   "name": "AvatarOptimizer",
+   "status": "partial",
+   "dszig": [
+    "avatar_optimizer.zig",
+    "avatar.zig"
+   ],
+   "checks": "native unit tests in avatar.zig/avatar_optimizer.zig; no committed DSPy oracle (DSPy 3.5 constructor calls removed TypedPredictor)",
+   "bench": [],
+   "upstream": "teleprompt/avatar_optimizer.py",
+   "sha256": "f13a8b305f48bf5424d019aae403c2e2cabc752089dd2f356e137673f4bf95b6"
+  },
+  {
+   "name": "BaseLM",
+   "status": "partial",
+   "dszig": [
+    "lm.zig"
+   ],
+   "checks": "lm_response_oracle.py, request_schema_oracle.py",
+   "bench": [],
+   "upstream": "clients/base_lm.py",
+   "sha256": "dabe873b9a65868252bbe03b9b5dd4d08494f7214a3fbf156e5f75e4c7f968e5"
+  },
+  {
+   "name": "BaseModule",
+   "status": "partial",
+   "dszig": [
+    "predict.zig"
+   ],
+   "checks": "named predictor discovery tests",
+   "bench": [],
+   "upstream": "primitives/base_module.py",
+   "sha256": "b634bddeb8a34e4d92de4de69e0b4e7d18075a51c6e81016cb86994b80ff8bf6"
+  },
+  {
+   "name": "BestOfN",
+   "status": "native",
+   "dszig": [
+    "best_of_n.zig"
+   ],
+   "checks": "behavior tests vs DSPy source",
+   "bench": [],
+   "upstream": "predict/best_of_n.py",
+   "sha256": "d228b6bd67fb5b1b67869ba39a714cb04362bd117707509d16860bb8ff3694e4"
+  },
+  {
+   "name": "BetterTogether",
+   "status": "partial",
+   "dszig": [
+    "better_together.zig",
+    "better_together_optimizers.zig"
+   ],
+   "checks": "native unit tests in better_together.zig, tests/behavior.zig; no committed DSPy oracle",
+   "bench": [],
+   "upstream": "teleprompt/bettertogether.py",
+   "sha256": "984fd3c19e4f7a5a984fba7cb12a176104b4a5792b80f974f56b02eb48d5fb3a"
+  },
+  {
+   "name": "BootstrapFewShot",
+   "status": "native",
+   "dszig": [
+    "optimize.zig"
+   ],
+   "checks": "bootstrap_rag.json, bootstrap_multihop.json, trace_selection.json, live replay",
+   "bench": [
+    "rag",
+    "dates",
+    "rag_react"
+   ],
+   "upstream": "teleprompt/bootstrap.py",
+   "sha256": "548d86ff173a4f932775ae3fd09cf5228c6c91f0ccb3bdb0dc53d1eb97be8f42"
+  },
+  {
+   "name": "BootstrapFewShotWithOptuna",
+   "status": "partial",
+   "dszig": [
+    "bootstrap_optuna.zig",
+    "tpe.zig"
+   ],
+   "checks": "bootstrap_optuna_oracle.py, optuna_tpe.json",
+   "bench": [],
+   "upstream": "teleprompt/teleprompt_optuna.py",
+   "sha256": "0ee3dcdacf8e88c966dc6b34509bb47a162efc84cceb1cf24b5db0fb282a8ae1"
+  },
+  {
+   "name": "BootstrapFewShotWithRandomSearch",
+   "status": "native",
+   "dszig": [
+    "optimize.zig"
+   ],
+   "checks": "suite replay candidates",
+   "bench": [
+    "dates_search"
+   ],
+   "upstream": "teleprompt/random_search.py",
+   "sha256": "39ffcbdfe49878b831a994ac943943fbfa393a0ffaf356884e8a3f1f579de954"
+  },
+  {
+   "name": "BootstrapFinetune",
+   "status": "partial",
+   "dszig": [
+    "bootstrap_finetune.zig",
+    "bootstrap_finetune_data.zig",
+    "training.zig"
+   ],
+   "checks": "finetune-data tests in tests/behavior.zig and bootstrap_finetune_data.zig; no committed DSPy oracle",
+   "bench": [],
+   "upstream": "teleprompt/bootstrap_finetune.py",
+   "sha256": "c9820d8ff154bfeabdf330f938a942fcc1caef9b56709f63d223841f596b5b12"
+  },
+  {
+   "name": "BootstrapRS",
+   "status": "native",
+   "dszig": [
+    "optimize.zig"
+   ],
+   "checks": "alias of BootstrapFewShotWithRandomSearch",
+   "bench": [
+    "dates_search"
+   ],
+   "upstream": "teleprompt/random_search.py",
+   "sha256": "39ffcbdfe49878b831a994ac943943fbfa393a0ffaf356884e8a3f1f579de954"
+  },
+  {
+   "name": "BoundingBox",
+   "status": "native",
+   "dszig": [
+    "bounding_box.zig"
+   ],
+   "checks": "bounding_box_oracle.py, bounding_box_identity_oracle.py",
+   "bench": [],
+   "upstream": "adapters/types/bounding_box.py",
+   "sha256": "f8271ee841558355613bf13b7a0dcb0a4dcbfc1224f70abcff82d986cb91a1ad"
+  },
+  {
+   "name": "COPRO",
+   "status": "native",
+   "dszig": [
+    "copro.zig"
+   ],
+   "checks": "suite replay candidates and scores",
+   "bench": [
+    "dates_copro"
+   ],
+   "upstream": "teleprompt/copro_optimizer.py",
+   "sha256": "7542956486c9d4ef68cfb34371e1dd3f0f5a730234bc34344ee81d762ccdde9b"
+  },
+  {
+   "name": "ChainOfThought",
+   "status": "native",
+   "dszig": [
+    "predict.zig"
+   ],
+   "checks": "format_cases.json, xml.json, dspy_3_5_0_mock_suite.json",
+   "bench": [
+    "cases"
+   ],
+   "upstream": "predict/chain_of_thought.py",
+   "sha256": "10e3d3ffd80977ee4d9333cd1c54035e0b811e7bedcce2ac891227bcad3c327b"
+  },
+  {
+   "name": "ChatAdapter",
+   "status": "native",
+   "dszig": [
+    "adapter.zig"
+   ],
+   "checks": "format_cases.json, xml.json, dspy_3_5_0_mock_suite.json",
+   "bench": [
+    "cases"
+   ],
+   "upstream": "adapters/chat_adapter.py",
+   "sha256": "53e2d2d49c6dd69489beb9328c5cc36ed88e4c9f2e6b27bd4002825e17a98e98"
+  },
+  {
+   "name": "Code",
+   "status": "native",
+   "dszig": [
+    "code.zig"
+   ],
+   "checks": "code_oracle.py, code_identity_oracle.py",
+   "bench": [],
+   "upstream": "adapters/types/code.py",
+   "sha256": "4d2cdba1357801fae23364ce062cf7648372ddc3873faad6f5a23c91bf2798c9"
+  },
+  {
+   "name": "CodeExecutionError",
+   "status": "missing",
+   "dszig": [],
+   "checks": "",
+   "bench": [],
+   "upstream": "primitives/code_interpreter.py",
+   "sha256": "5fe6f4a393a27c4202f54c2349ada2529d40966fa340be9d3a89e6e624dc2d83"
+  },
+  {
+   "name": "CodeInterpreter",
+   "status": "missing",
+   "dszig": [],
+   "checks": "",
+   "bench": [],
+   "upstream": "primitives/code_interpreter.py",
+   "sha256": "5fe6f4a393a27c4202f54c2349ada2529d40966fa340be9d3a89e6e624dc2d83"
+  },
+  {
+   "name": "CodeInterpreterError",
+   "status": "missing",
+   "dszig": [],
+   "checks": "",
+   "bench": [],
+   "upstream": "primitives/code_interpreter.py",
+   "sha256": "5fe6f4a393a27c4202f54c2349ada2529d40966fa340be9d3a89e6e624dc2d83"
+  },
+  {
+   "name": "ColBERTv2",
+   "status": "native",
+   "dszig": [
+    "colbertv2.zig"
+   ],
+   "checks": "colbertv2_oracle.py (81 HTTP requests)",
+   "bench": [],
+   "upstream": "dsp/colbertv2.py",
+   "sha256": "9713b55d50ec03ecfa47dcb7c2342e13cecf1b0653849b49ae4a1e9ab7c40f84"
+  },
+  {
+   "name": "Completions",
+   "status": "partial",
+   "dszig": [
+    "predict.zig"
+   ],
+   "checks": "suite replay",
+   "bench": [],
+   "upstream": "primitives/prediction.py",
+   "sha256": "c3535a9b4d2caf4b510aacd40c0534cc0f948ec563aed63ac8f190186fd1eee4"
+  },
+  {
+   "name": "ContextWindowExceededError",
+   "status": "partial",
+   "dszig": [
+    "lm.zig"
+   ],
+   "checks": "",
+   "bench": [],
+   "upstream": "utils/exceptions.py",
+   "sha256": "7a519f5188aface7725c65963b82edb951dc41b0cb2d8eab3d1c69947605ca34"
+  },
+  {
+   "name": "DSPyError",
+   "status": "partial",
+   "dszig": [
+    "lm.zig"
+   ],
+   "checks": "",
+   "bench": [],
+   "upstream": "utils/exceptions.py",
+   "sha256": "7a519f5188aface7725c65963b82edb951dc41b0cb2d8eab3d1c69947605ca34"
+  },
+  {
+   "name": "Embedder",
+   "status": "native",
+   "dszig": [
+    "embedder.zig"
+   ],
+   "checks": "embeddings_oracle.py",
+   "bench": [],
+   "upstream": "clients/embedding.py",
+   "sha256": "8f09a2326c0f339f11cd70a306c12f3ecd689877c545b5db0f9bacd0fb5fb1e0"
+  },
+  {
+   "name": "Embeddings",
+   "status": "native",
+   "dszig": [
+    "embeddings.zig"
+   ],
+   "checks": "embeddings_oracle.py",
+   "bench": [],
+   "upstream": "retrievers/embeddings.py",
+   "sha256": "32e960658206e349b5d5abb79b325b6577eddc0491ff939b19b1a443f0a1affe"
+  },
+  {
+   "name": "EmbeddingsWithScores",
+   "status": "native",
+   "dszig": [
+    "embeddings.zig"
+   ],
+   "checks": "embeddings_oracle.py",
+   "bench": [],
+   "upstream": "retrievers/embeddings.py",
+   "sha256": "32e960658206e349b5d5abb79b325b6577eddc0491ff939b19b1a443f0a1affe"
+  },
+  {
+   "name": "Ensemble",
+   "status": "native",
+   "dszig": [
+    "ensemble.zig"
+   ],
+   "checks": "ensemble.json",
+   "bench": [],
+   "upstream": "teleprompt/ensemble.py",
+   "sha256": "f206b5891d79b11590dc3ab41a9c22e249d3fa015f3c410d801f42759ef90793"
+  },
+  {
+   "name": "Evaluate",
+   "status": "partial",
+   "dszig": [
+    "optimize.zig",
+    "parallel.zig"
+   ],
+   "checks": "bootstrap_rag_eval scores, suite replay (serial); `parallel.Evaluator` devset-order sums vs serial in tests/parallel.zig",
+   "bench": [
+    "rag",
+    "dates"
+   ],
+   "upstream": "evaluate/evaluate.py",
+   "sha256": "2c6fcbef742c8e1023cd25c1ac342b1dc58dbeba33ff4cb5f029a69aab0a5fcb"
+  },
+  {
+   "name": "Example",
+   "status": "partial",
+   "dszig": [
+    "predict.zig"
+   ],
+   "checks": "suite replay",
+   "bench": [],
+   "upstream": "primitives/example.py",
+   "sha256": "0c14e356eb4b1f9d54d195b4107dadc4d6871e8083f5d6b2f1b87f6183f24e7e"
+  },
+  {
+   "name": "File",
+   "status": "native",
+   "dszig": [
+    "file.zig"
+   ],
+   "checks": "file_oracle.py",
+   "bench": [],
+   "upstream": "adapters/types/file.py",
+   "sha256": "0d958e6cac5de9639917c3b407a97de513d173cda3b3351c24bf32af9db6c07a"
+  },
+  {
+   "name": "FinalOutput",
+   "status": "missing",
+   "dszig": [],
+   "checks": "",
+   "bench": [],
+   "upstream": "primitives/code_interpreter.py",
+   "sha256": "5fe6f4a393a27c4202f54c2349ada2529d40966fa340be9d3a89e6e624dc2d83"
+  },
+  {
+   "name": "Flex",
+   "status": "missing",
+   "dszig": [],
+   "checks": "",
+   "bench": [],
+   "upstream": "predict/flex/flex.py",
+   "sha256": "b18491d59d5f1ac246e05af3dbf28242b16b1193eaa96c48f9d8c7c60e3161ed"
+  },
+  {
+   "name": "GEPA",
+   "status": "partial",
+   "dszig": [
+    "gepa.zig"
+   ],
+   "checks": "gepa.json, gepa_merge.json (serial and native-pool rollouts), suite replay",
+   "bench": [
+    "dates_gepa"
+   ],
+   "upstream": "teleprompt/gepa/gepa.py",
+   "sha256": "8fe81892f81a29196783f1f938c656af94bb759b9eae27feda17623e0650da81"
+  },
+  {
+   "name": "History",
+   "status": "native",
+   "dszig": [
+    "history.zig"
+   ],
+   "checks": "react.json",
+   "bench": [],
+   "upstream": "adapters/types/history.py",
+   "sha256": "e183289f3925325e2aeee490e0877e0a8f16d8e0e9eca9a75c74be9403f8e6b7"
+  },
+  {
+   "name": "Image",
+   "status": "partial",
+   "dszig": [
+    "image.zig",
+    "media_download.zig"
+   ],
+   "checks": "native unit tests in image.zig; no committed DSPy oracle",
+   "bench": [],
+   "upstream": "adapters/types/image.py",
+   "sha256": "eff7604a76e19ec274b78d34c79e7047c317b99100a7d7bd80a283ddff649ff1"
+  },
+  {
+   "name": "InferRules",
+   "status": "native",
+   "dszig": [
+    "infer_rules.zig"
+   ],
+   "checks": "infer_rules_oracle.py",
+   "bench": [],
+   "upstream": "teleprompt/infer_rules.py",
+   "sha256": "e3d289f854401d6ca9695e6ee2de73d26f9abf293bfbf3da6dc6daa14eb523af"
+  },
+  {
+   "name": "InputField",
+   "status": "partial",
+   "dszig": [
+    "signature.zig"
+   ],
+   "checks": "compile-fail cases, format_cases.json",
+   "bench": [],
+   "upstream": "signatures/field.py",
+   "sha256": "dbba7840c3a1fbf0a762b27c1aab12c593489d3c4908fce67e5448dd14bfc61d"
+  },
+  {
+   "name": "InterpreterPool",
+   "status": "missing",
+   "dszig": [],
+   "checks": "",
+   "bench": [],
+   "upstream": "primitives/interpreter_pool.py",
+   "sha256": "600357d0091feb2ccc5965636cec3b4cf6d2e11b59a5f33c934589325053cca5"
+  },
+  {
+   "name": "JSONAdapter",
+   "status": "native",
+   "dszig": [
+    "adapter.zig",
+    "json_repair.zig"
+   ],
+   "checks": "format_cases.json, xml.json, dspy_3_5_0_mock_suite.json, adapter_repair_oracle.py",
+   "bench": [
+    "cases"
+   ],
+   "upstream": "adapters/json_adapter.py",
+   "sha256": "1c80ea0a783f80c6a35b05880b307a79d0390c255b0de87dba0a6490308b9daf"
+  },
+  {
+   "name": "KNN",
+   "status": "native",
+   "dszig": [
+    "knn.zig"
+   ],
+   "checks": "knn_oracle.py",
+   "bench": [],
+   "upstream": "predict/knn.py",
+   "sha256": "b534496e1622beea639f5ec8a2a7d10aec4c9a7fd52d45dbc9e06e99e3b8bb8b"
+  },
+  {
+   "name": "KNNFewShot",
+   "status": "native",
+   "dszig": [
+    "knn_fewshot.zig"
+   ],
+   "checks": "knn_oracle.py",
+   "bench": [],
+   "upstream": "teleprompt/knn_fewshot.py",
+   "sha256": "3a50f0436e66289dc36454427e243bdc78eac9f68bf182b16cb6887be5e77a05"
+  },
+  {
+   "name": "LM",
+   "status": "partial",
+   "dszig": [
+    "lm.zig",
+    "http.zig",
+    "anthropic.zig",
+    "gemini.zig"
+   ],
+   "checks": "lm_response_oracle.py, live transcripts (OpenAI Chat Completions/Responses only); Anthropic/Gemini covered by native loopback tests, no hosted recordings",
+   "bench": [],
+   "upstream": "clients/lm.py",
+   "sha256": "315245e58d7d20bd33c90a613cd5aaade97be622148e64e88315ae9494348f8e"
+  },
+  {
+   "name": "LMAuthError",
+   "status": "partial",
+   "dszig": [
+    "lm.zig"
+   ],
+   "checks": "Zig error set, not Python exception classes",
+   "bench": [],
+   "upstream": "utils/exceptions.py",
+   "sha256": "7a519f5188aface7725c65963b82edb951dc41b0cb2d8eab3d1c69947605ca34"
+  },
+  {
+   "name": "LMBillingError",
+   "status": "partial",
+   "dszig": [
+    "lm.zig"
+   ],
+   "checks": "Zig error set, not Python exception classes",
+   "bench": [],
+   "upstream": "utils/exceptions.py",
+   "sha256": "7a519f5188aface7725c65963b82edb951dc41b0cb2d8eab3d1c69947605ca34"
+  },
+  {
+   "name": "LMCollectionLimitError",
+   "status": "partial",
+   "dszig": [
+    "lm.zig"
+   ],
+   "checks": "Zig error set, not Python exception classes",
+   "bench": [],
+   "upstream": "utils/exceptions.py",
+   "sha256": "7a519f5188aface7725c65963b82edb951dc41b0cb2d8eab3d1c69947605ca34"
+  },
+  {
+   "name": "LMConfigurationError",
+   "status": "partial",
+   "dszig": [
+    "lm.zig"
+   ],
+   "checks": "Zig error set, not Python exception classes",
+   "bench": [],
+   "upstream": "utils/exceptions.py",
+   "sha256": "7a519f5188aface7725c65963b82edb951dc41b0cb2d8eab3d1c69947605ca34"
+  },
+  {
+   "name": "LMError",
+   "status": "partial",
+   "dszig": [
+    "lm.zig"
+   ],
+   "checks": "Zig error set, not Python exception classes",
+   "bench": [],
+   "upstream": "utils/exceptions.py",
+   "sha256": "7a519f5188aface7725c65963b82edb951dc41b0cb2d8eab3d1c69947605ca34"
+  },
+  {
+   "name": "LMInvalidRequestError",
+   "status": "partial",
+   "dszig": [
+    "lm.zig"
+   ],
+   "checks": "Zig error set, not Python exception classes",
+   "bench": [],
+   "upstream": "utils/exceptions.py",
+   "sha256": "7a519f5188aface7725c65963b82edb951dc41b0cb2d8eab3d1c69947605ca34"
+  },
+  {
+   "name": "LMLockTimeoutError",
+   "status": "partial",
+   "dszig": [
+    "lm.zig"
+   ],
+   "checks": "Zig error set, not Python exception classes",
+   "bench": [],
+   "upstream": "utils/exceptions.py",
+   "sha256": "7a519f5188aface7725c65963b82edb951dc41b0cb2d8eab3d1c69947605ca34"
+  },
+  {
+   "name": "LMNotConfiguredError",
+   "status": "partial",
+   "dszig": [
+    "lm.zig"
+   ],
+   "checks": "Zig error set, not Python exception classes",
+   "bench": [],
+   "upstream": "utils/exceptions.py",
+   "sha256": "7a519f5188aface7725c65963b82edb951dc41b0cb2d8eab3d1c69947605ca34"
+  },
+  {
+   "name": "LMProviderError",
+   "status": "partial",
+   "dszig": [
+    "lm.zig"
+   ],
+   "checks": "Zig error set, not Python exception classes",
+   "bench": [],
+   "upstream": "utils/exceptions.py",
+   "sha256": "7a519f5188aface7725c65963b82edb951dc41b0cb2d8eab3d1c69947605ca34"
+  },
+  {
+   "name": "LMRateLimitError",
+   "status": "partial",
+   "dszig": [
+    "lm.zig"
+   ],
+   "checks": "Zig error set, not Python exception classes",
+   "bench": [],
+   "upstream": "utils/exceptions.py",
+   "sha256": "7a519f5188aface7725c65963b82edb951dc41b0cb2d8eab3d1c69947605ca34"
+  },
+  {
+   "name": "LMServerError",
+   "status": "partial",
+   "dszig": [
+    "lm.zig"
+   ],
+   "checks": "Zig error set, not Python exception classes",
+   "bench": [],
+   "upstream": "utils/exceptions.py",
+   "sha256": "7a519f5188aface7725c65963b82edb951dc41b0cb2d8eab3d1c69947605ca34"
+  },
+  {
+   "name": "LMStreamAssemblyError",
+   "status": "partial",
+   "dszig": [
+    "lm.zig"
+   ],
+   "checks": "Zig error set, not Python exception classes",
+   "bench": [],
+   "upstream": "utils/exceptions.py",
+   "sha256": "7a519f5188aface7725c65963b82edb951dc41b0cb2d8eab3d1c69947605ca34"
+  },
+  {
+   "name": "LMTimeoutError",
+   "status": "partial",
+   "dszig": [
+    "lm.zig"
+   ],
+   "checks": "Zig error set, not Python exception classes",
+   "bench": [],
+   "upstream": "utils/exceptions.py",
+   "sha256": "7a519f5188aface7725c65963b82edb951dc41b0cb2d8eab3d1c69947605ca34"
+  },
+  {
+   "name": "LMTransportError",
+   "status": "partial",
+   "dszig": [
+    "lm.zig"
+   ],
+   "checks": "Zig error set, not Python exception classes",
+   "bench": [],
+   "upstream": "utils/exceptions.py",
+   "sha256": "7a519f5188aface7725c65963b82edb951dc41b0cb2d8eab3d1c69947605ca34"
+  },
+  {
+   "name": "LMUnexpectedError",
+   "status": "partial",
+   "dszig": [
+    "lm.zig"
+   ],
+   "checks": "Zig error set, not Python exception classes",
+   "bench": [],
+   "upstream": "utils/exceptions.py",
+   "sha256": "7a519f5188aface7725c65963b82edb951dc41b0cb2d8eab3d1c69947605ca34"
+  },
+  {
+   "name": "LMUnsupportedFeatureError",
+   "status": "partial",
+   "dszig": [
+    "lm.zig"
+   ],
+   "checks": "Zig error set, not Python exception classes",
+   "bench": [],
+   "upstream": "utils/exceptions.py",
+   "sha256": "7a519f5188aface7725c65963b82edb951dc41b0cb2d8eab3d1c69947605ca34"
+  },
+  {
+   "name": "LMUnsupportedModelError",
+   "status": "partial",
+   "dszig": [
+    "lm.zig"
+   ],
+   "checks": "Zig error set, not Python exception classes",
+   "bench": [],
+   "upstream": "utils/exceptions.py",
+   "sha256": "7a519f5188aface7725c65963b82edb951dc41b0cb2d8eab3d1c69947605ca34"
+  },
+  {
+   "name": "LabeledFewShot",
+   "status": "native",
+   "dszig": [
+    "optimize.zig"
+   ],
+   "checks": "golden tests",
+   "bench": [],
+   "upstream": "teleprompt/vanilla.py",
+   "sha256": "2bc9fc0d970059373d5112f6bfeb69e3ad460bb6bc4a2d1fbab8a48d35ece093"
+  },
+  {
+   "name": "LocalInterpreter",
+   "status": "missing",
+   "dszig": [],
+   "checks": "",
+   "bench": [],
+   "upstream": "primitives/local_interpreter.py",
+   "sha256": "f3fbf6e7b6173ed0774f5bfddc94ee8ae87a589ed591e07ac20cfa0f85eaa47e"
+  },
+  {
+   "name": "MIPROv2",
+   "status": "native",
+   "dszig": [
+    "mipro.zig",
+    "tpe.zig"
+   ],
+   "checks": "suite replay instructions and trial logs, optuna_tpe.json",
+   "bench": [
+    "dates_mipro",
+    "dates_mipro_aware"
+   ],
+   "upstream": "teleprompt/mipro_optimizer_v2.py",
+   "sha256": "26d1879c6b1f3fb43be6bd61693b2f28496fabe4cbb3ca52c64201391b9c0c5e"
+  },
+  {
+   "name": "Module",
+   "status": "partial",
+   "dszig": [
+    "predict.zig"
+   ],
+   "checks": "comptime program structs",
+   "bench": [],
+   "upstream": "primitives/module.py",
+   "sha256": "0f63191e91db2c1c1d9ae087cecc7ea9997838198500b77d685edc25662687d3"
+  },
+  {
+   "name": "MultiChainComparison",
+   "status": "native",
+   "dszig": [
+    "multi_chain_comparison.zig"
+   ],
+   "checks": "behavior tests vs DSPy source",
+   "bench": [],
+   "upstream": "predict/multi_chain_comparison.py",
+   "sha256": "66a5b8c24e4a2825d9a5b69a24f29385ac53e40ac5b93a4ec94a87ecf3e6a73c"
+  },
+  {
+   "name": "OldField",
+   "status": "missing",
+   "dszig": [],
+   "checks": "",
+   "bench": [],
+   "upstream": "signatures/field.py",
+   "sha256": "dbba7840c3a1fbf0a762b27c1aab12c593489d3c4908fce67e5448dd14bfc61d"
+  },
+  {
+   "name": "OldInputField",
+   "status": "missing",
+   "dszig": [],
+   "checks": "",
+   "bench": [],
+   "upstream": "signatures/field.py",
+   "sha256": "dbba7840c3a1fbf0a762b27c1aab12c593489d3c4908fce67e5448dd14bfc61d"
+  },
+  {
+   "name": "OldOutputField",
+   "status": "missing",
+   "dszig": [],
+   "checks": "",
+   "bench": [],
+   "upstream": "signatures/field.py",
+   "sha256": "dbba7840c3a1fbf0a762b27c1aab12c593489d3c4908fce67e5448dd14bfc61d"
+  },
+  {
+   "name": "OutputField",
+   "status": "partial",
+   "dszig": [
+    "signature.zig"
+   ],
+   "checks": "compile-fail cases, format_cases.json",
+   "bench": [],
+   "upstream": "signatures/field.py",
+   "sha256": "dbba7840c3a1fbf0a762b27c1aab12c593489d3c4908fce67e5448dd14bfc61d"
+  },
+  {
+   "name": "Parallel",
+   "status": "partial",
+   "dszig": [
+    "parallel.zig",
+    "parallel_state.zig"
+   ],
+   "checks": "parallel.json (DSPy ParallelExecutor order, failures, max_errors cancel) on the native pool; tests/parallel.zig (typed program/Example bindings, straggler duplicates, cancellation joins, seeded scheduling); no progress bar, SIGINT or thread-local settings; attempts bounded (`AttemptCapacity`)",
+   "bench": [],
+   "upstream": "predict/parallel.py",
+   "sha256": "9359c28c44cb0067a262e0e0ac3bd90a22bafc78510f6e477a353fd7b26d3d19"
+  },
+  {
+   "name": "Predict",
+   "status": "native",
+   "dszig": [
+    "predict.zig"
+   ],
+   "checks": "format_cases.json, xml.json, dspy_3_5_0_mock_suite.json",
+   "bench": [
+    "cases"
+   ],
+   "upstream": "predict/predict.py",
+   "sha256": "a4f721bf2fb3500783d5319ff42debf556c9a055098b11e4e203bc8bd1dafabe"
+  },
+  {
+   "name": "Prediction",
+   "status": "partial",
+   "dszig": [
+    "predict.zig"
+   ],
+   "checks": "suite replay",
+   "bench": [],
+   "upstream": "primitives/prediction.py",
+   "sha256": "c3535a9b4d2caf4b510aacd40c0534cc0f948ec563aed63ac8f190186fd1eee4"
+  },
+  {
+   "name": "Provider",
+   "status": "missing",
+   "dszig": [],
+   "checks": "",
+   "bench": [],
+   "upstream": "clients/provider.py",
+   "sha256": "6a1de5a92edf453f8b7b5a0b54a3fb35ec9b0c8a978adbebf3799f95b727a768"
+  },
+  {
+   "name": "PythonInterpreter",
+   "status": "missing",
+   "dszig": [],
+   "checks": "",
+   "bench": [],
+   "upstream": "primitives/python_interpreter.py",
+   "sha256": "1cedd1d84c1431d36e79a8ec456704f9a6b28f5f68ea41bee143489e5c8b2467"
+  },
+  {
+   "name": "RLM",
+   "status": "partial",
+   "dszig": [
+    "rlm.zig",
+    "bounded_python.zig",
+    "bounded_python_rlm.zig"
+   ],
+   "checks": "native unit tests in rlm.zig/bounded_python*.zig; caller-supplied runtime or a narrow bounded Python profile, not a general Python interpreter; no committed DSPy oracle",
+   "bench": [],
+   "upstream": "predict/rlm.py",
+   "sha256": "dbdc472b62e661efbfb15fecab6dd1da08b41dfab220b2961f593175eea10453"
+  },
+  {
+   "name": "ReAct",
+   "status": "native",
+   "dszig": [
+    "react.zig",
+    "tool.zig"
+   ],
+   "checks": "react.json, refine_react_oracle.py, suite replay",
+   "bench": [
+    "rag_react"
+   ],
+   "upstream": "predict/react.py",
+   "sha256": "a5d852c07303448aeed795db2657e9adb5bf0930499020c8a3c57fbf605541da"
+  },
+  {
+   "name": "ReActV2",
+   "status": "missing",
+   "dszig": [],
+   "checks": "",
+   "bench": [],
+   "upstream": "predict/react_v2.py",
+   "sha256": "f5dcfe7b614b8f5d71fb5b5efa6529086e83067c62b158a18e1bd3d99e4012ea"
+  },
+  {
+   "name": "Reasoning",
+   "status": "native",
+   "dszig": [
+    "reasoning.zig"
+   ],
+   "checks": "reasoning_identity_oracle.py",
+   "bench": [],
+   "upstream": "adapters/types/reasoning.py",
+   "sha256": "2bdc331e5c4e049e5909c5ac4d7536852a18b472e394c831c376f9ef7dfc4ed4"
+  },
+  {
+   "name": "Refine",
+   "status": "native",
+   "dszig": [
+    "refine.zig"
+   ],
+   "checks": "refine_oracle.py",
+   "bench": [],
+   "upstream": "predict/refine.py",
+   "sha256": "d34cd8760f2a32a1546d0856b1b85b07465eca3ab0615d6a70e4912de3805b7e"
+  },
+  {
+   "name": "Retrieve",
+   "status": "native",
+   "dszig": [
+    "predict.zig"
+   ],
+   "checks": "bootstrap_rag.json, suite replay",
+   "bench": [
+    "rag"
+   ],
+   "upstream": "retrievers/retrieve.py",
+   "sha256": "a8fda84efdd31abd4237acc244af53670820f32c0ea872296392278118e17a2b"
+  },
+  {
+   "name": "SIMBA",
+   "status": "native",
+   "dszig": [
+    "simba.zig",
+    "nprandom.zig"
+   ],
+   "checks": "simba.json (serial and native-pool rollouts), suite replay train scores",
+   "bench": [
+    "dates_simba"
+   ],
+   "upstream": "teleprompt/simba.py",
+   "sha256": "4de72e1d0cb1cd30a180569c21973c41fa272c3ebb82a365e3f307986ab67a55"
+  },
+  {
+   "name": "SandboxSerializable",
+   "status": "missing",
+   "dszig": [],
+   "checks": "",
+   "bench": [],
+   "upstream": "primitives/sandbox_serializable.py",
+   "sha256": "1b00dfed67c7b36276fca2ed6505d1e4aa340b08ac52cdd74771e25421b73e92"
+  },
+  {
+   "name": "Signature",
+   "status": "partial",
+   "dszig": [
+    "signature.zig"
+   ],
+   "checks": "compile-fail cases, format_cases.json, nested.json",
+   "bench": [],
+   "upstream": "signatures/signature.py",
+   "sha256": "7f7da2bcc339e6276e456f5b3f66494184ddd793b08f6a6dde4f572330e22273"
+  },
+  {
+   "name": "SignatureMeta",
+   "status": "partial",
+   "dszig": [
+    "signature.zig"
+   ],
+   "checks": "comptime signatures",
+   "bench": [],
+   "upstream": "signatures/signature.py",
+   "sha256": "7f7da2bcc339e6276e456f5b3f66494184ddd793b08f6a6dde4f572330e22273"
+  },
+  {
+   "name": "Tool",
+   "status": "native",
+   "dszig": [
+    "tool.zig"
+   ],
+   "checks": "react.json, tool_argument_repair_oracle.py",
+   "bench": [],
+   "upstream": "adapters/types/tool.py",
+   "sha256": "76251a5bcfc802fafe92efc5bbb544e149548b4b6f1a226aa925b084f03ebf47"
+  },
+  {
+   "name": "ToolCallResults",
+   "status": "native",
+   "dszig": [
+    "tool.zig"
+   ],
+   "checks": "react.json",
+   "bench": [],
+   "upstream": "adapters/types/tool.py",
+   "sha256": "76251a5bcfc802fafe92efc5bbb544e149548b4b6f1a226aa925b084f03ebf47"
+  },
+  {
+   "name": "ToolCalls",
+   "status": "native",
+   "dszig": [
+    "tool.zig"
+   ],
+   "checks": "react.json",
+   "bench": [],
+   "upstream": "adapters/types/tool.py",
+   "sha256": "76251a5bcfc802fafe92efc5bbb544e149548b4b6f1a226aa925b084f03ebf47"
+  },
+  {
+   "name": "TrainingJob",
+   "status": "partial",
+   "dszig": [
+    "training.zig"
+   ],
+   "checks": "native unit tests in training.zig; OpenAI jobs only; no committed DSPy oracle",
+   "bench": [],
+   "upstream": "clients/provider.py",
+   "sha256": "6a1de5a92edf453f8b7b5a0b54a3fb35ec9b0c8a978adbebf3799f95b727a768"
+  },
+  {
+   "name": "TwoStepAdapter",
+   "status": "native",
+   "dszig": [
+    "adapter.zig"
+   ],
+   "checks": "two_step_oracle.py",
+   "bench": [],
+   "upstream": "adapters/two_step_adapter.py",
+   "sha256": "6a5940c33f15d02ae9c04e23be3590b0735e229b1d5288e79b7f620ed3d03171"
+  },
+  {
+   "name": "Type",
+   "status": "partial",
+   "dszig": [
+    "types.zig"
+   ],
+   "checks": "nested.json",
+   "bench": [],
+   "upstream": "adapters/types/base_type.py",
+   "sha256": "66c83d24c2418d8c52a5a877e9954a7c858b1785d0b5f0effb5d62aa32a44ce8"
+  },
+  {
+   "name": "XMLAdapter",
+   "status": "native",
+   "dszig": [
+    "xml.zig",
+    "xml_schema.zig"
+   ],
+   "checks": "xml.json",
+   "bench": [
+    "cases"
+   ],
+   "upstream": "adapters/xml_adapter.py",
+   "sha256": "12dffe06a5f40bcd61523d30ff77ff5da602af5f1d67f9b75a7ff5d6826dee91"
+  },
+  {
+   "name": "asyncify",
+   "status": "missing",
+   "dszig": [],
+   "checks": "",
+   "bench": [],
+   "upstream": "utils/asyncify.py",
+   "sha256": "52d30c8407425185d63889c27df637a7e55c923cddc0bfb701970ae8c825853e"
+  },
+  {
+   "name": "bootstrap_trace_data",
+   "status": "partial",
+   "dszig": [
+    "bootstrap_trace.zig"
+   ],
+   "checks": "trace-bootstrap tests in tests/behavior.zig; no committed DSPy oracle",
+   "bench": [],
+   "upstream": "teleprompt/bootstrap_trace.py",
+   "sha256": "2c5bf2aeeef2c0b8516bb80474f9105ea5d48d1b0b1c9e1665f96b60ce9cc39a"
+  },
+  {
+   "name": "configure",
+   "status": "partial",
+   "dszig": [
+    "predict.zig"
+   ],
+   "checks": "explicit Context instead of global settings",
+   "bench": [],
+   "upstream": "dsp/utils/settings.py",
+   "sha256": "f7acef6914c2dc587ea2655c02b4ddd1ce5d6e2cc071a8b098f14892c43b6292"
+  },
+  {
+   "name": "configure_cache",
+   "status": "partial",
+   "dszig": [
+    "cache.zig",
+    "request_cache.zig"
+   ],
+   "checks": "cache tests",
+   "bench": [],
+   "upstream": "clients/__init__.py",
+   "sha256": "bec64413c9f99ee1cfe4579a1d22156ca716e2f19e1708557df7f605b91583aa"
+  },
+  {
+   "name": "configure_dspy_loggers",
+   "status": "missing",
+   "dszig": [],
+   "checks": "",
+   "bench": [],
+   "upstream": "utils/logging_utils.py",
+   "sha256": "fa0046d4c4e091bebf9ee591be4c6d7f6b120462f04b7f7df009f457b63faba6"
+  },
+  {
+   "name": "context",
+   "status": "partial",
+   "dszig": [
+    "predict.zig"
+   ],
+   "checks": "explicit Context",
+   "bench": [],
+   "upstream": null,
+   "sha256": null
+  },
+  {
+   "name": "disable_litellm_logging",
+   "status": "missing",
+   "dszig": [],
+   "checks": "no litellm",
+   "bench": [],
+   "upstream": "clients/__init__.py",
+   "sha256": "bec64413c9f99ee1cfe4579a1d22156ca716e2f19e1708557df7f605b91583aa"
+  },
+  {
+   "name": "disable_logging",
+   "status": "missing",
+   "dszig": [],
+   "checks": "",
+   "bench": [],
+   "upstream": "utils/logging_utils.py",
+   "sha256": "fa0046d4c4e091bebf9ee591be4c6d7f6b120462f04b7f7df009f457b63faba6"
+  },
+  {
+   "name": "enable_litellm_logging",
+   "status": "missing",
+   "dszig": [],
+   "checks": "no litellm",
+   "bench": [],
+   "upstream": "clients/__init__.py",
+   "sha256": "bec64413c9f99ee1cfe4579a1d22156ca716e2f19e1708557df7f605b91583aa"
+  },
+  {
+   "name": "enable_logging",
+   "status": "missing",
+   "dszig": [],
+   "checks": "",
+   "bench": [],
+   "upstream": "utils/logging_utils.py",
+   "sha256": "fa0046d4c4e091bebf9ee591be4c6d7f6b120462f04b7f7df009f457b63faba6"
+  },
+  {
+   "name": "ensure_signature",
+   "status": "partial",
+   "dszig": [
+    "signature.zig"
+   ],
+   "checks": "comptime",
+   "bench": [],
+   "upstream": "signatures/signature.py",
+   "sha256": "7f7da2bcc339e6276e456f5b3f66494184ddd793b08f6a6dde4f572330e22273"
+  },
+  {
+   "name": "infer_prefix",
+   "status": "partial",
+   "dszig": [
+    "signature.zig"
+   ],
+   "checks": "format_cases.json",
+   "bench": [],
+   "upstream": "signatures/signature.py",
+   "sha256": "7f7da2bcc339e6276e456f5b3f66494184ddd793b08f6a6dde4f572330e22273"
+  },
+  {
+   "name": "inspect_history",
+   "status": "missing",
+   "dszig": [],
+   "checks": "",
+   "bench": [],
+   "upstream": "clients/base_lm.py",
+   "sha256": "dabe873b9a65868252bbe03b9b5dd4d08494f7214a3fbf156e5f75e4c7f968e5"
+  },
+  {
+   "name": "is_retryable_lm_error",
+   "status": "partial",
+   "dszig": [
+    "http.zig"
+   ],
+   "checks": "transport retry tests",
+   "bench": [],
+   "upstream": "utils/exceptions.py",
+   "sha256": "7a519f5188aface7725c65963b82edb951dc41b0cb2d8eab3d1c69947605ca34"
+  },
+  {
+   "name": "load",
+   "status": "native",
+   "dszig": [
+    "state.zig"
+   ],
+   "checks": "check_artifact.py (DSPy loads and re-saves DSZig artifacts)",
+   "bench": [],
+   "upstream": "utils/saving.py",
+   "sha256": "d1df7d4c55eb0bb4599ab9ce94d8a4e27acf43769dffcc9d394df2f28d7a116b"
+  },
+  {
+   "name": "load_settings",
+   "status": "missing",
+   "dszig": [],
+   "checks": "",
+   "bench": [],
+   "upstream": "dsp/utils/settings.py",
+   "sha256": "f7acef6914c2dc587ea2655c02b4ddd1ce5d6e2cc071a8b098f14892c43b6292"
+  },
+  {
+   "name": "majority",
+   "status": "native",
+   "dszig": [
+    "ensemble.zig"
+   ],
+   "checks": "ensemble.json",
+   "bench": [],
+   "upstream": "predict/aggregation.py",
+   "sha256": "a975e8ad21c830362446b16087ecdd84d77374a94b2a676ddf75340ee1398048"
+  },
+  {
+   "name": "make_signature",
+   "status": "partial",
+   "dszig": [
+    "signature.zig"
+   ],
+   "checks": "comptime",
+   "bench": [],
+   "upstream": "signatures/signature.py",
+   "sha256": "7f7da2bcc339e6276e456f5b3f66494184ddd793b08f6a6dde4f572330e22273"
+  },
+  {
+   "name": "resolve_interpreter_factory",
+   "status": "missing",
+   "dszig": [],
+   "checks": "",
+   "bench": [],
+   "upstream": "primitives/code_interpreter.py",
+   "sha256": "5fe6f4a393a27c4202f54c2349ada2529d40966fa340be9d3a89e6e624dc2d83"
+  },
+  {
+   "name": "settings",
+   "status": "partial",
+   "dszig": [
+    "predict.zig"
+   ],
+   "checks": "explicit Context",
+   "bench": [],
+   "upstream": null,
+   "sha256": null
+  },
+  {
+   "name": "streamify",
+   "status": "partial",
+   "dszig": [
+    "predict_stream.zig",
+    "async_stream.zig",
+    "openai_stream.zig",
+    "chat_stream_listener.zig",
+    "json_stream_listener.zig",
+    "xml_stream_listener.zig",
+    "stream_status.zig"
+   ],
+   "checks": "native unit tests in predict_stream.zig/async_stream.zig and the stream listeners; no committed DSPy oracle",
+   "bench": [],
+   "upstream": "streaming/streamify.py",
+   "sha256": "c51b289119337dedd442ed666b2117051b2bc379ff0484471fc21f413cf48ad0"
+  },
+  {
+   "name": "syncify",
+   "status": "missing",
+   "dszig": [],
+   "checks": "",
+   "bench": [],
+   "upstream": "utils/syncify.py",
+   "sha256": "8753bbb28bbc9a341bd6e9d54e98195ff9e5be6378f48da8d094bd9dc8a77803"
+  },
+  {
+   "name": "track_usage",
+   "status": "partial",
+   "dszig": [
+    "usage_tracker.zig",
+    "lm_usage.zig"
+   ],
+   "checks": "native unit tests in usage_tracker.zig; no committed DSPy oracle",
+   "bench": [],
+   "upstream": null,
+   "sha256": null
+  }
+ ]
+}

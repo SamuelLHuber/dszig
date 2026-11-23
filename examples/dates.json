@@ -1,0 +1,31 @@
+{
+  "note": "Gold answers follow an ISO 8601 convention the instructions never state; only demos can teach it.",
+  "train": [
+    ["When did Apollo 11 land on the Moon?", "1969-07-20"],
+    ["When did the Berlin Wall fall?", "1989-11-09"],
+    ["When was the US Declaration of Independence adopted?", "1776-07-04"],
+    ["When did the Titanic sink?", "1912-04-15"],
+    ["When was V-E Day, the end of World War II in Europe?", "1945-05-08"],
+    ["When was the first iPhone released in the US?", "2007-06-29"],
+    ["When did the September 11 attacks occur?", "2001-09-11"],
+    ["When was Neil Armstrong born?", "1930-08-05"],
+    ["When did euro banknotes enter circulation?", "2002-01-01"],
+    ["When was the Wright brothers' first powered flight?", "1903-12-17"],
+    ["When did the Chernobyl disaster occur?", "1986-04-26"],
+    ["When did Germany reunify?", "1990-10-03"]
+  ],
+  "dev": [
+    ["When did Sputnik 1 launch?", "1957-10-04"],
+    ["When was the attack on Pearl Harbor?", "1941-12-07"],
+    ["When did the storming of the Bastille take place?", "1789-07-14"],
+    ["When was Martin Luther King Jr. assassinated?", "1968-04-04"],
+    ["When did Yuri Gagarin fly into space?", "1961-04-12"],
+    ["When was the Treaty of Versailles signed?", "1919-06-28"],
+    ["When did the Space Shuttle Challenger disaster happen?", "1986-01-28"],
+    ["When was Nelson Mandela released from prison?", "1990-02-11"],
+    ["When was Albert Einstein born?", "1879-03-14"],
+    ["When did the Normandy landings (D-Day) take place?", "1944-06-06"],
+    ["When was President John F. Kennedy assassinated?", "1963-11-22"],
+    ["When did the Fukushima nuclear disaster begin?", "2011-03-11"]
+  ]
+}

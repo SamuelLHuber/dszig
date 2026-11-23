@@ -1,0 +1,14 @@
+.{
+    .name = .dszig,
+    .version = "3.5.0+dszig.1",
+    .fingerprint = 0xed95e071dc98b643,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "README.md",
+    },
+}

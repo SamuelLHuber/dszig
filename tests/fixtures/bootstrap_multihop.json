@@ -1,0 +1,142 @@
+{
+  "retrieve": {
+    "k": 1
+  },
+  "hop": {
+    "traces": [],
+    "train": [],
+    "demos": [
+      {
+        "augmented": true,
+        "context": [
+          "Paris is the capital of France."
+        ],
+        "question": "What is the capital of France?",
+        "query": "Tokyo Japan capital"
+      },
+      {
+        "augmented": true,
+        "context": [
+          "Mount Everest is the highest mountain on Earth.",
+          "Tokyo is the capital of Japan."
+        ],
+        "question": "What is the highest mountain?",
+        "query": "highest mountain Everest"
+      },
+      {
+        "augmented": true,
+        "context": [
+          "The Pacific is the largest ocean.",
+          "Tokyo is the capital of Japan."
+        ],
+        "question": "What is the largest ocean?",
+        "query": "highest mountain Everest"
+      },
+      {
+        "augmented": true,
+        "context": [
+          "Water boils at 100 degrees Celsius at sea level."
+        ],
+        "question": "At what temperature does water boil?",
+        "query": "Tokyo Japan capital"
+      }
+    ],
+    "signature": {
+      "instructions": "Write a search query that finds the missing facts.",
+      "fields": [
+        {
+          "prefix": "Context:",
+          "description": "${context}"
+        },
+        {
+          "prefix": "Question:",
+          "description": "${question}"
+        },
+        {
+          "prefix": "Query:",
+          "description": "${query}"
+        }
+      ]
+    },
+    "lm": null
+  },
+  "generate_answer.predict": {
+    "traces": [],
+    "train": [],
+    "demos": [
+      {
+        "augmented": true,
+        "context": [
+          "Paris is the capital of France.",
+          "Tokyo is the capital of Japan.",
+          "Mount Everest is the highest mountain on Earth."
+        ],
+        "question": "What is the capital of France?",
+        "reasoning": "The context says Paris is the capital of France.",
+        "answer": "Paris"
+      },
+      {
+        "augmented": true,
+        "context": [
+          "Mount Everest is the highest mountain on Earth.",
+          "Tokyo is the capital of Japan.",
+          "Mount Everest is the highest mountain on Earth."
+        ],
+        "question": "What is the highest mountain?",
+        "reasoning": "Everest is the highest mountain.",
+        "answer": "Mount Everest"
+      },
+      {
+        "augmented": true,
+        "context": [
+          "The Pacific is the largest ocean.",
+          "Tokyo is the capital of Japan.",
+          "Mount Everest is the highest mountain on Earth."
+        ],
+        "question": "What is the largest ocean?",
+        "reasoning": "The Pacific is the largest ocean.",
+        "answer": "The Pacific"
+      },
+      {
+        "augmented": true,
+        "context": [
+          "Water boils at 100 degrees Celsius at sea level.",
+          "Tokyo is the capital of Japan.",
+          "Mount Everest is the highest mountain on Earth."
+        ],
+        "question": "At what temperature does water boil?",
+        "reasoning": "Water boils at 100 degrees Celsius.",
+        "answer": "100 degrees Celsius"
+      }
+    ],
+    "signature": {
+      "instructions": "Answer questions with short factoid answers.",
+      "fields": [
+        {
+          "prefix": "Context:",
+          "description": "may contain relevant facts"
+        },
+        {
+          "prefix": "Question:",
+          "description": "${question}"
+        },
+        {
+          "prefix": "Reasoning:",
+          "description": "A short plan for solving the task."
+        },
+        {
+          "prefix": "Answer:",
+          "description": "often between 1 and 5 words"
+        }
+      ]
+    },
+    "lm": null
+  },
+  "metadata": {
+    "dependency_versions": {
+      "python": "3.11",
+      "dspy": "3.5.0",
+      "cloudpickle": "3.1"
+    }
+  }
+}

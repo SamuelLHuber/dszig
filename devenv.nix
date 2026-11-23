@@ -1,0 +1,189 @@
+{ pkgs, lib, ... }:
+
+let
+  # Linux uses nixpkgs' Zig, which links against and runs on the Nix store's
+  # glibc. On macOS, nixpkgs' zig_0_17 dies with SIGBUS, so it is the official
+  # ziglang.org build: the same tarball and SHA-256 as
+  # .github/scripts/install-zig.sh.
+  zigVersion = "0.17.0";
+  zigMacos = {
+    triple = "aarch64-macos";
+    sha256 = "b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a";
+  };
+  zig =
+    if pkgs.stdenv.hostPlatform.system == "aarch64-darwin" then
+      pkgs.stdenvNoCC.mkDerivation {
+        pname = "zig";
+        version = zigVersion;
+        src = pkgs.fetchurl {
+          url = "https://ziglang.org/download/${zigVersion}/zig-${zigMacos.triple}-${zigVersion}.tar.xz";
+          inherit (zigMacos) sha256;
+        };
+        patches = [ ./.github/scripts/zig-darwin-connect.patch ];
+        dontConfigure = true;
+        dontBuild = true;
+        dontFixup = true;
+        installPhase = ''
+          mkdir -p $out/bin $out/share/zig
+          cp -r . $out/share/zig
+          ln -s $out/share/zig/zig $out/bin/zig
+        '';
+      }
+    else
+      pkgs.zig_0_17;
+  # The DSPy reference harness (tools/dspy_reference) needs CPython 3.11; uv
+  # installs DSPy 3.5.0 from uv.lock, which pins every package by sha256.
+  python = pkgs.python311;
+in
+{
+  packages = [
+    zig
+    python
+    pkgs.uv
+  ]
+  ++ lib.optionals pkgs.stdenv.hostPlatform.isDarwin [ pkgs.xcbuild ];
+
+  env = {
+    UV_PYTHON = "${python}/bin/python3";
+    UV_PYTHON_DOWNLOADS = "never";
+  }
+  # NumPy's manylinux wheel (pulled in by Optuna, which MIPROv2 uses) loads
+  # libstdc++ and libz from the system; Nix shells have no system copies.
+  // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+    LD_LIBRARY_PATH = lib.makeLibraryPath [
+      pkgs.stdenv.cc.cc.lib
+      pkgs.zlib
+    ];
+  };
+
+  scripts = {
+    dz-test.exec = ''zig build test --summary all "$@"'';
+    dz-examples.exec = ''zig build examples --summary all "$@"'';
+    dz-dspy.exec = ''tools/dspy_reference/check.sh'';
+    # Framework-overhead benchmark: both runtimes replay the same full-suite transcript.
+    dz-bench.exec = ''
+      set -euo pipefail
+      transcript="$(realpath "''${1:-tests/fixtures/dspy_3_5_0_mock_suite.json}")"
+      out="''${DSZIG_BENCH_OUT:-zig-out/bench}"
+      mkdir -p "$out"
+      zig build -Doptimize=ReleaseFast --prefix zig-out/fast
+      zig-out/fast/bin/bench "$transcript" "''${DSZIG_BENCH_REPS:-20}" > "$out/dszig.json"
+      (cd tools/dspy_reference && uv run --locked bench.py "$transcript" "''${DSPY_BENCH_REPS:-5}" 2>/dev/null) > "$out/dspy.json"
+      python3 tools/dspy_reference/bench_report.py "$out/dszig.json" "$out/dspy.json"
+    '';
+    # Fails when DSPy exports a name or changes a source file that features.json has not reviewed.
+    dz-upstream.exec = ''(cd tools/dspy_reference && uv run --locked upstream_report.py)'';
+    # Re-record real-model transcripts (not run by CI). Credentials come from the
+    # SecretSpec `live` profile (Keychain), never from committed files:
+    # (tools/live, not the root: devenv auto-loads a root secretspec.toml):
+    #   secretspec --file tools/live/secretspec.toml set OPENAI_API_KEY --profile live
+    dz-live.exec = ''
+      exec secretspec --file "$DEVENV_ROOT/tools/live/secretspec.toml" run \
+        --profile live --reason "dszig live inference recording" -- \
+        env -u CODEX_LB_API_KEY OPENAI_BASE_URL=https://api.openai.com/v1 \
+        bash -euo pipefail -c '
+          : "''${OPENAI_API_KEY:?OPENAI_API_KEY is required for live inference}"
+          (cd tools/dspy_reference && uv run --locked live.py \
+            ../../tests/fixtures/live/dspy_3.5.0.json "openai/''${DSZIG_LIVE_MODEL:-gpt-4o-mini}")
+          zig build replay -- tests/fixtures/live/dspy_3.5.0.json
+          zig build live -- tests/fixtures/live/dszig_3.5.0.json
+          (cd tools/dspy_reference && uv run --locked check_live.py ../../tests/fixtures/live/dszig_3.5.0.json)
+          tools/dspy_reference/check.sh
+        '
+    '';
+    # One real CoT request (2 + 2) through the native LM, via SecretSpec.
+    dz-live-smoke.exec = ''
+      exec secretspec --file "$DEVENV_ROOT/tools/live/secretspec.toml" run \
+        --profile live --reason "dszig live inference smoke" -- \
+        env -u CODEX_LB_API_KEY OPENAI_BASE_URL=https://api.openai.com/v1 zig build live -- --smoke "$@"
+    '';
+    # Bounded model-generated Python actions; a second input is evaluated offline.
+    dz-live-python-rlm-smoke.exec = ''
+      exec secretspec --file "$DEVENV_ROOT/tools/live/secretspec.toml" run \
+        --profile live --reason "dszig bounded Python RLM smoke" -- \
+        env -u CODEX_LB_API_KEY OPENAI_BASE_URL=https://api.openai.com/v1 \
+        zig build live -- --python-rlm-smoke "$@"
+    '';
+    # One typed XML prediction with routed fields over real SSE.
+    dz-live-stream-smoke.exec = ''
+      exec secretspec --file "$DEVENV_ROOT/tools/live/secretspec.toml" run \
+        --profile live --reason "dszig live XML streaming smoke" -- \
+        env -u CODEX_LB_API_KEY OPENAI_BASE_URL=https://api.openai.com/v1 \
+        zig build live -- --stream-smoke "$@"
+    '';
+    dz-live-optimization-smoke.exec = ''
+      exec secretspec --file "$DEVENV_ROOT/tools/live/secretspec.toml" run \
+        --profile live --reason "dszig live optimization smoke" -- \
+        env -u CODEX_LB_API_KEY OPENAI_BASE_URL=https://api.openai.com/v1 \
+        zig build live -- --optimization-smoke "$@"
+    '';
+    dz-live-tool-smoke.exec = ''
+      exec secretspec --file "$DEVENV_ROOT/tools/live/secretspec.toml" run \
+        --profile live --reason "dszig live native tool inference smoke" -- \
+        env -u CODEX_LB_API_KEY OPENAI_BASE_URL=https://api.openai.com/v1 \
+        zig build live -- --tool-smoke "$@"
+    '';
+    dz-live-document-smoke.exec = ''
+      exec secretspec --file "$DEVENV_ROOT/tools/live/secretspec.toml" run \
+        --profile live --reason "dszig live document inference smoke" -- \
+        env -u CODEX_LB_API_KEY OPENAI_BASE_URL=https://api.openai.com/v1 DSZIG_LIVE_API=responses \
+        zig build live -- --document-smoke "$@"
+    '';
+    # Bounded release smoke, not a paid full-suite re-recording.
+    dz-live-verify.exec = ''
+      exec secretspec --file "$DEVENV_ROOT/tools/live/secretspec.toml" run \
+        --profile live --reason "verify DSZig OpenAI inference workloads" -- \
+        env -u CODEX_LB_API_KEY -u DSZIG_LIVE_REASONING -u DSZIG_LIVE_RESPONSE_SCHEMA \
+        -u DSZIG_LIVE_FUNCTION_CALLING OPENAI_BASE_URL=https://api.openai.com/v1 \
+        bash -euo pipefail -c '
+          if [ "$#" -ne 1 ]; then
+            printf "usage: dz-live-verify NEW_RECEIPT_DIRECTORY\n" >&2
+            exit 2
+          fi
+          : "''${OPENAI_API_KEY:?OPENAI_API_KEY is required for live inference}"
+          umask 077
+          mkdir -- "$1"
+          for api in chat_completions responses; do
+            DSZIG_LIVE_API="$api" zig build live -- --smoke "$1/$api-cot.json"
+            DSZIG_LIVE_API="$api" zig build live -- --stream-smoke "$1/$api-stream.json"
+            DSZIG_LIVE_API="$api" zig build live -- --schema-smoke "$1/$api-schema.json"
+            DSZIG_LIVE_API="$api" zig build live -- --tool-smoke "$1/$api-tool.json"
+            DSZIG_LIVE_API="$api" zig build live -- --optimization-smoke "$1/$api-optimization.json"
+          done
+          DSZIG_LIVE_API=responses zig build live -- --document-smoke "$1/responses-document.json"
+          DSZIG_LIVE_API=chat_completions zig build live -- --embedding-smoke "$1/embedding-knn.json"
+          DSZIG_LIVE_API=responses DSZIG_LIVE_MODEL=gpt-5-mini zig build live -- --reasoning-smoke "$1/responses-reasoning.json"
+          printf "%s\n" "{\"status\":\"passed\",\"workloads\":13}" > "$1/.verification.json.tmp"
+          mv "$1/.verification.json.tmp" "$1/verification.json"
+          printf "Verified 13 OpenAI workloads; receipts: %s\n" "$1"
+        ' dz-live-verify "$@"
+    '';
+    dz-check.exec = ''
+      set -euo pipefail
+      zig fmt --check .
+      for mode in Debug ReleaseSafe; do
+        dz-test -Doptimize="$mode"
+        dz-examples -Doptimize="$mode"
+      done
+      dz-dspy
+    '';
+  };
+
+  # Zig skips SDK detection when NIX_CFLAGS_COMPILE or NIX_LDFLAGS is set.
+  enterShell =
+    lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
+      unset NIX_CFLAGS_COMPILE NIX_CFLAGS_LINK NIX_LDFLAGS
+    ''
+    + ''
+      echo "dszig: zig $(zig version), $(python3 --version), uv $(uv --version | cut -d' ' -f2)"
+      echo "  dz-test, dz-examples, dz-dspy (cross-check with DSPy 3.5.0), dz-check (what CI runs), dz-bench, dz-upstream, dz-live / dz-live-smoke (real model via SecretSpec)"
+    '';
+
+  enterTest = ''
+    set -euo pipefail
+    test "$(zig version)" = "${zigVersion}"
+    grep -q ${zigMacos.sha256} .github/scripts/install-zig.sh
+    python3 -c 'import sys; assert sys.version_info[:2] == (3, 11), sys.version'
+    dz-check
+  '';
+}

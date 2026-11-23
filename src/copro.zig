@@ -1,0 +1,622 @@
+//! `dspy.COPRO` (DSPy 3.5.0): coordinate ascent over each predictor's
+//! instruction and output prefix. Depth 0 scores `breadth - 1` proposals plus
+//! the current instruction; every later depth asks for `breadth` more given
+//! the best attempts so far, in increasing score order. COPRO draws no random
+//! numbers, so the same LM answers give the same program.
+//!
+//! Upstream (DSPy 3.5.0): dspy/teleprompt/copro_optimizer.py
+
+const std = @import("std");
+const assert = std.debug.assert;
+const Allocator = std.mem.Allocator;
+const Writer = std.Io.Writer;
+
+const optimize = @import("optimize.zig");
+const predict = @import("predict.zig");
+const pyjson = @import("pyjson.zig");
+const signature = @import("signature.zig");
+const value = @import("value.zig");
+
+const Context = predict.Context;
+const Example = optimize.Example;
+const Metric = optimize.Metric;
+const Record = value.Record;
+
+const optimizer_preamble = "You are an instruction optimizer for large language models. ";
+const proposed_instruction_desc = "The improved instructions for the language model";
+const proposed_prefix_desc = "The string at the end of the prompt, which will help the model start solving the task";
+const Proposal = struct { proposed_instruction: []const u8, proposed_prefix_for_output_field: []const u8 };
+
+pub const BasicGenerateInstruction = signature.Signature(struct {
+    pub const instructions = optimizer_preamble ++ "I will give you a ``signature`` of fields (inputs and outputs) in English. Your task is to propose an instruction that will lead a good language model to perform the task well. Don't be afraid to be creative.";
+    pub const Input = struct { basic_instruction: []const u8 };
+    pub const Output = Proposal;
+    pub const descriptions = .{
+        .basic_instruction = "The initial instructions before optimization",
+        .proposed_instruction = proposed_instruction_desc,
+        .proposed_prefix_for_output_field = proposed_prefix_desc,
+    };
+});
+
+pub const GenerateInstructionGivenAttempts = signature.Signature(struct {
+    pub const instructions = optimizer_preamble ++ "I will give some task instructions I've tried, along with their corresponding validation scores. The instructions are arranged in increasing order based on their scores, where higher scores indicate better quality.\n\nYour task is to propose a new instruction that will lead a good language model to perform the task even better. Don't be afraid to be creative.";
+    pub const Input = struct { attempted_instructions: []const u8 };
+    pub const Output = Proposal;
+    pub const descriptions = .{
+        .proposed_instruction = proposed_instruction_desc,
+        .proposed_prefix_for_output_field = proposed_prefix_desc,
+    };
+});
+
+pub const COPRO = struct {
+    metric: Metric,
+    breadth: u32 = 10,
+    depth: usize = 3,
+    init_temperature: f64 = 1.4,
+    track_stats: bool = false,
+    /// Null inherits the caller context. A non-null value is a native override.
+    max_errors: ?usize = null,
+    /// DSPy `eval_kwargs.num_threads`; null evaluates serially.
+    concurrent_evaluation: ?optimize.ConcurrentEvaluation = null,
+
+    /// One entry of `best_program.candidate_programs`, without the program.
+    pub const Candidate = struct {
+        /// Index into the program's named predictors.
+        predictor: usize,
+        instruction: []const u8,
+        prefix: []const u8,
+        score: f64,
+        depth: usize,
+    };
+
+    pub const DepthStats = struct {
+        min: f64,
+        max: f64,
+        average: f64,
+        stddev: f64,
+    };
+
+    pub const PredictorStats = struct {
+        /// Indexed by zero-based depth, over up to ten retained prompt pairs.
+        best: []const DepthStats,
+        /// Indexed by zero-based depth. Includes the latest batches of earlier
+        /// predictors in the same depth, matching DSPy 3.5's shared accumulator.
+        latest: []const DepthStats,
+    };
+
+    pub fn Result(comptime P: type) type {
+        return struct {
+            program: P,
+            /// Sorted by score, descending and stable.
+            candidates: []const Candidate,
+            /// Runnable snapshots in the same order as `candidates`. Signature
+            /// updates do not change earlier snapshots. Like the winner, custom
+            /// pointers in P keep their normal Zig copy and lifetime semantics.
+            candidate_programs: []const CandidateProgram(P),
+            total_calls: usize,
+            /// Present only with `track_stats`, in named predictor order.
+            stats: ?[]const PredictorStats = null,
+        };
+    }
+
+    const Proposed = struct { instruction: []const u8, prefix: []const u8 };
+
+    const ScoreStats = struct {
+        count: usize = 0,
+        min: f64 = std.math.inf(f64),
+        max: f64 = -std.math.inf(f64),
+        sum: f64 = 0,
+        mean: f128 = 0,
+        squared_deviations: f128 = 0,
+        has_nonfinite_score: bool = false,
+
+        fn add(self: *ScoreStats, score: f64) void {
+            self.count += 1;
+            self.has_nonfinite_score = self.has_nonfinite_score or !std.math.isFinite(score);
+            self.min = @min(self.min, score);
+            self.max = @max(self.max, score);
+            self.sum += score;
+            const delta: f128 = @as(f128, score) - self.mean;
+            self.mean += delta / @as(f128, @floatFromInt(self.count));
+            self.squared_deviations += delta * (@as(f128, score) - self.mean);
+        }
+
+        fn finish(self: ScoreStats) error{NonFiniteScoreStatistics}!DepthStats {
+            assert(self.count > 0);
+            // CPython 3.11 pstdev rejects a nonfinite observation. Do not
+            // short-circuit evaluation: DSPy summarizes the finished batch.
+            if (self.has_nonfinite_score) return error.NonFiniteScoreStatistics;
+            const variance = self.squared_deviations / @as(f128, @floatFromInt(self.count));
+            return .{
+                .min = self.min,
+                .max = self.max,
+                .average = self.sum / @as(f64, @floatFromInt(self.count)),
+                .stddev = @floatCast(@sqrt(variance)),
+            };
+        }
+    };
+
+    fn bestStats(comptime P: type, evaluated: []const CandidateProgram(P)) error{NonFiniteScoreStatistics}!DepthStats {
+        assert(evaluated.len > 0);
+        var top: [10]f64 = undefined;
+        var count: usize = 0;
+        for (evaluated) |candidate| {
+            const score = candidate.candidate.score;
+            var i = count;
+            while (i > 0 and score > top[i - 1]) : (i -= 1) {
+                if (i < top.len) top[i] = top[i - 1];
+            }
+            if (i < top.len) top[i] = score;
+            count = @min(count + 1, top.len);
+        }
+        var stats: ScoreStats = .{};
+        for (top[0..count]) |score| stats.add(score);
+        return stats.finish();
+    }
+
+    pub fn CandidateProgram(comptime P: type) type {
+        return struct {
+            candidate: Candidate,
+            program: P,
+
+            fn greater(_: void, a: @This(), b: @This()) bool {
+                return a.candidate.score > b.candidate.score;
+            }
+        };
+    }
+
+    /// `prompt` is DSPy's `prompt_model` (defaults to `ctx`). Every
+    /// candidate program is scored on `trainset`. Results live in `out`.
+    pub fn compile(
+        self: COPRO,
+        comptime P: type,
+        out: Allocator,
+        gpa: Allocator,
+        ctx: Context,
+        prompt: ?Context,
+        student: P,
+        trainset: []const Example,
+    ) !Result(P) {
+        if (self.breadth <= 1) return error.InvalidBreadth;
+        const max_errors = self.max_errors orelse ctx.max_errors;
+        const E = CandidateProgram(P);
+        var clone = student;
+        const preds = try predict.namedPredictors(out, &clone);
+        if (preds.len == 0) return error.NoCandidates;
+        const all = try out.alloc(std.ArrayList(Proposed), preds.len);
+        const latest = try out.alloc([]const Proposed, preds.len);
+        const evaluated = try out.alloc(std.ArrayList(E), preds.len);
+        for (preds, all, latest, evaluated) |p, *a, *l, *e| {
+            const state = p.param.predict;
+            var inputs: Record = .empty;
+            try inputs.put(out, "basic_instruction", .{ .string = state.instructions });
+            a.* = .empty;
+            try self.propose(BasicGenerateInstruction, out, prompt orelse ctx, &inputs, self.breadth - 1, a);
+            try a.append(out, .{ .instruction = state.instructions, .prefix = state.prefixes[state.prefixes.len - 1] });
+            l.* = a.items;
+            e.* = .empty;
+        }
+
+        const best_stats = if (self.track_stats) try out.alloc(DepthStats, try std.math.mul(usize, preds.len, self.depth)) else null;
+        const latest_stats = if (best_stats) |best| try out.alloc(DepthStats, best.len) else null;
+        var total_calls: usize = 0;
+        for (0..self.depth) |d| {
+            var recent: ScoreStats = .{};
+            for (preds, 0..) |p, p_i| {
+                const candidates = if (preds.len > 1) all[p_i].items else latest[p_i];
+                const latest_start = candidates.len -| self.breadth;
+                for (candidates, 0..) |c, c_i| {
+                    const instruction = value.pyStrip(std.mem.trim(u8, c.instruction, "\""));
+                    const prefix = value.pyStrip(std.mem.trim(u8, c.prefix, "\""));
+                    try setSignature(out, p.param.predict, instruction, prefix);
+                    const score = (try optimize.evaluateWith(
+                        P,
+                        self.concurrent_evaluation,
+                        gpa,
+                        ctx,
+                        &clone,
+                        trainset,
+                        self.metric,
+                        max_errors,
+                    )).score;
+                    total_calls += 1;
+                    if (self.track_stats and c_i >= latest_start) recent.add(score);
+                    const entry: E = .{
+                        .candidate = .{ .predictor = p_i, .instruction = instruction, .prefix = prefix, .score = score, .depth = d },
+                        .program = clone,
+                    };
+                    for (evaluated[p_i].items) |*e| {
+                        if (!std.mem.eql(u8, e.candidate.instruction, instruction)) continue;
+                        if (!std.mem.eql(u8, e.candidate.prefix, prefix)) continue;
+                        // DSPy keeps the old entry only when old >= new.
+                        // With NaN on either side that comparison is false.
+                        if (!(e.candidate.score >= score)) e.* = entry;
+                        break;
+                    } else try evaluated[p_i].append(out, entry);
+                }
+                if (latest_stats) |stats| stats[p_i * self.depth + d] = try recent.finish();
+                var best = &evaluated[p_i].items[0];
+                for (evaluated[p_i].items[1..]) |*e| {
+                    if (e.candidate.score > best.candidate.score) best = e;
+                }
+                try setSignature(out, p.param.predict, best.candidate.instruction, best.candidate.prefix);
+            }
+            if (d == self.depth - 1) break;
+            for (preds, 0..) |_, p_i| {
+                if (best_stats) |stats| stats[p_i * self.depth + d] = try bestStats(P, evaluated[p_i].items);
+                const tried = try self.attempts(out, evaluated[p_i].items);
+                var inputs: Record = .empty;
+                try inputs.put(out, "attempted_instructions", .{ .array = tried });
+                var fresh: std.ArrayList(Proposed) = .empty;
+                try self.propose(GenerateInstructionGivenAttempts, out, prompt orelse ctx, &inputs, self.breadth, &fresh);
+                latest[p_i] = fresh.items;
+                try all[p_i].appendSlice(out, fresh.items);
+            }
+        }
+
+        var flat: std.ArrayList(E) = .empty;
+        for (evaluated, 0..) |e, p_i| {
+            try flat.appendSlice(out, e.items);
+            if (best_stats) |stats| {
+                if (self.depth > 0) stats[p_i * self.depth + self.depth - 1] = try bestStats(P, e.items);
+            }
+        }
+        // Zero depth still generates initial proposals, but scores none.
+        if (flat.items.len == 0) return error.NoCandidates;
+        std.sort.insertion(E, flat.items, {}, E.greater);
+        // DSPy's final duplicate check compares last-field objects by identity.
+        // Every scored signature update creates a fresh last field, so distinct
+        // retained evaluations cannot match, even when their prompt text does.
+        const kept = flat.items;
+        const candidates = try out.alloc(Candidate, kept.len);
+        for (candidates, kept) |*c, e| c.* = e.candidate;
+        const stats = if (best_stats) |best| tracked: {
+            const items = try out.alloc(PredictorStats, preds.len);
+            for (items, 0..) |*item, i| {
+                const start = i * self.depth;
+                item.* = .{
+                    .best = best[start..][0..self.depth],
+                    .latest = latest_stats.?[start..][0..self.depth],
+                };
+            }
+            break :tracked items;
+        } else null;
+        return .{
+            .program = kept[0].program,
+            .candidates = candidates,
+            .candidate_programs = kept,
+            .total_calls = total_calls,
+            .stats = stats,
+        };
+    }
+
+    /// `Predict(Sig, n=n, temperature=init_temperature)(**inputs).completions`.
+    fn propose(
+        self: COPRO,
+        comptime Sig: type,
+        out: Allocator,
+        base: Context,
+        inputs: *const Record,
+        n: u32,
+        into: *std.ArrayList(Proposed),
+    ) !void {
+        var c = base;
+        c.arena = out;
+        c.trace = null;
+        c.lm_options.temperature = self.init_temperature;
+        const predictor: predict.Predict(Sig) = .{};
+        const outputs = try predictor.state.callMany(c, inputs, n);
+        for (outputs) |o| try into.append(out, .{
+            .instruction = o.get("proposed_instruction").?.string,
+            .prefix = o.get("proposed_prefix_for_output_field").?.string,
+        });
+    }
+
+    /// The best `breadth` attempts, lowest score first, as
+    /// `Instruction #k`, `Prefix #k`, `Resulting Score #k` lines.
+    fn attempts(self: COPRO, out: Allocator, evaluated: anytype) !@import("runtime_value.zig").Array {
+        const E = @TypeOf(evaluated[0]);
+        const sorted = try out.dupe(E, evaluated);
+        std.sort.insertion(E, sorted, {}, E.greater);
+        const shortest = @min(sorted.len, self.breadth);
+        var list: @import("runtime_value.zig").Array = .init(out);
+        var i = shortest;
+        while (i > 0) {
+            i -= 1;
+            const k = shortest - i;
+            const c = sorted[i].candidate;
+            try list.append(.{ .string = try std.fmt.allocPrint(out, "Instruction #{d}: {s}", .{ k, c.instruction }) });
+            try list.append(.{ .string = try std.fmt.allocPrint(out, "Prefix #{d}: {s}", .{ k, c.prefix }) });
+            var aw: Writer.Allocating = .init(out);
+            aw.writer.print("Resulting Score #{d}: ", .{k}) catch return error.OutOfMemory;
+            pyjson.writeFloat(&aw.writer, c.score, .python) catch return error.OutOfMemory;
+            try list.append(.{ .string = aw.written() });
+        }
+        return list;
+    }
+
+    /// `signature.with_instructions(...).with_updated_fields(last, prefix=...)`.
+    fn setSignature(out: Allocator, state: *predict.PredictState, instruction: []const u8, prefix: []const u8) Allocator.Error!void {
+        const prefixes = try out.dupe([]const u8, state.prefixes);
+        prefixes[prefixes.len - 1] = prefix;
+        try state.forkSignatureClass(out);
+        state.instructions = instruction;
+        state.prefixes = prefixes;
+    }
+};
+
+const testing = std.testing;
+const lm_mod = @import("lm.zig");
+
+const TestQA = signature.Signature(struct {
+    pub const Input = struct { question: []const u8 };
+    pub const Output = struct { answer: []const u8 };
+});
+
+const TestProgram = struct {
+    generate: predict.Predict(TestQA) = .{},
+
+    pub const Input = TestQA.Input;
+    pub const Output = TestQA.Output;
+
+    pub fn forward(self: *const TestProgram, ctx: Context, input: Input) predict.Error!Output {
+        return self.generate.forward(ctx, input);
+    }
+};
+
+fn yesMetric(_: Allocator, _: *const Example, maybe_prediction: ?*const optimize.RecordPrediction, _: ?*const predict.Trace) value.ParseError!f64 {
+    const prediction = maybe_prediction orelse return error.ParseValue;
+    const answer = prediction.get("answer") orelse return 0;
+    return if (answer == .string and std.mem.eql(u8, answer.string, "yes")) 1 else 0;
+}
+
+test "COPRO returns input errors at the proposal and evaluation boundaries" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var history: lm_mod.History = .{ .arena = a };
+    var keyword: lm_mod.KeywordLM = .{
+        .history = &history,
+        .rules = &.{},
+        .default = "<proposed_instruction>\nTry.\n</proposed_instruction>\n\n<proposed_prefix_for_output_field>\nTry:\n</proposed_prefix_for_output_field>",
+    };
+    const ctx: Context = .{ .arena = a, .lm = keyword.lm() };
+    const train = [_]Example{try Example.fromJson(a, "{\"question\":\"x\",\"answer\":\"x\"}", &.{"question"})};
+    const Plain = struct {
+        pub const Input = TestQA.Input;
+        pub const Output = TestQA.Output;
+
+        pub fn forward(_: *const @This(), _: Context, input: Input) error{}!Output {
+            return .{ .answer = input.question };
+        }
+    };
+    var optimizer: COPRO = .{ .metric = yesMetric, .breadth = 1, .depth = 1 };
+    try testing.expectError(error.InvalidBreadth, optimizer.compile(TestProgram, a, testing.allocator, ctx, null, .{}, &train));
+    optimizer.breadth = 2;
+    try testing.expectError(error.NoCandidates, optimizer.compile(Plain, a, testing.allocator, ctx, null, .{}, &train));
+    try testing.expectEqual(@as(usize, 0), history.requests.items.len);
+    optimizer.depth = 0;
+    try testing.expectError(error.NoCandidates, optimizer.compile(TestProgram, a, testing.allocator, ctx, null, .{}, &train));
+    try testing.expectEqual(@as(usize, 1), history.requests.items.len);
+    optimizer.depth = 1;
+    try testing.expectError(error.EmptyDevset, optimizer.compile(TestProgram, a, testing.allocator, ctx, null, .{}, &.{}));
+    try testing.expectEqual(@as(usize, 2), history.requests.items.len);
+}
+
+test "COPRO stops candidate evaluation at the caller's error limit" {
+    const MetricFailure = struct {
+        fn score(
+            _: Allocator,
+            example: *const Example,
+            _: ?*const optimize.RecordPrediction,
+            _: ?*const predict.Trace,
+        ) value.ParseError!f64 {
+            if (std.mem.eql(u8, example.record.get("question").?.string, "fail"))
+                return error.ParseValue;
+            return 1;
+        }
+    };
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var history: lm_mod.History = .{ .arena = a };
+    var model: lm_mod.KeywordLM = .{
+        .history = &history,
+        .rules = &.{.{
+            .needle = "`proposed_instruction`",
+            .scope = .any,
+            .response = "<proposed_instruction>Try.</proposed_instruction>" ++
+                "<proposed_prefix_for_output_field>Try:</proposed_prefix_for_output_field>",
+        }},
+        .default = "<answer>yes</answer>",
+    };
+    const rows = [_]Example{
+        try Example.fromJson(a, "{\"question\":\"fail\"}", &.{"question"}),
+        try Example.fromJson(a, "{\"question\":\"pass\"}", &.{"question"}),
+    };
+    const ctx: Context = .{ .arena = a, .lm = model.lm(), .max_errors = 1 };
+    var opt: COPRO = .{ .metric = MetricFailure.score, .breadth = 2, .depth = 1 };
+    try testing.expectError(error.ParseValue, opt.compile(
+        predict.Predict(TestQA),
+        a,
+        testing.allocator,
+        ctx,
+        null,
+        .{},
+        &rows,
+    ));
+    try testing.expectEqual(@as(usize, 2), history.requests.items.len);
+    opt.max_errors = 2;
+    const result = try opt.compile(predict.Predict(TestQA), a, testing.allocator, ctx, null, .{}, &rows);
+    try testing.expectEqual(@as(usize, 2), result.total_calls);
+    try testing.expectEqual(@as(f64, 50), result.candidates[0].score);
+}
+
+test "COPRO replaces duplicate prompt scores when either score is NaN" {
+    const ScoreUndefined = struct {
+        fn score(a: Allocator, example: *const Example, prediction: ?*const optimize.RecordPrediction, trace: ?*const predict.Trace) value.ParseError!f64 {
+            const answer = (prediction orelse return error.ParseValue).get("answer") orelse return error.ParseValue;
+            if (answer == .string and std.mem.eql(u8, answer.string, "undefined")) return std.math.nan(f64);
+            return yesMetric(a, example, prediction, trace);
+        }
+    };
+    const proposed = "{\"proposed_instruction\":\"Recover.\",\"proposed_prefix_for_output_field\":\"Reply:\"}";
+    const undefined_score = "{\"answer\":\"undefined\"}";
+    const finite_score = "{\"answer\":\"yes\"}";
+    const cases = [_]struct { first: []const u8, second: []const u8, want_nan: bool }{
+        .{ .first = undefined_score, .second = finite_score, .want_nan = false },
+        .{ .first = finite_score, .second = undefined_score, .want_nan = true },
+        .{ .first = finite_score, .second = finite_score, .want_nan = false },
+    };
+
+    for (cases) |case| {
+        var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer memory.deinit();
+        const arena = memory.allocator();
+        var model: lm_mod.ScriptedLM = .{ .responses = &.{
+            proposed,
+            proposed,
+            case.first,
+            case.second,
+            "{\"answer\":\"no\"}",
+        } };
+        const ctx: Context = .{ .arena = arena, .lm = model.lm(), .adapter = .json };
+        const train = [_]Example{try Example.fromJson(arena, "{\"question\":\"x\"}", &.{"question"})};
+        const optimizer: COPRO = .{ .metric = ScoreUndefined.score, .breadth = 3, .depth = 1 };
+        const result = try optimizer.compile(TestProgram, arena, testing.allocator, ctx, null, .{}, &train);
+
+        try testing.expectEqual(@as(usize, 5), model.index);
+        try testing.expectEqual(@as(usize, 3), result.total_calls);
+        try testing.expectEqual(@as(usize, 2), result.candidates.len);
+        try testing.expectEqualStrings("Recover.", result.program.generate.state.instructions);
+        try testing.expectEqualStrings("Reply:", result.program.generate.state.prefixes[1]);
+        try testing.expectEqualStrings("Recover.", result.candidates[0].instruction);
+        if (case.want_nan) {
+            try testing.expect(std.math.isNan(result.candidates[0].score));
+        } else {
+            try testing.expectEqual(@as(f64, 100), result.candidates[0].score);
+        }
+        try testing.expectEqual(@as(f64, 0), result.candidates[1].score);
+    }
+}
+
+test "COPRO refuses nonfinite tracked statistics after evaluating the whole batch" {
+    const MetricByAnswer = struct {
+        fn score(a: Allocator, example: *const Example, prediction: ?*const optimize.RecordPrediction, trace: ?*const predict.Trace) value.ParseError!f64 {
+            const answer = (prediction orelse return error.ParseValue).get("answer") orelse return error.ParseValue;
+            if (answer == .string) {
+                if (std.mem.eql(u8, answer.string, "nan")) return std.math.nan(f64);
+                if (std.mem.eql(u8, answer.string, "inf")) return std.math.inf(f64);
+                if (std.mem.eql(u8, answer.string, "-inf")) return -std.math.inf(f64);
+            }
+            return yesMetric(a, example, prediction, trace);
+        }
+    };
+    const proposal = "{\"proposed_instruction\":\"Recover.\",\"proposed_prefix_for_output_field\":\"Reply:\"}";
+    for ([_][]const u8{ "nan", "inf", "-inf" }) |answer| {
+        var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer memory.deinit();
+        const arena = memory.allocator();
+        var model: lm_mod.ScriptedLM = .{ .responses = &.{
+            proposal,
+            proposal,
+            try std.json.Stringify.valueAlloc(arena, .{ .answer = answer }, .{}),
+            "{\"answer\":\"yes\"}",
+            "{\"answer\":\"no\"}",
+        } };
+        const ctx: Context = .{ .arena = arena, .lm = model.lm(), .adapter = .json };
+        const train = [_]Example{try Example.fromJson(arena, "{\"question\":\"x\"}", &.{"question"})};
+        const optimizer: COPRO = .{ .metric = MetricByAnswer.score, .breadth = 3, .depth = 1, .track_stats = true };
+        const result = optimizer.compile(TestProgram, arena, testing.allocator, ctx, null, .{}, &train);
+        try testing.expectEqual(@as(usize, 5), model.index);
+        try testing.expectError(error.NonFiniteScoreStatistics, result);
+    }
+}
+
+test "COPRO climbs from the basic instruction to the best proposal" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var keyword: lm_mod.KeywordLM = .{
+        .rules = &.{
+            .{ .needle = "increasing order", .scope = .any, .response = "<proposed_instruction>\n\"Say YES loudly.\"\n</proposed_instruction>\n\n<proposed_prefix_for_output_field>\nAnswer:\n</proposed_prefix_for_output_field>" },
+            .{ .needle = "``signature``", .scope = .any, .response = "<proposed_instruction>\nSay yes.\n</proposed_instruction>\n\n<proposed_prefix_for_output_field>\nReply:\n</proposed_prefix_for_output_field>" },
+            .{ .needle = "Say YES loudly.", .scope = .any, .response = "<answer>\nyes\n</answer>" },
+        },
+        .default = "<answer>\nno\n</answer>",
+    };
+    const ctx: Context = .{ .arena = a, .lm = keyword.lm() };
+    const trainset = [_]Example{try Example.fromJson(a, "{\"question\": \"ok?\", \"answer\": \"yes\"}", &.{"question"})};
+    const optimizer: COPRO = .{ .metric = yesMetric, .breadth = 3, .depth = 2 };
+    const result = try optimizer.compile(TestProgram, a, testing.allocator, ctx, null, .{}, &trainset);
+    try testing.expectEqualStrings("Say YES loudly.", result.program.generate.state.instructions);
+    try testing.expectEqualStrings("Answer:", result.program.generate.state.prefixes[1]);
+    // Depth 0: two identical proposals plus the basic instruction; depth 1:
+    // three identical proposals, all scored.
+    try testing.expectEqual(@as(usize, 6), result.total_calls);
+    try testing.expectEqual(@as(usize, 3), result.candidates.len);
+    try testing.expectEqual(@as(f64, 100), result.candidates[0].score);
+    try testing.expectEqual(@as(usize, 1), result.candidates[0].depth);
+    try testing.expect(result.stats == null);
+
+    var tracked_optimizer = optimizer;
+    tracked_optimizer.track_stats = true;
+    const tracked = try tracked_optimizer.compile(TestProgram, a, testing.allocator, ctx, null, .{}, &trainset);
+    try testing.expectEqual(result.total_calls, tracked.total_calls);
+    try testing.expectEqual(@as(f64, 100), tracked.stats.?[0].latest[1].average);
+    try testing.expectEqual(@as(f64, 0), tracked.stats.?[0].latest[1].stddev);
+    try testing.expectApproxEqAbs(@as(f64, 100.0 / 3.0), tracked.stats.?[0].best[1].average, 1e-12);
+    try testing.expectApproxEqAbs(@as(f64, 47.14045207910317), tracked.stats.?[0].best[1].stddev, 1e-12);
+}
+
+test "COPRO keeps and runs tied snapshots with identical prompt text from different coordinates" {
+    const Pair = struct {
+        first: predict.Predict(TestQA) = .{},
+        second: predict.Predict(TestQA) = .{},
+
+        pub const Input = TestQA.Input;
+        pub const Output = TestQA.Output;
+
+        pub fn forward(self: *const @This(), ctx: Context, input: Input) predict.Error!Output {
+            const first = try self.first.forward(ctx, input);
+            return self.second.forward(ctx, .{ .question = first.answer });
+        }
+    };
+
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var model: lm_mod.KeywordLM = .{
+        .rules = &.{
+            .{ .needle = "increasing order", .scope = .any, .response = "<proposed_instruction>\nBest instruction.\n</proposed_instruction>\n\n" ++
+                "<proposed_prefix_for_output_field>\nBest:\n</proposed_prefix_for_output_field>" },
+            .{ .needle = "``signature``", .scope = .any, .response = "<proposed_instruction>\nTry instruction.\n</proposed_instruction>\n\n" ++
+                "<proposed_prefix_for_output_field>\nTry:\n</proposed_prefix_for_output_field>" },
+            .{ .needle = "Best instruction.", .scope = .any, .response = "<answer>\nyes\n</answer>" },
+        },
+        .default = "<answer>\nno\n</answer>",
+    };
+    const ctx: Context = .{ .arena = arena, .lm = model.lm() };
+    const train = [_]Example{
+        try Example.fromJson(arena, "{\"question\":\"ok?\",\"answer\":\"yes\"}", &.{"question"}),
+    };
+    const optimizer: COPRO = .{ .metric = yesMetric, .breadth = 3, .depth = 2 };
+    const result = try optimizer.compile(Pair, arena, testing.allocator, ctx, null, .{}, &train);
+    // DSPy retains both occurrences of (Try, initial), despite equal scores
+    // and equal visible predictor signatures. The winner is (Try, Best).
+    const candidates = result.candidate_programs;
+    try testing.expectEqual(@as(usize, 6), candidates.len);
+    try testing.expectEqualStrings("yes", (try candidates[0].program.forward(ctx, .{
+        .question = "held out",
+    })).answer);
+    for ([_]usize{ 1, 5 }, [_]usize{ 0, 1 }) |index, coordinate| {
+        const entry = &candidates[index];
+        try testing.expectEqual(coordinate, entry.candidate.predictor);
+        try testing.expectEqual(@as(f64, 0), entry.candidate.score);
+        try testing.expectEqualStrings("Try:", entry.program.first.state.prefixes[1]);
+        try testing.expectEqualStrings("Answer:", entry.program.second.state.prefixes[1]);
+        try testing.expectEqualStrings("no", (try entry.program.forward(ctx, .{
+            .question = "held out",
+        })).answer);
+    }
+}
