@@ -3,6 +3,11 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    // Zig 0.17.0's self-hosted x86_64 backend (the Debug default) miscompiles
+    // `?anyerror` equality and fails to encode src/decimal.zig, so Debug
+    // x86_64 builds use LLVM unless -Dllvm says otherwise.
+    const use_llvm: ?bool = b.option(bool, "llvm", "Force (true) or forbid (false) the LLVM backend") orelse
+        if (optimize == .debug and target.result.cpu.arch == .x86_64) true else null;
 
     const dszig = b.addModule("dszig", .{
         .root_source_file = b.path("src/root.zig"),
@@ -10,7 +15,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const unit_tests = b.addTest(.{ .root_module = dszig });
+    const unit_tests = b.addTest(.{ .root_module = dszig, .use_llvm = use_llvm });
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
     const rag_program = b.createModule(.{
@@ -44,7 +49,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit, DSPy golden, behaviour and compile-fail tests");
     test_step.dependOn(&run_unit_tests.step);
     for ([_][]const u8{ "tests/golden.zig", "tests/behavior.zig", "tests/live_replay.zig", "tests/optuna.zig", "tests/trace_selection.zig", "tests/simulation.zig", "tests/parallel.zig" }) |path| {
-        const t = b.addTest(.{ .root_module = b.createModule(.{
+        const t = b.addTest(.{ .use_llvm = use_llvm, .root_module = b.createModule(.{
             .root_source_file = b.path(path),
             .target = target,
             .optimize = optimize,
@@ -62,7 +67,7 @@ pub fn build(b: *std.Build) void {
 
     const examples_step = b.step("examples", "Build and run the examples");
     for ([_][]const u8{ "rag", "bootstrap", "parallel" }) |name| {
-        const exe = b.addExecutable(.{ .name = name, .root_module = b.createModule(.{
+        const exe = b.addExecutable(.{ .name = name, .use_llvm = use_llvm, .root_module = b.createModule(.{
             .root_source_file = b.path(b.fmt("examples/{s}.zig", .{name})),
             .target = target,
             .optimize = optimize,
@@ -76,7 +81,7 @@ pub fn build(b: *std.Build) void {
     }
 
     // Needs OPENAI_API_KEY and network, so it is not part of `examples`.
-    const live = b.addExecutable(.{ .name = "live", .root_module = b.createModule(.{
+    const live = b.addExecutable(.{ .name = "live", .use_llvm = use_llvm, .root_module = b.createModule(.{
         .root_source_file = b.path("examples/live.zig"),
         .target = target,
         .optimize = optimize,
@@ -88,7 +93,7 @@ pub fn build(b: *std.Build) void {
     b.step("live", "Run examples/live.zig against a real OpenAI-compatible model").dependOn(&run_live.step);
     examples_step.dependOn(&live.step);
 
-    const replay = b.addExecutable(.{ .name = "replay", .root_module = b.createModule(.{
+    const replay = b.addExecutable(.{ .name = "replay", .use_llvm = use_llvm, .root_module = b.createModule(.{
         .root_source_file = b.path("examples/replay.zig"),
         .target = target,
         .optimize = optimize,
@@ -100,7 +105,7 @@ pub fn build(b: *std.Build) void {
     b.step("replay", "Verify a DSPy 3.5 transcript through the native Zig suite").dependOn(&run_replay.step);
     examples_step.dependOn(&replay.step);
 
-    const bench = b.addExecutable(.{ .name = "bench", .root_module = b.createModule(.{
+    const bench = b.addExecutable(.{ .name = "bench", .use_llvm = use_llvm, .root_module = b.createModule(.{
         .root_source_file = b.path("examples/bench.zig"),
         .target = target,
         .optimize = optimize,
@@ -112,7 +117,7 @@ pub fn build(b: *std.Build) void {
     b.step("bench", "Time the native suite replaying a transcript (compare with tools/dspy_reference/bench.py)").dependOn(&run_bench.step);
     examples_step.dependOn(&bench.step);
 
-    const simulate = b.addExecutable(.{ .name = "simulate", .root_module = b.createModule(.{
+    const simulate = b.addExecutable(.{ .name = "simulate", .use_llvm = use_llvm, .root_module = b.createModule(.{
         .root_source_file = b.path("tools/simulate.zig"),
         .target = target,
         .optimize = optimize,
@@ -125,7 +130,7 @@ pub fn build(b: *std.Build) void {
         &run_simulate.step,
     );
 
-    const python_sim = b.addExecutable(.{ .name = "bounded-python-sim", .root_module = b.createModule(.{
+    const python_sim = b.addExecutable(.{ .name = "bounded-python-sim", .use_llvm = use_llvm, .root_module = b.createModule(.{
         .root_source_file = b.path("tools/bounded_python_sim.zig"),
         .target = target,
         .optimize = optimize,

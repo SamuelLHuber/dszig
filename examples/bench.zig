@@ -7,7 +7,7 @@
 //! numbers are framework overhead (prompt formatting, parsing, optimizer
 //! logic, evaluation, serialization and the replay lookup). A timestamp is
 //! taken as each LM call starts. Prints JSON: per-repetition totals,
-//! per-call start offsets, peak live heap bytes and peak RSS.
+//! per-call start offsets, peak requested and reserved heap bytes and peak RSS.
 //!
 //!     zig build bench -Doptimize=ReleaseFast -- transcript.json [reps]
 const std = @import("std");
@@ -17,19 +17,24 @@ const suite = @import("live_suite");
 const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
 
-/// Live and peak bytes of every allocation made through it.
-const Counting = struct {
-    child: Allocator,
+/// Live and peak bytes of every allocation counted against it.
+const Meter = struct {
     live: usize = 0,
     peak: usize = 0,
+};
+
+/// Counts every allocation made through it against a shared meter.
+const Counting = struct {
+    child: Allocator,
+    meter: *Meter,
 
     fn allocator(self: *Counting) Allocator {
         return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
     }
 
     fn grow(self: *Counting, n: usize) void {
-        self.live += n;
-        self.peak = @max(self.peak, self.live);
+        self.meter.live += n;
+        self.meter.peak = @max(self.meter.peak, self.meter.live);
     }
 
     fn alloc(ctx: *anyopaque, len: usize, alignment: Alignment, ret_addr: usize) ?[*]u8 {
@@ -42,7 +47,7 @@ const Counting = struct {
     fn resize(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ret_addr: usize) bool {
         const self: *Counting = @ptrCast(@alignCast(ctx));
         if (!self.child.rawResize(memory, alignment, new_len, ret_addr)) return false;
-        self.live -= memory.len;
+        self.meter.live -= memory.len;
         self.grow(new_len);
         return true;
     }
@@ -50,7 +55,7 @@ const Counting = struct {
     fn remap(ctx: *anyopaque, memory: []u8, alignment: Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
         const self: *Counting = @ptrCast(@alignCast(ctx));
         const p = self.child.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
-        self.live -= memory.len;
+        self.meter.live -= memory.len;
         self.grow(new_len);
         return p;
     }
@@ -58,7 +63,7 @@ const Counting = struct {
     fn free(ctx: *anyopaque, memory: []u8, alignment: Alignment, ret_addr: usize) void {
         const self: *Counting = @ptrCast(@alignCast(ctx));
         self.child.rawFree(memory, alignment, ret_addr);
-        self.live -= memory.len;
+        self.meter.live -= memory.len;
     }
 };
 
@@ -117,11 +122,17 @@ pub fn main(init: std.process.Init) !void {
     const calls = try suite.parseCalls(arena, transcript);
     const n = dszig.lm.ReplayLM.completionCount(calls);
 
-    var counting: Counting = .{ .child = init.gpa };
+    // Reserved bytes include arena chunks, which grow geometrically and so
+    // jump in steps; requested bytes are what the suite asked for, the
+    // quantity tracemalloc reports for DSPy.
+    var reserved: Meter = .{};
+    var requested: Meter = .{};
+    var reserving: Counting = .{ .child = init.gpa, .meter = &reserved };
+    var gpa: Counting = .{ .child = reserving.allocator(), .meter = &requested };
     const totals = try arena.alloc(u64, reps);
     const stamps = try arena.alloc(u64, reps * n);
     for (0..reps) |rep| {
-        var run_arena: std.heap.ArenaAllocator = .init(counting.allocator());
+        var run_arena: std.heap.ArenaAllocator = .init(reserving.allocator());
         defer run_arena.deinit();
         const used = try run_arena.allocator().alloc(bool, n);
         @memset(used, false);
@@ -136,7 +147,11 @@ pub fn main(init: std.process.Init) !void {
         };
         const start = std.Io.Clock.awake.now(io);
         var timed: TimedLM = .{ .inner = replay.lm(), .io = io, .start = start, .stamps = stamps[rep * n ..][0..n] };
-        const result = try suite.run(run_arena.allocator(), counting.allocator(), timed.lm());
+        var arena_requests: Counting = .{ .child = run_arena.allocator(), .meter = &requested };
+        // Arena deinit frees everything without passing through the meter.
+        const live_before = requested.live;
+        defer requested.live = live_before;
+        const result = try suite.run(arena_requests.allocator(), gpa.allocator(), timed.lm());
         totals[rep] = elapsedNs(io, start);
         if (timed.count != n) return error.CallCountMismatch;
         if (!replay.exhausted()) return error.TranscriptNotExhausted;
@@ -157,6 +172,8 @@ pub fn main(init: std.process.Init) !void {
         for (stamps[rep * n ..][0..n], 0..) |s, i| try w.print("{s}{e}", .{ if (i == 0) "" else ", ", seconds(s) });
         try w.writeAll("]");
     }
-    try w.print("], \"heap_peak_bytes\": {d}, \"maxrss_kb\": {d}}}\n", .{ counting.peak, usage.maxrss });
+    try w.print("], \"heap_peak_bytes\": {d}, \"heap_reserved_peak_bytes\": {d}, \"maxrss_kb\": {d}}}\n", .{
+        requested.peak, reserved.peak, usage.maxrss,
+    });
     try w.flush();
 }

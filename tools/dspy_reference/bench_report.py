@@ -54,7 +54,8 @@ def main():
     for q in (0.5, 0.99):
         print(f"| Per-call overhead p{int(q * 100)} (us) | {pct(pg, q) * 1e6:,.1f} | {pct(zg, q) * 1e6:,.1f} |")
     print(f"| Startup: `import dspy` vs none (ms) | {py['import_seconds'] * 1e3:,.0f} | 0 |")
-    print(f"| Peak heap, one run (MiB) | {py['heap_peak_bytes'] / 2**20:,.1f} (tracemalloc) | {zig['heap_peak_bytes'] / 2**20:,.1f} (counting allocator) |")
+    print(f"| Peak heap, one run (MiB) | {py['heap_peak_bytes'] / 2**20:,.1f} (tracemalloc) | {zig['heap_peak_bytes'] / 2**20:,.1f} (requested) |")
+    print(f"| Heap reserved incl. arena chunks, one run (MiB) | n/a | {zig['heap_reserved_peak_bytes'] / 2**20:,.1f} |")
     print(f"| Peak RSS, process (MiB) | {py['maxrss_kb'] / 1024:,.0f} | {zig['maxrss_kb'] / 1024:,.0f} |")
 
 
