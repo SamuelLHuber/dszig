@@ -19,6 +19,7 @@ let
           url = "https://ziglang.org/download/${zigVersion}/zig-${zigMacos.triple}-${zigVersion}.tar.xz";
           inherit (zigMacos) sha256;
         };
+        patches = [ ./.github/scripts/zig-darwin-connect.patch ];
         dontConfigure = true;
         dontBuild = true;
         dontFixup = true;
@@ -77,29 +78,85 @@ in
     # (tools/live, not the root: devenv auto-loads a root secretspec.toml):
     #   secretspec --file tools/live/secretspec.toml set OPENAI_API_KEY --profile live
     dz-live.exec = ''
-      set -euo pipefail
-      if [ -z "''${DZ_LIVE_SECRETS:-}" ]; then
-        exec env DZ_LIVE_SECRETS=1 secretspec --file "$DEVENV_ROOT/tools/live/secretspec.toml" run \
-          --profile live --reason "dszig live inference recording" -- dz-live "$@"
-      fi
-      # DSPy 3.5 sends openai/* through the Responses API; record both runtimes on one route.
-      export DSZIG_LIVE_API="''${DSZIG_LIVE_API:-responses}"
-      model="''${DSZIG_LIVE_MODEL:-gpt-4o-mini}"
-      # Namespaced model ids (org/model) must not become path separators.
-      slug="''${model//\//_}"
-      (cd tools/dspy_reference && uv run --locked live.py \
-        "../../tests/fixtures/live/dspy_3.5.0_$slug.json" "openai/$model")
-      zig build replay -- "tests/fixtures/live/dspy_3.5.0_$slug.json"
-      DSZIG_LIVE_RESPONSE_SCHEMA="''${DSZIG_LIVE_RESPONSE_SCHEMA:-1}" \
-        DSZIG_LIVE_FUNCTION_CALLING="''${DSZIG_LIVE_FUNCTION_CALLING:-1}" \
-        zig build live -- "tests/fixtures/live/dszig_3.5.0_$slug.json"
-      (cd tools/dspy_reference && uv run --locked check_live.py "../../tests/fixtures/live/dszig_3.5.0_$slug.json")
-      tools/dspy_reference/check.sh
+      exec secretspec --file "$DEVENV_ROOT/tools/live/secretspec.toml" run \
+        --profile live --reason "dszig live inference recording" -- \
+        env -u CODEX_LB_API_KEY OPENAI_BASE_URL=https://api.openai.com/v1 \
+        bash -euo pipefail -c '
+          : "''${OPENAI_API_KEY:?OPENAI_API_KEY is required for live inference}"
+          (cd tools/dspy_reference && uv run --locked live.py \
+            ../../tests/fixtures/live/dspy_3.5.0.json "openai/''${DSZIG_LIVE_MODEL:-gpt-4o-mini}")
+          zig build replay -- tests/fixtures/live/dspy_3.5.0.json
+          zig build live -- tests/fixtures/live/dszig_3.5.0.json
+          (cd tools/dspy_reference && uv run --locked check_live.py ../../tests/fixtures/live/dszig_3.5.0.json)
+          tools/dspy_reference/check.sh
+        '
     '';
     # One real CoT request (2 + 2) through the native LM, via SecretSpec.
     dz-live-smoke.exec = ''
       exec secretspec --file "$DEVENV_ROOT/tools/live/secretspec.toml" run \
-        --profile live --reason "dszig live inference smoke" -- zig build live -- --smoke "$@"
+        --profile live --reason "dszig live inference smoke" -- \
+        env -u CODEX_LB_API_KEY OPENAI_BASE_URL=https://api.openai.com/v1 zig build live -- --smoke "$@"
+    '';
+    # Bounded model-generated Python actions; a second input is evaluated offline.
+    dz-live-python-rlm-smoke.exec = ''
+      exec secretspec --file "$DEVENV_ROOT/tools/live/secretspec.toml" run \
+        --profile live --reason "dszig bounded Python RLM smoke" -- \
+        env -u CODEX_LB_API_KEY OPENAI_BASE_URL=https://api.openai.com/v1 \
+        zig build live -- --python-rlm-smoke "$@"
+    '';
+    # One typed XML prediction with routed fields over real SSE.
+    dz-live-stream-smoke.exec = ''
+      exec secretspec --file "$DEVENV_ROOT/tools/live/secretspec.toml" run \
+        --profile live --reason "dszig live XML streaming smoke" -- \
+        env -u CODEX_LB_API_KEY OPENAI_BASE_URL=https://api.openai.com/v1 \
+        zig build live -- --stream-smoke "$@"
+    '';
+    dz-live-optimization-smoke.exec = ''
+      exec secretspec --file "$DEVENV_ROOT/tools/live/secretspec.toml" run \
+        --profile live --reason "dszig live optimization smoke" -- \
+        env -u CODEX_LB_API_KEY OPENAI_BASE_URL=https://api.openai.com/v1 \
+        zig build live -- --optimization-smoke "$@"
+    '';
+    dz-live-tool-smoke.exec = ''
+      exec secretspec --file "$DEVENV_ROOT/tools/live/secretspec.toml" run \
+        --profile live --reason "dszig live native tool inference smoke" -- \
+        env -u CODEX_LB_API_KEY OPENAI_BASE_URL=https://api.openai.com/v1 \
+        zig build live -- --tool-smoke "$@"
+    '';
+    dz-live-document-smoke.exec = ''
+      exec secretspec --file "$DEVENV_ROOT/tools/live/secretspec.toml" run \
+        --profile live --reason "dszig live document inference smoke" -- \
+        env -u CODEX_LB_API_KEY OPENAI_BASE_URL=https://api.openai.com/v1 DSZIG_LIVE_API=responses \
+        zig build live -- --document-smoke "$@"
+    '';
+    # Bounded release smoke, not a paid full-suite re-recording.
+    dz-live-verify.exec = ''
+      exec secretspec --file "$DEVENV_ROOT/tools/live/secretspec.toml" run \
+        --profile live --reason "verify DSZig OpenAI inference workloads" -- \
+        env -u CODEX_LB_API_KEY -u DSZIG_LIVE_REASONING -u DSZIG_LIVE_RESPONSE_SCHEMA \
+        -u DSZIG_LIVE_FUNCTION_CALLING OPENAI_BASE_URL=https://api.openai.com/v1 \
+        bash -euo pipefail -c '
+          if [ "$#" -ne 1 ]; then
+            printf "usage: dz-live-verify NEW_RECEIPT_DIRECTORY\n" >&2
+            exit 2
+          fi
+          : "''${OPENAI_API_KEY:?OPENAI_API_KEY is required for live inference}"
+          umask 077
+          mkdir -- "$1"
+          for api in chat_completions responses; do
+            DSZIG_LIVE_API="$api" zig build live -- --smoke "$1/$api-cot.json"
+            DSZIG_LIVE_API="$api" zig build live -- --stream-smoke "$1/$api-stream.json"
+            DSZIG_LIVE_API="$api" zig build live -- --schema-smoke "$1/$api-schema.json"
+            DSZIG_LIVE_API="$api" zig build live -- --tool-smoke "$1/$api-tool.json"
+            DSZIG_LIVE_API="$api" zig build live -- --optimization-smoke "$1/$api-optimization.json"
+          done
+          DSZIG_LIVE_API=responses zig build live -- --document-smoke "$1/responses-document.json"
+          DSZIG_LIVE_API=chat_completions zig build live -- --embedding-smoke "$1/embedding-knn.json"
+          DSZIG_LIVE_API=responses DSZIG_LIVE_MODEL=gpt-5-mini zig build live -- --reasoning-smoke "$1/responses-reasoning.json"
+          printf "%s\n" "{\"status\":\"passed\",\"workloads\":13}" > "$1/.verification.json.tmp"
+          mv "$1/.verification.json.tmp" "$1/verification.json"
+          printf "Verified 13 OpenAI workloads; receipts: %s\n" "$1"
+        ' dz-live-verify "$@"
     '';
     dz-check.exec = ''
       set -euo pipefail

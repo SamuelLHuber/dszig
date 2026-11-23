@@ -148,7 +148,7 @@ pub const Usage = struct {
         inline for (names) |name| runtime.freeValue(allocator, @field(usage, name));
     }
 
-    fn isKnown(usage: *const Usage) bool {
+    pub fn isKnown(usage: *const Usage) bool {
         inline for (names) |name| {
             if (@field(usage, name) != .null) return true;
         }

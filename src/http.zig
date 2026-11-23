@@ -12,6 +12,25 @@ pub const HeaderProvider = struct {
     prepare: *const fn (*anyopaque, Allocator, []const std.http.Header) anyerror![]const std.http.Header,
 };
 
+/// Payload preparation follows credential refresh on every attempt. The
+/// context and returned bytes must survive until that attempt completes.
+pub const BodyProvider = struct {
+    context: *anyopaque,
+    prepare: *const fn (*anyopaque, Allocator) anyerror![]const u8,
+};
+
+/// A successful response can be consumed incrementally without retaining its
+/// wire body. Returning early closes the unread connection during request
+/// cleanup. The consumer must enforce the supplied decompressed byte limit.
+pub const ResponseConsumer = struct {
+    context: *anyopaque,
+    consume: *const fn (*anyopaque, Allocator, *std.Io.Reader, usize) anyerror!void,
+    /// Called for the accepted response before reading its body. Copy any
+    /// header bytes that must survive into body consumption.
+    on_head: ?*const fn (*anyopaque, Allocator, *const std.http.Client.Response.Head) Allocator.Error!void = null,
+    failure: ?anyerror = null,
+};
+
 pub const Response = struct {
     status: std.http.Status,
     /// Owned by the underlying HTTP client's allocator.
@@ -19,16 +38,75 @@ pub const Response = struct {
     /// First nonempty `x-typesafe-request-id` response header, owned by the
     /// request arena; null when the server sent none.
     request_id: ?[]const u8 = null,
+    /// Request-arena-owned Content-Type, populated only when requested.
+    content_type: ?[]const u8 = null,
+};
+
+pub const FailureDecision = union(enum) {
+    retry,
+    terminal: anyerror,
 };
 
 pub const Request = struct {
     url: []const u8,
     method: std.http.Method = .GET,
     body: ?[]const u8 = null,
+    body_provider: ?BodyProvider = null,
+    response_consumer: ?*ResponseConsumer = null,
+    /// Classifies a rejected status after the bounded body has been read.
+    /// Null leaves the decision to the default transport retry policy.
+    classify_failure: ?*const fn (Allocator, std.http.Status, []const u8) ?FailureDecision = null,
+    capture_content_type: bool = false,
     content_type: ?[]const u8 = null,
     authorization: ?[]const u8 = null,
     headers: []const std.http.Header = &.{},
+
+    /// Both discarded preparation and actual attempts observe credentials
+    /// before serialization, without opening a connection.
+    pub fn prepare(self: *const Request, arena: Allocator, headers: ?HeaderProvider) anyerror!Request {
+        var prepared = self.*;
+        if (headers) |provider|
+            prepared.headers = try provider.prepare(provider.context, arena, self.headers);
+        if (self.body_provider) |provider|
+            prepared.body = try provider.prepare(provider.context, arena);
+        return prepared;
+    }
 };
+
+/// Preserve configured TLS trust while keeping scoped I/O out of the caller's pool.
+pub fn isolatedClient(client: *std.http.Client, io: std.Io) !std.http.Client {
+    var isolated: std.http.Client = .{
+        .allocator = client.allocator,
+        .io = io,
+        .tls_buffer_size = client.tls_buffer_size,
+        .ssl_key_log = client.ssl_key_log,
+        .read_buffer_size = client.read_buffer_size,
+        .write_buffer_size = client.write_buffer_size,
+        .http_proxy = client.http_proxy,
+        .https_proxy = client.https_proxy,
+    };
+    errdefer isolated.deinit();
+    if (std.http.Client.disable_tls) return isolated;
+    try client.ca_bundle_lock.lockShared(client.io);
+    defer client.ca_bundle_lock.unlockShared(client.io);
+    isolated.now = client.now;
+    if (client.now == null) return isolated;
+    try isolated.ca_bundle.bytes.appendSlice(isolated.allocator, client.ca_bundle.bytes.items);
+    try isolated.ca_bundle.map.ensureTotalCapacityContext(
+        isolated.allocator,
+        client.ca_bundle.map.count(),
+        .{ .cb = &isolated.ca_bundle },
+    );
+    var entries = client.ca_bundle.map.iterator();
+    while (entries.next()) |entry| {
+        isolated.ca_bundle.map.putAssumeCapacityContext(
+            entry.key_ptr.*,
+            entry.value_ptr.*,
+            .{ .cb = &isolated.ca_bundle },
+        );
+    }
+    return isolated;
+}
 
 pub const Transport = struct {
     client: *std.http.Client,
@@ -38,12 +116,25 @@ pub const Transport = struct {
     timeout_ns: ?u64 = null,
     connect_timeout_ns: ?u64 = null,
     header_provider: ?HeaderProvider = null,
-    /// Generation accepts only HTTP 200; callers inspecting status use .any.
-    success: enum { ok, any } = .any,
+    success: Success = .any,
     failure_error: anyerror = error.HttpFailure,
     response_limit_error: anyerror = error.ResponseTooLarge,
     max_redirects: u8 = 0,
     normalize_url: bool = false,
+
+    pub const Success = enum {
+        ok,
+        below_400,
+        any,
+
+        fn accepts(policy: Success, status: std.http.Status) bool {
+            return switch (policy) {
+                .ok => status == .ok,
+                .below_400 => @backingInt(status) < 400,
+                .any => true,
+            };
+        }
+    };
 
     const WireResponse = struct { response: Response, location: ?[]const u8 };
 
@@ -57,30 +148,8 @@ pub const Transport = struct {
         };
         // Connections retain their Io. The isolated client closes before this
         // stack adapter expires, without changing the caller's connection pool.
-        var isolated: std.http.Client = .{
-            .allocator = self.client.allocator,
-            .io = timed.io(),
-            .tls_buffer_size = self.client.tls_buffer_size,
-            .ssl_key_log = self.client.ssl_key_log,
-            .read_buffer_size = self.client.read_buffer_size,
-            .write_buffer_size = self.client.write_buffer_size,
-            .http_proxy = self.client.http_proxy,
-            .https_proxy = self.client.https_proxy,
-        };
+        var isolated = try isolatedClient(self.client, timed.io());
         defer isolated.deinit();
-        if (!std.http.Client.disable_tls) {
-            try self.client.ca_bundle_lock.lockShared(self.client.io);
-            defer self.client.ca_bundle_lock.unlockShared(self.client.io);
-            isolated.now = self.client.now;
-            if (self.client.now != null) {
-                try isolated.ca_bundle.bytes.appendSlice(isolated.allocator, self.client.ca_bundle.bytes.items);
-                try isolated.ca_bundle.map.ensureTotalCapacityContext(isolated.allocator, self.client.ca_bundle.map.count(), .{ .cb = &isolated.ca_bundle });
-                var entries = self.client.ca_bundle.map.iterator();
-                while (entries.next()) |entry| {
-                    isolated.ca_bundle.map.putAssumeCapacityContext(entry.key_ptr.*, entry.value_ptr.*, .{ .cb = &isolated.ca_bundle });
-                }
-            }
-        }
         var scoped = self.*;
         scoped.client = &isolated;
         return scoped.sendRetried(arena, input, &timed);
@@ -89,9 +158,7 @@ pub const Transport = struct {
     fn sendRetried(self: *const Transport, arena: Allocator, input: Request, timed: ?*TimedIo) anyerror!Response {
         var attempt: u8 = 0;
         while (true) : (attempt += 1) {
-            var prepared = input;
-            if (self.header_provider) |provider|
-                prepared.headers = try provider.prepare(provider.context, arena, input.headers);
+            const prepared = try input.prepare(arena, self.header_provider);
             if (timed) |timer| timer.resetFailure();
             var last_error = self.failure_error;
             const response: ?Response = self.fetch(arena, prepared) catch |err| switch (err) {
@@ -102,16 +169,32 @@ pub const Transport = struct {
                     if (cause) |failure| {
                         if (failure == error.Canceled) return error.Canceled;
                     } else if (err == error.Canceled) return error.Canceled;
+                    // Parsing has already consumed a successful response.
+                    // It is not an opening failure and must not replay a POST.
+                    if (err == error.ResponseConsumerFailed) {
+                        const failure = input.response_consumer.?.failure.?;
+                        return cause orelse if (failure == error.StreamTooLong)
+                            self.response_limit_error
+                        else
+                            failure;
+                    }
                     last_error = cause orelse self.failure_error;
                     break :failed null;
                 },
             };
-            const status: ?std.http.Status = if (response) |r| r.status else null;
+            var should_retry = true; // Transport failures reaching this point are retryable.
             if (response) |r| {
-                if (self.success == .any or r.status == .ok) return r;
-                self.client.allocator.free(r.body);
+                if (self.success.accepts(r.status)) return r;
+                defer self.client.allocator.free(r.body);
+                should_retry = retryable(r.status);
+                if (prepared.classify_failure) |classify| {
+                    if (classify(self.client.allocator, r.status, r.body)) |decision| switch (decision) {
+                        .retry => should_retry = true,
+                        .terminal => |err| return err,
+                    };
+                }
             }
-            if (!retryable(status) or attempt >= self.max_retries) return last_error;
+            if (!should_retry or attempt >= self.max_retries) return last_error;
             const delay_ms = @as(i64, self.retry_base_ms) << @as(u6, @intCast(@min(attempt, 31)));
             try std.Io.sleep(self.client.io, .fromMilliseconds(delay_ms), .awake);
         }
@@ -178,7 +261,7 @@ pub const Transport = struct {
             .headers = selected_headers,
         });
         defer request.deinit();
-        return self.transferRequest(arena, &request, input.body) catch |err| {
+        return self.transferRequest(arena, &request, &input) catch |err| {
             if (request.connection) |connection| {
                 if (connection.stream_reader.err) |read_error| {
                     if (read_error == error.Canceled) return error.Canceled;
@@ -191,9 +274,9 @@ pub const Transport = struct {
         };
     }
 
-    fn transferRequest(self: *const Transport, arena: Allocator, request: *std.http.Client.Request, body: ?[]const u8) !WireResponse {
-        if (body != null or request.method.requestHasBody()) {
-            const bytes = body orelse "";
+    fn transferRequest(self: *const Transport, arena: Allocator, request: *std.http.Client.Request, input: *const Request) !WireResponse {
+        if (input.body != null or request.method.requestHasBody()) {
+            const bytes = input.body orelse "";
             request.transfer_encoding = .{ .content_length = bytes.len };
             var payload = try request.sendBodyUnflushed(&.{});
             try payload.writer.writeAll(bytes);
@@ -217,6 +300,10 @@ pub const Transport = struct {
             if (response.head.location) |text| if (text.len > 0) try arena.dupe(u8, text) else null else null
         else
             null;
+        const content_type = if (input.capture_content_type and location == null)
+            if (response.head.content_type) |text| try arena.dupe(u8, text) else null
+        else
+            null;
         const decompress_buffer: []u8 = switch (response.head.content_encoding) {
             .identity => &.{},
             .zstd => try self.client.allocator.alloc(u8, std.compress.zstd.default_window_len),
@@ -226,12 +313,33 @@ pub const Transport = struct {
         defer self.client.allocator.free(decompress_buffer);
         var transfer_buffer: [64]u8 = undefined;
         var decompress: std.http.Decompress = undefined;
+        if (location == null and self.success.accepts(status)) {
+            if (input.response_consumer) |consumer| {
+                consumer.failure = null;
+                if (consumer.on_head) |on_head| try on_head(consumer.context, arena, &response.head);
+                const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
+                consumer.consume(consumer.context, arena, reader, self.max_response_bytes) catch |err| {
+                    consumer.failure = err;
+                    return error.ResponseConsumerFailed;
+                };
+                return .{
+                    .response = .{
+                        .status = status,
+                        .body = &.{},
+                        .request_id = request_id,
+                        .content_type = content_type,
+                    },
+                    .location = null,
+                };
+            }
+        }
         const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
         return .{
             .response = .{
                 .status = status,
                 .body = try reader.allocRemaining(self.client.allocator, .limited(self.max_response_bytes)),
                 .request_id = request_id,
+                .content_type = content_type,
             },
             .location = location,
         };

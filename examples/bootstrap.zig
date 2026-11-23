@@ -17,7 +17,11 @@ pub fn main(init: std.process.Init) !void {
     const trainset = try rag.trainset(arena);
 
     const baseline = try dszig.optimize.evaluate(rag.RAG, init.gpa, ctx, &rag.RAG{}, trainset, rag.keywordMetric, 10);
-    const optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 2, .max_labeled_demos = 3 };
+    var optimizer: dszig.BootstrapFewShot = .{
+        .metric = rag.keywordMetric,
+        .max_bootstrapped_demos = 2,
+        .max_labeled_demos = 3,
+    };
     const result = try optimizer.compile(rag.RAG, arena, init.gpa, ctx, .{}, null, trainset);
     const optimized = try dszig.optimize.evaluate(rag.RAG, init.gpa, ctx, &result.program, trainset, rag.keywordMetric, 10);
 

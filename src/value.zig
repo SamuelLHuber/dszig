@@ -232,8 +232,8 @@ pub fn parseInteger(v: Value) error{ParseValue}!Value {
     };
 }
 
-/// Pydantic's lax integer strings allow signs, zero prefixes, underscores and
-/// a zero-only fractional suffix, but not exponent strings or non-ASCII digits.
+/// Pydantic's lax integer strings allow signs, zero prefixes and underscores
+/// between whole-part digits. A fractional suffix must contain only zeroes.
 pub fn coerceInteger(arena: Allocator, input: Value) ParseError!Value {
     var v = input;
     if (v == .custom) {
@@ -256,42 +256,43 @@ pub fn coerceInteger(arena: Allocator, input: Value) ParseError!Value {
     const negative = source[0] == '-';
     if (source[0] == '+' or negative) start = 1;
     var end = start;
+    var first: ?usize = null;
     var digits: usize = 0;
     var separated = false;
     while (end < source.len and source[end] != '.') : (end += 1) {
-        if (source[end] == '_') {
+        const byte = source[end];
+        if (byte == '_') {
             if (end == start or end + 1 == source.len or
                 !std.ascii.isDigit(source[end - 1]) or !std.ascii.isDigit(source[end + 1]))
                 return error.ParseValue;
-            separated = true;
-        } else if (std.ascii.isDigit(source[end])) {
-            digits += 1;
+            separated = separated or first != null;
+        } else if (std.ascii.isDigit(byte)) {
+            if (byte != '0' and first == null) first = end;
+            // The digit limit applies after removing leading zero padding.
+            if (first != null) {
+                digits += 1;
+                if (digits > 4300) return error.ParseValue;
+            }
         } else return error.ParseValue;
     }
-    if (digits == 0 or digits > 4300) return error.ParseValue;
+    if (end == start) return error.ParseValue;
     if (end != source.len) {
-        if (end + 1 == source.len) return error.ParseValue;
-        for (source[end + 1 ..], 0..) |byte, offset| {
-            if (byte == '_') {
-                const index = end + 1 + offset;
-                if (offset == 0 or index + 1 == source.len or source[index - 1] != '0' or source[index + 1] != '0')
-                    return error.ParseValue;
-            } else if (byte != '0') return error.ParseValue;
-        }
+        const fraction = source[end + 1 ..];
+        if (fraction.len == 0) return error.ParseValue;
+        for (fraction) |byte| if (byte != '0') return error.ParseValue;
     }
-    var first = start;
-    while (first < end and (source[first] == '0' or source[first] == '_')) first += 1;
-    if (first == end) return .{ .integer = 0 };
-    if (std.fmt.parseInt(i64, source[0..end], 10)) |integer|
-        return .{ .integer = integer }
-    else |_| {}
-    const magnitude = source[first..end];
+    const begin = first orelse return .{ .integer = 0 };
+    const magnitude = source[begin..end];
+    if (digits <= 19) {
+        const unsigned = std.fmt.parseInt(u64, magnitude, 10) catch unreachable;
+        const signed: i128 = if (negative) -@as(i128, unsigned) else unsigned;
+        if (std.math.cast(i64, signed)) |integer| return .{ .integer = integer };
+    }
     if (!separated) {
-        if (!negative) return Value.parseFromNumberSlice(magnitude);
-        if (first == start) return Value.parseFromNumberSlice(source[0..end]);
+        if (!negative) return .{ .number_string = magnitude };
+        if (begin == start) return .{ .number_string = source[0..end] };
     }
-    const count = std.mem.count(u8, magnitude, "_");
-    const canonical = try arena.alloc(u8, @intFromBool(negative) + magnitude.len - count);
+    const canonical = try arena.alloc(u8, @intFromBool(negative) + digits);
     var index: usize = 0;
     if (negative) {
         canonical[0] = '-';
@@ -301,7 +302,7 @@ pub fn coerceInteger(arena: Allocator, input: Value) ParseError!Value {
         canonical[index] = byte;
         index += 1;
     };
-    return Value.parseFromNumberSlice(canonical);
+    return .{ .number_string = canonical };
 }
 
 fn coerceDecimalInteger(arena: Allocator, data: @import("decimal.zig").Decimal) ParseError!Value {
@@ -432,8 +433,8 @@ fn borrowedFieldValue(arena: Allocator, comptime T: type, input: *const T) Alloc
             .null;
     }
     if (comptime code.isCode(T) or decision.isDecision(T) or citation.isCitation(T) or
-        T == @import("file.zig").File or T == @import("bounding_box.zig").BoundingBox or
-        T == signature.Reasoning)
+        T == @import("file.zig").File or T == @import("image.zig").Image or T == @import("audio.zig").Audio or
+        T == @import("document.zig").Document or T == @import("bounding_box.zig").BoundingBox or T == signature.Reasoning)
     {
         return input.borrowedRuntime();
     }
@@ -447,7 +448,9 @@ fn borrowedFieldValue(arena: Allocator, comptime T: type, input: *const T) Alloc
 
 pub fn toValue(arena: Allocator, comptime T: type, v: T) Allocator.Error!Value {
     if (comptime code.isCode(T) or @import("enum.zig").isEnum(T) or @import("literal.zig").isLiteral(T) or T == @import("integer.zig").Integer or @import("decimal_type.zig").isDecimal(T)) return v.toRuntime(arena);
-    if (comptime decision.isDecision(T) or citation.isCitation(T) or T == @import("file.zig").File or T == @import("bounding_box.zig").BoundingBox or T == signature.Reasoning)
+    if (comptime decision.isDecision(T) or citation.isCitation(T) or T == @import("file.zig").File or
+        T == @import("image.zig").Image or T == @import("audio.zig").Audio or
+        T == @import("document.zig").Document or T == @import("bounding_box.zig").BoundingBox or T == signature.Reasoning)
         return v.toRuntime(arena);
     if (T == @import("tool.zig").ToolCalls) return v.toValue(arena);
     if (T == Value) return v;
@@ -514,10 +517,11 @@ pub fn fromValue(arena: Allocator, comptime T: type, v: Value) ConvertError!T {
     };
     if (comptime code.isCode(T)) return T.fromValue(v) catch error.TypeMismatch;
     if (T == @import("bounding_box.zig").BoundingBox) return T.fromValue(v) catch error.TypeMismatch;
-    if (T == @import("file.zig").File) return T.fromValue(arena, v) catch |err| switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        else => error.TypeMismatch,
-    };
+    if (T == @import("file.zig").File or T == @import("image.zig").Image or T == @import("audio.zig").Audio or T == @import("document.zig").Document)
+        return T.fromValue(arena, v) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.TypeMismatch,
+        };
     if (T == Value) return v;
     if (T == @import("integer.zig").Integer) return T.fromValue(v);
     if (comptime @import("decimal_type.zig").isDecimal(T)) return T.fromValue(v) catch error.TypeMismatch;
@@ -865,6 +869,78 @@ pub fn floatAtLeast(f: f64, input: Value) error{InvalidNumber}!bool {
     };
 }
 
+/// Python float(text), including Unicode Nd digits, surrounding whitespace
+/// and digit separators. Ordinary ASCII decimal input allocates nothing.
+pub fn floatFromString(arena: Allocator, source: []const u8) (Allocator.Error || error{InvalidNumber})!f64 {
+    var text = source;
+    for (source) |byte| {
+        if (byte < 128) continue;
+        text = try floatAscii(arena, source);
+        break;
+    }
+    text = std.mem.trim(u8, text, " \t\r\n\x0b\x0c");
+    if (text.len == 0) return error.InvalidNumber;
+    const negative = text[0] == '-';
+    const unsigned = text[@intFromBool(text[0] == '-' or text[0] == '+')..];
+    if (std.ascii.eqlIgnoreCase(unsigned, "inf") or
+        std.ascii.eqlIgnoreCase(unsigned, "infinity"))
+        return if (negative) -std.math.inf(f64) else std.math.inf(f64);
+    if (std.ascii.eqlIgnoreCase(unsigned, "nan"))
+        return if (negative) -std.math.nan(f64) else std.math.nan(f64);
+    if (std.mem.indexOfScalar(u8, text, '_') != null) {
+        const clean = try arena.alloc(u8, text.len);
+        var written: usize = 0;
+        for (text, 0..) |byte, index| {
+            if (byte == '_') {
+                if (index == 0 or index + 1 == text.len) return error.InvalidNumber;
+                if (!std.ascii.isDigit(text[index - 1])) return error.InvalidNumber;
+                if (!std.ascii.isDigit(text[index + 1])) return error.InvalidNumber;
+            } else {
+                clean[written] = byte;
+                written += 1;
+            }
+        }
+        text = clean[0..written];
+    }
+    if (!floatGrammar(text)) return error.InvalidNumber;
+    return std.fmt.parseFloat(f64, text) catch error.InvalidNumber;
+}
+
+fn floatAscii(arena: Allocator, source: []const u8) (Allocator.Error || error{InvalidNumber})![]const u8 {
+    const unicode = @import("unicode.zig");
+    const view = std.unicode.Utf8View.init(source) catch return error.InvalidNumber;
+    var iterator = view.iterator();
+    const out = try arena.alloc(u8, source.len);
+    var written: usize = 0;
+    while (iterator.nextCodepoint()) |cp| {
+        out[written] = if (cp < 128) @intCast(cp) else if (unicode.decimalDigit(cp)) |digit|
+            '0' + digit
+        else if (unicode.isSpace(cp)) ' ' else return error.InvalidNumber;
+        written += 1;
+    }
+    return out[0..written];
+}
+
+fn floatGrammar(text: []const u8) bool {
+    var index: usize = @intFromBool(text[0] == '-' or text[0] == '+');
+    var digits: usize = 0;
+    while (index < text.len and std.ascii.isDigit(text[index])) : (index += 1)
+        digits += 1;
+    if (index < text.len and text[index] == '.') {
+        index += 1;
+        while (index < text.len and std.ascii.isDigit(text[index])) : (index += 1)
+            digits += 1;
+    }
+    if (digits == 0) return false;
+    if (index < text.len and (text[index] == 'e' or text[index] == 'E')) {
+        index += 1;
+        if (index < text.len and (text[index] == '-' or text[index] == '+')) index += 1;
+        const start = index;
+        while (index < text.len and std.ascii.isDigit(text[index])) : (index += 1) {}
+        if (index == start) return false;
+    }
+    return index == text.len;
+}
 /// Python arithmetic's implicit float conversion, including integer overflow.
 pub fn numericFloat(input: Value) error{InvalidNumber}!f64 {
     const v = numericBase(input);

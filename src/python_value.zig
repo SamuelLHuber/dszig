@@ -276,6 +276,58 @@ pub fn frozenSetWithHashSeed(a: Allocator, items: []const Value, seed: u32) Erro
     return makeSet(a, items, seed, true);
 }
 
+/// Materialize an already observed set iteration order without reinserting in
+/// that order (which can change collision layout). Items must be unique and
+/// hashable. A fresh lookup table indexes the retained order, not vice versa.
+/// Children are borrowed. On success the box adopts the exact allocated item
+/// slice and owns its table; on failure the caller retains that slice.
+pub fn setFromOwnedIterationOrder(
+    a: Allocator,
+    items: []Value,
+    seed: u32,
+    frozen: bool,
+) Error!Value {
+    var builder: Table = .{ .allocator = a };
+    defer builder.deinit();
+    for (items, 0..) |item, index| {
+        if (!hashAdmissible(item)) return error.ParseValue;
+        const hash = try hashValue(item, seed);
+        const lookup = try builder.findValues(items, item, hash);
+        if (lookup.found) return error.ParseValue;
+        try builder.add(lookup.slot, index, hash, false);
+    }
+    const result = try boxed(
+        a,
+        if (frozen) .{ .frozen_set = items } else .{ .set = items },
+        if (frozen) &frozen_set_vtable else &set_vtable,
+    );
+    const box = runtimeBox(result.custom.ptr);
+    box.owns_storage = true;
+    box.hash_seed = seed;
+    box.table = builder.take();
+    box.owns_table = true;
+    return result;
+}
+
+/// The process hash seed retained by a builtin set. Foreign implementations
+/// of the Python protocol use the native default seed.
+pub fn sequenceHashSeed(value: Value) u32 {
+    return if (ownBox(value)) |box| box.hash_seed else 0;
+}
+
+/// Rebuild a Python-mode sequence after its children have been projected.
+/// Sets retain their original hash seed; children remain borrowed.
+pub fn sequenceWithItems(a: Allocator, original: Value, items: []const Value) Error!Value {
+    const payload = view(original) orelse return error.ParseValue;
+    const seed = if (ownBox(original)) |box| box.hash_seed else 0;
+    return switch (payload) {
+        .tuple => tuple(a, items),
+        .set => setWithHashSeed(a, items, seed),
+        .frozen_set => frozenSetWithHashSeed(a, items, seed),
+        else => error.ParseValue,
+    };
+}
+
 pub fn complex(a: Allocator, real: f64, imag: f64) Error!Value {
     return boxed(a, .{ .complex = .{ .real = real, .imag = imag } }, &complex_vtable);
 }
@@ -602,7 +654,7 @@ const Table = struct {
         return self.find(pairs, key, hash, true);
     }
 
-    fn find(self: *const Table, items: anytype, key: Value, hash: u64, comptime entries: bool) Error!Lookup {
+    fn find(self: *const Table, items: anytype, key: anytype, hash: u64, comptime entries: bool) Error!Lookup {
         if (self.slots.len == 0) return .{ .slot = 0, .found = false };
         const mask = self.slots.len - 1;
         var index: usize = @as(usize, @truncate(hash)) & mask;
@@ -613,8 +665,10 @@ const Table = struct {
                 const slot = self.slots[index + offset];
                 if (slot.index == absent) return .{ .slot = index + offset, .found = false };
                 const prior = if (entries) items[slot.index].key else items[slot.index];
-                if (slot.hash == hash and try containerEqual(prior, key))
-                    return .{ .slot = index + offset, .found = true };
+                if (slot.hash == hash) {
+                    const matches = if (@TypeOf(key) == usize) prior == key else try containerEqual(prior, key);
+                    if (matches) return .{ .slot = index + offset, .found = true };
+                }
             }
             perturb >>= 5;
             index = (index *% 5 +% 1 +% @as(usize, @truncate(perturb))) & mask;
@@ -694,6 +748,43 @@ const Table = struct {
         }
     }
 };
+
+fn indexLookup(table: *const Table, ids: []const usize, id: usize) Table.Lookup {
+    return table.find(ids, id, @as(u64, id) % hash_modulus, false) catch unreachable;
+}
+
+const IndexMap = std.AutoArrayHashMapUnmanaged(usize, usize);
+
+/// CPython 3.11 iteration order for `set(left) & set(right)` on ordered map keys.
+/// Intersection walks the smaller operand (right on ties); membership in the
+/// other operand uses the existing map because its traversal order is not read.
+pub fn indexSetIntersection(a: Allocator, left: *const IndexMap, right: *const IndexMap) Allocator.Error![]usize {
+    const scan_ids, const probe = if (left.count() < right.count())
+        .{ left.keys(), right }
+    else
+        .{ right.keys(), left };
+    var scan: Table = .{ .allocator = a };
+    defer scan.deinit();
+    for (scan_ids, 0..) |id, i| {
+        try scan.add(indexLookup(&scan, scan_ids, id).slot, i, @as(u64, id) % hash_modulus, false);
+    }
+    var result: Table = .{ .allocator = a };
+    defer result.deinit();
+    for (scan.slots) |slot| {
+        if (slot.index == absent) continue;
+        const id = scan_ids[slot.index];
+        if (!probe.contains(id)) continue;
+        try result.add(indexLookup(&result, scan_ids, id).slot, slot.index, slot.hash, false);
+    }
+    const ids = try a.alloc(usize, result.used);
+    var i: usize = 0;
+    for (result.slots) |slot| {
+        if (slot.index == absent) continue;
+        ids[i] = scan_ids[slot.index];
+        i += 1;
+    }
+    return ids;
+}
 
 fn makeSet(a: Allocator, items: []const Value, seed: u32, frozen: bool) Error!Value {
     var builder: Table = .{ .allocator = a };

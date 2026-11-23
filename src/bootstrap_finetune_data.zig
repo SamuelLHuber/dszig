@@ -202,7 +202,7 @@ test "failed finetune outputs are nonmapping except for zero-output signatures" 
     const rows = [_]bootstrap_trace.TraceData{.{
         .example_ind = 0,
         .example = &example,
-        .prediction = step.prediction,
+        .prediction = .{ .failed = step.prediction.failed },
         .trace = &.{step},
         .score = null,
     }};

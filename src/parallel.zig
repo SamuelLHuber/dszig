@@ -4,7 +4,8 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const scheduling = @import("parallel_state.zig");
-const Context = @import("predict.zig").Context;
+const predict = @import("predict.zig");
+const Context = predict.Context;
 const optimize = @import("optimize.zig");
 const value = @import("value.zig");
 
@@ -87,15 +88,29 @@ pub fn Rollouts(comptime Result: type) type {
         }
 
         /// Attempt context with this rollout's settings and the attempt's own
-        /// LM (unless shared) and retriever.
-        pub fn context(self: @This(), rollout: Context, attempt: Attempt, shared_lm: bool) Context {
+        /// LM (unless shared) and retriever. Inherited usage is deep-forked for
+        /// this task, never accumulated in a worker or merged into the caller.
+        pub fn context(self: @This(), rollout: Context, attempt: Attempt, shared_lm: bool) !Context {
+            assert(attempt.index < self.contexts.len);
             const own = self.contexts[attempt.index];
             var c = rollout;
             if (!shared_lm) c.lm = own.lm;
             c.retriever = own.retriever;
+            if (c.usage_tracker) |tracker| c.usage_tracker = try tracker.fork();
             return c;
         }
     };
+}
+
+/// Result of the canonical Module call of `P` (`predict.callProgram`): a
+/// Prediction for reflected output fields, the same instance for a genuine
+/// Prediction, and the bare output otherwise. The Result of a pool that binds
+/// `Program(P)`.
+pub fn ProgramResult(comptime P: type) type {
+    const program: *const P = undefined;
+    const ctx: Context = undefined;
+    const input: P.Input = undefined;
+    return @typeInfo(@TypeOf(predict.callProgram(program, ctx, input))).error_union.payload;
 }
 
 /// Result can be any native type, including optional values or a heterogeneous
@@ -309,11 +324,21 @@ pub fn Parallel(comptime Result: type, comptime limits: Limits) type {
             assert(!self.live);
         }
 
-        /// Typed native equivalent of binding a module and its arguments.
+        /// Typed native equivalent of binding a module and its arguments: each
+        /// attempt is one canonical Module call (`predict.callProgram`), so the
+        /// result keeps its Prediction identity, completions and LM usage.
         /// Provide independent per-attempt contexts; copying Context alone does
         /// not isolate an allocator, mutable LM, trace or retriever pointee.
+        ///
+        /// The pool itself opens no usage scope. An active
+        /// `Context.usage_tracker` is forked for every attempt
+        /// (`UsageTracker.fork`): the attempt charges its own deep copy,
+        /// seeded entries included, and nothing is merged back into the
+        /// original. Without one, `track_usage` gives each call its own
+        /// automatic scope and attached usage. Raw `Task` callbacks receive
+        /// no Context and are never forked.
         pub fn Program(comptime P: type) type {
-            if (P.Output != Result) @compileError("Parallel result must match the native program Output");
+            if (ProgramResult(P) != Result) @compileError("Parallel result must be parallel.ProgramResult of the native program");
             return struct {
                 program: *const P,
                 arguments: Arguments,
@@ -333,14 +358,16 @@ pub fn Parallel(comptime Result: type, comptime limits: Limits) type {
                     const self: *Call = @ptrCast(@alignCast(ptr));
                     assert(attempt.index < self.contexts.len);
                     try attempt.cancellation.check();
-                    const ctx = self.contexts[attempt.index];
-                    output.* = switch (self.arguments) {
-                        .input => |input| try self.program.forward(ctx, input),
+                    var ctx = self.contexts[attempt.index];
+                    if (ctx.usage_tracker) |tracker| ctx.usage_tracker = try tracker.fork();
+                    const input: P.Input = switch (self.arguments) {
+                        .input => |input| input,
                         .example => |example| blk: {
                             if (@typeInfo(P.Input) != .@"struct") return error.TypeMismatch;
-                            break :blk try optimize.forwardProgram(P, ctx, self.program, example);
+                            break :blk try optimize.exampleInput(P, ctx.arena, example);
                         },
                     };
+                    output.* = try predict.callProgram(self.program, ctx, input);
                 }
             };
         }
@@ -350,15 +377,19 @@ pub fn Parallel(comptime Result: type, comptime limits: Limits) type {
 /// Native `dspy.Evaluate(num_threads=limits.workers)`: concurrent program and
 /// metric calls whose results are summed in devset order, using failure_score
 /// for failed slots (zero by default).
-/// Initialize in place; never move a live evaluator. Per-attempt prediction
-/// records, typed outputs and scratch allocators are created at initialization.
+/// Initialize in place; never move a live evaluator. Per-attempt Prediction
+/// states, typed outputs and scratch allocators are created at initialization.
 /// Out-of-memory aborts the run, as in serial `optimize.evaluate`.
 pub fn Evaluator(comptime P: type, comptime limits: Limits) type {
-    const Pool = Parallel(f64, limits);
+    const Scored = struct { score: f64, prediction: optimize.RecordPrediction };
+    const Pool = Parallel(Scored, limits);
     const Storage = value.RecordStorage(@typeInfo(P.Output).@"struct".field_names.len);
     return struct {
         pool: Pool,
         storage: [limits.attempts]Storage,
+        /// Each adopts its storage's record at init and is the only header
+        /// used for it afterwards.
+        states: [limits.attempts]optimize.RecordPrediction.State,
         outputs: [limits.attempts]P.Output,
         scratch: [limits.attempts]std.heap.FixedBufferAllocator,
         calls: [limits.tasks]Call,
@@ -378,7 +409,10 @@ pub fn Evaluator(comptime P: type, comptime limits: Limits) type {
         /// Borrows one scratch backing slice per attempt until deinit.
         pub fn init(self: *Self, io: std.Io, config: std.Thread.SpawnConfig, backing: []const []u8) !void {
             assert(backing.len >= limits.attempts);
-            for (&self.storage) |*storage| try storage.init();
+            for (&self.storage, &self.states) |*storage, *state| {
+                try storage.init();
+                state.* = .{ .output = storage.record };
+            }
             for (&self.scratch, backing[0..limits.attempts]) |*scratch, bytes| scratch.* = .init(bytes);
             self.out_of_memory = .init(false);
             self.failure_score = 0;
@@ -396,7 +430,17 @@ pub fn Evaluator(comptime P: type, comptime limits: Limits) type {
             assert(contexts.len >= limits.attempts);
             self.bound_contexts = contexts;
             self.bound_options = options;
-            return .{ .ptr = self, .program_type = @import("runtime_value.zig").typeIdentity(P), .run = runBound };
+            return .{
+                .ptr = self,
+                .program_type = @import("runtime_value.zig").typeIdentity(P),
+                .contexts = boundAttemptContexts,
+                .run = runBound,
+            };
+        }
+
+        fn boundAttemptContexts(ptr: *anyopaque) []const Context {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            return self.bound_contexts[0..limits.attempts];
         }
 
         fn runBound(
@@ -405,17 +449,25 @@ pub fn Evaluator(comptime P: type, comptime limits: Limits) type {
             devset: []const optimize.Example,
             metric: optimize.Metric,
             max_errors: usize,
+            subscores: ?[]f64,
         ) anyerror!optimize.Evaluation {
             const self: *Self = @ptrCast(@alignCast(ptr));
             var options = self.bound_options;
             options.max_errors = std.math.cast(u32, max_errors) orelse std.math.maxInt(u32);
             const typed: *const P = @ptrCast(@alignCast(program));
-            return self.evaluate(self.bound_contexts, typed, devset, metric, options);
+            return self.evaluateScores(self.bound_contexts, typed, devset, metric, options, .{
+                .subscores = subscores,
+            });
         }
 
         /// contexts supply independent per-attempt LM/retriever pointees; their
         /// arena and trace are replaced. program and metric must be thread-safe.
-        /// Predictions borrow attempt storage, valid only during the metric call.
+        /// An active usage tracker is forked per attempt and never merged back.
+        /// Each Prediction borrows its attempt's state and scratch: it, its
+        /// fields and its usage are valid only during the metric call, and a
+        /// metric must `clone` what it keeps. With `track_usage` set and no
+        /// active tracker the usage snapshot comes from the attempt scratch.
+        /// An empty devset returns `error.EmptyDevset` without scheduling work.
         pub fn evaluate(
             self: *Self,
             contexts: []const Context,
@@ -424,7 +476,46 @@ pub fn Evaluator(comptime P: type, comptime limits: Limits) type {
             metric: optimize.Metric,
             options: Options,
         ) !optimize.Evaluation {
-            assert(devset.len > 0);
+            return self.evaluateScores(contexts, program, devset, metric, options, .{});
+        }
+
+        /// Retain only winning predictions after all attempts have joined.
+        /// The output arena owns rows and predictions; rows borrow examples.
+        pub fn evaluateDetailed(
+            self: *Self,
+            out: std.mem.Allocator,
+            contexts: []const Context,
+            program: *const P,
+            devset: []const optimize.Example,
+            metric: optimize.Metric,
+            options: Options,
+        ) !optimize.DetailedEvaluation {
+            if (devset.len == 0) return error.EmptyDevset;
+            if (devset.len > limits.tasks) return error.TaskCapacity;
+            const rows = try out.alloc(optimize.EvaluationRow, devset.len);
+            const summary = try self.evaluateScores(contexts, program, devset, metric, options, .{
+                .rows = .{ .out = out, .items = rows },
+            });
+            return .{ .summary = summary, .rows = rows };
+        }
+
+        const Retention = struct {
+            subscores: ?[]f64 = null,
+            rows: ?struct { out: std.mem.Allocator, items: []optimize.EvaluationRow } = null,
+        };
+
+        fn evaluateScores(
+            self: *Self,
+            contexts: []const Context,
+            program: *const P,
+            devset: []const optimize.Example,
+            metric: optimize.Metric,
+            options: Options,
+            retention: Retention,
+        ) !optimize.Evaluation {
+            if (devset.len == 0) return error.EmptyDevset;
+            if (retention.subscores) |scores| assert(scores.len == devset.len);
+            if (retention.rows) |rows| assert(rows.items.len == devset.len);
             assert(contexts.len >= limits.attempts);
             assert(!options.return_failed_tasks);
             if (devset.len > limits.tasks) return error.TaskCapacity;
@@ -444,17 +535,31 @@ pub fn Evaluator(comptime P: type, comptime limits: Limits) type {
             // Sum after the join in devset order, not completion order, as DSPy does.
             var sum: f64 = 0;
             var errors: usize = 0;
-            for (report.results) |slot| switch (slot) {
-                .failed => {
-                    errors += 1;
-                    sum += self.failure_score;
-                },
-                .value => |score| sum += score.*,
-            };
+            for (report.results, 0..) |slot, index| {
+                const score = switch (slot) {
+                    .failed => blk: {
+                        errors += 1;
+                        break :blk self.failure_score;
+                    },
+                    .value => |scored| scored.score,
+                };
+                sum += score;
+                if (retention.subscores) |scores| scores[index] = score;
+                // Each attempt has a unique backing slot for this forward;
+                // its prediction is valid until the next forward reuses it.
+                if (retention.rows) |rows| rows.items[index] = .{
+                    .example = &devset[index],
+                    .prediction = switch (slot) {
+                        .value => |scored| try scored.prediction.clone(rows.out),
+                        .failed => null,
+                    },
+                    .score = score,
+                };
+            }
             return optimize.summarize(sum, devset.len, errors);
         }
 
-        fn invoke(ptr: *anyopaque, attempt: Attempt, score: *f64) anyerror!void {
+        fn invoke(ptr: *anyopaque, attempt: Attempt, scored: *Scored) anyerror!void {
             const call: *Call = @ptrCast(@alignCast(ptr));
             const self = call.evaluator;
             assert(attempt.index < limits.attempts);
@@ -464,8 +569,17 @@ pub fn Evaluator(comptime P: type, comptime limits: Limits) type {
             var ctx = self.contexts[attempt.index];
             ctx.arena = scratch.allocator();
             ctx.trace = null;
-            const prediction = &self.storage[attempt.index].record;
-            score.* = scoreExample(self, ctx, call.example, &self.outputs[attempt.index], prediction) catch |err| {
+            // As for `Parallel.Program`: every attempt charges its own deep
+            // copy of an active tracker and never the original.
+            if (ctx.usage_tracker) |tracker| ctx.usage_tracker = tracker.fork() catch |err| {
+                if (err == error.OutOfMemory) {
+                    self.out_of_memory.store(true, .release);
+                    self.pool.cancel();
+                }
+                return err;
+            };
+            const state = &self.states[attempt.index];
+            scored.* = scoreExample(self, ctx, call.example, &self.outputs[attempt.index], state) catch |err| {
                 if (err == error.OutOfMemory) {
                     self.out_of_memory.store(true, .release);
                     self.pool.cancel();
@@ -479,10 +593,13 @@ pub fn Evaluator(comptime P: type, comptime limits: Limits) type {
             ctx: Context,
             example: *const optimize.Example,
             output: *P.Output,
-            prediction: *value.Record,
-        ) !f64 {
-            try optimize.runProgramInto(P, ctx, self.program, example, output, prediction);
-            return self.metric(ctx.arena, example, prediction, null);
+            state: *optimize.RecordPrediction.State,
+        ) !Scored {
+            const prediction = try optimize.runProgramInto(P, ctx, self.program, example, output, state);
+            return .{
+                .score = try self.metric(ctx.arena, example, &prediction, null),
+                .prediction = prediction,
+            };
         }
     };
 }

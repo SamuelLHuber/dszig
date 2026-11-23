@@ -40,11 +40,13 @@ pub const Options = struct {
     teachers: ?[]const finetune.Teacher = null,
     valset: ?[]const optimize.Example = null,
     valset_ratio: f64 = 0.1,
-    seed: ?u32 = null,
+    /// CPython integer seeding uses the absolute value, including for minInt(i64).
+    seed: ?i64 = null,
     shuffle_trainset_between_steps: bool = true,
     strategy: []const u8 = "p -> w -> p",
     optimizer_compile_args: []const CompileArgs = &.{},
-    max_errors: usize = 10,
+    /// Null inherits the caller context for baseline and candidate validation.
+    max_errors: ?usize = null,
     concurrent_evaluation: ?optimize.ConcurrentEvaluation = null,
 };
 
@@ -147,13 +149,12 @@ pub const BetterTogether = struct {
             .teacher = if (teachers) |list| .{ .list = list } else .none,
             .step_index = 0,
         };
-        var seed = options.seed;
-        if (seed == null) {
+        const magnitude: u64 = if (options.seed) |seed| @abs(seed) else seed: {
             var bytes: [4]u8 = undefined;
             try io.randomSecure(&bytes);
-            seed = std.mem.readInt(u32, &bytes, .little);
-        }
-        var rng = pyrandom.Random.init(seed.?);
+            break :seed std.mem.readInt(u32, &bytes, .little);
+        };
+        var rng = pyrandom.Random.initWide(magnitude);
         const candidates = try out.alloc(Candidate(P), steps.len + 1);
         lifecycle(initial, .launch, &.{}) catch |err| {
             try lifecycle(initial, .kill, &.{});
@@ -395,11 +396,20 @@ pub const BetterTogether = struct {
     }
 
     fn candidate(self: *const BetterTogether, comptime P: type, request: *const optimizers.Request(P), program: P, strategy: []const u8, options: Options) !Candidate(P) {
-        const score: ?f64 = if (request.valset) |set| if (set.len > 0)
-            // Source eval_candidate_program catches Evaluate exceptions as zero.
-            (optimize.evaluateWith(P, options.concurrent_evaluation, request.gpa, request.ctx, &program, set, self.metric, options.max_errors) catch optimize.Evaluation{ .score = 0, .sum = 0, .total = set.len, .errors = set.len }).score
-        else
-            null else null;
+        const score: ?f64 = if (request.valset) |set| score: {
+            if (set.len == 0) break :score null;
+            const evaluation = optimize.evaluateWith(
+                P,
+                options.concurrent_evaluation,
+                request.gpa,
+                request.ctx,
+                &program,
+                set,
+                self.metric,
+                options.max_errors orelse request.ctx.max_errors,
+            ) catch break :score 0; // Source scores failed evaluations as zero.
+            break :score evaluation.score;
+        } else null;
         return .{
             .program = try copyProgram(P, request.out, program),
             .score = score,
@@ -672,7 +682,7 @@ const TestTeacherProbe = struct {
         return request.student_ref.*;
     }
 };
-fn testMetric(_: Allocator, _: *const optimize.Example, _: ?*const value.Record, _: ?*const predict.Trace) value.ParseError!f64 {
+fn testMetric(_: Allocator, _: *const optimize.Example, _: ?*const optimize.RecordPrediction, _: ?*const predict.Trace) value.ParseError!f64 {
     return 1;
 }
 fn testOptimizer() BetterTogether {
@@ -686,6 +696,50 @@ fn testOptimizer() BetterTogether {
             .max_strategy_bytes = 256,
         },
     };
+}
+
+test "BetterTogether signed seeds reproduce both DSPy trainset shuffles" {
+    const Probe = struct {
+        orders: [2][6]u8 = undefined,
+        calls: usize = 0,
+
+        pub fn compile(self: *@This(), comptime P: type, request: optimizers.Request(P)) !P {
+            for (request.trainset, &self.orders[self.calls]) |row, *id| id.* = row.record.get("question").?.string[0];
+            self.calls += 1;
+            return request.student;
+        }
+    };
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var trainset: [6]optimize.Example = undefined;
+    inline for (0..6) |i| {
+        trainset[i] = try optimize.Example.fromJson(out, std.fmt.comptimePrint("{{\"question\":\"{d}\"}}", .{i}), &.{"question"});
+    }
+    // Recorded from DSPy 3.5 BetterTogether.compile(strategy="probe -> probe", valset_ratio=0).
+    const cases = [_]struct { seed: i64, first: []const u8, second: []const u8 }{
+        .{ .seed = @as(u32, 9), .first = "501243", .second = "432150" },
+        .{ .seed = 0x100000009, .first = "425310", .second = "320145" },
+        .{ .seed = -0x100000009, .first = "425310", .second = "320145" },
+        .{ .seed = std.math.minInt(i64), .first = "520134", .second = "152340" },
+    };
+    for (cases) |case| {
+        var student: TestProgram = .{};
+        var model: lm.OpenAI = .{ .client = undefined, .base_url = "http://unused", .model = "base" };
+        try predict.setLM(out, &student, model.lm());
+        var probe: Probe = .{};
+        const result = try testOptimizer().compileWith(TestProgram, out, testing.allocator, testing.io, .{ .arena = out }, &student, &trainset, .{
+            .seed = case.seed,
+            .strategy = "probe -> probe",
+            .valset_ratio = 0,
+        }, .{ .probe = &probe });
+        try testing.expect(!result.flag_compilation_error_occurred);
+        try testing.expectEqual(@as(usize, 2), probe.calls);
+        try testing.expectEqualStrings(case.first, &probe.orders[0]);
+        try testing.expectEqualStrings(case.second, &probe.orders[1]);
+        for (trainset, "012345") |row, id| try testing.expectEqual(id, row.record.get("question").?.string[0]);
+    }
 }
 
 test "BetterTogether retains first validation tie and distinct memoized LM snapshots" {
@@ -715,6 +769,51 @@ test "BetterTogether retains first validation tie and distinct memoized LM snaps
     }
     model.model = "changed after compile";
     try testing.expectEqualStrings("base", result.program.first.state.lm.?.modelName().?);
+}
+
+test "BetterTogether inherits the validation error limit unless explicitly overridden" {
+    const Metric = struct {
+        fn score(
+            _: Allocator,
+            example: *const optimize.Example,
+            _: ?*const optimize.RecordPrediction,
+            _: ?*const predict.Trace,
+        ) value.ParseError!f64 {
+            if (std.mem.eql(u8, example.record.get("question").?.string, "fail"))
+                return error.ParseValue;
+            return 1;
+        }
+    };
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var model: lm.OpenAI = .{ .client = undefined, .base_url = "http://unused", .model = "base" };
+    const rows = [_]optimize.Example{
+        try optimize.Example.fromJson(out, "{\"question\":\"fail\"}", &.{"question"}),
+        try optimize.Example.fromJson(out, "{\"question\":\"pass\"}", &.{"question"}),
+    };
+    var meta = testOptimizer();
+    meta.metric = Metric.score;
+    for ([_]?usize{ null, 2 }) |limit| {
+        var student: TestProgram = .{};
+        try predict.setLM(out, &student, model.lm());
+        var improve: TestOptimizer = .{};
+        const result = try meta.compileWith(
+            TestProgram,
+            out,
+            testing.allocator,
+            testing.io,
+            .{ .arena = out, .max_errors = 1 },
+            &student,
+            rows[1..],
+            .{ .seed = 0, .strategy = "improve", .valset = &rows, .max_errors = limit },
+            .{ .improve = &improve },
+        );
+        try testing.expectEqual(@as(usize, 2), result.candidate_programs.len);
+        for (result.candidate_programs) |candidate| {
+            try testing.expectEqual(@as(?f64, if (limit == null) 0 else 50), candidate.score);
+        }
+    }
 }
 
 // A raw single-program override must reach the optimizer as that nominal

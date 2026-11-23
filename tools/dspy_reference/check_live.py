@@ -9,6 +9,7 @@ import json
 import sys
 
 import live_suite
+from tqdm import tqdm
 
 PIPELINES = ("rag", "dates", "dates_search", "dates_mipro", "dates_mipro_aware", "dates_copro", "rag_react", "dates_simba", "dates_gepa")
 
@@ -28,9 +29,14 @@ def main():
         failures.append(f"{len(lm.misses)} requests had no recorded twin")
     if not all(lm.used):
         failures.append(f"{lm.used.count(False)} recorded calls were never requested")
-    for want, got in zip(transcript["cases"], result["cases"], strict=True):
+    if len(transcript["cases"]) != len(result["cases"]):
+        failures.append(f"expected {len(transcript['cases'])} adapter cases, got {len(result['cases'])}")
+    for want, got in zip(transcript["cases"], result["cases"]):
         # Error types are runtime-specific names; only the outcome must agree.
-        if ("error" in want) != ("error" in got) or want.get("outputs") != got.get("outputs"):
+        if (want["name"] != got["name"]
+                or ("error" in want) != ("error" in got)
+                or ("outputs" in want) != ("outputs" in got)
+                or want.get("outputs") != got.get("outputs")):
             failures.append(f"case {want['name']}: recorded {want} != replayed {got}")
     for pipeline in PIPELINES:
         for key in ("baseline", "optimized", "artifact", "candidates", "instructions", "trials", "scores", "train_scores"):
@@ -46,4 +52,7 @@ def main():
 
 
 if __name__ == "__main__":
+    # Progress bars are useful, but their daemon monitor is not needed for
+    # replay. Avoid leaving it waiting on Python locks during finalization.
+    tqdm.monitor_interval = 0
     main()

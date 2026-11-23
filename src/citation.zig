@@ -345,6 +345,7 @@ pub const Citations = struct {
             .is_type = true,
             .iterate = Citation.iterateRuntime,
             .raw_value = Citation.rawRuntimeValue,
+            .model_dump = Citation.modelDumpRuntimeValue,
             .serialized = Citation.serializedRuntimeValue,
             .write_str = Citation.writeRuntimeStr,
             .write_repr = Citation.writeRuntimeRepr,
@@ -376,6 +377,9 @@ pub const Citations = struct {
         }
         fn rawRuntimeValue(arena: Allocator, ptr: *const anyopaque) Allocator.Error!Value {
             return Citation.actual(ptr).toValue(arena);
+        }
+        fn modelDumpRuntimeValue(arena: Allocator, ptr: *const anyopaque) Error!Value {
+            return Citation.actual(ptr).format(arena);
         }
         fn serializedRuntimeValue(arena: Allocator, ptr: *const anyopaque, depth: u32) runtime.SerializationError!Value {
             return values.serializedValueDepth(arena, try Citation.actual(ptr).format(arena), depth + 1);
@@ -610,6 +614,12 @@ pub const Citations = struct {
         return output.toOwnedSlice();
     }
 
+    /// Format one canonical part without allocating intermediate model storage.
+    pub fn writePart(part: inference.CitationPart, writer: *Writer) runtime.CustomWriteError!void {
+        const citations: Citations = .{ .citations = &.{Citation.fromPart(part)} };
+        try citations.writeFormat(writer, 0);
+    }
+
     fn writeFormat(self: Citations, writer: *Writer, depth: u32) runtime.CustomWriteError!void {
         if (depth >= pyjson.max_depth) return error.JsonTooDeep;
         try writer.writeByte('[');
@@ -679,6 +689,7 @@ pub const Citations = struct {
         .bool_value = runtimeTruthy,
         .iterate = iterateRuntime,
         .raw_value = rawRuntimeValue,
+        .model_dump = modelDumpRuntimeValue,
         .serialized = serializedRuntimeValue,
         .write_str = writeRuntimeStr,
         .write_repr = writeRuntimeRepr,
@@ -702,6 +713,9 @@ pub const Citations = struct {
     }
     fn rawRuntimeValue(arena: Allocator, ptr: *const anyopaque) Allocator.Error!Value {
         return actual(ptr).toValue(arena);
+    }
+    fn modelDumpRuntimeValue(arena: Allocator, ptr: *const anyopaque) Error!Value {
+        return .{ .string = try actual(ptr).format(arena) };
     }
     fn serializedRuntimeValue(arena: Allocator, ptr: *const anyopaque, depth: u32) runtime.SerializationError!Value {
         if (depth >= pyjson.max_depth) return error.ParseValue;

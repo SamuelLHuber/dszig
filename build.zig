@@ -124,6 +124,19 @@ pub fn build(b: *std.Build) void {
     b.step("simulate", "Run seeded native evaluator simulation or a concrete replay").dependOn(
         &run_simulate.step,
     );
+
+    const python_sim = b.addExecutable(.{ .name = "bounded-python-sim", .root_module = b.createModule(.{
+        .root_source_file = b.path("tools/bounded_python_sim.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = imports,
+    }) });
+    const run_python_sim = b.addRunArtifact(python_sim);
+    run_python_sim.addPassthruArgs();
+    b.step("bounded-python-sim", "Run deterministic bounded Python guest simulation").dependOn(&run_python_sim.step);
+    const run_python_sim_tests = b.addRunArtifact(python_sim);
+    run_python_sim_tests.addArgs(&.{ "--seed", "42" });
+    test_step.dependOn(&run_python_sim_tests.step);
 }
 
 /// Each tests/compile_fail/<name>.zig must fail to compile with `message`.

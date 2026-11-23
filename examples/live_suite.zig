@@ -83,7 +83,7 @@ pub fn dateExamples(arena: Allocator, comptime split: enum { train, dev }) ![]co
 }
 
 /// `pred.answer.strip() == example.answer`.
-pub fn exactMetric(_: Allocator, example: *const dszig.Example, prediction: ?*const Record, _: ?*const dszig.Trace) dszig.value.ParseError!f64 {
+pub fn exactMetric(_: Allocator, example: *const dszig.Example, prediction: ?*const dszig.optimize.RecordPrediction, _: ?*const dszig.Trace) dszig.value.ParseError!f64 {
     const want = example.record.get("answer").?.string;
     const pred = prediction orelse return error.ParseValue;
     const got = (pred.get("answer") orelse return 0).string;
@@ -106,7 +106,7 @@ pub const Pipeline = struct {
     /// Compiled program in `program.save()` format.
     artifact: []const u8,
     /// Random-search candidates (`candidate_programs`); empty otherwise.
-    candidates: []const dszig.optimize.BootstrapFewShotWithRandomSearch.Candidate = &.{},
+    candidates: []const CandidateSummary = &.{},
     /// MIPROv2 only: instruction candidates, `trial_logs` and the scores of
     /// `candidate_programs`.
     instructions: []const []const []const u8 = &.{},
@@ -195,7 +195,7 @@ pub const gepa_budget = 60;
 pub fn gepaMetric(
     arena: Allocator,
     example: *const dszig.Example,
-    prediction: *const Record,
+    prediction: *const dszig.optimize.RecordPrediction,
     trace: ?*const dszig.Trace,
     pred_name: ?[]const u8,
     _: ?*const dszig.Trace.Step,
@@ -316,16 +316,27 @@ fn pipeline(
     const search = @TypeOf(optimizer) == dszig.BootstrapFewShotWithRandomSearch;
     const compiled = if (search)
         try optimizer.compile(P, arena, gpa, ctx, student, null, trainset, null, .{ .restrict = null, .labeled_sample = true })
-    else
-        try optimizer.compile(P, arena, gpa, ctx, student, null, trainset);
+    else bootstrap: {
+        var instance = optimizer;
+        break :bootstrap try instance.compile(P, arena, gpa, ctx, student, null, trainset);
+    };
     const optimized = try dszig.optimize.evaluate(P, gpa, ctx, &compiled.program, devset, metric, 10);
+    const candidates = if (search) summaries: {
+        const rows = try arena.alloc(CandidateSummary, compiled.candidates.len);
+        for (compiled.candidates, rows) |candidate, *row| {
+            row.* = .{ .seed = candidate.seed, .score = candidate.score };
+        }
+        break :summaries rows;
+    } else &.{};
     return .{
         .baseline = baseline.score,
         .optimized = optimized.score,
         .artifact = try dszig.state.saveAlloc(arena, &compiled.program),
-        .candidates = if (search) compiled.candidates else &.{},
+        .candidates = candidates,
     };
 }
+
+const CandidateSummary = struct { seed: i64, score: f64 };
 
 fn runCase(
     comptime P: type,
@@ -432,6 +443,57 @@ pub fn parseCalls(arena: Allocator, transcript: Value) ![]const Call {
             if (list.len != 0 and list.len != (if (completions.len > 0) completions.len else 1)) return error.BadTranscript;
             metadata = list;
         }
+        var generated_media: []const bool = &.{};
+        if (item.object.get("generated_media")) |all| {
+            if (all != .array) return error.BadTranscript;
+            const list = try arena.alloc(bool, all.array.items.len);
+            for (all.array.items, list) |entry, *dst| {
+                if (entry != .bool) return error.BadTranscript;
+                dst.* = entry.bool;
+            }
+            if (list.len != 0 and list.len != (if (completions.len > 0) completions.len else 1)) return error.BadTranscript;
+            generated_media = list;
+        }
+        var logprobs: []const ?[]const dszig.lm.TokenLogprob = &.{};
+        if (item.object.get("logprobs")) |all| {
+            if (all != .array) return error.BadTranscript;
+            const list = try arena.alloc(?[]const dszig.lm.TokenLogprob, all.array.items.len);
+            for (all.array.items, list) |entry, *dst| {
+                dst.* = if (entry == .null) null else try dszig.lm.logprobs.fromNativeValue(arena, entry);
+            }
+            if (list.len != 0 and list.len != (if (completions.len > 0) completions.len else 1)) return error.BadTranscript;
+            logprobs = list;
+        }
+        var logprobs_complete: []const bool = &.{};
+        if (item.object.get("logprobs_complete")) |all| {
+            if (all != .array) return error.BadTranscript;
+            const list = try arena.alloc(bool, all.array.items.len);
+            for (all.array.items, list) |entry, *dst| {
+                if (entry != .bool) return error.BadTranscript;
+                dst.* = entry.bool;
+            }
+            if (list.len != 0 and list.len != (if (completions.len > 0) completions.len else 1)) return error.BadTranscript;
+            logprobs_complete = list;
+        }
+        var response_messages: []const ?dszig.sdk_response.Message = &.{};
+        if (item.object.get("response_messages")) |all| {
+            if (all != .array) return error.BadTranscript;
+            const list = try arena.alloc(?dszig.sdk_response.Message, all.array.items.len);
+            for (all.array.items, list) |entry, *dst| {
+                dst.* = if (entry == .null) null else try dszig.sdk_response.Message.fromValue(arena, entry);
+            }
+            if (list.len != 0 and list.len != (if (completions.len > 0) completions.len else 1)) return error.BadTranscript;
+            response_messages = list;
+        }
+        var adaptations: []const []const dszig.sdk_response.Adaptation = &.{};
+        if (item.object.get("adaptations")) |all| {
+            if (all != .array) return error.BadTranscript;
+            const list = try arena.alloc([]const dszig.sdk_response.Adaptation, all.array.items.len);
+            for (all.array.items, list) |entry, *dst|
+                dst.* = try dszig.sdk_response.adaptationsFromValue(arena, entry);
+            if (list.len != 0 and list.len != (if (completions.len > 0) completions.len else 1)) return error.BadTranscript;
+            adaptations = list;
+        }
         const options: ?dszig.lm.Options = if (item.object.get("options")) |raw|
             if (raw == .null) null else try dszig.lm.optionsFromValue(arena, raw)
         else
@@ -461,6 +523,11 @@ pub fn parseCalls(arena: Allocator, transcript: Value) ![]const Call {
             .continuation = continuation,
             .provider_data = provider_data,
             .metadata = metadata,
+            .generated_media = generated_media,
+            .logprobs = logprobs,
+            .logprobs_complete = logprobs_complete,
+            .response_messages = response_messages,
+            .adaptations = adaptations,
         };
     }
     return calls;
@@ -508,6 +575,33 @@ pub fn writeTranscript(arena: Allocator, runtime: []const u8, model: []const u8,
             for (call.metadata) |entry| try metadata.append(try dszig.lm.responseMetadataValue(arena, entry));
             try obj.put(arena, "metadata", .{ .array = metadata });
         }
+        if (call.generated_media.len != 0) {
+            var flags: dszig.Array = .init(arena);
+            for (call.generated_media) |flag| try flags.append(.{ .bool = flag });
+            try obj.put(arena, "generated_media", .{ .array = flags });
+        }
+        if (call.logprobs.len != 0) {
+            var scores: dszig.Array = .init(arena);
+            for (call.logprobs) |parts| try scores.append(if (parts) |entries| try dszig.lm.logprobs.toNativeValue(arena, entries) else .null);
+            try obj.put(arena, "logprobs", .{ .array = scores });
+        }
+        if (call.logprobs_complete.len != 0) {
+            var flags: dszig.Array = .init(arena);
+            for (call.logprobs_complete) |flag| try flags.append(.{ .bool = flag });
+            try obj.put(arena, "logprobs_complete", .{ .array = flags });
+        }
+        if (call.response_messages.len != 0) {
+            var response_messages: dszig.Array = .init(arena);
+            for (call.response_messages) |message|
+                try response_messages.append(if (message) |entry| try entry.toValue(arena) else .null);
+            try obj.put(arena, "response_messages", .{ .array = response_messages });
+        }
+        if (call.adaptations.len != 0) {
+            var adaptations: dszig.Array = .init(arena);
+            for (call.adaptations) |entries|
+                try adaptations.append(try dszig.sdk_response.adaptationsValue(arena, entries));
+            try obj.put(arena, "adaptations", .{ .array = adaptations });
+        }
         if (call.options) |options| try obj.put(arena, "options", try dszig.lm.optionsValue(arena, options));
         try call_values.append(.{ .object = obj });
     }
@@ -519,6 +613,7 @@ pub fn writeTranscript(arena: Allocator, runtime: []const u8, model: []const u8,
     try root.put(arena, "supports_response_format", .{ .bool = lm.supports_response_format });
     try root.put(arena, "supports_response_schema", .{ .bool = lm.supports_response_schema });
     try root.put(arena, "supports_function_calling", .{ .bool = lm.supports_function_calling });
+    try root.put(arena, "records_tool_result_names", .{ .bool = true });
     if (lm.supports_decision_requests) try root.put(arena, "supports_decision_requests", .{ .bool = true });
     try root.put(arena, "calls", .{ .array = call_values });
     try appendResult(arena, &root, result);

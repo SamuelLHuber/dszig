@@ -19,10 +19,14 @@
 
 const std = @import("std");
 const nested = @import("types.zig");
+const unicode = @import("unicode.zig");
 const History = @import("history.zig").History;
 const ToolCalls = @import("tool.zig").ToolCalls;
 const BoundingBox = @import("bounding_box.zig").BoundingBox;
 const File = @import("file.zig").File;
+const Image = @import("image.zig").Image;
+const Audio = @import("audio.zig").Audio;
+const Document = @import("document.zig").Document;
 const citation = @import("citation.zig");
 const decision = @import("decision.zig");
 const code = @import("code.zig");
@@ -245,10 +249,21 @@ fn customXmlLiteral(comptime T: type) bool {
 /// Source keeps BaseModels owned by a `dspy.*` module as literal JSON leaves.
 /// Module metadata also covers native models that are not rich DSPy Types.
 fn dspyXmlModel(comptime T: type) bool {
-    if (code.isCode(T) or T == BoundingBox or T == File or citation.isCitation(T)) return true;
+    if (code.isCode(T) or T == BoundingBox or T == File or T == Image or T == Audio or citation.isCitation(T)) return true;
     return switch (@typeInfo(T)) {
         .@"struct" => @hasDecl(T, "model_module") and
             @hasDecl(T, "model_name") and std.mem.startsWith(u8, T.model_module, "dspy."),
+        else => false,
+    };
+}
+
+fn containsDocument(comptime T: type) bool {
+    if (T == Document) return true;
+    if (nested.isDict(T)) return containsDocument(T.dszig_dict_value);
+    return switch (@typeInfo(T)) {
+        .optional => |optional| containsDocument(optional.child),
+        .pointer => |pointer| pointer.size == .slice and containsDocument(pointer.child),
+        .array => |array| containsDocument(array.child),
         else => false,
     };
 }
@@ -286,10 +301,10 @@ fn fieldsOf(comptime T: type, comptime role: []const u8, comptime descriptions: 
                 .native_bounding_box = FT == BoundingBox,
                 .xml_literal = FT == History or FT == ToolCalls or FT == ?Reasoning or customXmlLiteral(FT),
                 .native_tool_calls = FT == ToolCalls,
-                .type_description = if (code.annotationType(FT)) |C| C.description else if (citation.annotationType(FT)) |C| C.description else if (decision_description) |C| C.description else if (FT == ToolCalls) ToolCalls.description else "",
-                .type_description_name = if (code.annotationType(FT)) |C| C.model_name else if (citation.annotationType(FT)) |C| C.model_name else if (decision_description) |C| C.model_name else "",
+                .type_description = if (code.annotationType(FT)) |C| C.description else if (citation.annotationType(FT)) |C| C.description else if (decision_description) |C| C.description else if (containsDocument(FT)) Document.description else if (FT == ToolCalls) ToolCalls.description else "",
+                .type_description_name = if (code.annotationType(FT)) |C| C.model_name else if (citation.annotationType(FT)) |C| C.model_name else if (decision_description) |C| C.model_name else if (containsDocument(FT)) Document.model_name else "",
                 .code_type = code.isCode(FT),
-                .dspy_type = code.isCode(FT) or citation.isCitation(FT) or decision.isDecision(FT) or FT == Reasoning or FT == BoundingBox or FT == File or FT == History or FT == ToolCalls,
+                .dspy_type = code.isCode(FT) or citation.isCitation(FT) or decision.isDecision(FT) or FT == Reasoning or FT == BoundingBox or FT == File or FT == Image or FT == Audio or FT == Document or FT == History or FT == ToolCalls,
                 .parse_value = if (@import("enum.zig").isEnum(FT) or @import("literal.zig").isLiteral(FT)) FT.parseValue else null,
                 .schema_definition_name = if (code.isCode(FT) or decision.isDecision(FT)) FT.schema_name else "",
                 .nullable = @typeInfo(FT) == .optional,
@@ -381,7 +396,7 @@ fn validate(comptime inputs: []const Field, comptime outputs: []const Field, com
     if (outputs.len == 0) @compileError("dszig: signature must declare at least one output field");
     for (inputs ++ outputs, 0..) |f, i| {
         if (!isIdentifier(f.name)) {
-            @compileError("dszig: field name `" ++ f.name ++ "` must match \\w+ (ASCII letters, digits, '_')");
+            @compileError("dszig: field name `" ++ f.name ++ "` must match \\w+ (Unicode alphanumeric characters and '_')");
         }
         for (reserved_names) |r| {
             if (std.mem.eql(u8, f.name, r)) @compileError("dszig: field name `" ++ f.name ++ "` is reserved by the chat protocol");
@@ -408,8 +423,12 @@ fn validate(comptime inputs: []const Field, comptime outputs: []const Field, com
 
 fn isIdentifier(comptime name: []const u8) bool {
     if (name.len == 0) return false;
-    for (name) |c| {
-        if (!(std.ascii.isAlphanumeric(c) or c == '_')) return false;
+    const utf8 = std.unicode.Utf8View.init(name) catch return false;
+    var iter = utf8.iterator();
+    while (iter.nextCodepoint()) |cp| {
+        if (cp < 0x80) {
+            if (!(std.ascii.isAlphanumeric(@intCast(cp)) or cp == '_')) return false;
+        } else if (!unicode.isWord(cp)) return false;
     }
     return true;
 }

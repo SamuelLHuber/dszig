@@ -246,9 +246,12 @@ def normalized_messages(request):
             if len(results) != len(message.parts):
                 raise TypeError("the shared transcript cannot flatten mixed tool-result content")
             for result in results:
-                messages.append({"role": message.role, "content": text_parts(result.content), "tool_calls": [],
-                                 "tool_call_id": result.id, "reasoning": None,
-                                 "continuation": normalized_continuation((*message.continuation, *result.continuation))})
+                row = {"role": message.role, "content": text_parts(result.content), "tool_calls": [],
+                       "tool_call_id": result.id, "reasoning": None,
+                       "continuation": normalized_continuation((*message.continuation, *result.continuation))}
+                if result.name is not None:
+                    row["tool_result_name"] = result.name
+                messages.append(row)
         else:
             messages.append({"role": message.role, "content": "".join(part.text for part in message.parts_of(TextPart)),
                              "tool_calls": normalized_tool_calls(message.parts_of(ToolCallPart)),
@@ -276,9 +279,13 @@ def request_metadata(request, rollout):
         "tools": tools,
         "options": {
             "temperature": request.config.temperature,
+            **({"top_p": request.config.top_p} if request.config.top_p is not None else {}),
+            **({"top_k": request.config.top_k} if request.config.top_k is not None else {}),
+            **({"store": request.config.store} if request.config.store is not None else {}),
             "rollout_id": json.loads(json.dumps(rollout, ensure_ascii=False)),
             "n": 1,
             "reasoning_effort": request.config.reasoning.effort if request.config.reasoning is not None else None,
+            "logprobs": request.config.logprobs,
             # Predictor-only explicit-null intent is consumed before this
             # normalized engine Request; it is not a wire generation option.
             "reasoning_effort_present": False,
@@ -362,10 +369,17 @@ class ReplayLM(ref.ReferenceLM):
     def complete(self, request):
         metadata = request_metadata(request, ref.rollout_id(self))
         want = metadata["messages"]
+        if "records_tool_result_names" not in self._capabilities:
+            # Historical flat rows omit names, but canonical records below
+            # still compare the complete SDK request when available.
+            for message in want:
+                message.pop("tool_result_name", None)
         for i, call in enumerate(self.calls):
             if call["messages"] != want or call.get("tools", []) != metadata["tools"]:
                 continue
-            if call["options"] != metadata["options"]:
+            # A missing logprobs key in an older transcript means disabled;
+            # zero and positive counts remain distinct request identities.
+            if {"logprobs": None, **call["options"]} != metadata["options"]:
                 continue
             if "request" in call:
                 recorded = {**call["request"], "model": request.model}

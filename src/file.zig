@@ -230,6 +230,7 @@ pub const File = struct {
         .is_type = true,
         .hashable = true,
         .raw_value = rawRuntimeValue,
+        .model_dump = modelDumpRuntimeValue,
         .serialized = serializedRuntimeValue,
         .write_str = writeRuntimeStr,
         .write_repr = writeRuntimeRepr,
@@ -246,6 +247,10 @@ pub const File = struct {
 
     fn rawRuntimeValue(arena: Allocator, ptr: *const anyopaque) Allocator.Error!Value {
         return runtimeFile(ptr).toValue(arena);
+    }
+
+    fn modelDumpRuntimeValue(arena: Allocator, ptr: *const anyopaque) runtime.CustomError!Value {
+        return serializedRuntimeValue(arena, ptr, 0);
     }
 
     fn serializedRuntimeValue(arena: Allocator, ptr: *const anyopaque, _: u32) runtime.CustomError!Value {

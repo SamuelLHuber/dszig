@@ -17,5 +17,9 @@ curl --fail --location --retry 3 --silent --show-error \
   --output "$dest/$name.tar.xz" "https://ziglang.org/download/$version/$name.tar.xz"
 echo "$sha256  $dest/$name.tar.xz" | shasum -a 256 --check -
 tar -xJf "$dest/$name.tar.xz" -C "$dest"
+if [[ "$triple" == aarch64-macos ]]; then
+  script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+  patch --batch -d "$dest/$name" -p1 -i "$script_dir/zig-darwin-connect.patch"
+fi
 echo "$dest/$name" >> "${GITHUB_PATH:-/dev/null}"
 "$dest/$name/zig" version

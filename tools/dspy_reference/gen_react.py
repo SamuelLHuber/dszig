@@ -53,6 +53,9 @@ CASES = [
     ("react_parse_error", [search], 3, ["not XML", "not JSON", turn("Recover", [SUBMIT])]),
     ("react_unknown_tool", [search], 3, [turn("Unknown", [call("missing", {})]), turn("Done", [SUBMIT])]),
     ("react_zero_iters", [search], 0, [turn("Submit immediately", [SUBMIT])]),
+    ("react_negative_iters", [search], -2, [
+        turn("Submit immediately", [call("search", {"query": "ignored in forced submit"}), SUBMIT]),
+    ]),
 ]
 
 

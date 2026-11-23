@@ -113,14 +113,15 @@ pub const InferRules = struct {
         /// Bind an actual mutable settings object to model Python dictionary
         /// aliasing. The pointee must outlive this optimizer. Value settings are
         /// captured by value instead; they do not pretend to be shared dicts.
-        /// Rules dereference this object for every call; the existing bootstrap
-        /// API receives its current value once at compile entry.
+        /// Rules read their captured binding on every induction call.
+        /// Bootstrap reads the optimizer's current binding on each attempt.
         teacher_settings_ref: ?*const optimize.TeacherSettings = null,
         metric_threshold: ?f64 = null,
         max_bootstrapped_demos: usize = 4,
         max_labeled_demos: usize = 16,
         max_rounds: usize = 1,
-        max_errors: usize = 10,
+        /// Null inherits the outer context for bootstrap and candidate evaluation.
+        max_errors: ?usize = null,
         failure_classifier: ?FailureClassifier = null,
     };
 
@@ -135,7 +136,7 @@ pub const InferRules = struct {
     max_bootstrapped_demos: usize,
     max_labeled_demos: usize,
     max_rounds: usize,
-    max_errors: usize,
+    max_errors: ?usize,
     failure_classifier: ?FailureClassifier,
     /// Cause of the source-equivalent assertion/context-window failure.
     last_induction_failure: ?anyerror = null,
@@ -224,14 +225,15 @@ pub const InferRules = struct {
         var bootstrap_arena: std.heap.ArenaAllocator = .init(gpa);
         defer bootstrap_arena.deinit();
         const bootstrap_out = bootstrap_arena.allocator();
-        const bootstrap: optimize.BootstrapFewShot = .{
+        var bootstrap: optimize.BootstrapFewShot = .{
             .metric = self.metric,
             .metric_threshold = self.metric_threshold,
             .max_bootstrapped_demos = self.max_bootstrapped_demos,
             .max_labeled_demos = self.max_labeled_demos,
             .max_rounds = self.max_rounds,
             .max_errors = self.max_errors,
-            .teacher_settings = if (self.teacher_settings_ref) |bound| bound.* else self.teacher_settings,
+            .teacher_settings = self.teacher_settings,
+            .teacher_settings_ref = self.teacher_settings_ref,
         };
         const bootstrapped = try bootstrap.compile(P, bootstrap_out, gpa, ctx, student_in.*, if (teacher_in) |t| t.* else null, trainset);
         const original = try out.create(P);
@@ -332,11 +334,11 @@ pub const InferRules = struct {
         program: *const P,
         dataset: []const Example,
     ) !f64 {
-        // Evaluate checks this after induction, not at compile entry. Avoid the
-        // existing sequential evaluator's nonempty-devset assertion.
+        // Evaluate checks this after induction, not at compile entry.
         if (dataset.len == 0) return error.EmptyValidationSet;
+        const max_errors = self.max_errors orelse ctx.max_errors;
         if (self.metric) |metric| {
-            return (try optimize.evaluateWith(P, self.concurrent_evaluation, gpa, ctx, program, dataset, metric, self.max_errors)).score;
+            return (try optimize.evaluateWith(P, self.concurrent_evaluation, gpa, ctx, program, dataset, metric, max_errors)).score;
         }
         // Source allows metric=None at construction. It still runs the program
         // for each example, then fails calling the missing metric; failed items
@@ -351,7 +353,7 @@ pub const InferRules = struct {
             }
         };
         const wrapper: MissingMetric = .{ .program = program };
-        return (try optimize.evaluate(MissingMetric, gpa, ctx, &wrapper, dataset, unusedMetric, self.max_errors)).score;
+        return (try optimize.evaluate(MissingMetric, gpa, ctx, &wrapper, dataset, unusedMetric, max_errors)).score;
     }
 };
 
@@ -455,7 +457,7 @@ fn setAliasedInstruction(targets: AliasTargets, identity: *const predict.Predict
     }
 }
 
-fn unusedMetric(_: Allocator, _: *const Example, _: ?*const Record, _: ?*const predict.Trace) value.ParseError!f64 {
+fn unusedMetric(_: Allocator, _: *const Example, _: ?*const optimize.RecordPrediction, _: ?*const predict.Trace) value.ParseError!f64 {
     unreachable;
 }
 
@@ -606,14 +608,14 @@ fn testExamples(arena: Allocator, count: usize) ![]const Example {
     }
     return examples;
 }
-fn testMetric(_: Allocator, example: *const Example, maybe_prediction: ?*const Record, _: ?*const predict.Trace) value.ParseError!f64 {
+fn testMetric(_: Allocator, example: *const Example, maybe_prediction: ?*const optimize.RecordPrediction, _: ?*const predict.Trace) value.ParseError!f64 {
     const prediction = maybe_prediction orelse return error.ParseValue;
     return if (try value.pyEqual(example.record.get("answer").?, prediction.get("answer") orelse return 0)) 1 else 0;
 }
-fn nanMetric(_: Allocator, _: *const Example, _: ?*const Record, _: ?*const predict.Trace) value.ParseError!f64 {
+fn nanMetric(_: Allocator, _: *const Example, _: ?*const optimize.RecordPrediction, _: ?*const predict.Trace) value.ParseError!f64 {
     return std.math.nan(f64);
 }
-fn negativeInfinityMetric(_: Allocator, _: *const Example, _: ?*const Record, _: ?*const predict.Trace) value.ParseError!f64 {
+fn negativeInfinityMetric(_: Allocator, _: *const Example, _: ?*const optimize.RecordPrediction, _: ?*const predict.Trace) value.ParseError!f64 {
     return -std.math.inf(f64);
 }
 fn expectedInstruction(out: Allocator, original: []const u8, rule_index: usize) ![]const u8 {
@@ -1005,14 +1007,14 @@ test "InferRules missing metric runs prediction before evaluation errors" {
     const a = memory.allocator();
     var state: TestState = .{ .history = .{ .arena = a } };
     var model: TestLM = .{ .state = &state };
-    const ctx: Context = .{ .arena = a, .lm = model.lm() };
+    const ctx: Context = .{ .arena = a, .lm = model.lm(), .max_errors = 1 };
     const student: TestProgram = .{};
     var optimizer = try InferRules.init(a, .{});
-    const dataset = try testExamples(a, 1);
-    try testing.expectEqual(@as(f64, 0), try optimizer.evaluateProgram(TestProgram, testing.allocator, ctx, &student, dataset));
-    try testing.expectEqual(@as(usize, 2), state.history.requests.items.len);
-    optimizer.max_errors = 1;
+    const dataset = try testExamples(a, 2);
     try testing.expectError(error.MissingMetric, optimizer.evaluateProgram(TestProgram, testing.allocator, ctx, &student, dataset));
-    try testing.expectEqual(@as(usize, 4), state.history.requests.items.len);
+    try testing.expectEqual(@as(usize, 2), state.history.requests.items.len);
+    optimizer.max_errors = 3;
+    try testing.expectEqual(@as(f64, 0), try optimizer.evaluateProgram(TestProgram, testing.allocator, ctx, &student, dataset));
+    try testing.expectEqual(@as(usize, 6), state.history.requests.items.len);
     try testing.expectError(error.EmptyValidationSet, optimizer.evaluateProgram(TestProgram, testing.allocator, ctx, &student, &.{}));
 }

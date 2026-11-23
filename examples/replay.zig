@@ -36,6 +36,8 @@ pub fn main(init: std.process.Init) !void {
         .supports_response_format = try capability(transcript, "supports_response_format"),
         .supports_response_schema = try capability(transcript, "supports_response_schema"),
         .supports_function_calling = try capability(transcript, "supports_function_calling"),
+        // The saved pre-name live recordings remain replayable as recorded.
+        .legacy_tool_result_names = transcript.object.get("records_tool_result_names") == null,
         // Written only when true; historical transcripts predate this trait.
         .supports_decision_requests = if (transcript.object.get("supports_decision_requests")) |_|
             try capability(transcript, "supports_decision_requests")

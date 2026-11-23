@@ -13,6 +13,25 @@ const Writer = std.Io.Writer;
 
 pub const Style = @import("runtime_value.zig").JsonStyle;
 
+/// Python's comma-separated decimal formatting for nonnegative metadata counts.
+/// The maximum u128 has 39 decimal digits and 12 separators.
+pub fn groupedDecimal(buffer: *[51]u8, count: u128) []const u8 {
+    var remaining = count;
+    var pos: usize = buffer.len;
+    var digits: usize = 0;
+    while (true) {
+        pos -= 1;
+        buffer[pos] = '0' + @as(u8, @intCast(remaining % 10));
+        remaining /= 10;
+        if (remaining == 0) return buffer[pos..];
+        digits += 1;
+        if (digits % 3 == 0) {
+            pos -= 1;
+            buffer[pos] = ',';
+        }
+    }
+}
+
 /// Containers nested deeper than this are rejected rather than recursed.
 pub const max_depth = 64;
 
@@ -26,6 +45,11 @@ pub fn writeJson(w: *Writer, v: Value, style: Style) Error!void {
 /// Unlike DSPy's custom serializer, plain JSON rejects native class objects.
 pub fn writeJsonAscii(w: *Writer, v: Value) Error!void {
     try writeJsonDepth(w, v, .compact, 0, true);
+}
+
+/// Python json.dumps(value, indent=2), including default ASCII escaping.
+pub fn writeJsonAsciiIndented(w: *Writer, v: Value) Error!void {
+    try writeJsonDepth(w, v, .indent2, 0, true);
 }
 
 test "Python repr treats a WTF8 surrogate as one nonprintable code point" {
@@ -177,19 +201,31 @@ fn writePlainDictionary(w: *Writer, entries: []const @import("runtime_value.zig"
     try w.writeByte('{');
     for (entries, 0..) |entry, index| {
         try writeSeparator(w, style, depth + 1, index == 0);
-        switch (entry.key) {
-            .string => |s| try writeJsonAsciiString(w, s),
-            .null, .bool, .integer, .float, .number_string => {
-                try w.writeByte('"');
-                try writeJsonOptions(w, entry.key, style, depth + 1, true, false);
-                try w.writeByte('"');
-            },
-            else => return error.ParseValue,
-        }
+        try writeJsonKey(w, entry.key, style, depth + 1, true);
         try w.writeAll(if (style == .minified) ":" else ": ");
         try writeJsonOptions(w, entry.value, style, depth + 1, true, false);
     }
     try writeClose(w, style, depth, '}');
+}
+
+/// Python JSON accepts string, numeric, boolean and None dictionary keys.
+/// Keep this policy shared with graph-backed provider wire serialization.
+pub fn writeJsonKey(
+    w: *Writer,
+    key: Value,
+    style: Style,
+    depth: u32,
+    comptime ascii: bool,
+) Error!void {
+    switch (key) {
+        .string => try writeJsonDepth(w, key, style, depth, ascii),
+        .null, .bool, .integer, .float, .number_string => {
+            try w.writeByte('"');
+            try writeJsonOptions(w, key, style, depth, true, false);
+            try w.writeByte('"');
+        },
+        else => return error.ParseValue,
+    }
 }
 
 fn checkIntegerRepr(text: []const u8) error{ParseValue}!void {

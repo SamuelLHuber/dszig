@@ -1,6 +1,6 @@
 .{
     .name = .dszig,
-    .version = "0.1.0",
+    .version = "3.5.0+dszig.1",
     .fingerprint = 0xed95e071dc98b643,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{},

@@ -433,6 +433,12 @@ fn DecisionType(comptime config: Configuration) type {
                 error.OutOfMemory => error.OutOfMemory,
                 else => error.ParseValue,
             };
+            return validateParsedJson(arena, input, mode);
+        }
+
+        /// Validate an already parsed JSON value; JSON object keys are strings
+        /// even when a model declares an integer-keyed dictionary.
+        pub fn validateParsedJson(arena: Allocator, input: Value, mode: ValidationMode) runtime.CustomError!Value {
             return (try decode(arena, input, mode, true)).toRuntime(arena);
         }
 
@@ -711,6 +717,7 @@ fn DecisionType(comptime config: Configuration) type {
             .decision = .{ .kind = kind, .field = runtimeField, .ancestors = &ancestor_identities },
             .iterate = iterateRuntime,
             .raw_value = rawRuntimeValue,
+            .model_dump = rawRuntimeValue,
             .serialized = serializedRuntimeValue,
             .write_str = writeRuntimeStr,
             .write_repr = writeRuntimeRepr,
@@ -851,6 +858,7 @@ fn DecisionType(comptime config: Configuration) type {
             .decision = .{ .kind = kind, .field = rawField, .ancestors = &ancestor_identities },
             .iterate = rawIterate,
             .raw_value = rawDump,
+            .model_dump = rawDump,
             .serialized = rawSerialized,
             .write_str = rawStr,
             .write_repr = rawRepr,

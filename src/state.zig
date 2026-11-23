@@ -32,20 +32,56 @@ pub const LoadOptions = struct {
     allow_unsafe_lm_state: bool = false,
 };
 
+/// Startup routing for a program with bindings from several native providers.
+pub const ProviderLoaders = struct {
+    openai: ?*lm.OpenAI.StateLoader = null,
+    anthropic: ?*@import("anthropic.zig").Anthropic.StateLoader = null,
+    gemini: ?*@import("gemini.zig").Gemini.StateLoader = null,
+
+    pub fn loader(self: *ProviderLoaders) lm.LM.StateLoader {
+        return .{ .ptr = self, .restore_engine = restore };
+    }
+
+    fn restore(ptr: *anyopaque, arena: Allocator, saved: Value) lm.StateError!lm.LM {
+        const self: *ProviderLoaders = @ptrCast(@alignCast(ptr));
+        if (saved != .object) return error.InvalidLMState;
+        const class = saved.object.get("__lm_class__") orelse return error.InvalidLMState;
+        if (class != .string) return error.InvalidLMState;
+        const selected = inline for (.{
+            .{ "dszig.lm.OpenAI", self.openai },
+            .{ "dszig.lm.Anthropic", self.anthropic },
+            .{ "dszig.lm.Gemini", self.gemini },
+        }) |entry| {
+            if (std.mem.eql(u8, class.string, entry[0])) {
+                const provider = entry[1] orelse return error.UnsupportedLMState;
+                break provider.loader();
+            }
+        } else return error.UnsupportedLMState;
+        // The outer StateLoader already validates and reapplies the public model mode.
+        return selected.restore_engine(selected.ptr, arena, saved);
+    }
+};
+
 /// `module.dump_state()` plus the `metadata` key added by `save`.
 /// Read-only: `program` may be a const pointer.
 pub fn dumpState(arena: Allocator, program: anytype) SaveError!Value {
+    const P = @typeInfo(@TypeOf(program)).pointer.child;
     var root: Record = .empty;
-    // The parameter walk yields mutable pointers; nothing here writes through them.
-    for (try predict.namedParameters(arena, @constCast(program))) |p| {
-        try root.put(arena, p.name, switch (p.param) {
-            .predict => |s| try dumpPredict(arena, s),
-            .retrieve => |r| blk: {
-                var obj: Record = .empty;
-                try obj.put(arena, "k", .{ .integer = r.k });
-                break :blk .{ .object = obj };
-            },
-        });
+    // The synthetic optimizer path "self" is not part of standalone Predict state.
+    if (@hasDecl(P, "is_dszig_predict")) {
+        root = try dumpPredict(arena, &program.state);
+    } else {
+        // The parameter walk yields mutable pointers; nothing here writes through them.
+        for (try predict.namedParameters(arena, @constCast(program))) |p| {
+            try root.put(arena, p.name, switch (p.param) {
+                .predict => |s| .{ .object = try dumpPredict(arena, s) },
+                .retrieve => |r| blk: {
+                    var obj: Record = .empty;
+                    try obj.put(arena, "k", .{ .integer = r.k });
+                    break :blk .{ .object = obj };
+                },
+            });
+        }
     }
     var versions: Record = .empty;
     for (dependency_versions) |kv| try versions.put(arena, kv[0], .{ .string = kv[1] });
@@ -55,7 +91,7 @@ pub fn dumpState(arena: Allocator, program: anytype) SaveError!Value {
     return .{ .object = root };
 }
 
-fn dumpPredict(arena: Allocator, s: *const predict.PredictState) SaveError!Value {
+fn dumpPredict(arena: Allocator, s: *const predict.PredictState) SaveError!Record {
     var obj: Record = .empty;
     try obj.put(arena, "traces", .{ .array = .init(arena) });
     try obj.put(arena, "train", .{ .array = .init(arena) });
@@ -87,7 +123,7 @@ fn dumpPredict(arena: Allocator, s: *const predict.PredictState) SaveError!Value
         };
         try obj.put(arena, "fields", try value.cloneValue(arena, s.decision_fields));
     }
-    return .{ .object = obj };
+    return obj;
 }
 
 /// Write the state exactly as DSPy's `orjson` OPT_INDENT_2 | OPT_APPEND_NEWLINE.
@@ -111,6 +147,10 @@ pub fn saveAlloc(arena: Allocator, program: anytype) (error{JsonTooDeep} || Save
 /// Loaded strings and demos are copied into `arena`.
 pub fn loadState(arena: Allocator, program: anytype, state: Value, options: LoadOptions) LoadError!void {
     if (state != .object) return error.InvalidState;
+    const P = @typeInfo(@TypeOf(program)).pointer.child;
+    if (@hasDecl(P, "is_dszig_predict")) {
+        return loadPredict(arena, &program.state, &state.object, options);
+    }
     for (try predict.namedParameters(arena, program)) |p| {
         const saved = state.object.get(p.name) orelse return error.MissingState;
         if (saved != .object) return error.InvalidState;
@@ -130,6 +170,36 @@ pub fn load(arena: Allocator, program: anytype, json: []const u8, options: LoadO
         else => return error.InvalidJson,
     };
     try loadState(arena, program, state, options);
+}
+
+test "native Google and Anthropic loaders never apply file-supplied routing or credentials" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var client: std.http.Client = .{ .allocator = testing.allocator, .io = testing.io };
+    defer client.deinit();
+
+    const A = @import("anthropic.zig").Anthropic;
+    const G = @import("gemini.zig").Gemini;
+    inline for (.{ A, G }, .{ "dszig.lm.Anthropic", "dszig.lm.Gemini" }) |Provider, class| {
+        var loader: Provider.StateLoader = .{
+            .client = &client,
+            .base_url = "https://trusted.invalid",
+            .api_key = "injected",
+        };
+        const saved = try std.json.parseFromSliceLeaky(Value, arena, "{\"__lm_class__\":\"" ++ class ++ "\",\"model\":\"fixture\"," ++
+            "\"base_url\":\"https://untrusted.invalid\",\"api_key\":\"untrusted\"," ++
+            "\"door\":\"vertex_express\"}", .{});
+        const restored = try loader.loader().restore(arena, saved);
+        const provider: *const Provider = @ptrCast(@alignCast(restored.ptr));
+        try testing.expectEqualStrings("https://trusted.invalid", provider.base_url);
+        try testing.expectEqualStrings("injected", provider.api_key.?);
+        if (Provider == G) try testing.expect(provider.door == .developer);
+        const serialized = try restored.dumpState(arena);
+        try testing.expect(!serialized.object.contains("base_url"));
+        try testing.expect(!serialized.object.contains("api_key"));
+        try testing.expect(!serialized.object.contains("door"));
+    }
 }
 
 test "OpenAI program state restores owned configuration without saved credentials or untrusted routing" {
@@ -158,6 +228,7 @@ test "OpenAI program state restores owned configuration without saved credential
     };
     var program: predict.Predict(Sig) = .{};
     program.state.lm = model.lm();
+    program.state.lm.?.model_type = .text;
     const json = try saveAlloc(source, &program);
     try testing.expect(std.mem.indexOf(u8, json, "must-not-be-saved") == null);
     var loader: lm.OpenAI.StateLoader = .{
@@ -176,11 +247,12 @@ test "OpenAI program state restores owned configuration without saved credential
     try testing.expectEqualStrings("https://trusted.invalid/v1", safe_model.base_url);
     try testing.expectEqualStrings("https://saved.invalid/v1", trusted_model.base_url);
     try testing.expectEqualStrings("injected-credential", safe_model.api_key.?);
-    const body = try safe_model.requestBody(target, .{ .messages = &.{.{ .role = .user, .content = .{ .text = "q" } }} });
-    const decoded = try std.json.parseFromSliceLeaky(Value, target, body, .{});
-    try testing.expectEqualStrings("trained-model", decoded.object.get("model").?.string);
-    try testing.expectEqual(@as(i64, 73), decoded.object.get("max_output_tokens").?.integer);
+    try testing.expectEqualStrings("trained-model", safe_model.model);
+    try testing.expectEqual(@as(?u32, 73), safe_model.max_tokens);
     try testing.expect(safe.state.lm.?.supports_reasoning);
+    try testing.expectEqual(lm.OpenAI.Api.responses, safe_model.api);
+    try testing.expectEqual(@import("call_result.zig").ModelType.text, safe.state.lm.?.model_type);
+    try testing.expectEqual(@import("call_result.zig").ModelType.text, trusted.state.lm.?.model_type);
     try testing.expectEqual(@as(u8, 2), safe_model.max_retries);
     try testing.expectEqual(@as(?u64, 123456789), safe_model.timeout_ns);
 }
@@ -196,12 +268,11 @@ test "state LM failures retain source partial commits and null clears an existin
     var program: predict.Predict(Sig) = .{};
     var model: lm.ScriptedLM = .{ .responses = &.{} };
     var saved = try dumpState(arena, &program);
-    const entry = saved.object.getPtr("self").?;
-    const sig = entry.object.getPtr("signature").?;
+    const sig = saved.object.getPtr("signature").?;
     try sig.object.put(arena, "instructions", .{ .string = "changed before failed LM restore" });
     var nonempty: Record = .empty;
     try nonempty.put(arena, "__lm_class__", .{ .string = "unknown.NativeLM" });
-    try entry.object.put(arena, "lm", .{ .object = nonempty });
+    try saved.object.put(arena, "lm", .{ .object = nonempty });
     program.state.lm = model.lm();
     try testing.expectError(error.MissingLMLoader, loadState(arena, &program, saved, .{}));
     try testing.expectEqualStrings("changed before failed LM restore", program.state.instructions);
@@ -209,7 +280,7 @@ test "state LM failures retain source partial commits and null clears an existin
     const falsy = [_]Value{ .null, .{ .bool = false }, .{ .integer = 0 }, .{ .string = "" }, .{ .array = .init(arena) }, .{ .object = .empty } };
     for (falsy) |item| {
         program.state.lm = model.lm();
-        try entry.object.put(arena, "lm", item);
+        try saved.object.put(arena, "lm", item);
         try loadState(arena, &program, saved, .{});
         try testing.expect(program.state.lm == null);
     }
@@ -232,11 +303,11 @@ fn restoreLM(arena: Allocator, model: Value, options: LoadOptions) LoadError!?lm
     if (!truthy) return null;
     if (model != .object) return error.InvalidLMState;
     const loader = options.lm_loader orelse return error.MissingLMLoader;
-    if (options.allow_unsafe_lm_state) return try loader.restore(loader.ptr, arena, model);
+    if (options.allow_unsafe_lm_state) return try loader.restore(arena, model);
     var unsafe_count: u32 = 0;
     for ([_][]const u8{ "api_base", "base_url", "model_list" }) |key|
         unsafe_count += @intFromBool(model.object.contains(key));
-    if (unsafe_count == 0) return try loader.restore(loader.ptr, arena, model);
+    if (unsafe_count == 0) return try loader.restore(arena, model);
     var sanitized: Record = .empty;
     try sanitized.ensureTotalCapacity(arena, model.object.count() - unsafe_count);
     for (model.object.keys(), model.object.values()) |key, item| {
@@ -244,7 +315,7 @@ fn restoreLM(arena: Allocator, model: Value, options: LoadOptions) LoadError!?lm
             std.mem.eql(u8, key, "base_url") or std.mem.eql(u8, key, "model_list");
         if (!unsafe_key) sanitized.putAssumeCapacity(key, item);
     }
-    return try loader.restore(loader.ptr, arena, .{ .object = sanitized });
+    return try loader.restore(arena, .{ .object = sanitized });
 }
 
 fn loadPredict(arena: Allocator, s: *predict.PredictState, saved: *const Record, options: LoadOptions) LoadError!void {

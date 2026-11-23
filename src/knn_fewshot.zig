@@ -40,39 +40,48 @@ pub fn KNNFewShot(comptime P: type) type {
         knn: KNN,
         bootstrap: BootstrapFewShot,
 
-        const Captured = struct {
-            optimizer: *const Self,
-            gpa: Allocator,
-            original: *const P,
-            teacher: ?*const P,
-        };
+        pub const Program = ProgramWithTeacher(P);
 
-        pub const Program = struct {
-            pub const Input = P.Input;
-            pub const Output = P.Output;
-            pub const dszig_parameter_target = "visible";
+        pub fn ProgramWithTeacher(comptime Teacher: type) type {
+            return struct {
+                const Compiled = @This();
+                const Captured = struct {
+                    optimizer: *const Self,
+                    gpa: Allocator,
+                    original: *const P,
+                    teacher: ?*const Teacher,
+                };
 
-            visible: P,
-            compiled: bool,
-            captured: *const Captured,
+                pub const Input = P.Input;
+                pub const Output = P.Output;
+                pub const dszig_parameter_target = "visible";
 
-            pub fn forward(self: *const Program, ctx: Context, input: Input) anyerror!Output {
-                const kwargs = try value.toRecord(ctx.arena, Input, input);
-                const neighbors = try self.captured.optimizer.knn.call(ctx.arena, kwargs);
-                const result = try self.captured.optimizer.bootstrap.compile(
-                    P,
-                    ctx.arena,
-                    self.captured.gpa,
-                    ctx,
-                    self.captured.original.*,
-                    if (self.captured.teacher) |teacher| teacher.* else null,
-                    neighbors,
-                );
-                const program = try ctx.arena.create(P);
-                program.* = result.program;
-                return program.forward(ctx, input);
-            }
-        };
+                visible: P,
+                compiled: bool,
+                captured: *const Captured,
+
+                pub fn forward(self: *const Compiled, ctx: Context, input: Input) anyerror!Output {
+                    const kwargs = try value.toRecord(ctx.arena, Input, input);
+                    const neighbors = try self.captured.optimizer.knn.call(ctx.arena, kwargs);
+                    // DSPy creates a fresh BootstrapFewShot for each neighborhood.
+                    var bootstrap = self.captured.optimizer.bootstrap;
+                    bootstrap.error_count = 0;
+                    const result = try bootstrap.compile(
+                        P,
+                        ctx.arena,
+                        self.captured.gpa,
+                        ctx,
+                        self.captured.original.*,
+                        if (self.captured.teacher) |teacher| teacher.* else null,
+                        neighbors,
+                    );
+                    const program = try ctx.arena.create(P);
+                    program.* = result.program;
+
+                    return program.forward(ctx, input);
+                }
+            };
+        }
 
         pub fn init(
             out: Allocator,
@@ -100,10 +109,24 @@ pub fn KNNFewShot(comptime P: type) type {
             student: *const P,
             teacher: ?*const P,
         ) anyerror!Program {
+            return self.compileWithTeacher(P, out, gpa, ctx, student, teacher);
+        }
+
+        /// A different teacher program type is valid when its named predictors
+        /// and signatures match the student at query time.
+        pub fn compileWithTeacher(
+            self: *const Self,
+            comptime Teacher: type,
+            out: Allocator,
+            gpa: Allocator,
+            ctx: Context,
+            student: *const P,
+            teacher: ?*const Teacher,
+        ) anyerror!ProgramWithTeacher(Teacher) {
             _ = ctx;
             var visible = student.*;
             try predict.resetPredictors(out, &visible);
-            const captured = try out.create(Captured);
+            const captured = try out.create(ProgramWithTeacher(Teacher).Captured);
             captured.* = .{
                 .optimizer = self,
                 .gpa = gpa,
@@ -147,27 +170,33 @@ const TestEvents = struct {
     }
 };
 
-const TestProgram = struct {
-    pub const Input = TestSignature.Input;
-    pub const Output = TestSignature.Output;
+const TestProgram = testProgram(false);
+const TestTeacher = testProgram(true);
 
-    qa: predict.Predict(TestSignature) = .{},
-    marker: []const u8,
-    counter: usize = 7,
-    events: *TestEvents,
-    compiled: bool = false,
+fn testProgram(comptime is_teacher: bool) type {
+    return struct {
+        pub const teacher = is_teacher;
+        pub const Input = TestSignature.Input;
+        pub const Output = TestSignature.Output;
 
-    pub fn forward(self: *const @This(), ctx: Context, input: Input) anyerror!Output {
-        try self.events.forwards.append(self.events.arena, .{
-            .marker = try self.events.arena.dupe(u8, self.marker),
-            .counter = self.counter,
-            .question = try self.events.arena.dupe(u8, input.question),
-        });
-        return self.qa.forward(ctx, .{
-            .question = try std.fmt.allocPrint(ctx.arena, "{s}|{s}", .{ input.question, self.marker }),
-        });
-    }
-};
+        qa: predict.Predict(TestSignature) = .{},
+        marker: []const u8,
+        counter: usize = 7,
+        events: *TestEvents,
+        compiled: bool = false,
+
+        pub fn forward(self: *const @This(), ctx: Context, input: Input) anyerror!Output {
+            try self.events.forwards.append(self.events.arena, .{
+                .marker = try self.events.arena.dupe(u8, self.marker),
+                .counter = self.counter,
+                .question = try self.events.arena.dupe(u8, input.question),
+            });
+            return self.qa.forward(ctx, .{
+                .question = try std.fmt.allocPrint(ctx.arena, "{s}|{s}", .{ input.question, self.marker }),
+            });
+        }
+    };
+}
 
 const TestLM = struct {
     label: []const u8,
@@ -206,7 +235,7 @@ fn xmlField(text: []const u8, opening: []const u8, closing: []const u8) error{LM
     return std.mem.trim(u8, text[start..end], value.py_whitespace);
 }
 
-fn testMetric(_: Allocator, example: *const Example, maybe_prediction: ?*const Record, trace: ?*const predict.Trace) value.ParseError!f64 {
+fn testMetric(_: Allocator, example: *const Example, maybe_prediction: ?*const optimize.RecordPrediction, trace: ?*const predict.Trace) value.ParseError!f64 {
     const captured = trace orelse return 0;
     if (captured.steps.items.len != 1) return 0;
     const input = captured.steps.items[0].inputs.get("question") orelse return 0;
@@ -252,10 +281,10 @@ test "KNNFewShot uses original captures, real bootstrap demos, teacher settings,
     });
     var student: TestProgram = .{ .marker = "original", .events = &events };
     student.qa.state.demos = try testDemo(arena, "old");
-    var teacher: TestProgram = .{ .marker = "teacher", .events = &events, .compiled = true };
+    var teacher: TestTeacher = .{ .marker = "teacher", .events = &events, .compiled = true };
     teacher.qa.state.demos = try testDemo(arena, "teacher-old");
     const compile_ctx: Context = .{ .arena = arena, .lm = unused_lm.lm() };
-    var program = try optimizer.compile(arena, testing.allocator, compile_ctx, &student, &teacher);
+    var program = try optimizer.compileWithTeacher(TestTeacher, arena, testing.allocator, compile_ctx, &student, &teacher);
     try testing.expectEqual(@as(usize, 1), events.embeddings.items.len);
     try testing.expectEqual(@as(usize, 0), events.calls.items.len);
     try testing.expectEqualStrings("original", program.visible.marker);
@@ -454,8 +483,8 @@ test "KNNFewShot validates live teacher metadata before empty-neighborhood boots
         .max_labeled_demos = 0,
     });
     var student: TestProgram = .{ .marker = "student", .events = &events };
-    var teacher: TestProgram = .{ .marker = "teacher", .events = &events };
-    const program = try optimizer.compile(arena, testing.allocator, ctx, &student, &teacher);
+    var teacher: TestTeacher = .{ .marker = "teacher", .events = &events };
+    const program = try optimizer.compileWithTeacher(TestTeacher, arena, testing.allocator, ctx, &student, &teacher);
     const Mutation = enum { instructions, desc, prefix };
     for ([_]Mutation{ .instructions, .desc, .prefix }) |mutation| {
         teacher.qa.state = student.qa.state;

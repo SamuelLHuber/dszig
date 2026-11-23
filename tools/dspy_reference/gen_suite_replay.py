@@ -109,6 +109,7 @@ def main():
                   "supports_response_format": "response_format" in lm.supported_params,
                   "supports_response_schema": lm.supports_response_schema,
                   "supports_function_calling": lm.supports_function_calling,
+                  "records_tool_result_names": True,
                   "calls": lm.calls, **result}
     (out / "dspy_3_5_0_mock_suite.json").write_text(json.dumps(transcript, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 

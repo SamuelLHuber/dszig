@@ -1,0 +1,33 @@
+--- a/lib/std/Io/Threaded.zig
++++ b/lib/std/Io/Threaded.zig
+@@ -12243,13 +12243,15 @@
+     addr: *const posix.sockaddr,
+     addr_len: posix.socklen_t,
+ ) !void {
+     const syscall: Syscall = try .start();
++    var interrupted = false;
+     while (true) switch (posix.errno(posix.system.connect(socket_fd, addr, addr_len))) {
+         .SUCCESS => {
+             syscall.finish();
+             return;
+         },
+         .INTR => {
+             try syscall.checkCancel();
++            interrupted = true;
+             continue;
+         },
+@@ -12267,7 +12269,13 @@
+         .BADF => |err| return syscall.errnoBug(err), // File descriptor used after closed.
+         .CONNABORTED => |err| return syscall.errnoBug(err),
+         .FAULT => |err| return syscall.errnoBug(err),
+-        .ISCONN => |err| return syscall.errnoBug(err),
++        .ISCONN => |err| {
++            // Darwin can complete the interrupted connect asynchronously.
++            if (!is_darwin or !interrupted) return syscall.errnoBug(err);
++            try syscall.checkCancel();
++            syscall.finish();
++            return;
++        },
+         .NOENT => |err| return syscall.errnoBug(err),
+         .NOTSOCK => |err| return syscall.errnoBug(err),
+         .PERM => |err| return syscall.errnoBug(err),

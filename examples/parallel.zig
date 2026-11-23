@@ -15,7 +15,7 @@ const Compute = struct {
         return value;
     }
 };
-const Pool = dszig.Parallel(Compute.Output, .{
+const Pool = dszig.Parallel(dszig.parallel.ProgramResult(Compute), .{
     .workers = 4,
     .tasks = count,
     .attempts = count,

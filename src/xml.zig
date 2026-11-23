@@ -186,6 +186,12 @@ fn scanRequirements(node: Value, nullable: *bool, mapping: *bool, depth: usize) 
 }
 
 pub const XmlAdapter = struct {
+    pub fn fieldUsesNested(arena: Allocator, field: Field) Error!bool {
+        if (field.kind != .json) return usesNested(field, .null);
+        if (field.xml_literal) return false;
+        return usesNested(field, try fieldSchema(arena, field));
+    }
+
     pub fn fieldStructure(arena: Allocator, definitions: []const Field) Error![]const u8 {
         if (definitions.len == 0) return "";
         var out: Writer.Allocating = .init(arena);
@@ -308,13 +314,7 @@ pub const XmlAdapter = struct {
                 try result.put(arena, field.name, fallback);
                 continue;
             }
-            const decoded = try elementsValue(arena, group, schema, get(schema, "$defs"), 0);
-            var parsing_field = field;
-            if ((decoded == .object or decoded == .array) and group[0].children.len > 0) {
-                if (field.xml_validate) |validate| parsing_field.validate = validate;
-            }
-            const parsed = try adapter.parseFieldValue(arena, parsing_field, decoded);
-            try result.put(arena, field.name, parsed);
+            try result.put(arena, field.name, try parseField(arena, field, group, schema));
         }
         if (missing) {
             failure.?.parsed_result = result;
@@ -323,6 +323,31 @@ pub const XmlAdapter = struct {
         return result;
     }
 };
+
+fn parseField(arena: Allocator, field: Field, nodes: []const Node, schema: Value) Error!Value {
+    const definitions = get(schema, "$defs");
+    if (parseCandidate(arena, field, nodes, schema, definitions)) |parsed| return parsed else |err| {
+        if (err != error.AdapterParse) return err;
+    }
+    // DSPy tries the whole schema first, then decodes with each top-level anyOf
+    // branch in order. Every candidate still validates against the full field.
+    const alternatives = get(schema, "anyOf");
+    if (alternatives == .array) for (alternatives.array.items) |candidate| {
+        if (parseCandidate(arena, field, nodes, candidate, definitions)) |parsed| return parsed else |err| {
+            if (err != error.AdapterParse) return err;
+        }
+    };
+    return error.AdapterParse;
+}
+
+fn parseCandidate(arena: Allocator, field: Field, nodes: []const Node, schema: Value, definitions: Value) Error!Value {
+    const decoded = try elementsValue(arena, nodes, schema, definitions, 0);
+    var parsing_field = field;
+    if ((decoded == .object or decoded == .array) and nodes[0].children.len > 0) {
+        if (field.xml_validate) |validate| parsing_field.validate = validate;
+    }
+    return adapter.parseFieldValue(arena, parsing_field, decoded);
+}
 
 fn allowsNull(schema: Value) bool {
     if (isType(schema, "null")) return true;
@@ -923,6 +948,63 @@ test "runtime schema union validates XML chat and JSON without a native callback
         try testing.expectEqualStrings("hello", literal.get("result").?.string);
         try testing.expectError(error.AdapterParse, which.parse(arena, view, invalid_text));
     }
+}
+
+test "XML retries field schema alternatives for repeated union outputs" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const fields = [_]Field{.{
+        .name = "result",
+        .kind = .json,
+        .type_name = "int | list[int]",
+        .desc = "${result}",
+        .prefix = "Result:",
+        .schema = "{\"anyOf\":[{\"type\":\"integer\"},{\"items\":{\"type\":\"integer\"},\"type\":\"array\"}]}",
+    }};
+    const view: adapter.View = .{ .instructions = "", .inputs = &.{}, .outputs = &fields };
+    for ([_][]const u8{
+        "<result>7</result><result>8</result>",
+        "<result><item>7</item><item>8</item></result>",
+    }) |completion| {
+        const parsed = try adapter.Adapter.xml.parse(arena, view, completion);
+        const result = parsed.get("result").?;
+        try testing.expect(result == .array);
+        try testing.expectEqual(@as(usize, 2), result.array.items.len);
+        try testing.expectEqual(@as(i64, 7), result.array.items[0].integer);
+        try testing.expectEqual(@as(i64, 8), result.array.items[1].integer);
+    }
+    const single = try adapter.Adapter.xml.parse(arena, view, "<result>7</result>");
+    try testing.expectEqual(@as(i64, 7), single.get("result").?.integer);
+    try testing.expectError(error.AdapterParse, adapter.Adapter.xml.parse(arena, view, "<result>7</result><result>bad</result>"));
+}
+
+test "XML retries field schema alternatives after union validation fails" {
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const fields = [_]Field{.{
+        .name = "result",
+        .kind = .json,
+        .type_name = "list[dict[str, int]] | dict[str, str]",
+        .desc = "${result}",
+        .prefix = "Result:",
+        .schema = "{\"anyOf\":[{\"items\":{\"additionalProperties\":{\"type\":\"integer\"},\"type\":\"object\"},\"type\":\"array\"},{\"additionalProperties\":{\"type\":\"string\"},\"type\":\"object\"}]}",
+    }};
+    const view: adapter.View = .{ .instructions = "", .inputs = &.{}, .outputs = &fields };
+
+    // Both completions initially decode as a list containing a dictionary.
+    // Only the first needs to retry decoding as a dictionary directly.
+    const text = try adapter.Adapter.xml.parse(arena, view, "<result><key>words</key></result>");
+    const object = text.get("result").?;
+    try testing.expect(object == .object);
+    try testing.expectEqualStrings("words", object.object.get("key").?.string);
+
+    const number = try adapter.Adapter.xml.parse(arena, view, "<result><key>7</key></result>");
+    const list = number.get("result").?;
+    try testing.expect(list == .array);
+    try testing.expectEqual(@as(usize, 1), list.array.items.len);
+    try testing.expectEqual(@as(i64, 7), list.array.items[0].object.get("key").?.integer);
 }
 
 test "runtime number unions preserve large integers and dictionary key schemas reject forbidden names" {

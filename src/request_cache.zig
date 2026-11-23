@@ -21,18 +21,44 @@ const json_graph = @import("json_graph.zig");
 
 pub const Key = [32]u8;
 
-/// Heap-stable JSON graph whose arena owns every node of `root`.
+/// Heap-stable mutable graph. Its arena owns new nodes; immutable dependencies
+/// retain any shallow views into older payloads.
 pub const Payload = struct {
     gpa: Allocator,
     arena_state: std.heap.ArenaAllocator,
     references: std.atomic.Value(usize),
     root: json_graph.Value = .null,
+    // Immutable older owners make dependency cycles impossible. The link is
+    // used only after the last reference, for allocation-free iterative release.
+    dependencies: []const *Payload = &.{},
+    release_next: ?*Payload = null,
 
     /// One reference, owned by the caller.
     pub fn create(gpa: Allocator) Allocator.Error!*Payload {
         const payload = try gpa.create(Payload);
         payload.* = .{ .gpa = gpa, .arena_state = .init(gpa), .references = .init(1) };
         return payload;
+    }
+
+    /// A new owner of shallow graph views into existing, independently owned
+    /// payloads. Adopts the gpa-allocated parent slice on success only; parents
+    /// themselves remain borrowed throughout construction.
+    pub fn createDependent(gpa: Allocator, parents: []const *Payload) Allocator.Error!*Payload {
+        const payload = try create(gpa);
+        payload.attachDependencies(parents);
+        return payload;
+    }
+
+    /// Finish an unpublished payload whose dependency set depends on its
+    /// projected leaves. Adopts the gpa-allocated slice without allocation.
+    pub fn attachDependencies(self: *Payload, parents: []const *Payload) void {
+        assert(self.references.load(.monotonic) == 1);
+        assert(self.dependencies.len == 0);
+        for (parents) |parent| {
+            assert(parent != self);
+            parent.retain();
+        }
+        self.dependencies = parents;
     }
 
     /// Allocator for nodes of `root`; freed by the final `release`.
@@ -49,9 +75,23 @@ pub const Payload = struct {
         const previous = self.references.fetchSub(1, .acq_rel);
         assert(previous > 0);
         if (previous != 1) return;
-        const gpa = self.gpa;
-        self.arena_state.deinit();
-        gpa.destroy(self);
+        var pending: ?*Payload = self;
+        while (pending) |current| {
+            pending = current.release_next;
+            for (current.dependencies) |parent| {
+                assert(parent != current);
+                const count = parent.references.fetchSub(1, .acq_rel);
+                assert(count > 0);
+                if (count == 1) {
+                    parent.release_next = pending;
+                    pending = parent;
+                }
+            }
+            const gpa = current.gpa;
+            gpa.free(current.dependencies);
+            current.arena_state.deinit();
+            gpa.destroy(current);
+        }
     }
 
     /// New payload (one reference) holding a deep copy of `root` that keeps
@@ -63,6 +103,26 @@ pub const Payload = struct {
         return out;
     }
 };
+
+test "shallow payload ownership releases deep dependency chains without recursion" {
+    const allocator = std.testing.allocator;
+    var current = try Payload.create(allocator);
+    errdefer current.release();
+    current.root = .{ .integer = 7 };
+    for (0..10000) |_| {
+        const parents = try allocator.alloc(*Payload, 1);
+        parents[0] = current;
+        const next = Payload.createDependent(allocator, parents) catch |err| {
+            allocator.free(parents);
+            return err;
+        };
+        next.root = current.root;
+        current.release();
+        current = next;
+    }
+    try std.testing.expectEqual(@as(i64, 7), current.root.integer);
+    current.release();
+}
 
 pub const Cache = struct {
     gpa: Allocator,

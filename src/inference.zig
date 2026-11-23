@@ -6,6 +6,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const runtime = @import("runtime_value.zig");
 const Value = runtime.Value;
+const json = @import("sdk_json.zig");
 
 pub const MetadataError = error{BadMetadata} || Allocator.Error;
 pub const SchemaError = error{ InvalidSchema, JsonTooDeep } || Allocator.Error;
@@ -106,7 +107,7 @@ pub const FunctionTool = struct {
 pub const Continuation = struct {
     provider: []const u8,
     kind: []const u8,
-    data: Value,
+    data: json.Value,
 };
 
 pub const ToolCall = struct {
@@ -158,7 +159,7 @@ pub fn freeCitations(allocator: Allocator, input: []const CitationPart) void {
     allocator.free(input);
 }
 
-pub fn citationsValue(arena: Allocator, input: []const CitationPart) Allocator.Error!Value {
+pub fn citationsValue(arena: Allocator, input: []const CitationPart) json.Error!Value {
     var out: @import("runtime_value.zig").Array = .init(arena);
     try out.ensureTotalCapacity(input.len);
     for (input) |part| {
@@ -279,6 +280,8 @@ pub fn freeJsonValue(allocator: Allocator, input: Value) void {
 }
 
 pub fn cloneContinuations(allocator: Allocator, input: []const Continuation) Allocator.Error![]const Continuation {
+    var context: json.CloneContext = .{ .allocator = allocator };
+    defer context.deinit();
     const out = try allocator.alloc(Continuation, input.len);
     var initialized: usize = 0;
     errdefer {
@@ -290,7 +293,7 @@ pub fn cloneContinuations(allocator: Allocator, input: []const Continuation) All
         errdefer allocator.free(provider);
         const kind = try allocator.dupe(u8, state.kind);
         errdefer allocator.free(kind);
-        const data = try cloneJsonValue(allocator, state.data);
+        const data = try context.clone(state.data);
         copy.* = .{ .provider = provider, .kind = kind, .data = data };
         initialized += 1;
     }
@@ -300,7 +303,7 @@ pub fn cloneContinuations(allocator: Allocator, input: []const Continuation) All
 fn freeContinuation(allocator: Allocator, state: Continuation) void {
     allocator.free(state.provider);
     allocator.free(state.kind);
-    freeJsonValue(allocator, state.data);
+    state.data.free();
 }
 
 pub fn freeContinuations(allocator: Allocator, input: []const Continuation) void {
@@ -308,14 +311,14 @@ pub fn freeContinuations(allocator: Allocator, input: []const Continuation) void
     allocator.free(input);
 }
 
-pub fn continuationsValue(arena: Allocator, input: []const Continuation) Allocator.Error!Value {
+pub fn continuationsValue(arena: Allocator, input: []const Continuation) json.Error!Value {
     var out: @import("runtime_value.zig").Array = .init(arena);
     try out.ensureTotalCapacity(input.len);
     for (input) |state| {
         var object: @import("runtime_value.zig").ObjectMap = .empty;
         try object.put(arena, "provider", .{ .string = state.provider });
         try object.put(arena, "kind", .{ .string = state.kind });
-        try object.put(arena, "data", state.data);
+        try object.put(arena, "data", try state.data.toValue(arena));
         out.appendAssumeCapacity(.{ .object = object });
     }
     return .{ .array = out };
@@ -324,18 +327,31 @@ pub fn continuationsValue(arena: Allocator, input: []const Continuation) Allocat
 pub fn continuationsFromValue(arena: Allocator, input: Value) MetadataError![]const Continuation {
     if (input != .array) return error.BadMetadata;
     const out = try arena.alloc(Continuation, input.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |state| freeContinuation(arena, state);
+        arena.free(out);
+    }
     for (input.array.items, out) |state, *copy| {
         if (state != .object) return error.BadMetadata;
-        const data = state.object.get("data") orelse return error.BadMetadata;
+        const data: Value = state.object.get("data") orelse .{ .object = .empty };
         if (data != .object) return error.BadMetadata;
         const provider = try stringField(state, "provider");
         const kind = try stringField(state, "kind");
         if (provider.len == 0 or kind.len == 0) return error.BadMetadata;
+        const owned_provider = try arena.dupe(u8, provider);
+        errdefer arena.free(owned_provider);
+        const owned_kind = try arena.dupe(u8, kind);
+        errdefer arena.free(owned_kind);
         copy.* = .{
-            .provider = try arena.dupe(u8, provider),
-            .kind = try arena.dupe(u8, kind),
-            .data = try cloneJsonValue(arena, data),
+            .provider = owned_provider,
+            .kind = owned_kind,
+            .data = json.Value.fromValue(arena, data) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.BadMetadata,
+            },
         };
+        initialized += 1;
     }
     return out;
 }
@@ -344,7 +360,7 @@ pub fn continuationsEqual(a: []const Continuation, b: []const Continuation) runt
     if (a.len != b.len) return false;
     for (a, b) |x, y| {
         if (!std.mem.eql(u8, x.provider, y.provider) or !std.mem.eql(u8, x.kind, y.kind) or
-            !(try jsonEqual(x.data, y.data))) return false;
+            !(try jsonEqual(x.data.root, y.data.root))) return false;
     }
     return true;
 }
@@ -425,7 +441,7 @@ pub fn toolsValue(arena: Allocator, tools: []const FunctionTool) Allocator.Error
     return .{ .array = out };
 }
 
-pub fn toolCallsValue(arena: Allocator, calls: []const ToolCall) Allocator.Error!Value {
+pub fn toolCallsValue(arena: Allocator, calls: []const ToolCall) json.Error!Value {
     var out: @import("runtime_value.zig").Array = .init(arena);
     try out.ensureTotalCapacity(calls.len);
     for (calls) |call| {
@@ -575,32 +591,135 @@ pub fn toolCallsEqual(a: []const ToolCall, b: []const ToolCall) runtime.CustomEr
 
 /// Schema booleans are not numbers: Python-style true == 1 would accept a
 /// different native request. Object insertion order does not change a schema.
-pub fn jsonEqual(a: Value, b: Value) runtime.CustomError!bool {
-    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
-    return switch (a) {
-        .null => true,
-        .custom => |custom| try custom.eql(b.custom),
-        .bool => |x| x == b.bool,
-        .integer => |x| x == b.integer,
-        .float => |x| x == b.float,
-        .string => |x| std.mem.eql(u8, x, b.string),
-        .number_string => |x| std.mem.eql(u8, x, b.number_string),
-        .array => |x| blk: {
-            if (x.items.len != b.array.items.len) break :blk false;
-            for (x.items, b.array.items) |first, second| {
-                if (!(try jsonEqual(first, second))) break :blk false;
-            }
-            break :blk true;
-        },
-        .object => |x| blk: {
-            if (x.count() != b.object.count()) break :blk false;
-            var iterator = x.iterator();
-            while (iterator.next()) |entry| {
-                if (!(try jsonEqual(entry.value_ptr.*, b.object.get(entry.key_ptr.*) orelse break :blk false))) break :blk false;
-            }
-            break :blk true;
-        },
+pub fn jsonEqual(a: anytype, b: @TypeOf(a)) runtime.CustomError!bool {
+    const Node = @TypeOf(a);
+    const Frame = struct { left: Node, right: Node, index: usize = 0 };
+    var frames: [@import("pyjson.zig").max_depth]Frame = undefined;
+    frames[0] = .{ .left = a, .right = b };
+    var depth: usize = 1;
+    while (depth != 0) {
+        const frame = &frames[depth - 1];
+        const left = frame.left;
+        const right = frame.right;
+        if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
+        const equal = switch (left) {
+            .null => true,
+            .bool => |x| x == right.bool,
+            .integer => |x| x == right.integer,
+            .float => |x| x == right.float,
+            .string => |x| std.mem.eql(u8, x, right.string),
+            .number_string => |x| std.mem.eql(u8, x, right.number_string),
+            .array, .object => {
+                const array = left == .array;
+                const count = if (array) left.array.items.len else left.object.count();
+                const other_count = if (array) right.array.items.len else right.object.count();
+                if (count != other_count) return false;
+                if (frame.index == count) {
+                    depth -= 1;
+                    continue;
+                }
+                const index = frame.index;
+                frame.index += 1;
+                const first = if (array) left.array.items[index] else left.object.values()[index];
+                const second = if (array) right.array.items[index] else right.object.get(left.object.keys()[index]) orelse return false;
+                // Cycles and excessive nesting fail without recursion or a
+                // temporary flat projection of the mutable graph.
+                if (depth == frames.len) return error.ParseValue;
+                frames[depth] = .{ .left = first, .right = second };
+                depth += 1;
+                continue;
+            },
+            else => if (left == .custom) try left.custom.eql(right.custom) else return error.ParseValue,
+        };
+        if (!equal) return false;
+        depth -= 1;
+    }
+    return true;
+}
+
+test "continuation clones preserve shared graph growth after source destruction" {
+    const allocator = std.testing.allocator;
+    const cloned = block: {
+        const payload = try json.Value.fromValue(allocator, .{ .object = .empty });
+        defer payload.free();
+        const state: Continuation = .{ .provider = "fixture", .kind = "state", .data = payload };
+        break :block try cloneContinuations(allocator, &.{ state, state });
     };
+    defer freeContinuations(allocator, cloned);
+    const data = cloned[0].data;
+    const arena = data.storage.?.allocator();
+    const items = try arena.create(@import("json_graph.zig").Array);
+    items.* = .init(arena);
+    try data.root.object.put(arena, "items", .{ .array = items });
+    for (0..100) |index| try items.append(.{ .integer = @intCast(index) });
+    try std.testing.expectEqual(@as(i64, 99), cloned[1].data.root.object.get("items").?.array.items[99].integer);
+}
+
+test "continuation readers default to distinct objects and unwind partial failures" {
+    const Check = struct {
+        fn run(allocator: Allocator) !void {
+            var memory: std.heap.ArenaAllocator = .init(allocator);
+            defer memory.deinit();
+            const parsed = try std.json.parseFromSlice(Value, allocator,
+                \\[{"provider":"fixture","kind":"first"},{"provider":"fixture","kind":"second"}]
+            , .{});
+            defer parsed.deinit();
+            const states = try continuationsFromValue(allocator, parsed.value);
+            defer freeContinuations(allocator, states);
+            try states[0].data.root.object.put(states[0].data.storage.?.allocator(), "marker", .{ .bool = true });
+            try std.testing.expect(!states[1].data.root.object.contains("marker"));
+            const copy = try cloneContinuations(allocator, states);
+            defer freeContinuations(allocator, copy);
+            try copy[0].data.root.object.put(copy[0].data.storage.?.allocator(), "marker", .{ .bool = false });
+            try std.testing.expect(states[0].data.root.object.get("marker").?.bool);
+            try std.testing.expect(!(try continuationsEqual(states, copy)));
+            const wire = try continuationsValue(memory.allocator(), states);
+            try std.testing.expect(wire.array.items[0].object.get("data").?.object.get("marker").?.bool);
+            const invalid = try std.json.parseFromSlice(Value, allocator,
+                \\[{"provider":"fixture","kind":"first"},{"provider":"","kind":"invalid"}]
+            , .{});
+            defer invalid.deinit();
+            if (continuationsFromValue(allocator, invalid.value)) |unexpected| {
+                freeContinuations(allocator, unexpected);
+                return error.ExpectedBadMetadata;
+            } else |err| switch (err) {
+                error.OutOfMemory => return err,
+                error.BadMetadata => {},
+            }
+        }
+    };
+    var backing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(backing.allocator(), Check.run, .{});
+}
+
+test "JSON equality is ordered for arrays unordered for objects and bounded for cycles" {
+    const graph = @import("json_graph.zig");
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const a = try graph.parse(arena, "{\"x\":[1,true],\"y\":null}");
+    const b = try graph.parse(arena, "{\"y\":null,\"x\":[1,true]}");
+    try std.testing.expect(try jsonEqual(a, b));
+    b.object.getPtr("x").?.array.items[0] = .{ .float = 1 };
+    try std.testing.expect(!(try jsonEqual(a, b)));
+    b.object.getPtr("x").?.array.items[0] = .{ .integer = 1 };
+    std.mem.swap(graph.Value, &b.object.getPtr("x").?.array.items[0], &b.object.getPtr("x").?.array.items[1]);
+    try std.testing.expect(!(try jsonEqual(a, b)));
+    var deep: graph.Value = .null;
+    for (1..@import("pyjson.zig").max_depth) |_| {
+        const array = try arena.create(graph.Array);
+        array.* = .init(arena);
+        try array.append(deep);
+        deep = .{ .array = array };
+    }
+    try std.testing.expect(try jsonEqual(deep, deep));
+    const overflow = try arena.create(graph.Array);
+    overflow.* = .init(arena);
+    try overflow.append(deep);
+    const too_deep: graph.Value = .{ .array = overflow };
+    try std.testing.expectError(error.ParseValue, jsonEqual(too_deep, too_deep));
+    overflow.items[0] = too_deep;
+    try std.testing.expectError(error.ParseValue, jsonEqual(too_deep, too_deep));
 }
 
 fn optionalStringEqual(a: ?[]const u8, b: ?[]const u8) bool {

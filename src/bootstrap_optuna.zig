@@ -53,14 +53,17 @@ const Example = optimize.Example;
 pub const BootstrapFewShotWithOptuna = struct {
     metric: optimize.Metric,
     teacher_settings: optimize.TeacherSettings = .{},
+    /// When present, takes precedence over value settings and is read by each
+    /// bootstrap attempt. The pointee must outlive compile.
+    teacher_settings_ref: ?*const optimize.TeacherSettings = null,
     /// Source constructor metadata; compile(max_demos) overrides this value.
     max_bootstrapped_demos: usize = 4,
     max_labeled_demos: usize = 16,
     max_rounds: usize = 1,
     num_candidate_programs: usize = 16,
     concurrent_evaluation: ?optimize.ConcurrentEvaluation = null,
-    /// Native counterpart of DSPy settings.max_errors, for bootstrap/evaluate.
-    max_errors: usize = 10,
+    /// Null inherits the caller context for bootstrap and objective evaluation.
+    max_errors: ?usize = null,
     seed: ?u32 = null,
 
     pub fn Trial(comptime P: type) type {
@@ -99,25 +102,60 @@ pub const BootstrapFewShotWithOptuna = struct {
         trainset: []const Example,
         valset: ?[]const Example,
     ) !Result(P) {
+        return self.compileTyped(P, P, out, gpa, io, ctx, student_in, teacher_in, max_demos, trainset, valset);
+    }
+
+    /// Use a distinct teacher type with BootstrapFewShot-compatible predictors.
+    /// Trials still evaluate and return the student type.
+    pub fn compileWithTeacher(
+        self: BootstrapFewShotWithOptuna,
+        comptime P: type,
+        out: Allocator,
+        gpa: Allocator,
+        io: std.Io,
+        ctx: predict.Context,
+        student_in: P,
+        teacher: anytype,
+        max_demos: usize,
+        trainset: []const Example,
+        valset: ?[]const Example,
+    ) !Result(P) {
+        return self.compileTyped(P, @TypeOf(teacher), out, gpa, io, ctx, student_in, teacher, max_demos, trainset, valset);
+    }
+
+    fn compileTyped(
+        self: BootstrapFewShotWithOptuna,
+        comptime P: type,
+        comptime T: type,
+        out: Allocator,
+        gpa: Allocator,
+        io: std.Io,
+        ctx: predict.Context,
+        student_in: P,
+        teacher_in: ?T,
+        max_demos: usize,
+        trainset: []const Example,
+        valset: ?[]const Example,
+    ) !Result(P) {
         var workspace: std.heap.ArenaAllocator = .init(gpa);
         defer workspace.deinit();
         const arena = workspace.allocator();
         const student = try copyProgram(P, arena, arena, student_in, true);
-        const teacher = if (teacher_in) |given|
-            try copyProgram(P, arena, arena, given, false)
-        else
-            try copyProgram(P, arena, arena, student_in, true);
         const val = if (valset) |given| if (given.len > 0) given else trainset else trainset;
 
-        const bootstrap: optimize.BootstrapFewShot = .{
+        var bootstrap: optimize.BootstrapFewShot = .{
             .metric = self.metric,
             .max_bootstrapped_demos = max_demos,
             .max_labeled_demos = self.max_labeled_demos,
             .max_rounds = self.max_rounds,
             .max_errors = self.max_errors,
             .teacher_settings = self.teacher_settings,
+            .teacher_settings_ref = self.teacher_settings_ref,
         };
-        var compiled = try bootstrap.compile(P, arena, gpa, ctx, student, teacher, trainset);
+        var compiled = if (teacher_in) |given|
+            try bootstrap.compile(P, arena, gpa, ctx, student, try copyProgram(T, arena, arena, given, false), trainset)
+        else
+            try bootstrap.compile(P, arena, gpa, ctx, student, try copyProgram(P, arena, arena, student_in, true), trainset);
         const compiled_predictors = try predict.namedPredictors(arena, &compiled.program);
         const parameters = try out.alloc(tpe.Param, compiled_predictors.len);
         for (compiled_predictors, parameters) |p, *param| {
@@ -154,7 +192,16 @@ pub const BootstrapFewShotWithOptuna = struct {
             }
             // No catch-and-continue: study.optimize's default catch=() aborts
             // on objective exceptions, including a later failed candidate.
-            const evaluation = try optimize.evaluateWith(P, self.concurrent_evaluation, gpa, ctx, &program, val, self.metric, self.max_errors);
+            const evaluation = try optimize.evaluateWith(
+                P,
+                self.concurrent_evaluation,
+                gpa,
+                ctx,
+                &program,
+                val,
+                self.metric,
+                self.max_errors orelse ctx.max_errors,
+            );
             const failed = std.math.isNan(evaluation.score);
             const state: tpe.State = if (failed) .fail else .complete;
             trial.* = .{ .number = number, .program = program, .params = saved, .score = if (failed) null else evaluation.score, .state = state };
@@ -237,35 +284,35 @@ const TestProgram = struct {
     }
 };
 
-fn sourceMetric(_: Allocator, example: *const Example, maybe_prediction: ?*const Record, trace: ?*const predict.Trace) value.ParseError!f64 {
+fn sourceMetric(_: Allocator, example: *const Example, maybe_prediction: ?*const optimize.RecordPrediction, trace: ?*const predict.Trace) value.ParseError!f64 {
     if (trace != null) return 1;
     const target = std.fmt.parseInt(i64, example.record.get("question").?.string, 10) catch return 0;
     const prediction = maybe_prediction orelse return error.ParseValue;
     return if (@mod(2 * prediction.get("z").?.integer + prediction.get("a").?.integer, 5) == @mod(target, 5)) 1 else 0;
 }
 
-fn tiedMetric(_: Allocator, _: *const Example, _: ?*const Record, _: ?*const predict.Trace) value.ParseError!f64 {
+fn tiedMetric(_: Allocator, _: *const Example, _: ?*const optimize.RecordPrediction, _: ?*const predict.Trace) value.ParseError!f64 {
     return 1;
 }
 
-fn nanMetric(_: Allocator, _: *const Example, _: ?*const Record, trace: ?*const predict.Trace) value.ParseError!f64 {
+fn nanMetric(_: Allocator, _: *const Example, _: ?*const optimize.RecordPrediction, trace: ?*const predict.Trace) value.ParseError!f64 {
     return if (trace != null) 1 else std.math.nan(f64);
 }
 
-fn mixedNanMetric(_: Allocator, _: *const Example, maybe_prediction: ?*const Record, trace: ?*const predict.Trace) value.ParseError!f64 {
+fn mixedNanMetric(_: Allocator, _: *const Example, maybe_prediction: ?*const optimize.RecordPrediction, trace: ?*const predict.Trace) value.ParseError!f64 {
     if (trace != null) return 1;
     const prediction = maybe_prediction orelse return error.ParseValue;
     if (prediction.get("z").?.integer != 0) return 1;
     return std.math.nan(f64);
 }
 
-fn teacherMetric(_: Allocator, _: *const Example, maybe_prediction: ?*const Record, trace: ?*const predict.Trace) value.ParseError!f64 {
+fn teacherMetric(_: Allocator, _: *const Example, maybe_prediction: ?*const optimize.RecordPrediction, trace: ?*const predict.Trace) value.ParseError!f64 {
     if (trace == null) return 1;
     const prediction = maybe_prediction orelse return error.ParseValue;
     return if (prediction.get("z").?.integer == 88 and prediction.get("a").?.integer == 77) 1 else 0;
 }
 
-fn resetTeacherMetric(_: Allocator, _: *const Example, maybe_prediction: ?*const Record, trace: ?*const predict.Trace) value.ParseError!f64 {
+fn resetTeacherMetric(_: Allocator, _: *const Example, maybe_prediction: ?*const optimize.RecordPrediction, trace: ?*const predict.Trace) value.ParseError!f64 {
     if (trace == null) return 1;
     const prediction = maybe_prediction orelse return error.ParseValue;
     return if (prediction.get("z").?.integer == -1 and prediction.get("a").?.integer == -1) 1 else 0;
@@ -280,6 +327,116 @@ fn testExamples(arena: Allocator, values: []const []const u8) ![]Example {
         row.* = .{ .record = record, .input_keys = &.{"question"} };
     }
     return rows;
+}
+
+// Locked DSPy observations: tools/dspy_reference/bootstrap_teacher_oracle.py.
+// Same predictor paths/signatures as TestProgram, but the outer signature and
+// metric-visible output are deliberately different.
+const DistinctTeacher = struct {
+    z: predict.Predict(TestSignature) = .{},
+    a: predict.Predict(TestSignature) = .{},
+
+    pub const Input = struct { question: []const u8, hint: []const u8 };
+    pub const Output = struct { gate: bool, first: i64, second: i64, hint: []const u8 };
+
+    pub fn forward(self: *const @This(), ctx: predict.Context, input: Input) !Output {
+        if (ctx.trace) |trace| {
+            const inputs = try value.toRecord(ctx.arena, TestSignature.Input, .{ .question = input.question });
+            const z = try value.toRecord(ctx.arena, TestSignature.Output, .{ .answer = "7" });
+            const a = try value.toRecord(ctx.arena, TestSignature.Output, .{ .answer = "8" });
+            try trace.record(&self.z.state, &inputs, &z);
+            try trace.record(&self.a.state, &inputs, &a);
+        }
+        return .{
+            .gate = true,
+            .first = @intCast(self.z.state.demos.len),
+            .second = @intCast(self.a.state.demos.len),
+            .hint = input.hint,
+        };
+    }
+};
+
+fn distinctTeacherMetric(_: Allocator, _: *const Example, maybe_pred: ?*const optimize.RecordPrediction, trace: ?*const predict.Trace) value.ParseError!f64 {
+    const pred = maybe_pred orelse return error.ParseValue;
+    if (trace) |t| {
+        const gate = pred.get("gate") orelse return 0;
+        return if (gate.bool and pred.get("first").?.integer == 0 and
+            pred.get("second").?.integer == 0 and std.mem.eql(u8, pred.get("hint").?.string, "teacher input") and
+            t.steps.items.len == 2) 1 else 0;
+    }
+    return if (pred.get("z").?.integer == 7 and pred.get("a").?.integer == 8) 1 else 0;
+}
+
+test "heterogeneous Bootstrap maps teacher traces, scores its own output and preserves mismatches" {
+    var mem: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer mem.deinit();
+    const arena = mem.allocator();
+    const train = [_]Example{try .fromJson(arena, "{\"question\":\"0\",\"hint\":\"teacher input\",\"answer\":\"0\"}", &.{ "question", "hint" })};
+    const ctx: predict.Context = .{ .arena = arena };
+    var bootstrap: optimize.BootstrapFewShot = .{
+        .metric = distinctTeacherMetric,
+        .max_bootstrapped_demos = 1,
+        .max_labeled_demos = 1,
+    };
+    var teacher: DistinctTeacher = .{};
+    const result = try bootstrap.compile(TestProgram, arena, testing.allocator, ctx, .{}, @as(?DistinctTeacher, teacher), &train);
+    try testing.expectEqualDeep(optimize.BootstrapFewShot.Report{ .bootstrapped = 1, .attempts = 1, .errors = 0, .validation = 0 }, result.report);
+    try testing.expect(result.program.compiled);
+    try testing.expectEqual(@as(i64, 7), try TestProgram.selected(result.program.z.state));
+    try testing.expectEqual(@as(i64, 8), try TestProgram.selected(result.program.a.state));
+    const demo = &result.program.z.state.demos[0];
+    try testing.expect(demo.get("augmented").?.bool);
+    try testing.expectEqualStrings("0", demo.get("question").?.string);
+    try testing.expect(demo.get("gate") == null and demo.get("hint") == null);
+    try testing.expectEqual(@as(usize, 0), teacher.z.state.demos.len);
+
+    teacher.a.state.instructions = "Different instruction.";
+    try testing.expectError(error.ProgramMismatch, bootstrap.compile(TestProgram, arena, testing.allocator, ctx, .{}, teacher, &.{}));
+    try testing.expectError(error.ProgramMismatch, bootstrap.compile(TestProgram, arena, testing.allocator, ctx, .{}, teacher, &train));
+
+    bootstrap.metric = tiedMetric;
+    const fallback = try bootstrap.compile(TestProgram, arena, testing.allocator, ctx, .{}, @as(?DistinctTeacher, null), &train);
+    try testing.expectEqual(@as(i64, 0), try TestProgram.selected(fallback.program.z.state));
+}
+
+test "heterogeneous Bootstrap teachers improve RandomSearch and Optuna student candidates" {
+    var mem: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer mem.deinit();
+    const arena = mem.allocator();
+    const train = [_]Example{try .fromJson(arena, "{\"question\":\"0\",\"hint\":\"teacher input\",\"answer\":\"0\"}", &.{ "question", "hint" })};
+    const ctx: predict.Context = .{ .arena = arena };
+    const teacher: DistinctTeacher = .{};
+    const search: optimize.BootstrapFewShotWithRandomSearch = .{
+        .metric = distinctTeacherMetric,
+        .max_bootstrapped_demos = 1,
+        .max_labeled_demos = 1,
+        .num_candidate_programs = 1,
+    };
+    const randomized = try search.compile(TestProgram, arena, testing.allocator, ctx, .{}, teacher, &train, null, .{});
+    try testing.expectEqual(@as(usize, 4), randomized.candidates.len);
+    for (randomized.candidates, [_]i64{ -1, 0, -3, -2 }, [_]f64{ 100, 100, 0, 0 }) |candidate, seed, score| {
+        try testing.expectEqual(seed, candidate.seed);
+        try testing.expectEqual(score, candidate.score);
+        try testing.expectEqualSlices(f64, &.{score / 100}, candidate.subscores);
+    }
+    try testing.expectEqual(@as(i64, 7), try TestProgram.selected(randomized.program.z.state));
+
+    const search_optuna: BootstrapFewShotWithOptuna = .{
+        .metric = distinctTeacherMetric,
+        .seed = 9,
+        .max_labeled_demos = 1,
+        .num_candidate_programs = 2,
+    };
+    const tuned = try search_optuna.compileWithTeacher(TestProgram, arena, testing.allocator, testing.io, ctx, .{}, teacher, 1, &train, null);
+    try testing.expectEqual(@as(usize, 1), tuned.bootstrap_report.bootstrapped);
+    try testing.expectEqual(@as(usize, 0), tuned.best_trial);
+    try testing.expectEqual(@as(usize, 2), tuned.trials.len);
+    for (tuned.trials) |trial| {
+        try testing.expectEqual(@as(?f64, 100), trial.score);
+        try testing.expectEqualSlices(?i64, &.{ 0, 0 }, trial.params);
+    }
+    try testing.expectEqual(@as(i64, 7), try TestProgram.selected(tuned.program.z.state));
+    try testing.expectEqual(@as(i64, 8), try TestProgram.selected(tuned.program.a.state));
 }
 
 const source_choices = [_][2]i64{
@@ -470,6 +627,65 @@ test "BootstrapOptuna catches individual evaluation failures but never swallows 
     const abort_val = try testExamples(arena, &.{ "fail", "fail", "fail", "fail", "fail", "fail", "fail", "fail", "fail", "fail" });
     try testing.expectError(error.LMFailure, optimizer.compile(TestProgram, arena, testing.allocator, testing.io, ctx, .{ .fail = true }, null, 3, trainset, abort_val));
     try testing.expectError(error.LMFailure, optimizer.compile(TestProgram, arena, testing.allocator, testing.io, ctx, .{ .fail = true, .fail_after_first = true }, null, 3, trainset, abort_val));
+}
+
+test "BootstrapOptuna inherits the caller limit in bootstrap and trial evaluation" {
+    const Metric = struct {
+        fn score(
+            _: Allocator,
+            example: *const Example,
+            _: ?*const optimize.RecordPrediction,
+            _: ?*const predict.Trace,
+        ) value.ParseError!f64 {
+            if (std.mem.eql(u8, example.record.get("question").?.string, "fail"))
+                return error.ParseValue;
+            return 1;
+        }
+    };
+    var out: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer out.deinit();
+    const a = out.allocator();
+    var history: @import("lm.zig").History = .{ .arena = a };
+    var model: @import("lm.zig").KeywordLM = .{
+        .history = &history,
+        .rules = &.{},
+        .default = "<answer>yes</answer>",
+    };
+    const rows = try testExamples(a, &.{ "fail", "pass" });
+    const P = predict.Predict(TestSignature);
+    const opt: BootstrapFewShotWithOptuna = .{
+        .metric = Metric.score,
+        .num_candidate_programs = 1,
+        .max_labeled_demos = 1,
+        .seed = 0,
+    };
+    const ctx: predict.Context = .{ .arena = a, .lm = model.lm(), .max_errors = 1 };
+    try testing.expectError(error.ParseValue, opt.compile(
+        P,
+        a,
+        testing.allocator,
+        testing.io,
+        ctx,
+        .{},
+        null,
+        1,
+        rows,
+        rows[1..],
+    ));
+    try testing.expectEqual(@as(usize, 1), history.requests.items.len);
+    try testing.expectError(error.ParseValue, opt.compile(
+        P,
+        a,
+        testing.allocator,
+        testing.io,
+        ctx,
+        .{},
+        null,
+        0,
+        rows[1..],
+        rows,
+    ));
+    try testing.expectEqual(@as(usize, 2), history.requests.items.len);
 }
 
 test "BootstrapOptuna keeps supplied teacher demos but resets the implicit teacher" {

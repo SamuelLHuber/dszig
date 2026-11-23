@@ -27,6 +27,7 @@ test "DSZig reproduces DSPy 3.5.0's independently recorded deterministic suite" 
     try testing.expectEqualStrings("dspy 3.5.0 deterministic mock", transcript.object.get("runtime").?.string);
     const supports_reasoning = transcript.object.get("supports_reasoning").?.bool;
     const calls = try suite.parseCalls(arena, transcript);
+    try testing.expect(transcript.object.get("records_tool_result_names").?.bool);
     // Current-version parity may not use ReplayLM's historical options bypass.
     for (calls) |call| try testing.expect(call.options != null);
     const used = try arena.alloc(bool, dszig.lm.ReplayLM.completionCount(calls));

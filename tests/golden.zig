@@ -65,18 +65,21 @@ fn compact(arena: Allocator, v: Value) ![]const u8 {
 }
 
 fn expectMessages(arena: Allocator, expected: []const Value, actual: []const dszig.adapter.Message) !void {
-    // DSPy's fixture boundary is prompt_to_openai_messages, not just content.
-    // Use the production serializer to compare native calls and tool-result IDs
-    // as well, while keeping prompt text and argument strings byte-exact.
-    const provider: dszig.lm.OpenAI = .{ .client = undefined, .base_url = "http://unused", .model = "golden" };
-    const body = try provider.requestBody(arena, .{ .messages = actual });
-    const root = try std.json.parseFromSliceLeaky(Value, arena, body, .{});
-    const projected = root.object.get("messages").?.array.items;
-    try testing.expectEqual(expected.len, projected.len);
-    for (expected, projected) |want, got| {
-        try testing.expectEqualStrings(want.object.get("role").?.string, got.object.get("role").?.string);
-        try testing.expectEqualStrings(want.object.get("content").?.string, got.object.get("content").?.string);
-        try testing.expect(try dszig.value.recordEqual(&want.object, &got.object));
+    // This frozen boundary is prompt_to_openai_messages, not SDK build_request:
+    // prompt tool-argument strings retain spelling before the SDK parses JSON.
+    try testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |want, message| {
+        var projected: dszig.ObjectMap = .empty;
+        try projected.put(arena, "role", .{ .string = message.role.name() });
+        try projected.put(arena, "content", try message.content.toOpenAIChatValue(arena, testing.io));
+        if (message.tool_call_id) |id| try projected.put(arena, "tool_call_id", .{ .string = id });
+        if (message.tool_calls.len != 0) {
+            var calls: std.array_list.Managed(Value) = .init(arena);
+            for (message.tool_calls) |call|
+                try calls.append(try dszig.lm.OpenAI.toolCallValue(arena, .chat_completions, call));
+            try projected.put(arena, "tool_calls", .{ .array = calls });
+        }
+        try testing.expect(try dszig.value.recordEqual(&want.object, &projected));
     }
 }
 
@@ -178,7 +181,7 @@ test "BootstrapFewShot RAG artifact is byte-identical to DSPy" {
     const retriever = rag.corpus.retriever();
     const ctx: dszig.Context = .{ .arena = out.allocator(), .lm = keyword.lm(), .retriever = retriever };
     const trainset = try rag.trainset(out.allocator());
-    const optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 2, .max_labeled_demos = 3 };
+    var optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 2, .max_labeled_demos = 3 };
     const result = try optimizer.compile(rag.RAG, out.allocator(), testing.allocator, ctx, .{}, null, trainset);
     try testing.expect(result.program.compiled);
     try testing.expectEqual(@as(usize, 2), result.report.bootstrapped);
@@ -197,7 +200,7 @@ test "BootstrapFewShot multi-hop artifact picks DSPy's same-predictor traces" {
     const retriever = rag.corpus.retriever();
     const ctx: dszig.Context = .{ .arena = out.allocator(), .lm = keyword.lm(), .retriever = retriever };
     const trainset = try rag.trainset(out.allocator());
-    const optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 4, .max_labeled_demos = 1 };
+    var optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 4, .max_labeled_demos = 1 };
     const result = try optimizer.compile(rag.MultiHop, out.allocator(), testing.allocator, ctx, .{}, null, trainset);
     try testing.expectEqual(@as(usize, 4), result.report.bootstrapped);
     const saved = try dszig.state.saveAlloc(out.allocator(), &result.program);
@@ -252,10 +255,10 @@ fn checkReact(comptime Agent: type, name: []const u8) !void {
     var history: dszig.lm.History = .{ .arena = arena };
     var scripted: dszig.lm.ScriptedLM = .{ .responses = completions, .history = &history };
     const ctx: dszig.Context = .{ .arena = arena, .lm = scripted.lm() };
-    var agent = try Agent.init(arena);
-    agent.max_iters = @intCast(case.get("max_iters").?.integer);
+    const agent = try Agent.init(arena);
     var inputs: Record = .empty;
     try inputs.put(arena, "question", .{ .string = "When did Apollo 11 land?" });
+    try inputs.put(arena, "max_iters", case.get("max_iters").?);
     const prediction = try agent.run(ctx, &inputs);
     try testing.expectEqual(calls.len, history.requests.items.len);
     for (calls, history.requests.items) |c, request| {
@@ -269,12 +272,13 @@ fn checkReact(comptime Agent: type, name: []const u8) !void {
 
 test "ReAct prompts structured history termination and outputs match DSPy" {
     try checkReact(dszig.ReAct(AgentQA, &.{ search_tool, add_tool }), "react_tools");
-    try checkReact(dszig.ReAct(AgentQA, &.{search_tool}), "react_max_iters");
+    try checkReact(dszig.ReActV2(AgentQA, &.{search_tool}), "react_max_iters");
     try checkReact(dszig.ReAct(AgentQA, &.{ search_tool, add_tool }), "react_batched");
     try checkReact(dszig.ReAct(AgentQA, &.{search_tool}), "react_empty_tool_calls");
     try checkReact(dszig.ReAct(AgentQA, &.{search_tool}), "react_parse_error");
     try checkReact(dszig.ReAct(AgentQA, &.{search_tool}), "react_unknown_tool");
     try checkReact(dszig.ReAct(AgentQA, &.{search_tool}), "react_zero_iters");
+    try checkReact(dszig.ReAct(AgentQA, &.{search_tool}), "react_negative_iters");
 }
 
 test "ReAct records invalid arguments as tool errors before forced typed submit" {
@@ -358,6 +362,40 @@ test "Ensemble reduces with majority and samples like random.sample" {
     const outputs = try sampled.forwardAll(ctx, .{ .question = "?" });
     try testing.expectEqualStrings("Rome", outputs[0].answer);
     try testing.expectEqualStrings("Berlin", outputs[1].answer);
+}
+
+test "Ensemble handles DSPy zero and invalid sizes and custom reduction order" {
+    const Reduce = struct {
+        fn join(ctx: dszig.Context, outputs: []const Echo.Output) ![]const u8 {
+            const answers = try ctx.arena.alloc([]const u8, outputs.len);
+            for (answers, outputs) |*answer, output| answer.* = output.answer;
+            return std.mem.join(ctx.arena, ",", answers);
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer memory.deinit();
+    var scripted: dszig.lm.ScriptedLM = .{ .responses = &.{} };
+    const ctx: dszig.Context = .{ .arena = memory.allocator(), .lm = scripted.lm() };
+    const input: Echo.Input = .{ .question = "?" };
+    var rng: dszig.pyrandom.Random = .init(42);
+    var program: dszig.EnsembleWithReducer(Echo, 4, Reduce.join) = .{ .ensemble = .{
+        .programs = .{ .{ .answer = "0" }, .{ .answer = "1" }, .{ .answer = "2" }, .{ .answer = "3" } },
+        .size = 0,
+        .rng = &rng,
+    } };
+    try testing.expectEqualStrings("0,1,2,3", try program.forward(ctx, input));
+    program.ensemble.size = 3;
+    // Actual DSPy 3.5.0 with random.seed(42), after the size=0 call.
+    try testing.expectEqualStrings("0,3,1", try program.forward(ctx, input));
+    for ([_]i128{ -1, 5 }) |size| {
+        program.ensemble.size = size;
+        try testing.expectError(error.InvalidSampleSize, program.forward(ctx, input));
+    }
+    program.ensemble.size = 1;
+    program.ensemble.rng = null;
+    try testing.expectError(error.MissingEnsembleRng, program.forward(ctx, input));
+    const empty: dszig.EnsembleWithReducer(Echo, 0, Reduce.join) = .{ .ensemble = .{ .programs = .{} } };
+    try testing.expectEqualStrings("", try empty.forward(ctx, input));
 }
 
 /// tools/dspy_reference/gen_simba.py's MockLM: answers depend on the rollout
@@ -783,7 +821,7 @@ const GepaMock = struct {
 fn gepaMetric(
     arena: Allocator,
     example: *const dszig.Example,
-    prediction: *const Record,
+    prediction: *const dszig.optimize.RecordPrediction,
     trace: ?*const dszig.Trace,
     pred_name: ?[]const u8,
     _: ?*const dszig.Trace.Step,

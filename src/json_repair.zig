@@ -57,6 +57,27 @@ pub fn parseJson(arena: Allocator, input: []const u8) Error!Value {
     return parser.wholeStrict();
 }
 
+/// Ordered lexical values from the same strict decoder. Object delimiters and
+/// duplicate keys survive, numeric spellings remain exact, and strings retain
+/// the decoder's existing lone-surrogate behavior.
+pub const Token = union(enum) {
+    object_begin,
+    object_end,
+    array_begin,
+    array_end,
+    scalar: Value,
+    number: []const u8,
+};
+
+pub fn parseJsonTokens(arena: Allocator, input: []const u8) Error![]const Token {
+    var parser: Parser = .{ .arena = arena, .text = try Text.init(arena, input) };
+    parser.strictWhitespace();
+    _ = try parser.strictValue(0, true);
+    parser.strictWhitespace();
+    if (parser.index != parser.text.len()) return error.ParseValue;
+    return parser.tokens.items;
+}
+
 /// json_repair.loads(input) with every option left at its default.
 pub fn loads(arena: Allocator, input: []const u8) Error!Value {
     var parser: Parser = .{ .arena = arena, .text = try Text.init(arena, input) };
@@ -338,9 +359,11 @@ const StringState = struct {
     pending_inline_container: bool = false,
     inline_stack: std.ArrayList(u21) = .empty,
     no_future_delimiter: bool = false,
+    comma_quote_tail: struct { index: isize = -1, is_member: bool = false } = .{},
     cache: std.ArrayList(CacheEntry) = .empty,
     unmatched_braces: usize = 0,
-    regex_class_start: ?usize = null,
+    // True after the latest `[` until a `]` or whitespace is appended.
+    compact_regex_class: bool = false,
 
     fn outer(self: *const StringState) u21 {
         return self.rstring;
@@ -355,31 +378,32 @@ const StringState = struct {
         return if (self.acc.items.len == 0) null else self.acc.items[self.acc.items.len - 1];
     }
     fn appendContent(self: *StringState, arena: Allocator, content: []const u21) Allocator.Error!void {
-        const start = self.acc.items.len;
         try self.acc.appendSlice(arena, content);
-        for (content, 0..) |c, offset| self.track(c, start + offset);
+        for (content) |c| self.track(c);
     }
-    fn track(self: *StringState, c: u21, position: usize) void {
+    fn track(self: *StringState, c: u21) void {
         switch (c) {
             '{' => self.unmatched_braces += 1,
             '}' => if (self.unmatched_braces != 0) {
                 self.unmatched_braces -= 1;
             },
-            '[' => self.regex_class_start = position + 1,
-            ']' => self.regex_class_start = null,
             else => {},
         }
+        switch (c) {
+            '[' => self.compact_regex_class = true,
+            ']' => self.compact_regex_class = false,
+            else => if (self.compact_regex_class and space(c)) {
+                self.compact_regex_class = false;
+            },
+        }
     }
-    fn rebuild(self: *StringState) void {
-        self.unmatched_braces = 0;
-        self.regex_class_start = null;
-        for (self.acc.items, 0..) |c, i| self.track(c, i);
-    }
-    /// Replace the trailing backslash with `content`, as acc[:-1] + content.
-    fn replaceLast(self: *StringState, arena: Allocator, content: []const u21) Allocator.Error!void {
-        self.acc.items.len -= 1;
-        try self.acc.appendSlice(arena, content);
-        self.rebuild();
+    /// Backslashes do not affect brace or regex-class tracking. Only the
+    /// decoded character needs to be tracked; the prefix has not changed.
+    fn replaceTrailingBackslash(self: *StringState, decoded: u21) void {
+        std.debug.assert(lastIs(self.acc.items, '\\'));
+        const position = self.acc.items.len - 1;
+        self.acc.items[position] = decoded;
+        self.track(decoded);
     }
 };
 
@@ -395,6 +419,7 @@ const Parser = struct {
     deferred_count: usize = 0,
     calls: usize = 0,
     tried_suffix: bool = false,
+    tokens: std.ArrayList(Token) = .empty,
 
     fn char(self: *const Parser, offset: isize) ?u21 {
         return self.text.at(self.index + offset);
@@ -482,69 +507,26 @@ const Parser = struct {
     fn wholeStrict(self: *Parser) Error!Value {
         self.index = 0;
         self.strictWhitespace();
-        const value = try self.strictValue(0);
+        const value = try self.strictValue(0, false);
         self.strictWhitespace();
         if (self.index != self.text.len()) return error.ParseValue;
         return value;
     }
-    fn strictValue(self: *Parser, depth: usize) Error!Value {
+    fn strictValue(self: *Parser, depth: usize, comptime tokens: bool) Error!Value {
         if (depth >= max_depth) return error.JsonTooDeep;
         const c = self.char(0) orelse return error.ParseValue;
         switch (c) {
-            '"' => return .{ .string = try self.strictString() },
-            '{' => {
-                self.index += 1;
-                var object: runtime.ObjectMap = .empty;
-                self.strictWhitespace();
-                if (self.char(0) == '}') {
-                    self.index += 1;
-                    return .{ .object = object };
-                }
-                while (true) {
-                    if (self.char(0) != '"') return error.ParseValue;
-                    const key = try self.strictString();
-                    self.strictWhitespace();
-                    if (self.char(0) != ':') return error.ParseValue;
-                    self.index += 1;
-                    self.strictWhitespace();
-                    const value = try self.strictValue(depth + 1);
-                    try object.put(self.arena, key, value);
-                    self.strictWhitespace();
-                    if (self.char(0) == '}') break;
-                    if (self.char(0) != ',') return error.ParseValue;
-                    self.index += 1;
-                    self.strictWhitespace();
-                }
-                self.index += 1;
-                return .{ .object = object };
-            },
-            '[' => {
-                self.index += 1;
-                var array: runtime.Array = .init(self.arena);
-                self.strictWhitespace();
-                if (self.char(0) == ']') {
-                    self.index += 1;
-                    return .{ .array = array };
-                }
-                while (true) {
-                    try array.append(try self.strictValue(depth + 1));
-                    self.strictWhitespace();
-                    if (self.char(0) == ']') break;
-                    if (self.char(0) != ',') return error.ParseValue;
-                    self.index += 1;
-                    self.strictWhitespace();
-                }
-                self.index += 1;
-                return .{ .array = array };
-            },
+            '"' => return self.strictScalar(tokens, .{ .string = try self.strictString() }),
+            '{' => return self.strictObject(depth, tokens),
+            '[' => return self.strictArray(depth, tokens),
             else => {},
         }
-        if (self.starts(0, "null")) return self.takeLiteral(4, .null);
-        if (self.starts(0, "true")) return self.takeLiteral(4, .{ .bool = true });
-        if (self.starts(0, "false")) return self.takeLiteral(5, .{ .bool = false });
-        if (self.starts(0, "NaN")) return self.takeLiteral(3, .{ .float = std.math.nan(f64) });
-        if (self.starts(0, "Infinity")) return self.takeLiteral(8, .{ .float = std.math.inf(f64) });
-        if (self.starts(0, "-Infinity")) return self.takeLiteral(9, .{ .float = -std.math.inf(f64) });
+        if (self.starts(0, "null")) return self.strictScalar(tokens, self.takeLiteral(4, .null));
+        if (self.starts(0, "true")) return self.strictScalar(tokens, self.takeLiteral(4, .{ .bool = true }));
+        if (self.starts(0, "false")) return self.strictScalar(tokens, self.takeLiteral(5, .{ .bool = false }));
+        if (self.starts(0, "NaN")) return self.strictScalar(tokens, self.takeLiteral(3, .{ .float = std.math.nan(f64) }));
+        if (self.starts(0, "Infinity")) return self.strictScalar(tokens, self.takeLiteral(8, .{ .float = std.math.inf(f64) }));
+        if (self.starts(0, "-Infinity")) return self.strictScalar(tokens, self.takeLiteral(9, .{ .float = -std.math.inf(f64) }));
         // NUMBER_RE: (-?(?:0|[1-9]\d*))(\.\d+)?([eE][-+]?\d+)?
         const start = self.index;
         if (self.char(0) == '-') self.index += 1;
@@ -568,8 +550,66 @@ const Parser = struct {
             }
         }
         const number = try self.text.string(self.arena, start, self.index);
+        if (tokens) {
+            try self.tokens.append(self.arena, .{ .number = number });
+            return .null;
+        }
         if (floating) return .{ .float = std.fmt.parseFloat(f64, number) catch unreachable };
         return integer(self.arena, number);
+    }
+
+    fn strictScalar(self: *Parser, comptime tokens: bool, value: Value) Allocator.Error!Value {
+        if (tokens) try self.tokens.append(self.arena, .{ .scalar = value });
+        return value;
+    }
+
+    fn strictObject(self: *Parser, depth: usize, comptime tokens: bool) Error!Value {
+        self.index += 1;
+        var object: runtime.ObjectMap = .empty;
+        if (tokens) try self.tokens.append(self.arena, .object_begin);
+        self.strictWhitespace();
+        if (self.char(0) != '}') {
+            while (true) {
+                if (self.char(0) != '"') return error.ParseValue;
+                const key = try self.strictString();
+                if (tokens) try self.tokens.append(self.arena, .{ .scalar = .{ .string = key } });
+                self.strictWhitespace();
+                if (self.char(0) != ':') return error.ParseValue;
+                self.index += 1;
+                self.strictWhitespace();
+                const value = try self.strictValue(depth + 1, tokens);
+                if (!tokens) try object.put(self.arena, key, value);
+                self.strictWhitespace();
+                if (self.char(0) == '}') break;
+                if (self.char(0) != ',') return error.ParseValue;
+                self.index += 1;
+                self.strictWhitespace();
+            }
+        }
+        self.index += 1;
+        if (tokens) try self.tokens.append(self.arena, .object_end);
+        return .{ .object = object };
+    }
+
+    fn strictArray(self: *Parser, depth: usize, comptime tokens: bool) Error!Value {
+        self.index += 1;
+        var array: runtime.Array = .init(self.arena);
+        if (tokens) try self.tokens.append(self.arena, .array_begin);
+        self.strictWhitespace();
+        if (self.char(0) != ']') {
+            while (true) {
+                const value = try self.strictValue(depth + 1, tokens);
+                if (!tokens) try array.append(value);
+                self.strictWhitespace();
+                if (self.char(0) == ']') break;
+                if (self.char(0) != ',') return error.ParseValue;
+                self.index += 1;
+                self.strictWhitespace();
+            }
+        }
+        self.index += 1;
+        if (tokens) try self.tokens.append(self.arena, .array_end);
+        return .{ .array = array };
     }
     fn takeLiteral(self: *Parser, size: isize, value: Value) Value {
         self.index += size;
@@ -636,7 +676,7 @@ const Parser = struct {
     }
     /// JSONDecoder().raw_decode at the current index (no leading whitespace).
     fn rawDecode(self: *Parser) Error!Value {
-        return self.strictValue(0);
+        return self.strictValue(0, false);
     }
 
     // ---- json_parser.py ----
@@ -962,7 +1002,11 @@ const Parser = struct {
         const text = number.items;
         if (std.mem.indexOfScalar(u8, text, ',') != null) return .{ .string = text };
         if (std.mem.indexOfAny(u8, text, ".eE") != null) {
-            return if (try pythonFloat(self.arena, text)) |f| .{ .float = f } else .{ .string = text };
+            const parsed_number = @import("value.zig").floatFromString(self.arena, text) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.InvalidNumber => .{ .string = text },
+            };
+            return .{ .float = parsed_number };
         }
         const digits_start: usize = @intFromBool(text.len != 0 and text[0] == '-');
         if (digits_start == text.len) return .{ .string = text };
@@ -1366,7 +1410,7 @@ const Parser = struct {
     fn normalizeEscape(self: *Parser, state: *StringState, c: u21) Error!struct { bool, ?u21 } {
         const active = state.active();
         if (state.inLow() and c == '"') {
-            try state.replaceLast(self.arena, &.{c});
+            state.replaceTrailingBackslash(c);
             state.low_spans -= 1;
             self.index += 1;
             return .{ true, self.char(0) };
@@ -1377,9 +1421,10 @@ const Parser = struct {
             while (run_end < self.text.len() and self.text.at(run_end).? == '\\') run_end += 1;
             const run_length: usize = @intCast(run_end - run_start);
             if (run_length % 2 == 0 and self.char(run_end - self.index) != active) {
-                state.acc.items.len -= 1;
-                try state.acc.appendNTimes(self.arena, '\\', run_length / 2);
-                state.rebuild();
+                // Keep the already-buffered backslash. Adding more does not
+                // affect brace or regex-class tracking.
+                std.debug.assert(lastIs(state.acc.items, '\\'));
+                try state.acc.appendNTimes(self.arena, '\\', run_length / 2 - 1);
                 self.index = run_end;
                 return .{ true, self.char(0) };
             }
@@ -1392,11 +1437,11 @@ const Parser = struct {
                 'b' => 8,
                 else => c,
             };
-            try state.replaceLast(self.arena, &.{decoded});
+            state.replaceTrailingBackslash(decoded);
             self.index += 1;
             var next = self.char(0);
             while (next != null and lastIs(state.acc.items, '\\') and oneOf(next, &.{ active, '\\' })) {
-                try state.replaceLast(self.arena, &.{next.?});
+                state.replaceTrailingBackslash(next.?);
                 self.index += 1;
                 next = self.char(0);
             }
@@ -1410,12 +1455,12 @@ const Parser = struct {
                 const h = hex(self.char(k)) orelse return .{ false, c };
                 cp = cp * 16 + h;
             }
-            try state.replaceLast(self.arena, &.{cp});
+            state.replaceTrailingBackslash(cp);
             self.index += 1 + count;
             return .{ true, self.char(0) };
         }
         if (c == 0x201e or (quote(c) and c != active)) {
-            try state.replaceLast(self.arena, &.{c});
+            state.replaceTrailingBackslash(c);
             self.index += 1;
             return .{ true, self.char(0) };
         }
@@ -1527,7 +1572,11 @@ const Parser = struct {
         }
         unreachable;
     }
-    fn braceBeforeFenceBelongsToString(self: *Parser, state: *StringState, fence: isize) Error!bool {
+    const FenceQuoteLookahead = struct {
+        start: isize = -1,
+        end: isize = -1,
+    };
+    fn braceBeforeFenceBelongsToString(self: *Parser, state: *StringState, fence: isize, lookahead: *FenceQuoteLookahead) Error!bool {
         var quote_search = fence + 3;
         const next_content = self.scrollCommentPrefixedMemberStart(quote_search);
         var keep_container = false;
@@ -1538,17 +1587,24 @@ const Parser = struct {
                 quote_search = container_end;
             }
         }
-        const outer = state.outer();
-        var quote_index = self.skip1(outer, quote_search);
-        while (self.char(quote_index) == outer) {
-            const after = self.char(self.scroll(quote_index + 1));
-            if (after == null or oneOf(after, &.{ ',', '}', ']' })) {
-                if (keep_container) state.pending_inline_container = true;
-                return true;
+        // Each search starts after a backtick or a container closer, so it
+        // cannot split a backslash run. Reuse the first qualifying quote (or
+        // EOF) within the searched interval. A later fence can start before
+        // that interval if the previous fence skipped a container.
+        const start = self.index + quote_search;
+        if (start < lookahead.start or start > lookahead.end) {
+            const outer = state.outer();
+            var offset = self.skip1(outer, quote_search);
+            while (self.char(offset) == outer) {
+                const after = self.char(self.scroll(offset + 1));
+                if (after == null or oneOf(after, &.{ ',', '}', ']' })) break;
+                offset = self.skip1(outer, offset + 1);
             }
-            quote_index = self.skip1(outer, quote_index + 1);
+            lookahead.* = .{ .start = start, .end = self.index + offset };
         }
-        return false;
+        if (lookahead.end == self.text.len()) return false;
+        if (keep_container) state.pending_inline_container = true;
+        return true;
     }
     fn bareMemberHasRecoverableValue(self: *Parser, state: *StringState, value_offset: isize) Error!bool {
         const start = self.scroll(value_offset);
@@ -1565,15 +1621,25 @@ const Parser = struct {
         return self.char(end) == '}';
     }
     const Comma = enum { container, member, string, string_no_future_delimiter };
+    fn classifyCommaQuoteTail(self: *const Parser, state: *StringState, end_quote: isize) Comma {
+        if (self.char(end_quote) == null) return .string;
+        // Many embedded commas can look ahead to the same quote. The
+        // whitespace and colon check after it depend only on its position.
+        const index = self.index + end_quote;
+        if (state.comma_quote_tail.index != index) {
+            state.comma_quote_tail = .{
+                .index = index,
+                .is_member = self.char(self.scroll(end_quote + 1)) == ':',
+            };
+        }
+        return if (state.comma_quote_tail.is_member) .member else .string;
+    }
     fn classifyObjectValueComma(self: *Parser, state: *StringState) Error!Comma {
         const next_index = self.scroll(1);
         const next = self.char(next_index) orelse return .member;
         if (next == '}') return .member;
         if (quote(next)) {
-            var key_end = self.skip1(next, next_index + 1);
-            if (self.char(key_end) == null) return .string;
-            key_end = self.scroll(key_end + 1);
-            return if (self.char(key_end) == ':') .member else .string;
+            return self.classifyCommaQuoteTail(state, self.skip1(next, next_index + 1));
         }
         if (next == '`') {
             var i = next_index + 1;
@@ -1590,15 +1656,7 @@ const Parser = struct {
         const special_index = try self.cachedSkip(state, &.{ '"', '\'', 0x201c, 0x201d, '{', '[' }, next_index);
         const special = self.char(special_index) orelse return .string_no_future_delimiter;
         if (special == '{' or special == '[') return .string;
-        var key_end = try self.cachedSkip(state, &.{special}, special_index + 1);
-        if (self.char(key_end) == null) return .string;
-        key_end = self.scroll(key_end + 1);
-        return if (self.char(key_end) == ':') .member else .string;
-    }
-    fn quoteBelongsToRegexClass(self: *const Parser, state: *const StringState) bool {
-        const start = state.regex_class_start orelse return false;
-        for (state.acc.items[@min(start, state.acc.items.len)..]) |c| if (space(c)) return false;
-        return self.char(self.skip1(']', 1)) == ']';
+        return self.classifyCommaQuoteTail(state, try self.cachedSkip(state, &.{special}, special_index + 1));
     }
     const Delimiter = struct { handled: bool, char: ?u21, stop: bool };
     fn handleRightDelimiter(self: *Parser, state: *StringState, c: u21) Error!Delimiter {
@@ -1689,8 +1747,25 @@ const Parser = struct {
         }
         return .{ .handled = false, .char = c, .stop = false };
     }
+    fn braceMayEndValueBeforeQuote(self: *const Parser, opening_quote: u21, closing_offset: isize) bool {
+        const start = self.scroll(closing_offset + 1);
+        const next = self.char(start);
+        if (next == null or oneOf(next, &.{ ',', '}' })) return false;
+        const opening_offset = self.skip1(opening_quote, start);
+        if (self.char(opening_offset) == null) return false;
+        const after = self.char(self.scroll(opening_offset + 1));
+        return after == null or after == ':';
+    }
     fn scanStringBody(self: *Parser, state: *StringState) Error!?u21 {
         const outer = state.outer();
+        var no_future_colon = false;
+        var next_closing_brace: isize = -1;
+        var next_array_string_quote: isize = -1;
+        var next_regex_class_close: isize = -1;
+        var key_opening_quote: isize = -1;
+        var key_closing_quote: struct { index: isize = -1, ends_key: bool = false } = .{};
+        var quote_tail: struct { index: isize = -1, may_end_value: bool = false } = .{};
+        var fence_quotes: FenceQuoteLookahead = .{};
         var c = self.char(0);
         while (c != null and (c.? != outer or state.inLow())) {
             const ch = c.?;
@@ -1744,39 +1819,50 @@ const Parser = struct {
                 var missing = true;
                 self.skipWhitespace();
                 if (self.char(1) == '\\') missing = false;
-                var i = try self.cachedSkip(state, &.{outer}, 1);
-                if (self.char(i) != null) {
-                    i = self.scroll(i + 1);
-                    const next = self.char(i);
-                    if (next == null or oneOf(next, &.{ ',', '}' })) {
-                        missing = false;
-                    } else {
-                        i = self.skip1(state.lstring, i);
-                        if (self.char(i) == null) {
-                            missing = false;
-                        } else {
-                            i = self.scroll(i + 1);
-                            const after = self.char(i);
-                            if (after != null and after.? != ':') missing = false;
-                        }
+                const quote_offset = try self.cachedSkip(state, &.{outer}, 1);
+                if (self.char(quote_offset) != null) {
+                    // Braces that see the same quote also see the same tail.
+                    // Cache its classification, not the cursor-dependent check above.
+                    const quote_index = self.index + quote_offset;
+                    if (quote_tail.index != quote_index) {
+                        quote_tail = .{
+                            .index = quote_index,
+                            .may_end_value = self.braceMayEndValueBeforeQuote(state.lstring, quote_offset),
+                        };
                     }
+                    missing = missing and quote_tail.may_end_value;
                 } else {
-                    i = self.skip1(':', 1);
-                    if (self.char(i) != null) break;
-                    i = self.scroll(1);
-                    const j = self.skip1('}', i);
-                    if (j - i > 1) missing = false;
+                    // The search starts after `}` (or subsequent whitespace),
+                    // never inside a backslash run. As the cursor advances,
+                    // a colon miss stays valid and the next brace stays valid
+                    // until the search start passes it.
+                    if (!no_future_colon) {
+                        if (self.char(self.skip1(':', 1)) != null) break;
+                        no_future_colon = true;
+                    }
+                    const i = self.scroll(1);
+                    const start = self.index + i;
+                    if (start > next_closing_brace) {
+                        next_closing_brace = self.index + self.skip1('}', i);
+                    }
+                    if (next_closing_brace - start > 1) missing = false;
                 }
                 if (missing) break;
             }
             if (ch == ']' and self.contains(.array) and !lastIs(state.acc.items, outer)) {
-                if (self.char(self.skip1(outer, 0)) == null) break;
+                // A search starting at `]` never starts inside a backslash
+                // run, so later brackets before this quote see the same match.
+                if (self.index > next_array_string_quote) {
+                    const offset = self.skip1(outer, 0);
+                    if (self.char(offset) == null) break;
+                    next_array_string_quote = self.index + offset;
+                }
             }
             if (cur == .value and ch == '}') {
                 const i = self.scroll(1);
                 const next = self.char(i);
                 if (next == '`' and self.char(i + 1) == '`' and self.char(i + 2) == '`') {
-                    if (try self.braceBeforeFenceBelongsToString(state, i)) {
+                    if (try self.braceBeforeFenceBelongsToString(state, i, &fence_quotes)) {
                         c = try self.appendLiteral(state, ch);
                         continue;
                     }
@@ -1795,23 +1881,37 @@ const Parser = struct {
                 if (c == null) break;
             }
             if (c.? == ':' and !state.missing_quotes and self.current() == .key) {
-                var i = self.skip1(state.lstring, 1);
-                if (self.char(i) != null) {
-                    i = self.skip1(outer, i + 1);
-                    if (self.char(i) != null) {
-                        i = self.scroll(i + 1);
-                        if (oneOf(self.char(i), &.{ ',', '}' })) break;
-                    }
-                } else break;
+                // Both searches start outside a backslash run. Several opening
+                // smart quotes can share one closing quote (or the same EOF).
+                if (self.index >= key_opening_quote) {
+                    key_opening_quote = self.index + self.skip1(state.lstring, 1);
+                }
+                if (key_opening_quote == self.text.len()) break;
+                if (key_opening_quote >= key_closing_quote.index) {
+                    const second = self.skip1(outer, key_opening_quote - self.index + 1);
+                    key_closing_quote = .{
+                        .index = self.index + second,
+                        .ends_key = self.char(second) != null and
+                            oneOf(self.char(self.scroll(second + 1)), &.{ ',', '}' }),
+                    };
+                }
+                if (key_closing_quote.ends_key) break;
             }
             if (state.inLow() and c.? == '"') {
                 state.low_spans -= 1;
                 c = try self.appendLiteral(state, c.?);
                 continue;
             }
-            if (c.? == outer and self.current() == .value and self.quoteBelongsToRegexClass(state)) {
-                c = try self.appendLiteral(state, c.?);
-                continue;
+            if (c.? == outer and self.current() == .value and state.compact_regex_class) {
+                // Each search starts after a quote, outside any backslash run.
+                // Reuse the same unescaped bracket (or EOF) until we pass it.
+                if (self.index >= next_regex_class_close) {
+                    next_regex_class_close = self.index + self.skip1(']', 1);
+                }
+                if (next_regex_class_close < self.text.len()) {
+                    c = try self.appendLiteral(state, c.?);
+                    continue;
+                }
             }
             if (c.? == outer and state.acc.items.len != 0 and !lastIs(state.acc.items, '\\')) {
                 const result = try self.handleRightDelimiter(state, c.?);
@@ -1946,43 +2046,6 @@ fn stripComments(arena: Allocator, body: []const u21) Allocator.Error![]const u2
         i += 1;
     }
     return out.items;
-}
-/// Python float() for parse_number text (digits, '-', '+', '.', 'e', 'E',
-/// '/'): [+-](digits[.digits*]|.digits)[eE[+-]digits], else null. The text is
-/// validated first and rewritten with explicit zero digits around the point,
-/// so Zig's correctly rounded parser sees only one canonical syntax.
-fn pythonFloat(arena: Allocator, text: []const u8) Allocator.Error!?f64 {
-    var i: usize = 0;
-    if (i < text.len and (text[i] == '-' or text[i] == '+')) i += 1;
-    const integer_start = i;
-    while (i < text.len and std.ascii.isDigit(text[i])) i += 1;
-    const integer_end = i;
-    var fraction_start = i;
-    var fraction_end = i;
-    if (i < text.len and text[i] == '.') {
-        i += 1;
-        fraction_start = i;
-        while (i < text.len and std.ascii.isDigit(text[i])) i += 1;
-        fraction_end = i;
-    }
-    if (integer_end == integer_start and fraction_end == fraction_start) return null;
-    const exponent_start = i;
-    if (i < text.len and (text[i] == 'e' or text[i] == 'E')) {
-        i += 1;
-        if (i < text.len and (text[i] == '+' or text[i] == '-')) i += 1;
-        const digits_start = i;
-        while (i < text.len and std.ascii.isDigit(text[i])) i += 1;
-        if (i == digits_start) return null;
-    }
-    if (i != text.len) return null;
-    var canonical: std.ArrayList(u8) = .empty;
-    try canonical.ensureTotalCapacity(arena, text.len + 3);
-    canonical.appendSliceAssumeCapacity(text[0..integer_start]);
-    if (integer_end == integer_start) canonical.appendAssumeCapacity('0') else canonical.appendSliceAssumeCapacity(text[integer_start..integer_end]);
-    canonical.appendAssumeCapacity('.');
-    if (fraction_end == fraction_start) canonical.appendAssumeCapacity('0') else canonical.appendSliceAssumeCapacity(text[fraction_start..fraction_end]);
-    canonical.appendSliceAssumeCapacity(text[exponent_start..]);
-    return std.fmt.parseFloat(f64, canonical.items) catch unreachable;
 }
 
 // Generated by tool_argument_repair_oracle.py --zig-unicode-tables from CPython 3.11.17 (Unicode 14.0.0).

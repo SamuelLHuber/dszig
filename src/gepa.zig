@@ -1,19 +1,21 @@
-//! `dspy.GEPA` (DSPy 3.4.1 on gepa 0.1.4): reflective prompt evolution.
-//! Each iteration picks a parent from the per-example Pareto front, runs it
+//! `dspy.GEPA` (DSPy 3.5.0 on gepa 0.1.4): reflective prompt evolution.
+//! Each iteration picks a parent with the configured selector, runs it
 //! on a minibatch with traces, asks a reflection LM (`ProposeInstruction`,
 //! JSONAdapter) for a better instruction from the metric's textual
-//! feedback, and keeps the child when its minibatch score sum strictly
-//! improves; kept children are scored on the full valset. Merge combines two
+//! feedback, and applies the configured acceptance criterion to the minibatch
+//! scores. Accepted children are scored on the full valset. Merge combines two
 //! Pareto programs that improved different predictors of a common ancestor.
 //! Python's `random.Random(seed)` is ported (one stream for the engine, one
 //! for the DSPy adapter), so the same LM answers give the same program.
 //!
-//! Not supported: custom proposers, `dspy.Flex` code components, frontier
-//! types other than `"instance"`, `"epsilon_greedy"`/`"top_k_pareto"`,
-//! `add_format_failure_as_feedback`, `log_dir`. DSPy `num_threads` maps to
+//! `GEPA.batch_reflection` exposes the underlying gepa 0.1.4 batch extension.
+//! DSPy's own DspyAdapter supplies `propose_new_texts` and bypasses that hook;
+//! an ordinary DSPy GEPA run does not imply provider-batched reflection.
+//! Not supported: `dspy.Flex` code components.
+//! DSPy `num_threads` maps to
 //! `rollouts`: each minibatch/valset evaluation then runs on a native pool,
-//! results in example order. CPython iterates small-int sets in ascending
-//! order; DSZig assumes it always does.
+//! results in example order. Sparse merge subsamples use CPython's integer
+//! set intersection order, which is not necessarily ascending.
 //!
 //! Upstream (DSPy 3.5.0): dspy/teleprompt/gepa/gepa.py
 
@@ -25,26 +27,92 @@ const Writer = std.Io.Writer;
 const optimize = @import("optimize.zig");
 const parallel = @import("parallel.zig");
 const predict = @import("predict.zig");
+const python_value = @import("python_value.zig");
 const pyjson = @import("pyjson.zig");
 const pyrandom = @import("pyrandom.zig");
+const Code = @import("code.zig").Code;
+const BoundingBox = @import("bounding_box.zig").BoundingBox;
+const Citations = @import("citation.zig").Citations;
+const Citation = Citations.Citation;
+const Noul = @import("decision.zig").Noul;
+const Score = @import("decision.zig").Score;
+const Choice = @import("decision.zig").Choice;
 const signature = @import("signature.zig");
 const value = @import("value.zig");
 
 const Context = predict.Context;
+const Adapter = @import("adapter.zig").Adapter;
 const Example = optimize.Example;
 const Record = value.Record;
 const Trace = predict.Trace;
-const Value = @import("runtime_value.zig").Value;
+const runtime = @import("runtime_value.zig");
+const Value = runtime.Value;
+const Graph = @import("json_graph.zig");
+const history_mod = @import("history.zig");
+const History = history_mod.History;
 
-/// What a GEPA metric returns: DSPy's float or `dspy.Prediction(score, feedback)`.
-pub const Feedback = struct { score: f64, feedback: ?[]const u8 = null };
+pub const ObjectiveScore = struct { name: []const u8, score: f64 };
+pub const ObjectiveLeaders = struct { name: []const u8, candidates: []const usize };
 
-/// `metric(gold, pred, trace, pred_name, pred_trace)`. `pred_name` and
-/// `pred_step` are set only when GEPA asks for feedback on one predictor.
+fn writeHtmlText(writer: *Writer, text: []const u8) Writer.Error!void {
+    var start: usize = 0;
+    for (text, 0..) |byte, i| {
+        const entity = switch (byte) {
+            '&' => "&amp;",
+            '<' => "&lt;",
+            '>' => "&gt;",
+            else => continue,
+        };
+        try writer.writeAll(text[start..i]);
+        try writer.writeAll(entity);
+        start = i + 1;
+    }
+    try writer.writeAll(text[start..]);
+}
+
+fn reduceFronts(programs: []usize, scores: []const f64, fronts: []const []const usize, retained: []bool) void {
+    std.sort.insertion(usize, programs, scores, struct {
+        fn less(s: []const f64, a: usize, b: usize) bool {
+            return s[a] < s[b];
+        }
+    }.less);
+    // Removing candidates never makes a previously indispensable candidate
+    // removable. A single ascending pass is equivalent to restarting.
+    for (programs) |index| {
+        for (fronts) |front| {
+            if (std.mem.indexOfScalar(usize, front, index) == null) continue;
+            for (front) |other| {
+                if (index != other and retained[other]) break;
+            } else break;
+        } else retained[index] = false;
+    }
+}
+
+test "GEPA lineage removes covered candidates but keeps a sole remaining row leader" {
+    var order = [_]usize{ 0, 1, 2, 3 };
+    var retained = [_]bool{ true, true, true, true };
+    const scores = [_]f64{ 0.1, 0.2, 0.3, 0.4 };
+    const fronts = [_][]const usize{ &.{ 0, 1 }, &.{ 1, 2 }, &.{ 2, 3 } };
+    reduceFronts(&order, &scores, &fronts, &retained);
+    try std.testing.expectEqualSlices(bool, &.{ false, true, false, true }, &retained);
+}
+
+/// What a GEPA metric returns: DSPy's score, feedback and named objectives.
+pub const Feedback = struct {
+    score: f64,
+    feedback: ?[]const u8 = null,
+    /// Unique names in metric order. Return static or metric-arena storage.
+    objective_scores: []const ObjectiveScore = &.{},
+};
+
+/// `metric(gold, pred, trace, pred_name, pred_trace)`. The final three
+/// arguments are set only when GEPA asks for feedback on one predictor.
+/// `prediction` is the program's retained Prediction, with the usage of its
+/// invocation; a failed evaluation row passes an empty one, as Source does.
 pub const FeedbackMetric = *const fn (
     arena: Allocator,
     example: *const Example,
-    prediction: *const Record,
+    prediction: *const optimize.RecordPrediction,
     trace: ?*const Trace,
     pred_name: ?[]const u8,
     pred_step: ?*const Trace.Step,
@@ -61,40 +129,864 @@ pub const ProposeInstruction = signature.Signature(struct {
     };
 });
 
+const CompressInstruction = signature.Signature(struct {
+    pub const instructions =
+        \\Shorten the instruction to fit within the stated limit. Preserve every
+        \\strategy, rule, and constraint; cut redundancy and verbosity. Do not add
+        \\new content. Output only the shortened instruction.
+    ;
+    pub const Input = struct { instruction: []const u8, length_limit: []const u8 };
+    pub const Output = struct { shortened_instruction: []const u8 };
+    pub const descriptions = .{ .instruction = "", .length_limit = "", .shortened_instruction = "" };
+});
+
+const ProposalControls = signature.Signature(struct {
+    pub const Input = struct {
+        reference_skills: []const u8,
+        additional_instructions: []const u8,
+        length_limit: []const u8,
+    };
+    pub const Output = struct { unused: []const u8 };
+    pub const descriptions = .{
+        .reference_skills = "Trusted reference material chosen by the user. Draw on it when writing the new instruction.",
+        .additional_instructions = "Additional requirements from the user for the new instruction. Follow them.",
+        .length_limit = "Hard limit on the length of the new instruction.",
+    };
+});
+
+/// Loaded reference material. Applications resolve files and metadata at startup.
+pub const ReflectionSkill = struct {
+    name: []const u8,
+    content: []const u8,
+    description: []const u8 = "",
+};
+
+/// Options for the built-in reflection LM proposer. The caller owns the strings.
+pub const ConfiguredInstructionProposer = struct {
+    base_instructions: []const u8 = "",
+    additional_instructions: []const u8 = "",
+    skills: []const ReflectionSkill = &.{},
+    max_chars: ?u32 = null,
+    /// Compact tool and REPL observations in typed History fields.
+    truncate_history_outputs: bool = false,
+    adapter: @import("adapter.zig").Adapter = .json,
+
+    /// Prepare a typed History for insertion into a standalone proposal record.
+    /// Unchanged fields borrow from `history`; the input itself is never mutated.
+    pub fn prepareHistory(
+        options: ConfiguredInstructionProposer,
+        arena: Allocator,
+        history: History,
+    ) value.ParseError!Value {
+        if (!options.truncate_history_outputs) return history.toValue(arena);
+        var messages: ?[]Record = null;
+        for (history.messages, 0..) |message, index| {
+            var copied = false;
+            for (message.keys(), message.values()) |name, item| {
+                const compacted = try compactHistoryItem(arena, name, item) orelse continue;
+                if (messages == null) messages = try arena.dupe(Record, history.messages);
+                const output = &messages.?[index];
+                if (!copied) output.* = try message.clone(arena);
+                copied = true;
+                try output.put(arena, name, compacted);
+            }
+        }
+        return (History{ .messages = messages orelse history.messages }).toValue(arena);
+    }
+
+    pub fn propose(
+        options: ConfiguredInstructionProposer,
+        context: Context,
+        current_instruction: []const u8,
+        examples: []const Record,
+    ) (predict.Error || error{ InvalidInstructionLimit, InvalidInstruction, InvalidReflectionSkill })![]const u8 {
+        const max_chars = options.max_chars;
+        if (max_chars == 0) return error.InvalidInstructionLimit;
+        var ctx = context;
+        ctx.adapter = options.adapter;
+        ctx.trace = null;
+        const length_limit = if (max_chars) |max|
+            try std.fmt.allocPrint(ctx.arena, "The new instruction must be at most {d} characters.", .{max})
+        else
+            "";
+        const draft = try options.generateDraft(ctx, current_instruction, examples, length_limit);
+        if (draft.len == 0) return error.InvalidInstruction;
+        const max = max_chars orelse return draft;
+        if (try fitsInstruction(draft, max)) return draft;
+        const compressor: predict.Predict(CompressInstruction) = .{};
+        const output = try compressor.forward(ctx, .{ .instruction = draft, .length_limit = length_limit });
+        const shortened = value.pyStrip(output.shortened_instruction);
+        if (shortened.len == 0 or !(try fitsInstruction(shortened, max)))
+            return error.InvalidInstruction;
+        return shortened;
+    }
+
+    fn fitsInstruction(text: []const u8, max: u32) error{InvalidInstruction}!bool {
+        const count = std.unicode.utf8CountCodepoints(text) catch return error.InvalidInstruction;
+        return count <= max;
+    }
+
+    fn renderSkills(
+        skills: []const ReflectionSkill,
+        arena: Allocator,
+    ) (Allocator.Error || error{InvalidReflectionSkill})![]const u8 {
+        if (skills.len == 0) return "";
+        if (skills.len > 64) return error.InvalidReflectionSkill;
+        var bytes_left: usize = 256 * 1024;
+        var output: std.Io.Writer.Allocating = .init(arena);
+        defer output.deinit();
+        for (skills, 0..) |skill, index| {
+            for ([_][]const u8{ skill.name, skill.description, skill.content }) |text| {
+                if (text.len > bytes_left) return error.InvalidReflectionSkill;
+                bytes_left -= text.len;
+                if (!std.unicode.utf8ValidateSlice(text)) return error.InvalidReflectionSkill;
+            }
+            const content = value.pyStrip(skill.content);
+            if (skill.name.len == 0 or content.len == 0) return error.InvalidReflectionSkill;
+            writeSkill(&output.writer, skill, content, index != 0) catch return error.OutOfMemory;
+        }
+        return output.toOwnedSlice();
+    }
+
+    fn writeSkill(
+        writer: *std.Io.Writer,
+        skill: ReflectionSkill,
+        content: []const u8,
+        separator: bool,
+    ) std.Io.Writer.Error!void {
+        const repr = @import("pyjson.zig").writeReprString;
+        if (separator) try writer.writeAll("\n\n");
+        try writer.writeAll("<skill name=");
+        try repr(writer, skill.name);
+        if (skill.description.len > 0) {
+            try writer.writeAll(" description=");
+            try repr(writer, skill.description);
+        }
+        try writer.writeAll(">\n");
+        try writer.writeAll(content);
+        try writer.writeAll("\n</skill>");
+    }
+
+    fn generateDraft(
+        options: ConfiguredInstructionProposer,
+        ctx: Context,
+        current_instruction: []const u8,
+        examples: []const Record,
+        length_limit: []const u8,
+    ) (predict.Error || error{InvalidReflectionSkill})![]const u8 {
+        const controls_count = ProposalControls.fields.len - 1;
+        const capacity = controls_count + ProposeInstruction.fields.len;
+        var fields: [capacity]signature.Field = undefined;
+        var field_count: usize = 0;
+        var inputs: Record = .empty;
+        const skills = try renderSkills(options.skills, ctx.arena);
+        const additional = value.pyStrip(options.additional_instructions);
+        const controls = [controls_count][]const u8{ skills, additional, length_limit };
+        for (ProposalControls.fields[0..controls_count], controls) |field, text| {
+            if (text.len == 0) continue;
+            fields[field_count] = field;
+            field_count += 1;
+            try inputs.put(ctx.arena, field.name, .{ .string = text });
+        }
+        @memcpy(fields[field_count..][0..ProposeInstruction.fields.len], ProposeInstruction.fields);
+        field_count += ProposeInstruction.fields.len;
+        var descs: [capacity][]const u8 = undefined;
+        var prefixes: [capacity][]const u8 = undefined;
+        for (fields[0..field_count], descs[0..field_count], prefixes[0..field_count]) |field, *desc, *prefix| {
+            desc.* = field.desc;
+            prefix.* = field.prefix;
+        }
+        const rows = try ctx.arena.alloc(Value, examples.len);
+        for (examples, rows) |example, *row| row.* = .{ .object = example };
+        try inputs.put(ctx.arena, "current_instruction", .{ .string = current_instruction });
+        try inputs.put(ctx.arena, "examples_with_feedback", .{ .array = .fromOwnedSlice(ctx.arena, rows) });
+        const proposer: predict.Predict(ProposeInstruction) = .{};
+        var state = proposer.state;
+        state.fields = fields[0..field_count];
+        state.descs = descs[0..field_count];
+        state.prefixes = prefixes[0..field_count];
+        state.input_count = field_count - 1;
+        const base = value.pyStrip(options.base_instructions);
+        if (base.len > 0) state.instructions = base;
+        const output = try state.call(ctx, &inputs);
+        const text = output.get("new_instruction") orelse return error.AdapterParse;
+        if (text != .string) return error.AdapterParse;
+        return value.pyStrip(text.string);
+    }
+};
+
+test "blank reflection skills are refused before a model request" {
+    var model: @import("lm.zig").ScriptedLM = .{
+        .responses = &.{"{\"new_instruction\":\"should not be requested\"}"},
+    };
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const options: ConfiguredInstructionProposer = .{
+        .skills = &.{.{ .name = "Blank", .content = "\u{2003}\n" }},
+    };
+    try std.testing.expectError(error.InvalidReflectionSkill, options.propose(
+        .{ .arena = arena_state.allocator(), .lm = model.lm() },
+        "Original.",
+        &.{},
+    ));
+    try std.testing.expectEqual(@as(usize, 0), model.index);
+}
+
 pub const GEPA = struct {
     metric: FeedbackMetric,
+    instruction_proposer: ?InstructionProposer = null,
+    /// Optional native GEPA reflection backend. Ignored when `instruction_proposer` is set.
+    batch_reflection: ?BatchReflection = null,
+    /// Used by built-in reflection, including fallback from `batch_reflection`.
+    proposal_options: ConfiguredInstructionProposer = .{},
     auto: ?Auto = null,
     max_full_evals: ?usize = null,
     max_metric_calls: ?usize = null,
-    reflection_minibatch_size: usize = 3,
+    /// Checked in caller order after seed evaluation and between iterations.
+    stop_callbacks: []const StopCallback = &.{},
+    /// Null and zero use three with the built-in sampler. Leave null with `batch_sampler`.
+    reflection_minibatch_size: ?usize = null,
+    batch_sampler: ?BatchSampler = null,
+    val_evaluation_policy: ?ValidationPolicy = null,
+    merge_val_overlap_floor: usize = 5,
     candidate_selection_strategy: Selection = .pareto,
+    frontier_type: Frontier = .instance,
+    acceptance_criterion: Acceptance = .strict_improvement,
+    sampling_strategy: ProposalSampling = .single,
+    selection_strategy: ProposalSelection = .all,
+    /// Reuse scored rows during validation and merge, not traced reflection rollouts.
+    cache_evaluation: bool = false,
     skip_perfect_score: bool = true,
+    /// Use genuine predictor parse failures as reflection examples.
+    add_format_failure_as_feedback: bool = false,
     component_selector: ComponentSelector = .round_robin,
     use_merge: bool = true,
     max_merge_invocations: usize = 5,
     failure_score: f64 = 0.0,
     perfect_score: f64 = 1.0,
     seed: u32 = 0,
+    /// Retain the predictions attaining the best score for each validation row.
+    track_best_outputs: bool = false,
+    /// Override the validation prediction directory supplied by `Options.log_dir`.
+    /// May also be configured independently of run logs.
+    validation_output_dir: ?ValidationOutputDir = null,
+    /// Warn once per compile if predictor and program scores disagree.
+    warn_on_score_mismatch: bool = true,
     /// DSPy `num_threads`: a `parallel.Parallel(GEPA.Run, limits).runner()`
     /// plus per-attempt contexts. Program and metric must be thread-safe, and
     /// `out`, which retains predictions and traces, must then be thread-safe
     /// (an ArenaAllocator over a thread-safe child is). null runs serially.
     rollouts: ?Rollouts = null,
 
+    pub const ValidationOutputDir = struct {
+        io: std.Io,
+        path: []const u8,
+
+        fn save(
+            dir: ValidationOutputDir,
+            row: usize,
+            iteration: usize,
+            candidate: usize,
+            output: Value,
+            max_file_bytes: ?usize,
+        ) !void {
+            const sep = std.fs.path.sep_str;
+            var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const path = std.fmt.bufPrint(
+                &path_buffer,
+                "{s}" ++ sep ++ "generated_best_outputs_valset" ++ sep ++ "task_{d}" ++ sep ++ "iter_{d}_prog_{d}.json",
+                .{ if (dir.path.len == 0) "." else dir.path, row, iteration, candidate },
+            ) catch return error.NameTooLong;
+            var destination = try std.Io.Dir.cwd().createFileAtomic(dir.io, path, .{
+                .make_path = true,
+                .replace = true,
+            });
+            defer destination.deinit(dir.io);
+            var buffer: [4096]u8 = undefined;
+            var writer = destination.file.writer(dir.io, &buffer);
+            const options: std.json.Stringify.Options = .{ .whitespace = .indent_4 };
+            if (max_file_bytes) |limit| {
+                var limited: CheckpointWriter = .{ .sink = &writer.interface, .remaining = limit };
+                std.json.Stringify.value(output, options, &limited.writer) catch |err| {
+                    if (limited.too_large) return error.GepaLogTooLarge;
+                    return err;
+                };
+            } else {
+                try std.json.Stringify.value(output, options, &writer.interface);
+            }
+            try writer.flush();
+            try destination.replace(dir.io);
+        }
+    };
+
+    fn epochMinibatchSize(self: GEPA) usize {
+        const configured = self.reflection_minibatch_size orelse 0;
+        return if (configured == 0) 3 else configured;
+    }
+
     pub const Rollouts = parallel.Rollouts(Run);
 
+    /// Choose training indices in evaluation order. Repeated indices are allowed.
+    /// The returned slice must remain valid until the next sampler call or compile exit.
+    pub const BatchSampler = struct {
+        ptr: *anyopaque,
+        max_batch_size: usize,
+        next: *const fn (*anyopaque, *const BatchSample) anyerror![]const usize,
+    };
+
+    pub const BatchSample = struct {
+        trainset: []const Example,
+        parent_idx: usize,
+        iteration: usize,
+        total_metric_calls: usize,
+    };
+
     pub const Auto = enum { light, medium, heavy };
-    pub const Selection = enum { pareto, current_best };
-    pub const ComponentSelector = enum { round_robin, all };
+    pub const Selection = union(enum) {
+        pareto,
+        current_best,
+        epsilon_greedy,
+        top_k_pareto,
+        custom: CustomCandidateSelector,
+    };
+
+    pub const CustomCandidateSelector = struct {
+        ptr: *anyopaque,
+        select: *const fn (*anyopaque, *const CandidateSelection) anyerror!usize,
+    };
+
+    /// Borrowed for one callback before each reflection minibatch.
+    /// Candidate instructions follow `names`; indices follow discovery order.
+    pub const CandidateSelection = struct {
+        names: []const []const u8,
+        candidates: []const []const []const u8,
+        val_subscores: []const []const f64,
+        val_ids: ?[]const []const usize,
+        parents: []const []const ?usize,
+        discovery_eval_counts: []const usize,
+        iteration: usize,
+        total_metric_calls: usize,
+        num_full_val_evals: usize,
+        frontier_type: Frontier,
+        frontier_count: usize,
+        engine: *const anyopaque,
+        get_front: *const fn (*const anyopaque, usize) []const usize,
+
+        /// Validation leader indices in the active frontier's native order.
+        pub fn front(self: *const CandidateSelection, index: usize) ?[]const usize {
+            if (index >= self.frontier_count) return null;
+            return self.get_front(self.engine, index);
+        }
+    };
+    pub const Frontier = enum { instance, objective, hybrid, cartesian };
+    pub const Acceptance = union(enum) {
+        strict_improvement,
+        improvement_or_equal,
+        custom: CustomAcceptance,
+    };
+
+    pub const CustomAcceptance = struct {
+        ptr: *anyopaque,
+        should_accept: *const fn (*anyopaque, *const AcceptanceInput) anyerror!bool,
+    };
+
+    /// Borrowed for one callback after both minibatch runs and before validation.
+    /// Candidate instructions follow `names`; run entries follow `minibatch_ids`.
+    pub const AcceptanceInput = struct {
+        names: []const []const u8,
+        child: []const []const u8,
+        parent_idx: usize,
+        iteration: usize,
+        total_metric_calls: usize,
+        candidates: []const []const []const u8,
+        val_subscores: []const []const f64,
+        val_ids: ?[]const []const usize,
+        parents: []const []const ?usize,
+        trainset: []const Example,
+        minibatch_ids: []const usize,
+        before: []const Run,
+        after: []const Run,
+    };
+    pub const ComponentSelector = union(enum) {
+        round_robin,
+        all,
+        custom: CustomComponentSelector,
+    };
+
+    /// Candidate instructions follow `names`; runs follow `minibatch_ids`.
+    /// All slices and their contents are borrowed for the selector invocation.
+    pub const ComponentSelection = struct {
+        names: []const []const u8,
+        candidates: []const []const []const u8,
+        val_subscores: []const []const f64,
+        val_ids: ?[]const []const usize,
+        parents: []const []const ?usize,
+        parent_idx: usize,
+        total_metric_calls: usize,
+        trainset: []const Example,
+        minibatch_ids: []const usize,
+        runs: []const Run,
+    };
+
+    /// Return distinct predictor names in reflection order, using static
+    /// storage or the provided scratch arena. An empty slice skips reflection.
+    pub const CustomComponentSelector = struct {
+        ptr: *anyopaque,
+        select: *const fn (
+            *anyopaque,
+            Context,
+            *const ComponentSelection,
+        ) anyerror![]const []const u8,
+    };
+
+    /// Read-only snapshot borrowed for the duration of a stop callback.
+    pub const StopState = struct {
+        last_iteration: ?usize,
+        total_metric_calls: usize,
+        num_full_val_evals: usize,
+        max_metric_calls: usize,
+        candidates: []const []const []const u8,
+        val_subscores: []const []const f64,
+        val_ids: ?[]const []const usize,
+        parents: []const []const ?usize,
+        discovery_eval_counts: []const usize,
+    };
+
+    pub const StopCallback = struct {
+        ptr: *anyopaque,
+        should_stop: *const fn (*anyopaque, *const StopState) anyerror!bool,
+    };
 
     pub const Options = struct {
         /// Defaults to the trainset, as in DSPy.
         valset: ?[]const Example = null,
         /// DSPy's `reflection_lm` (defaults to `ctx`).
         reflection: ?Context = null,
+        checkpoint: ?Checkpoint = null,
+        log_dir: ?LogDirectory = null,
     };
 
-    pub const Error = error{ ZeroWeights, NoBudget };
+    /// A single-writer, caller-trusted native checkpoint. Ordered training and
+    /// validation rows, predictor demos and configs, their context overrides,
+    /// base task LM options, task adapter, and task model names and
+    /// reasoning/function-calling capabilities (including TwoStep extraction
+    /// and effective predictor LMs for each parallel rollout attempt slot)
+    /// are checked automatically.
+    /// Change revision for other module configuration or scoring policy changes.
+    /// The metric budget may increase across runs. Callback-owned state is not saved.
+    pub const Checkpoint = struct {
+        io: std.Io,
+        path: []const u8,
+        revision: []const u8,
+        max_bytes: usize = 64 * 1024 * 1024,
+        /// Register specialized Code classes retained in predictions. Use the
+        /// same ordered bindings on restart, with unique stable IDs and types.
+        /// Base Code needs no registration.
+        code_classes: []const CheckpointCode = &.{},
+        /// Register configured Noul classes using the same ordered, stable
+        /// bindings on restart. Base Noul needs no registration.
+        noul_classes: []const CheckpointNoul = &.{},
+        /// Register ScoreWithLevels classes with the same ordered, stable
+        /// bindings on restart. Base Score needs no registration.
+        score_classes: []const CheckpointScore = &.{},
+        /// Register ChoiceWithOptions classes with the same ordered, stable
+        /// bindings on restart. Base Choice needs no registration.
+        choice_classes: []const CheckpointChoice = &.{},
+    };
+
+    /// Native decoder binding for one concrete CodeWithLanguage class.
+    pub const CheckpointCode = struct {
+        id: []const u8,
+        identity: *const anyopaque,
+        type_name: []const u8,
+        language: []const u8,
+        restore: *const fn (Allocator, []const u8) Allocator.Error!Value,
+
+        pub fn bind(comptime T: type, comptime id: []const u8) CheckpointCode {
+            if (!@import("code.zig").isCode(T) or T == Code)
+                @compileError("bind expects a specialized Code class");
+            if (id.len == 0 or !std.unicode.utf8ValidateSlice(id))
+                @compileError("checkpoint Code class ID must be nonempty UTF-8");
+            return .{
+                .id = id,
+                .identity = runtime.typeIdentity(T),
+                .type_name = @typeName(T),
+                .language = T.language,
+                .restore = struct {
+                    fn decode(arena: Allocator, text: []const u8) Allocator.Error!Value {
+                        // This is already validated state, not a new response.
+                        return (T{ .code = text }).toRuntime(arena);
+                    }
+                }.decode,
+            };
+        }
+    };
+
+    /// Native decoder binding for one concrete NoulWithCriteria class.
+    pub const CheckpointNoul = struct {
+        id: []const u8,
+        identity: *const anyopaque,
+        criteria_json: []const u8,
+        valid: *const fn (runtime.Custom) bool,
+        restore: *const fn (Allocator, Value) runtime.CustomError!Value,
+
+        pub fn bind(comptime T: type, comptime id: []const u8) CheckpointNoul {
+            comptime {
+                if (!@import("decision.zig").isDecision(T) or T.kind != .noul or !T.configured or T.model_module.len == 0)
+                    @compileError("bind expects a NoulWithCriteria class");
+                if (id.len == 0 or !std.unicode.utf8ValidateSlice(id))
+                    @compileError("checkpoint Noul class ID must be nonempty UTF-8");
+            }
+            return .{
+                .id = id,
+                .identity = runtime.typeIdentity(T),
+                .criteria_json = T.criteria_json,
+                .valid = struct {
+                    fn check(custom: runtime.Custom) bool {
+                        const model = custom.get(T) orelse return false;
+                        return validNoulEvidence(model.confidence, model.probability);
+                    }
+                }.check,
+                .restore = T.validateStrict,
+            };
+        }
+    };
+
+    /// Native decoder binding for one concrete ScoreWithLevels class.
+    pub const CheckpointScore = struct {
+        id: []const u8,
+        identity: *const anyopaque,
+        criteria_json: []const u8,
+        valid: *const fn (runtime.Custom) bool,
+        restore: *const fn (Allocator, Value, @import("decision.zig").ValidationMode) runtime.CustomError!Value,
+
+        pub fn bind(comptime T: type, comptime id: []const u8) CheckpointScore {
+            comptime {
+                if (!@import("decision.zig").isDecision(T) or T.kind != .score or !T.configured or T.model_module.len == 0)
+                    @compileError("bind expects a ScoreWithLevels class");
+                if (id.len == 0 or !std.unicode.utf8ValidateSlice(id))
+                    @compileError("checkpoint Score class ID must be nonempty UTF-8");
+            }
+            return .{
+                .id = id,
+                .identity = runtime.typeIdentity(T),
+                .criteria_json = T.criteria_json,
+                .valid = struct {
+                    fn check(custom: runtime.Custom) bool {
+                        return validScore(T, custom);
+                    }
+                }.check,
+                .restore = T.validateParsedJson,
+            };
+        }
+    };
+
+    /// Native decoder binding for one concrete ChoiceWithOptions class.
+    pub const CheckpointChoice = struct {
+        id: []const u8,
+        identity: *const anyopaque,
+        type_name: []const u8,
+        criteria_json: []const u8,
+        valid: *const fn (runtime.Custom) bool,
+        restore: *const fn (Allocator, Value) error{ InvalidGepaCheckpoint, OutOfMemory }!Value,
+
+        pub fn bind(comptime T: type, comptime id: []const u8) CheckpointChoice {
+            comptime {
+                if (!@import("decision.zig").isDecision(T) or T.kind != .choice or !T.configured or T.model_module.len == 0)
+                    @compileError("bind expects a ChoiceWithOptions class");
+                if (id.len == 0 or !std.unicode.utf8ValidateSlice(id))
+                    @compileError("checkpoint Choice class ID must be nonempty UTF-8");
+            }
+            return .{
+                .id = id,
+                .identity = runtime.typeIdentity(T),
+                .type_name = T.model_name,
+                .criteria_json = T.criteria_json,
+                .valid = struct {
+                    fn check(custom: runtime.Custom) bool {
+                        return validChoice(T, custom);
+                    }
+                }.check,
+                .restore = struct {
+                    fn decode(arena: Allocator, node: Value) error{ InvalidGepaCheckpoint, OutOfMemory }!Value {
+                        return restoreChoice(T, arena, node);
+                    }
+                }.decode,
+            };
+        }
+    };
+
+    fn validChoiceValue(comptime T: type, input: Value) bool {
+        switch (input) {
+            .null, .bool, .integer => {},
+            .number_string => if (!validCheckpointInteger(input)) return false,
+            .string => |text| if (!std.unicode.utf8ValidateSlice(text)) return false,
+            else => return false,
+        }
+        if (!T.configured) return true;
+        // Do not let Python equality silently change a stored option's type.
+        for (T.members) |member| {
+            if (std.meta.activeTag(member) == std.meta.activeTag(input) and
+                (value.pyEqual(member, input) catch return false)) return true;
+        }
+        return false;
+    }
+
+    fn validChoiceProbabilities(input: Value) bool {
+        if (input != .object) return false;
+        for (input.object.keys(), input.object.values()) |key, p| {
+            if (!std.unicode.utf8ValidateSlice(key) or !validScoreProbability(p)) return false;
+        }
+        return true;
+    }
+
+    fn validChoice(comptime T: type, custom: runtime.Custom) bool {
+        const model = custom.get(T) orelse return false;
+        return validNoulEvidence(model.confidence, null) and validChoiceValue(T, model.value) and
+            (if (model.probabilities) |probs| validChoiceProbabilities(probs) else true);
+    }
+
+    fn restoreChoice(comptime T: type, arena: Allocator, node: Value) error{ InvalidGepaCheckpoint, OutOfMemory }!Value {
+        if (node != .object or
+            !validScoreProbability(node.object.get("confidence") orelse return error.InvalidGepaCheckpoint) or
+            !validChoiceValue(T, node.object.get("value") orelse return error.InvalidGepaCheckpoint))
+            return error.InvalidGepaCheckpoint;
+        if (node.object.get("probabilities")) |probs| {
+            if (probs != .null and !validChoiceProbabilities(probs)) return error.InvalidGepaCheckpoint;
+        }
+        // The checkpoint already checked typed membership. Decode the shared
+        // fields without Literal's validation-time normalization of options.
+        const model = Choice.fromValue(arena, node) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.InvalidGepaCheckpoint,
+        };
+        return (T{ .confidence = model.confidence, .value = model.value, .probabilities = model.probabilities }).toRuntime(arena);
+    }
+
+    fn validScore(comptime T: type, custom: runtime.Custom) bool {
+        const model = custom.get(T) orelse return false;
+        if (!validNoulEvidence(model.confidence, null) or !std.math.isFinite(model.value)) return false;
+        const max_level: f64 = if (T.configured) @floatFromInt(T.members.len - 1) else std.math.inf(f64);
+        if (T.configured and (model.value < 0 or model.value > max_level)) return false;
+        if (model.level) |level| {
+            const integer = level.value;
+            if (!validCheckpointInteger(integer)) return false;
+            if (if (integer == .integer) integer.integer < 0 else integer.number_string[0] == '-') return false;
+            if (T.configured and !(value.floatAtLeast(max_level, integer) catch return false)) return false;
+        }
+        if (model.probabilities) |probs| {
+            if (probs == .object) return probs.object.count() == 0;
+            const view = python_value.view(probs) orelse return false;
+            if (view != .dictionary) return false;
+            for (view.dictionary) |entry| {
+                if (!validCheckpointInteger(entry.key) or !validScoreProbability(entry.value)) return false;
+            }
+        }
+        return true;
+    }
+
+    fn validScoreProbability(input: Value) bool {
+        return switch (input) {
+            .integer => input.integer == 0 or input.integer == 1,
+            .float => validNoulEvidence(input.float, null),
+            else => false,
+        };
+    }
+
+    // Checkpoint JSON has string keys. Only canonical decimal encodings may
+    // become integer evidence keys; do not admit coercions or key collisions.
+    fn restoreScore(arena: Allocator, node: Value, decode: @FieldType(CheckpointScore, "restore")) !Value {
+        if (node != .object) return error.InvalidGepaCheckpoint;
+        if (node.object.get("level")) |level| {
+            if (level != .null and !validCheckpointInteger(level)) return error.InvalidGepaCheckpoint;
+        }
+        if (node.object.get("probabilities")) |probs| {
+            if (probs != .null) {
+                if (probs != .object) return error.InvalidGepaCheckpoint;
+                for (probs.object.keys(), probs.object.values()) |key, p| {
+                    if (!validCheckpointIntegerText(key) or !validScoreProbability(p))
+                        return error.InvalidGepaCheckpoint;
+                }
+            }
+        }
+        return decode(arena, node, .strict) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.InvalidGepaCheckpoint,
+        };
+    }
+
+    fn validNoulEvidence(confidence: f64, probability: ?f64) bool {
+        return confidence >= 0 and confidence <= 1 and
+            (if (probability) |p| p >= 0 and p <= 1 else true);
+    }
+
+    /// Human-readable DSPy run artifacts, separate from the restart checkpoint.
+    pub const LogDirectory = struct {
+        io: std.Io,
+        path: []const u8,
+        max_file_bytes: usize = 64 * 1024 * 1024,
+    };
+
+    pub const Error = error{
+        InvalidValidationBatch,
+        ZeroWeights,
+        NoBudget,
+        UnknownInstructionComponent,
+        InvalidComponentSelection,
+        InvalidCandidateSelection,
+        InvalidBatchSamplerConfiguration,
+        InvalidBatchSample,
+        EmptyProposalBatch,
+        ProposalTaskLimitExceeded,
+    };
+
+    pub const Instruction = struct {
+        name: []const u8,
+        text: []const u8,
+    };
+
+    pub const ReflectionDataset = struct {
+        name: []const u8,
+        examples: []const Record,
+    };
+
+    pub const InstructionProposal = struct {
+        candidate: []const Instruction,
+        reflective_dataset: []const ReflectionDataset,
+        components_to_update: []const []const u8,
+    };
+
+    /// Called once per reflection task, with a retry on errors other than
+    /// `OutOfMemory` and `Canceled`.
+    /// Inputs are borrowed. Return static data or allocate updates in ctx.arena;
+    /// GEPA copies accepted text before releasing that scratch arena.
+    /// An empty slice skips evaluation; any existing component can be updated.
+    pub const InstructionProposer = struct {
+        ptr: *anyopaque,
+        propose: *const fn (*anyopaque, Context, *const InstructionProposal) anyerror![]const Instruction,
+    };
+
+    pub const BatchReflectionJob = InstructionProposal;
+
+    /// Native equivalent of the underlying GEPA `reflect_many` hook, not a
+    /// provider batch API. Called once per nonempty batch of eligible tasks in
+    /// sampling order (one job for `.single`). Each result is a list of named
+    /// instruction updates for the corresponding job; an empty list skips it.
+    /// `components_to_update` is in selector order and may include components
+    /// without a dataset. A task with no usable dataset is omitted entirely.
+    ///
+    /// Inputs are borrowed for this call. Return static storage or use the
+    /// reflection context's scratch arena for both slices and text. GEPA copies
+    /// the updates it retains. An error or a wrong result count triggers one
+    /// built-in reflection attempt per job, except `OutOfMemory` and `Canceled`,
+    /// which abort compile. The callback owns its own state and prompt policy.
+    pub const BatchReflection = struct {
+        ptr: *anyopaque,
+        propose: *const fn (*anyopaque, Context, []const BatchReflectionJob) anyerror![]const []const Instruction,
+    };
+
+    pub const BestOutput = struct {
+        candidate_idx: usize,
+        output: union(enum) {
+            prediction: optimize.RecordPrediction,
+            failed_parse: struct {
+                completion_text: []const u8,
+                format_reward: f64,
+            },
+        },
+    };
+
+    pub const max_proposal_tasks = 32;
+
+    pub const ProposalSampling = union(enum) {
+        single,
+        same_parent: usize,
+        independent: usize,
+        pxn: struct { parents: usize, mutations: usize },
+        custom: CustomProposalSampler,
+
+        fn shape(sampling: ProposalSampling) struct { parents: usize, mutations: usize } {
+            return switch (sampling) {
+                .single => .{ .parents = 1, .mutations = 1 },
+                .same_parent => |n| .{ .parents = 1, .mutations = n },
+                .independent => |n| .{ .parents = n, .mutations = 1 },
+                .pxn => |pn| .{ .parents = pn.parents, .mutations = pn.mutations },
+                .custom => unreachable,
+            };
+        }
+    };
+
+    pub const ProposalTask = struct {
+        parent_idx: usize,
+        minibatch_ids: []const usize,
+    };
+
+    /// The helpers advance the same selector and sampler as the built-ins.
+    /// This view and helper results are only valid during the current iteration.
+    pub const ProposalSample = struct {
+        arena: Allocator,
+        names: []const []const u8,
+        trainset: []const Example,
+        state: ValidationState,
+        context: *anyopaque,
+        select_parent: *const fn (*anyopaque) anyerror!usize,
+        next_minibatch: *const fn (*anyopaque, usize) anyerror![]const usize,
+
+        pub fn selectParent(self: *const ProposalSample) !usize {
+            return self.select_parent(self.context);
+        }
+
+        pub fn nextMinibatch(self: *const ProposalSample, parent_idx: usize) ![]const usize {
+            if (parent_idx >= self.state.candidates.len) return error.InvalidProposalTask;
+            return self.next_minibatch(self.context, parent_idx);
+        }
+    };
+
+    pub const CustomProposalSampler = struct {
+        ptr: *anyopaque,
+        max_minibatch_size: usize = 4096,
+        /// Fill a prefix of `tasks` in evaluation order. Return zero to skip
+        /// the iteration. IDs index trainset and may repeat. Use input.arena
+        /// for temporary ID lists, or borrow lists that outlive the iteration.
+        sample: *const fn (*anyopaque, *const ProposalSample, []ProposalTask) anyerror!usize,
+    };
+
+    pub const ProposalSelection = union(enum) {
+        all,
+        best,
+        top_k: isize,
+        custom: CustomProposalSelector,
+    };
+
+    pub const Proposal = struct {
+        child: []const []const u8,
+        parent_idx: usize,
+        minibatch_ids: []const usize,
+        before: []const Run,
+        after: []const Run,
+    };
+
+    /// Borrowed for one invocation. Query `shouldAccept` only during selection.
+    pub const ProposalBatch = struct {
+        names: []const []const u8,
+        proposals: []const Proposal,
+        state: ValidationState,
+        decision_context: *anyopaque,
+        decide: *const fn (*anyopaque, usize) anyerror!bool,
+
+        pub fn shouldAccept(batch: *const ProposalBatch, index: usize) !bool {
+            if (index >= batch.proposals.len) return error.InvalidProposalIndex;
+            return batch.decide(batch.decision_context, index);
+        }
+    };
+
+    /// Write proposal indices in selection order and return their count.
+    /// Unknown indices and duplicate candidates are ignored; the selector
+    /// may choose a proposal even if the acceptance criterion rejects it.
+    pub const CustomProposalSelector = struct {
+        ptr: *anyopaque,
+        select: *const fn (*anyopaque, *const ProposalBatch, []usize) anyerror!usize,
+    };
 
     /// `DspyGEPAResult` (`track_stats=True`) plus the optimized program.
     pub fn Result(comptime P: type) type {
@@ -104,22 +996,1127 @@ pub const GEPA = struct {
             candidates: []const []const []const u8,
             parents: []const []const ?usize,
             val_aggregate_scores: []const f64,
+            /// Row IDs in score order, or null for dense, valset-ordered scores.
+            val_ids: ?[]const []const usize,
             val_subscores: []const []const f64,
+            /// Indexed by candidate; each objective averages only rows that supplied it.
+            val_aggregate_subscores: ?[]const []const ObjectiveScore,
+            per_objective_best_candidates: ?[]const ObjectiveLeaders,
+            objective_pareto_front: ?[]const ObjectiveScore,
+            /// Indexed by validation row; tied candidates are in discovery order.
+            per_val_instance_best_candidates: []const []const usize,
+            /// Indexed by validation row, in candidate discovery order.
+            best_outputs_valset: ?[]const []const BestOutput,
             discovery_eval_counts: []const usize,
             best_idx: usize,
             total_metric_calls: usize,
             num_full_val_evals: usize,
             max_metric_calls: usize,
+            seed: u32,
         };
     }
 
-    const merge_overlap_floor = 5;
+    /// Batch selection from a fixed ordered validation set. Returned IDs must
+    /// stay readable through the selected batch's evaluation.
+    pub const ValidationPolicy = struct {
+        ptr: *anyopaque,
+        /// Custom batches must be nonempty and fit this limit.
+        max_batch_size: usize,
+        seed_batch: ?*const fn (*anyopaque, []const Example) anyerror![]const usize = null,
+        next_batch: *const fn (*anyopaque, *const ValidationState) anyerror![]const usize,
+        /// Diagnostic hooks do not affect the returned candidate or aggregate scores.
+        get_best_program: ?*const fn (*anyopaque, *const ValidationState) anyerror!usize = null,
+        get_valset_score: ?*const fn (*anyopaque, usize, *const ValidationState) anyerror!f64 = null,
+    };
+
+    /// Borrowed during the callback. Score rows follow their matching ID rows.
+    pub const ValidationState = struct {
+        valset: []const Example,
+        candidates: []const []const []const u8,
+        val_ids: []const []const usize,
+        val_subscores: []const []const f64,
+        parents: []const []const ?usize,
+        iteration: usize,
+        /// True only for final diagnostics when the seed was the only evaluation.
+        before_first_iteration: bool = false,
+        total_metric_calls: usize,
+    };
     const merge_subsample = 5;
     const max_attempts = 10;
 
-    pub const Run = struct { prediction: ?Record, trace: *const Trace, score: f64 };
+    /// The reflective dataset serializes trace-step records and feedback
+    /// only, so a prediction's usage reaches the metric and nothing else.
+    pub const Run = struct {
+        prediction: ?optimize.RecordPrediction,
+        trace: *const Trace,
+        score: f64,
+        format_failure: ?FormatFailure = null,
+        /// A failed parse has a diagnostic output even when there is no prediction.
+        failed_completion: ?[]const u8 = null,
+        objective_scores: []const ObjectiveScore = &.{},
+
+        fn validationOutput(run: Run, repr: *Writer.Allocating) Writer.Error!?Value {
+            if (run.failed_completion) |text| {
+                const w = &repr.writer;
+                try w.writeAll("FailedPrediction(completion_text=");
+                try pyjson.writeReprString(w, text);
+                try w.writeAll(", format_reward=");
+                try pyjson.writeFloat(w, run.score, .python);
+                try w.writeByte(')');
+                return .{ .string = repr.written() };
+            }
+            return if (run.prediction) |prediction| .{ .object = prediction.fields().* } else null;
+        }
+    };
+
+    pub const FormatFailure = struct {
+        predictor: *const predict.PredictState,
+        inputs: Record,
+        text: []const u8,
+    };
+
+    const StoredObjective = struct { name: []const u8, score: u64 };
+
+    const StoredClassNode = struct { index: usize, class: usize };
+
+    const StoredRun = struct {
+        score: u64,
+        objectives: []const StoredObjective,
+        fields: ?Value,
+        completions: ?[]const Value,
+        usage: ?Value,
+        failed_completion: ?[]const u8 = null,
+        reasoning_nodes: []const usize = &.{},
+        code_nodes: []const usize = &.{},
+        specialized_code_nodes: []const StoredClassNode = &.{},
+        bounding_box_nodes: []const usize = &.{},
+        citations_nodes: []const usize = &.{},
+        citation_nodes: []const usize = &.{},
+        noul_nodes: []const usize = &.{},
+        configured_noul_nodes: []const StoredClassNode = &.{},
+        score_nodes: []const usize = &.{},
+        configured_score_nodes: []const StoredClassNode = &.{},
+        choice_nodes: []const usize = &.{},
+        configured_choice_nodes: []const StoredClassNode = &.{},
+        tuple_nodes: []const usize = &.{},
+
+        pub fn jsonStringify(stored: StoredRun, json: anytype) !void {
+            try json.beginObject();
+            inline for (@typeInfo(StoredRun).@"struct".field_names) |name| {
+                // Omit unused extension markers to keep version-26 files compatible.
+                const optional_marker = comptime std.mem.eql(u8, name, "code_nodes") or
+                    std.mem.eql(u8, name, "specialized_code_nodes") or std.mem.eql(u8, name, "bounding_box_nodes") or
+                    std.mem.eql(u8, name, "citations_nodes") or std.mem.eql(u8, name, "citation_nodes") or
+                    std.mem.eql(u8, name, "noul_nodes") or std.mem.eql(u8, name, "configured_noul_nodes") or
+                    std.mem.eql(u8, name, "score_nodes") or std.mem.eql(u8, name, "configured_score_nodes") or
+                    std.mem.eql(u8, name, "choice_nodes") or std.mem.eql(u8, name, "configured_choice_nodes") or
+                    std.mem.eql(u8, name, "tuple_nodes");
+                if (!optional_marker or @field(stored, name).len != 0) {
+                    try json.objectField(name);
+                    try json.write(@field(stored, name));
+                }
+            }
+            try json.endObject();
+        }
+
+        fn capture(run: Run, arena: Allocator, retain_prediction: bool, checkpoint: Checkpoint) !StoredRun {
+            const objectives = try arena.alloc(StoredObjective, run.objective_scores.len);
+            for (objectives, run.objective_scores) |*stored, entry| {
+                stored.* = .{ .name = entry.name, .score = @bitCast(entry.score) };
+            }
+            var stored: StoredRun = .{
+                .score = @bitCast(run.score),
+                .objectives = objectives,
+                .fields = null,
+                .completions = null,
+                .usage = null,
+                .failed_completion = run.failed_completion,
+            };
+            if (retain_prediction) if (run.prediction) |prediction| {
+                stored.fields = .{ .object = prediction.fields().* };
+                if (prediction.completions()) |completions| {
+                    const records = try arena.alloc(Value, completions.len);
+                    for (records, completions) |*record, fields| record.* = .{ .object = fields };
+                    stored.completions = records;
+                }
+                if (prediction.getLMUsage()) |usage| stored.usage = try Graph.toValue(arena, usage);
+            };
+            var nodes: CheckpointValues.Capture = .{};
+            var walk: CheckpointValues = .{
+                .arena = arena,
+                .capture = &nodes,
+                .code_classes = checkpoint.code_classes,
+                .noul_classes = checkpoint.noul_classes,
+                .score_classes = checkpoint.score_classes,
+                .choice_classes = checkpoint.choice_classes,
+            };
+            if (stored.fields) |*fields| try walk.visit(fields, 0);
+            if (stored.completions) |records| for (records) |record| {
+                var root = record;
+                try walk.visit(&root, 0);
+            };
+            stored.reasoning_nodes = nodes.reasoning.items;
+            stored.code_nodes = nodes.code.items;
+            stored.specialized_code_nodes = nodes.specialized_code.items;
+            stored.bounding_box_nodes = nodes.bounding_box.items;
+            stored.citations_nodes = nodes.citations.items;
+            stored.citation_nodes = nodes.citation.items;
+            stored.noul_nodes = nodes.noul.items;
+            stored.configured_noul_nodes = nodes.configured_noul.items;
+            stored.score_nodes = nodes.score.items;
+            stored.configured_score_nodes = nodes.configured_score.items;
+            stored.choice_nodes = nodes.choice.items;
+            stored.configured_choice_nodes = nodes.configured_choice.items;
+            stored.tuple_nodes = nodes.tuple.items;
+            if (stored.usage) |*usage| {
+                var plain: CheckpointValues = .{ .arena = arena };
+                try plain.visit(usage, 0);
+            }
+            return stored;
+        }
+
+        fn restore(stored: *const StoredRun, arena: Allocator, trace: *const Trace, checkpoint: Checkpoint) !Run {
+            var walk: CheckpointValues = .{
+                .arena = arena,
+                .reasoning_nodes = stored.reasoning_nodes,
+                .code_nodes = stored.code_nodes,
+                .specialized_code_nodes = stored.specialized_code_nodes,
+                .bounding_box_nodes = stored.bounding_box_nodes,
+                .citations_nodes = stored.citations_nodes,
+                .citation_nodes = stored.citation_nodes,
+                .noul_nodes = stored.noul_nodes,
+                .configured_noul_nodes = stored.configured_noul_nodes,
+                .code_classes = checkpoint.code_classes,
+                .noul_classes = checkpoint.noul_classes,
+                .score_nodes = stored.score_nodes,
+                .configured_score_nodes = stored.configured_score_nodes,
+                .score_classes = checkpoint.score_classes,
+                .choice_nodes = stored.choice_nodes,
+                .configured_choice_nodes = stored.configured_choice_nodes,
+                .tuple_nodes = stored.tuple_nodes,
+                .choice_classes = checkpoint.choice_classes,
+            };
+            const objectives = try arena.alloc(ObjectiveScore, stored.objectives.len);
+            for (objectives, stored.objectives) |*entry, snapshot| {
+                entry.* = .{ .name = snapshot.name, .score = @bitCast(snapshot.score) };
+            }
+            var prediction: ?optimize.RecordPrediction = null;
+            if (stored.fields) |fields| {
+                if (fields != .object) return error.InvalidGepaCheckpoint;
+                var root = fields;
+                try walk.visit(&root, 0);
+                const restored = try optimize.RecordPrediction.init(arena, root.object);
+                if (stored.completions) |records| {
+                    if (records.len == 0) return error.InvalidGepaCheckpoint;
+                    const completions = try arena.alloc(Record, records.len);
+                    for (records, completions) |record, *completion| {
+                        if (record != .object) return error.InvalidGepaCheckpoint;
+                        root = record;
+                        try walk.visit(&root, 0);
+                        completion.* = root.object;
+                    }
+                    restored.state.outputs = completions;
+                }
+                if (stored.usage) |usage| {
+                    root = usage;
+                    var plain: CheckpointValues = .{ .arena = arena };
+                    try plain.visit(&root, 0);
+                    restored.setLMUsage(try Graph.fromValue(arena, root));
+                }
+                prediction = restored;
+            } else if (stored.completions != null or stored.usage != null) {
+                return error.InvalidGepaCheckpoint;
+            }
+            if (walk.reasoning_nodes.len != 0 or walk.code_nodes.len != 0 or
+                walk.specialized_code_nodes.len != 0 or walk.bounding_box_nodes.len != 0 or
+                walk.citations_nodes.len != 0 or walk.citation_nodes.len != 0 or
+                walk.noul_nodes.len != 0 or walk.configured_noul_nodes.len != 0 or
+                walk.score_nodes.len != 0 or walk.configured_score_nodes.len != 0 or
+                walk.choice_nodes.len != 0 or walk.configured_choice_nodes.len != 0 or walk.tuple_nodes.len != 0)
+                return error.InvalidGepaCheckpoint;
+            return .{
+                .score = @bitCast(stored.score),
+                .objective_scores = objectives,
+                .prediction = prediction,
+                .trace = trace,
+                .failed_completion = stored.failed_completion,
+            };
+        }
+    };
+
+    // Preorder positions in fields followed by each completion. A model box
+    // is one node, even when its JSON representation is itself an object.
+    // Tuples are containers: index their elements as with plain arrays.
+    // Separate markers keep ordinary strings, objects, and arrays unboxed.
+    const CheckpointValues = struct {
+        const Capture = struct {
+            reasoning: std.ArrayList(usize) = .empty,
+            code: std.ArrayList(usize) = .empty,
+            specialized_code: std.ArrayList(StoredClassNode) = .empty,
+            bounding_box: std.ArrayList(usize) = .empty,
+            citations: std.ArrayList(usize) = .empty,
+            citation: std.ArrayList(usize) = .empty,
+            noul: std.ArrayList(usize) = .empty,
+            configured_noul: std.ArrayList(StoredClassNode) = .empty,
+            score: std.ArrayList(usize) = .empty,
+            configured_score: std.ArrayList(StoredClassNode) = .empty,
+            choice: std.ArrayList(usize) = .empty,
+            configured_choice: std.ArrayList(StoredClassNode) = .empty,
+            tuple: std.ArrayList(usize) = .empty,
+        };
+
+        arena: Allocator,
+        capture: ?*Capture = null,
+        reasoning_nodes: []const usize = &.{},
+        code_nodes: []const usize = &.{},
+        specialized_code_nodes: []const StoredClassNode = &.{},
+        bounding_box_nodes: []const usize = &.{},
+        citations_nodes: []const usize = &.{},
+        citation_nodes: []const usize = &.{},
+        noul_nodes: []const usize = &.{},
+        configured_noul_nodes: []const StoredClassNode = &.{},
+        code_classes: []const CheckpointCode = &.{},
+        noul_classes: []const CheckpointNoul = &.{},
+        score_nodes: []const usize = &.{},
+        configured_score_nodes: []const StoredClassNode = &.{},
+        score_classes: []const CheckpointScore = &.{},
+        choice_nodes: []const usize = &.{},
+        tuple_nodes: []const usize = &.{},
+        configured_choice_nodes: []const StoredClassNode = &.{},
+        choice_classes: []const CheckpointChoice = &.{},
+        next: usize = 0,
+
+        fn restoreCitation(walk: *CheckpointValues, node: Value) !Citation {
+            if (node != .object or node.object.count() != Citation.field_names.len)
+                return error.InvalidGepaCheckpoint;
+            inline for (Citation.field_names) |name| {
+                const field = node.object.get(name) orelse return error.InvalidGepaCheckpoint;
+                const T = @FieldType(Citation, name);
+                const valid = if (field == .null)
+                    T != []const u8
+                else if (T == []const u8 or T == ?[]const u8)
+                    field == .string and std.unicode.utf8ValidateSlice(field.string)
+                else
+                    validCheckpointInteger(field);
+                if (!valid) return error.InvalidGepaCheckpoint;
+            }
+            return Citation.fromValue(walk.arena, node) catch |err| switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.InvalidGepaCheckpoint,
+            };
+        }
+
+        fn visit(walk: *CheckpointValues, node: *Value, depth: usize) !void {
+            if (depth > 128) return error.UnsupportedGepaCheckpointValue;
+            const index = walk.next;
+            walk.next += 1;
+            const reasoning = walk.reasoning_nodes.len != 0 and walk.reasoning_nodes[0] <= index;
+            const code = walk.code_nodes.len != 0 and walk.code_nodes[0] <= index;
+            const specialized = walk.specialized_code_nodes.len != 0 and walk.specialized_code_nodes[0].index <= index;
+            const bounding_box = walk.bounding_box_nodes.len != 0 and walk.bounding_box_nodes[0] <= index;
+            const citations = walk.citations_nodes.len != 0 and walk.citations_nodes[0] <= index;
+            const citation = walk.citation_nodes.len != 0 and walk.citation_nodes[0] <= index;
+            const noul = walk.noul_nodes.len != 0 and walk.noul_nodes[0] <= index;
+            const configured_noul = walk.configured_noul_nodes.len != 0 and walk.configured_noul_nodes[0].index <= index;
+            const score = walk.score_nodes.len != 0 and walk.score_nodes[0] <= index;
+            const configured_score = walk.configured_score_nodes.len != 0 and walk.configured_score_nodes[0].index <= index;
+            const choice = walk.choice_nodes.len != 0 and walk.choice_nodes[0] <= index;
+            const configured_choice = walk.configured_choice_nodes.len != 0 and walk.configured_choice_nodes[0].index <= index;
+            const tuple = walk.tuple_nodes.len != 0 and walk.tuple_nodes[0] <= index;
+            const markers = @as(u4, @intFromBool(reasoning)) + @intFromBool(code) +
+                @intFromBool(specialized) + @intFromBool(bounding_box) +
+                @intFromBool(citations) + @intFromBool(citation) +
+                @intFromBool(noul) + @intFromBool(configured_noul) +
+                @intFromBool(score) + @intFromBool(configured_score) +
+                @intFromBool(choice) + @intFromBool(configured_choice) + @intFromBool(tuple);
+            if (markers != 0) {
+                if (depth == 0 or markers != 1) return error.InvalidGepaCheckpoint;
+                if (tuple) {
+                    if (walk.tuple_nodes[0] != index or node.* != .array)
+                        return error.InvalidGepaCheckpoint;
+                    walk.tuple_nodes = walk.tuple_nodes[1..];
+                    const items = node.array.items;
+                    for (items) |*child| try walk.visit(child, depth + 1);
+                    node.* = try python_value.tuple(walk.arena, items);
+                } else if (reasoning) {
+                    if (walk.reasoning_nodes[0] != index or node.* != .object or node.object.count() != 1)
+                        return error.InvalidGepaCheckpoint;
+                    const model = signature.Reasoning.fromValue(node.*) catch return error.InvalidGepaCheckpoint;
+                    if (!std.unicode.utf8ValidateSlice(model.content)) return error.InvalidGepaCheckpoint;
+                    node.* = try model.toRuntime(walk.arena);
+                    walk.reasoning_nodes = walk.reasoning_nodes[1..];
+                } else if (bounding_box) {
+                    if (walk.bounding_box_nodes[0] != index) return error.InvalidGepaCheckpoint;
+                    const box = BoundingBox.fromValue(node.*) catch return error.InvalidGepaCheckpoint;
+                    node.* = try box.toRuntime(walk.arena);
+                    walk.bounding_box_nodes = walk.bounding_box_nodes[1..];
+                } else if (citations) {
+                    if (walk.citations_nodes[0] != index or node.* != .object or node.object.count() != 1)
+                        return error.InvalidGepaCheckpoint;
+                    const items = node.object.get("citations") orelse return error.InvalidGepaCheckpoint;
+                    if (items != .array) return error.InvalidGepaCheckpoint;
+                    const restored = try walk.arena.alloc(Citation, items.array.items.len);
+                    for (items.array.items, restored) |item, *dest| dest.* = try walk.restoreCitation(item);
+                    node.* = try (Citations{ .citations = restored }).toRuntime(walk.arena);
+                    walk.citations_nodes = walk.citations_nodes[1..];
+                } else if (citation) {
+                    if (walk.citation_nodes[0] != index) return error.InvalidGepaCheckpoint;
+                    node.* = try (try walk.restoreCitation(node.*)).toRuntime(walk.arena);
+                    walk.citation_nodes = walk.citation_nodes[1..];
+                } else if (configured_choice) {
+                    const mark = walk.configured_choice_nodes[0];
+                    if (mark.index != index or mark.class >= walk.choice_classes.len)
+                        return error.InvalidGepaCheckpoint;
+                    node.* = try walk.choice_classes[mark.class].restore(walk.arena, node.*);
+                    walk.configured_choice_nodes = walk.configured_choice_nodes[1..];
+                } else if (choice) {
+                    if (walk.choice_nodes[0] != index) return error.InvalidGepaCheckpoint;
+                    node.* = try restoreChoice(Choice, walk.arena, node.*);
+                    walk.choice_nodes = walk.choice_nodes[1..];
+                } else if (score or configured_score) {
+                    const decode = if (configured_score) decode: {
+                        const mark = walk.configured_score_nodes[0];
+                        if (mark.index != index or mark.class >= walk.score_classes.len)
+                            return error.InvalidGepaCheckpoint;
+                        walk.configured_score_nodes = walk.configured_score_nodes[1..];
+                        break :decode walk.score_classes[mark.class].restore;
+                    } else decode: {
+                        if (walk.score_nodes[0] != index) return error.InvalidGepaCheckpoint;
+                        walk.score_nodes = walk.score_nodes[1..];
+                        break :decode &Score.validateParsedJson;
+                    };
+                    node.* = try restoreScore(walk.arena, node.*, decode);
+                } else if (noul or configured_noul) {
+                    if (node.* != .object) return error.InvalidGepaCheckpoint;
+                    const decode = if (configured_noul) decode: {
+                        const mark = walk.configured_noul_nodes[0];
+                        if (mark.index != index or mark.class >= walk.noul_classes.len)
+                            return error.InvalidGepaCheckpoint;
+                        walk.configured_noul_nodes = walk.configured_noul_nodes[1..];
+                        break :decode walk.noul_classes[mark.class].restore;
+                    } else decode: {
+                        if (walk.noul_nodes[0] != index) return error.InvalidGepaCheckpoint;
+                        walk.noul_nodes = walk.noul_nodes[1..];
+                        break :decode &Noul.validateStrict;
+                    };
+                    node.* = decode(walk.arena, node.*) catch |err| return switch (err) {
+                        error.OutOfMemory => error.OutOfMemory,
+                        else => error.InvalidGepaCheckpoint,
+                    };
+                } else {
+                    if (node.* != .string or !std.unicode.utf8ValidateSlice(node.string))
+                        return error.InvalidGepaCheckpoint;
+                    if (specialized) {
+                        const mark = walk.specialized_code_nodes[0];
+                        if (mark.index != index or mark.class >= walk.code_classes.len)
+                            return error.InvalidGepaCheckpoint;
+                        node.* = try walk.code_classes[mark.class].restore(walk.arena, node.string);
+                        walk.specialized_code_nodes = walk.specialized_code_nodes[1..];
+                    } else {
+                        if (walk.code_nodes[0] != index) return error.InvalidGepaCheckpoint;
+                        node.* = try (Code{ .code = node.string }).toRuntime(walk.arena);
+                        walk.code_nodes = walk.code_nodes[1..];
+                    }
+                }
+                return;
+            }
+            switch (node.*) {
+                .object => |map| {
+                    var entries = map.iterator();
+                    while (entries.next()) |entry| {
+                        if (!std.unicode.utf8ValidateSlice(entry.key_ptr.*))
+                            return error.UnsupportedGepaCheckpointValue;
+                        try walk.visit(entry.value_ptr, depth + 1);
+                    }
+                },
+                .array => |list| for (list.items) |*child| try walk.visit(child, depth + 1),
+                .custom => |custom| {
+                    const positions = walk.capture orelse return error.UnsupportedGepaCheckpointValue;
+                    if (python_value.view(node.*)) |builtin| {
+                        if (builtin != .tuple) return error.UnsupportedGepaCheckpointValue;
+                        try positions.tuple.append(walk.arena, index);
+                        for (builtin.tuple) |item| {
+                            var child = item;
+                            try walk.visit(&child, depth + 1);
+                        }
+                    } else if (custom.get(signature.Reasoning)) |model| {
+                        if (!std.unicode.utf8ValidateSlice(model.content)) return error.UnsupportedGepaCheckpointValue;
+                        try positions.reasoning.append(walk.arena, index);
+                    } else if (custom.get(Code)) |model| {
+                        if (!std.unicode.utf8ValidateSlice(model.code)) return error.UnsupportedGepaCheckpointValue;
+                        try positions.code.append(walk.arena, index);
+                    } else if (custom.get(BoundingBox)) |box| {
+                        _ = BoundingBox.init(box.top, box.bottom, box.left, box.right) catch
+                            return error.UnsupportedGepaCheckpointValue;
+                        try positions.bounding_box.append(walk.arena, index);
+                    } else if (custom.get(Citations)) |model| {
+                        for (model.citations) |item| try validateCitation(item);
+                        try positions.citations.append(walk.arena, index);
+                    } else if (custom.get(Citation)) |item| {
+                        try validateCitation(item.*);
+                        try positions.citation.append(walk.arena, index);
+                    } else if (custom.get(Noul)) |model| {
+                        if (!validNoulEvidence(model.confidence, model.probability))
+                            return error.UnsupportedGepaCheckpointValue;
+                        try positions.noul.append(walk.arena, index);
+                    } else if (custom.get(Score) != null) {
+                        if (!validScore(Score, custom)) return error.UnsupportedGepaCheckpointValue;
+                        try positions.score.append(walk.arena, index);
+                    } else if (custom.get(Choice) != null) {
+                        if (!validChoice(Choice, custom)) return error.UnsupportedGepaCheckpointValue;
+                        try positions.choice.append(walk.arena, index);
+                    } else if (custom.vtable.decision) |metadata| {
+                        if (metadata.kind == .choice) {
+                            for (walk.choice_classes, 0..) |binding, class| {
+                                if (custom.vtable.type_identity != binding.identity) continue;
+                                if (!binding.valid(custom)) return error.UnsupportedGepaCheckpointValue;
+                                try positions.configured_choice.append(walk.arena, .{ .index = index, .class = class });
+                                return;
+                            }
+                            return error.UnsupportedGepaCheckpointValue;
+                        }
+                        if (metadata.kind == .score) {
+                            for (walk.score_classes, 0..) |binding, class| {
+                                if (custom.vtable.type_identity != binding.identity) continue;
+                                if (!binding.valid(custom)) return error.UnsupportedGepaCheckpointValue;
+                                try positions.configured_score.append(walk.arena, .{ .index = index, .class = class });
+                                return;
+                            }
+                            return error.UnsupportedGepaCheckpointValue;
+                        }
+                        if (metadata.kind != .noul) return error.UnsupportedGepaCheckpointValue;
+                        for (walk.noul_classes, 0..) |binding, class| {
+                            if (custom.vtable.type_identity != binding.identity) continue;
+                            if (!binding.valid(custom)) return error.UnsupportedGepaCheckpointValue;
+                            try positions.configured_noul.append(walk.arena, .{ .index = index, .class = class });
+                            break;
+                        } else return error.UnsupportedGepaCheckpointValue;
+                    } else {
+                        const metadata = custom.vtable.code orelse return error.UnsupportedGepaCheckpointValue;
+                        if (!std.unicode.utf8ValidateSlice(metadata.content(custom.ptr)))
+                            return error.UnsupportedGepaCheckpointValue;
+                        for (walk.code_classes, 0..) |binding, class| {
+                            if (custom.vtable.type_identity != binding.identity) continue;
+                            try positions.specialized_code.append(walk.arena, .{ .index = index, .class = class });
+                            break;
+                        } else return error.UnsupportedGepaCheckpointValue;
+                    }
+                },
+                .number_string => |text| {
+                    // Runtime JSON writes wide integers as number tokens and
+                    // reads them back in the same variant, without using f64.
+                    // Other raw numbers need not round-trip as the same value.
+                    if (!validCheckpointInteger(.{ .number_string = text }))
+                        return error.UnsupportedGepaCheckpointValue;
+                },
+                .string => |text| {
+                    if (!std.unicode.utf8ValidateSlice(text))
+                        return error.UnsupportedGepaCheckpointValue;
+                },
+                .float => |number| {
+                    if (!std.math.isFinite(number)) return error.UnsupportedGepaCheckpointValue;
+                },
+                else => {},
+            }
+        }
+    };
+
+    // Citation validators used at the adapter boundary coerce values and omit
+    // unknown fields. A checkpoint must instead contain the exact raw record.
+    fn validCheckpointInteger(field: Value) bool {
+        if (field == .integer) return true;
+        if (field != .number_string) return false;
+        const text = field.number_string;
+        if (!validCheckpointIntegerText(text)) return false;
+        const integer = value.parseInteger(field) catch return false;
+        return integer == .number_string;
+    }
+
+    fn validCheckpointIntegerText(text: []const u8) bool {
+        const negative = text.len != 0 and text[0] == '-';
+        const digits = text[@intFromBool(negative)..];
+        if (digits.len == 0 or digits.len > 4300) return false;
+        if (digits[0] == '0') return !negative and digits.len == 1;
+        for (digits) |digit| if (!std.ascii.isDigit(digit)) return false;
+        return true;
+    }
+
+    fn validateCitation(item: Citation) !void {
+        inline for (Citation.field_names) |name| {
+            const field = @field(item, name);
+            const T = @TypeOf(field);
+            const valid = if (T == []const u8)
+                std.unicode.utf8ValidateSlice(field)
+            else if (T == ?[]const u8)
+                if (field) |text| std.unicode.utf8ValidateSlice(text) else true
+            else if (field) |number| validCheckpointInteger(number.value) else true;
+            if (!valid) return error.UnsupportedGepaCheckpointValue;
+        }
+    }
+
+    const StoredCandidate = struct {
+        instructions: []const []const u8,
+        parents: []const ?usize,
+        ids: []const usize,
+        runs: []const StoredRun,
+        discovery: usize,
+        next_pred: usize,
+    };
+
+    const StoredCacheRow = struct {
+        instructions: []const []const u8,
+        id: usize,
+        run: StoredRun,
+    };
+
+    const LogTask = struct {
+        parent_idx: usize,
+        subsample_ids: []const usize,
+        subsample_scores: ?[]const f64 = null,
+        new_subsample_scores: ?[]const f64 = null,
+    };
+
+    const IterationLog = struct {
+        i: usize,
+        selected_program_candidate: ?usize = null,
+        subsample_ids: ?[]const usize = null,
+        n_tasks: ?usize = null,
+        tasks: ?[]const LogTask = null,
+        subsample_scores: ?[]const f64 = null,
+        new_subsample_scores: ?[]const f64 = null,
+        new_program_idx: ?usize = null,
+        new_program_indices: ?[]const usize = null,
+        evaluated_val_indices: ?[]const usize = null,
+        invoked_merge: ?bool = null,
+        merged: ?bool = null,
+        merged_entities: ?[3]usize = null,
+        id1_subsample_scores: ?[]const f64 = null,
+        id2_subsample_scores: ?[]const f64 = null,
+        new_program_subsample_scores: ?[]const f64 = null,
+    };
+
+    const CandidateLog = struct {
+        names: []const []const u8,
+        candidates: []const []const []const u8,
+
+        pub fn jsonStringify(log: CandidateLog, json: anytype) !void {
+            try json.beginArray();
+            for (log.candidates) |candidate| {
+                assert(candidate.len == log.names.len);
+                try json.beginObject();
+                for (log.names, candidate) |name, instructions| {
+                    try json.objectField(name);
+                    try json.write(instructions);
+                }
+                try json.endObject();
+            }
+            try json.endArray();
+        }
+    };
+
+    const checkpoint_version = 26;
+
+    const StoredState = struct {
+        version: u32,
+        revision: []const u8,
+        seed: u32,
+        train_count: usize,
+        val_count: usize,
+        // Allow old files to parse so they get the version incompatibility error.
+        train_digest: ?[32]u8 = null,
+        val_digest: ?[32]u8 = null,
+        demos_digest: ?[32]u8 = null,
+        field_metadata_digest: ?[32]u8 = null,
+        predict_config_digest: ?[32]u8 = null,
+        lm_options_digest: ?[32]u8 = null,
+        task_adapter: ?Adapter = null,
+        task_json_fallback: ?bool = null,
+        task_native_function_calling: ?bool = null,
+        // Store the exact f64 without relying on JSON float encoding.
+        failure_score_bits: ?u64 = null,
+        task_model_digest: ?[32]u8 = null,
+        names: []const []const u8,
+        frontier: Frontier,
+        sparse: bool,
+        track_outputs: bool,
+        adapter_rng: pyrandom.Random,
+        last_iteration: ?usize,
+        total_evals: usize,
+        candidates: []const StoredCandidate,
+        cache: []const StoredCacheRow,
+        run_log: []const IterationLog = &.{},
+    };
+
+    const CheckpointDigest = struct {
+        const Sha256 = std.crypto.hash.sha2.Sha256;
+        const DigestError = error{UnsupportedCheckpointValue};
+
+        fn dataset(rows: []const Example) DigestError![32]u8 {
+            var hash = Sha256.init(.{});
+            size(&hash, rows.len);
+            for (rows) |row| {
+                size(&hash, row.input_keys.len);
+                for (row.input_keys) |key| bytes(&hash, key);
+                try node(&hash, .{ .object = row.record }, 0);
+            }
+            return hash.finalResult();
+        }
+
+        fn demos(predictors: []const predict.NamedParam, override: ?[]const Record) DigestError![32]u8 {
+            var hash = Sha256.init(.{});
+            size(&hash, predictors.len);
+            for (predictors) |p| try demoRecords(&hash, p.param.predict.demos);
+            // Null uses stored demos; an explicit empty override clears them.
+            hash.update(&.{@intFromBool(override != null)});
+            if (override) |records| try demoRecords(&hash, records);
+            return hash.finalResult();
+        }
+
+        fn fieldMetadata(allocator: Allocator, predictors: []const predict.NamedParam, checkpoint: Checkpoint) (DigestError || Allocator.Error)![32]u8 {
+            var hash = Sha256.init(.{});
+            size(&hash, predictors.len);
+            for (predictors) |p| {
+                const state = p.param.predict;
+                size(&hash, state.fields.len);
+                size(&hash, state.input_count);
+                // Hash the live overlays used by PredictState.view, not the
+                // default descriptions and prefixes in its static field table.
+                for (state.fields, state.descs, state.prefixes) |field, desc, prefix| {
+                    bytes(&hash, field.name);
+                    bytes(&hash, desc);
+                    bytes(&hash, prefix);
+                    // Fingerprint the annotation by value, never by validator
+                    // address or nominal class identity across processes.
+                    bytes(&hash, @tagName(field.kind));
+                    bytes(&hash, field.type_name);
+                    bytes(&hash, field.schema);
+                    bytes(&hash, field.xml_schema);
+                    bytes(&hash, field.schema_definition_name);
+                    hash.update(&.{@intFromBool(field.nullable)});
+                    size(&hash, field.literals.len);
+                    for (field.literals) |literal| bytes(&hash, literal);
+                    // Decision metadata may change the evidence prompt and
+                    // decoding without changing the primitive field schema.
+                    hash.update(&.{@intFromBool(field.decision != null)});
+                    if (field.decision) |binding| {
+                        hash.update(&.{ @intFromBool(binding.rich), @intFromBool(binding.automatic) });
+                        bytes(&hash, @tagName(binding.model.kind));
+                        bytes(&hash, binding.model.criteria_json);
+                        size(&hash, binding.model.labels.len);
+                        for (binding.model.labels) |label| bytes(&hash, label);
+                        size(&hash, binding.model.values.len);
+                        for (binding.model.values) |member| try node(&hash, member, 0);
+                        bytes(&hash, binding.evidence_name);
+                        bytes(&hash, binding.evidence_schema);
+                    }
+                    // Defaults can change the request schema and the value
+                    // scored when a completion omits the field.
+                    hash.update(&.{@intFromBool(field.default_value != null)});
+                    if (field.default_value) |get| {
+                        var scratch = std.heap.ArenaAllocator.init(allocator);
+                        defer scratch.deinit();
+                        const arena = scratch.allocator();
+                        try valueNode(&hash, try get(arena), 0, arena);
+                    }
+                }
+            }
+            if (checkpoint.code_classes.len != 0) {
+                // Omit unused extensions for existing version-26 checkpoints.
+                bytes(&hash, "specialized Code checkpoint classes");
+                size(&hash, checkpoint.code_classes.len);
+                for (checkpoint.code_classes) |binding| {
+                    bytes(&hash, binding.id);
+                    bytes(&hash, binding.type_name);
+                    bytes(&hash, binding.language);
+                }
+            }
+            if (checkpoint.noul_classes.len != 0) {
+                bytes(&hash, "configured Noul checkpoint classes");
+                size(&hash, checkpoint.noul_classes.len);
+                for (checkpoint.noul_classes) |binding| {
+                    bytes(&hash, binding.id);
+                    bytes(&hash, binding.criteria_json);
+                }
+            }
+            if (checkpoint.score_classes.len != 0) {
+                bytes(&hash, "configured Score checkpoint classes");
+                size(&hash, checkpoint.score_classes.len);
+                for (checkpoint.score_classes) |binding| {
+                    bytes(&hash, binding.id);
+                    bytes(&hash, binding.criteria_json);
+                }
+            }
+            if (checkpoint.choice_classes.len != 0) {
+                bytes(&hash, "configured Choice checkpoint classes");
+                size(&hash, checkpoint.choice_classes.len);
+                for (checkpoint.choice_classes) |binding| {
+                    bytes(&hash, binding.id);
+                    bytes(&hash, binding.type_name);
+                    bytes(&hash, binding.criteria_json);
+                }
+            }
+            return hash.finalResult();
+        }
+
+        fn predictConfig(allocator: Allocator, predictors: []const predict.NamedParam, override: ?*const predict.PredictConfig) (DigestError || Allocator.Error)![32]u8 {
+            var hash = Sha256.init(.{});
+            size(&hash, predictors.len);
+            // No config and an empty config both inherit at either layer.
+            for (predictors) |p| {
+                const config = p.param.predict.config;
+                try configField(&hash, if (config) |c| c.* else predict.PredictConfig{});
+                // Criteria and instructions change the prompt; thresholds,
+                // cuts, and weights can change the decoded prediction.
+                var scratch = std.heap.ArenaAllocator.init(allocator);
+                defer scratch.deinit();
+                try valueNode(&hash, p.param.predict.decision_fields, 0, scratch.allocator());
+            }
+            try configField(&hash, if (override) |c| c.* else predict.PredictConfig{});
+            return hash.finalResult();
+        }
+
+        fn lmOptions(ctx: Context) DigestError![32]u8 {
+            var hash = Sha256.init(.{});
+            try configField(&hash, ctx.lm_options);
+            // TwoStep extraction starts a separate Predict with its own LM options.
+            if (ctx.adapter == .two_step) {
+                hash.update(&.{@intFromBool(ctx.two_step != null)});
+                if (ctx.two_step) |adapter| try configField(&hash, adapter.extraction_options);
+            }
+            return hash.finalResult();
+        }
+
+        fn taskModels(predictors: []const predict.NamedParam, ctx: Context, rollouts: ?Rollouts) [32]u8 {
+            var hash = Sha256.init(.{});
+            size(&hash, predictors.len);
+            hash.update(&.{@intFromBool(rollouts != null)});
+            if (rollouts) |pool| {
+                // GEPA uses the LM from the attempt's context, not the base LM.
+                // Slot order matters; extra contexts beyond capacity are unused.
+                size(&hash, pool.runner.attempts);
+                for (pool.contexts[0..pool.runner.attempts]) |slot| {
+                    var task_ctx = ctx;
+                    task_ctx.lm = slot.lm;
+                    predictorModels(&hash, predictors, task_ctx);
+                }
+            } else {
+                predictorModels(&hash, predictors, ctx);
+            }
+            if (ctx.adapter == .two_step) {
+                hash.update(&.{@intFromBool(ctx.two_step != null)});
+                if (ctx.two_step) |adapter| modelIdentity(&hash, adapter.extraction_model);
+            }
+            return hash.finalResult();
+        }
+
+        fn predictorModels(hash: *Sha256, predictors: []const predict.NamedParam, ctx: Context) void {
+            // Predictor order is checked separately against the stored names.
+            // Do not hash process-local handles or an LM shadowed by a binding.
+            for (predictors) |p| modelIdentity(hash, p.param.predict.effectiveLM(ctx));
+        }
+
+        fn modelIdentity(hash: *Sha256, model: @import("lm.zig").LM) void {
+            const name = model.modelName();
+            hash.update(&.{
+                @intFromBool(model.supports_function_calling),
+                @intFromBool(model.supports_reasoning),
+                @intFromBool(model.supports_decision_requests),
+                @intFromBool(model.supports_response_format),
+                @intFromBool(model.supports_response_schema),
+                @intFromBool(name != null),
+            });
+            if (name) |text| bytes(hash, text);
+        }
+
+        // Encode fields by value, not by pointer or raw struct bytes. Optional
+        // levels matter: an omitted setting and an explicit clear differ.
+        fn configField(hash: *Sha256, field: anytype) DigestError!void {
+            const T = @TypeOf(field);
+            if (T == Value) return node(hash, field, 0);
+            switch (@typeInfo(T)) {
+                .optional => {
+                    hash.update(&.{@intFromBool(field != null)});
+                    if (field) |present| try configField(hash, present);
+                },
+                .@"struct" => |info| inline for (info.field_names) |name| {
+                    const item = @field(field, name);
+                    if (comptime (T == @import("lm.zig").Options or T == predict.PredictConfig) and
+                        (std.mem.eql(u8, name, "cache") or std.mem.eql(u8, name, "max_tokens") or
+                            std.mem.eql(u8, name, "top_p") or std.mem.eql(u8, name, "frequency_penalty") or
+                            std.mem.eql(u8, name, "presence_penalty") or std.mem.eql(u8, name, "store") or
+                            std.mem.eql(u8, name, "user_id") or std.mem.eql(u8, name, "service_tier") or
+                            (T == predict.PredictConfig and std.mem.eql(u8, name, "top_k"))))
+                    {
+                        // Omit unset extensions from existing version-26 digests.
+                        if (item != null) {
+                            bytes(hash, if (comptime std.mem.eql(u8, name, "cache")) "response cache override" else name);
+                            try configField(hash, item);
+                        }
+                    } else if (comptime T == @import("lm.zig").Options and std.mem.eql(u8, name, "top_k")) {
+                        if (item != .null) {
+                            bytes(hash, "top_k");
+                            try configField(hash, item);
+                        }
+                    } else if (comptime T == @import("lm.zig").Options and std.mem.eql(u8, name, "stop")) {
+                        if (item.len != 0) {
+                            bytes(hash, "stop");
+                            try configField(hash, item);
+                        }
+                    } else if (comptime T == predict.PredictConfig and std.mem.eql(u8, name, "stop")) {
+                        if (item) |stops| {
+                            bytes(hash, "stop");
+                            try configField(hash, stops);
+                        }
+                    } else {
+                        try configField(hash, item);
+                    }
+                },
+                .@"union" => switch (field) {
+                    inline else => |payload, tag| {
+                        bytes(hash, @tagName(tag));
+                        try configField(hash, payload);
+                    },
+                },
+                .pointer => |info| {
+                    comptime assert(info.size == .slice);
+                    if (info.child == u8) {
+                        bytes(hash, field);
+                    } else {
+                        size(hash, field.len);
+                        for (field) |item| try configField(hash, item);
+                    }
+                },
+                .@"enum" => bytes(hash, @tagName(field)),
+                .bool => hash.update(&.{@intFromBool(field)}),
+                .int => size(hash, field),
+                .float => size(hash, @bitCast(field)),
+                .void => {},
+                else => @compileError("unsupported GEPA checkpoint config field: " ++ @typeName(T)),
+            }
+        }
+
+        fn demoRecords(hash: *Sha256, records: []const Record) DigestError!void {
+            size(hash, records.len);
+            for (records) |record| try node(hash, .{ .object = record }, 0);
+        }
+
+        fn size(hash: *Sha256, n: u64) void {
+            var encoded: [8]u8 = undefined;
+            std.mem.writeInt(u64, &encoded, n, .little);
+            hash.update(&encoded);
+        }
+
+        fn bytes(hash: *Sha256, text: []const u8) void {
+            size(hash, text.len);
+            hash.update(text);
+        }
+
+        fn node(hash: *Sha256, val: Value, depth: usize) DigestError!void {
+            return valueNode(hash, val, depth, null) catch |err| switch (err) {
+                error.UnsupportedCheckpointValue => error.UnsupportedCheckpointValue,
+                error.OutOfMemory => unreachable, // No allocator or custom projection.
+            };
+        }
+
+        fn valueNode(hash: *Sha256, val: Value, depth: usize, default_arena: ?Allocator) (DigestError || Allocator.Error)!void {
+            if (depth > 128) return error.UnsupportedCheckpointValue;
+            bytes(hash, @tagName(val));
+            switch (val) {
+                .null => {},
+                .bool => |b| hash.update(&.{@intFromBool(b)}),
+                .integer => |n| size(hash, @bitCast(n)),
+                .float => |n| size(hash, @bitCast(n)),
+                .string, .number_string => |text| bytes(hash, text),
+                .array => |list| {
+                    size(hash, list.items.len);
+                    for (list.items) |item| try valueNode(hash, item, depth + 1, default_arena);
+                },
+                .object => |map| {
+                    size(hash, map.count());
+                    for (map.keys(), map.values()) |key, item| {
+                        bytes(hash, key);
+                        try valueNode(hash, item, depth + 1, default_arena);
+                    }
+                },
+                .custom => |custom| try defaultCustom(hash, custom, depth + 1, default_arena orelse return error.UnsupportedCheckpointValue),
+            }
+        }
+
+        fn defaultCustom(hash: *Sha256, custom: @import("runtime_value.zig").Custom, depth: usize, arena: Allocator) (DigestError || Allocator.Error)!void {
+            if (depth > 128) return error.UnsupportedCheckpointValue;
+            bytes(hash, custom.vtable.type_name);
+            if (custom.vtable.enumeration) |inspect| {
+                const member = inspect(custom.ptr);
+                bytes(hash, "enum");
+                bytes(hash, member.class_name);
+                bytes(hash, member.member_name);
+                return valueNode(hash, member.value, depth, arena);
+            }
+            if (custom.vtable.python) |inspect| {
+                const payload = inspect(custom.ptr);
+                bytes(hash, @tagName(payload));
+                switch (payload) {
+                    .bytes, .bytearray => |text| bytes(hash, text),
+                    .float => |n| size(hash, @bitCast(n)),
+                    .tuple, .set, .frozen_set => |items| {
+                        size(hash, items.len);
+                        for (items) |item| try valueNode(hash, item, depth, arena);
+                    },
+                    .complex => |n| {
+                        size(hash, @bitCast(n.real));
+                        size(hash, @bitCast(n.imag));
+                    },
+                    .decimal => |n| {
+                        bytes(hash, @tagName(n.kind));
+                        hash.update(&.{@intFromBool(n.negative)});
+                        bytes(hash, n.digits);
+                        size(hash, @bitCast(n.exponent));
+                    },
+                    .ellipsis => {},
+                    .dictionary => |entries| {
+                        size(hash, entries.len);
+                        for (entries) |entry| {
+                            try valueNode(hash, entry.key, depth, arena);
+                            try valueNode(hash, entry.value, depth, arena);
+                        }
+                    },
+                }
+                return;
+            }
+            bytes(hash, "raw");
+            const raw = try custom.rawValue(arena);
+            if (raw == .custom and raw.custom.ptr == custom.ptr and raw.custom.vtable == custom.vtable)
+                return error.UnsupportedCheckpointValue;
+            return valueNode(hash, raw, depth, arena);
+        }
+    };
+
+    const CheckpointWriter = struct {
+        sink: *std.Io.Writer,
+        remaining: usize,
+        too_large: bool = false,
+        writer: std.Io.Writer = .{ .vtable = &.{ .drain = drain }, .buffer = &.{} },
+
+        fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+            const limiter: *CheckpointWriter = @fieldParentPtr("writer", w);
+            assert(w.end == 0);
+            assert(data.len > 0);
+            var budget = limiter.remaining;
+            const last = data[data.len - 1];
+            const repeated = std.math.mul(usize, last.len, splat) catch return limiter.overflow();
+            if (repeated > budget) return limiter.overflow();
+            budget -= repeated;
+            for (data[0 .. data.len - 1]) |bytes| {
+                if (bytes.len > budget) return limiter.overflow();
+                budget -= bytes.len;
+            }
+            for (data[0 .. data.len - 1]) |bytes| try limiter.sink.writeAll(bytes);
+            if (last.len != 0) {
+                for (0..splat) |_| try limiter.sink.writeAll(last);
+            }
+            const written = limiter.remaining - budget;
+            limiter.remaining = budget;
+            return written;
+        }
+
+        fn overflow(limiter: *CheckpointWriter) error{WriteFailed} {
+            limiter.too_large = true;
+            return error.WriteFailed;
+        }
+    };
 
     const Desc = struct { id1: usize, id2: usize, picks: []const usize };
+
+    const Leader = struct {
+        score: ?f64 = null,
+        candidates: std.ArrayList(usize) = .empty,
+
+        fn update(leader: *Leader, out: Allocator, candidate: usize, score: f64) !void {
+            const previous = leader.score orelse -std.math.inf(f64);
+            if (candidate == 0 or score > previous) {
+                leader.score = score;
+                leader.candidates.clearRetainingCapacity();
+            } else if (score != previous) return;
+            try leader.candidates.append(out, candidate);
+        }
+    };
+
+    const Objectives = struct {
+        named: std.StringArrayHashMapUnmanaged(Leader) = .empty,
+        cartesian: std.AutoArrayHashMapUnmanaged([2]usize, Leader) = .empty,
+        aggregates: std.ArrayList([]const ObjectiveScore) = .empty,
+        totals: std.StringArrayHashMapUnmanaged(Total) = .empty,
+
+        const Total = struct { sum: f64 = 0, count: usize = 0, last_row: ?usize = null };
+
+        fn update(
+            state: *Objectives,
+            out: Allocator,
+            mode: Frontier,
+            candidate: usize,
+            runs: []const Run,
+            ids: ?[]const usize,
+        ) !void {
+            assert(ids == null or ids.?.len == runs.len);
+            const totals = &state.totals;
+            defer totals.clearRetainingCapacity();
+            for (runs, 0..) |run, row| for (run.objective_scores) |entry| {
+                const total = try totals.getOrPut(out, entry.name);
+                if (!total.found_existing) total.value_ptr.* = .{};
+                if (total.value_ptr.last_row == row) return error.DuplicateObjective;
+                total.value_ptr.last_row = row;
+                total.value_ptr.sum += entry.score;
+                total.value_ptr.count += 1;
+            };
+            if (totals.count() == 0) {
+                if (mode != .instance) return error.MissingObjectiveScores;
+                if (state.aggregates.items.len != 0) try state.aggregates.append(out, &.{});
+                return;
+            }
+            if (state.aggregates.items.len == 0) try state.aggregates.appendNTimes(out, &.{}, candidate);
+            assert(state.aggregates.items.len == candidate);
+            const aggregate = try out.alloc(ObjectiveScore, totals.count());
+            for (aggregate, totals.keys(), totals.values()) |*entry, name, total| {
+                const score = total.sum / @as(f64, @floatFromInt(total.count));
+                const named = try state.named.getOrPut(out, name);
+                if (!named.found_existing) {
+                    named.key_ptr.* = try out.dupe(u8, name);
+                    named.value_ptr.* = .{};
+                }
+                try named.value_ptr.update(out, candidate, score);
+                entry.* = .{ .name = named.key_ptr.*, .score = score };
+            }
+            try state.aggregates.append(out, aggregate);
+            if (mode == .cartesian) {
+                for (runs, 0..) |run, row| for (run.objective_scores) |entry| {
+                    const id = if (ids) |rows| rows[row] else row;
+                    const key = [2]usize{ id, state.named.getIndex(entry.name).? };
+                    const front = try state.cartesian.getOrPut(out, key);
+                    if (!front.found_existing) front.value_ptr.* = .{};
+                    try front.value_ptr.update(out, candidate, entry.score);
+                };
+            }
+        }
+
+        fn results(state: *const Objectives, out: Allocator) !struct {
+            leaders: ?[]const ObjectiveLeaders,
+            scores: ?[]const ObjectiveScore,
+        } {
+            var leaders: std.ArrayList(ObjectiveLeaders) = .empty;
+            var scores: std.ArrayList(ObjectiveScore) = .empty;
+            for (state.named.keys(), state.named.values()) |name, front| {
+                if (front.candidates.items.len > 0) try leaders.append(out, .{
+                    .name = name,
+                    .candidates = front.candidates.items,
+                });
+                if (front.score) |score| try scores.append(out, .{ .name = name, .score = score });
+            }
+            return .{
+                .leaders = if (leaders.items.len == 0) null else leaders.items,
+                .scores = if (scores.items.len == 0) null else scores.items,
+            };
+        }
+    };
 
     fn Engine(comptime P: type) type {
         return struct {
@@ -136,14 +2133,24 @@ pub const GEPA = struct {
             adapter_rng: pyrandom.Random,
             candidates: std.ArrayList([]const []const u8) = .empty,
             subscores: std.ArrayList([]const f64) = .empty,
+            // Full validation still needs row IDs when history includes subsets.
+            partial_validation_archive: bool = false,
+            all_val_ids: []const usize = &.{},
+            val_ids: std.ArrayList([]const usize) = .empty,
+            val_indices: std.ArrayList(std.AutoArrayHashMapUnmanaged(usize, usize)) = .empty,
+            val_front_order: std.ArrayList(usize) = .empty,
             parents: std.ArrayList([]const ?usize) = .empty,
             discovery: std.ArrayList(usize) = .empty,
             next_pred: std.ArrayList(usize) = .empty,
             front_score: []f64,
             fronts: []std.ArrayList(usize),
+            objectives: Objectives = .{},
+            best_outputs: ?[]std.ArrayList(BestOutput) = null,
+            evaluation_cache: std.HashMapUnmanaged(CacheKey, Run, CacheContext, 80) = .empty,
             total_evals: usize = 0,
             full_evals: usize = 0,
             i: usize = 0,
+            score_mismatch_warned: bool = false,
             // EpochShuffledBatchSampler
             shuffled: std.ArrayList(usize) = .empty,
             epoch: ?usize = null,
@@ -155,6 +2162,423 @@ pub const GEPA = struct {
             last_iter_found_new_program: bool = false,
             triplets: std.ArrayList([3]usize) = .empty,
             descs: std.ArrayList(Desc) = .empty,
+            checkpoint: ?Checkpoint = null,
+            train_digest: ?[32]u8 = null,
+            val_digest: ?[32]u8 = null,
+            demos_digest: ?[32]u8 = null,
+            field_metadata_digest: ?[32]u8 = null,
+            predict_config_digest: ?[32]u8 = null,
+            lm_options_digest: ?[32]u8 = null,
+            task_model_digest: ?[32]u8 = null,
+            checkpoint_runs: std.ArrayList([]const Run) = .empty,
+            log_dir: ?LogDirectory = null,
+            run_log: std.ArrayList(IterationLog) = .empty,
+            stop_path: ?[]const u8 = null,
+            logged_tree_size: usize = 1,
+
+            fn currentLog(e: *Self) ?*IterationLog {
+                if (e.log_dir == null) return null;
+                assert(e.run_log.items.len != 0);
+                const entry = &e.run_log.items[e.run_log.items.len - 1];
+                assert(entry.i == e.i);
+                return entry;
+            }
+
+            fn saveRunArtifacts(e: *Self) !void {
+                const dir = e.log_dir orelse return;
+                var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                defer scratch.deinit();
+                const arena = scratch.allocator();
+                if (e.run_log.items.len != 0) {
+                    const path = try std.fs.path.join(arena, &.{ dir.path, "run_log.json" });
+                    try writeBoundedJson(dir.io, path, dir.max_file_bytes, e.run_log.items, .run_log);
+                }
+                const path = try std.fs.path.join(arena, &.{ dir.path, "candidates.json" });
+                const candidates: CandidateLog = .{ .names = e.names, .candidates = e.candidates.items };
+                try writeBoundedJson(dir.io, path, dir.max_file_bytes, candidates, .run_log);
+                if (e.candidates.items.len > e.logged_tree_size) {
+                    if (e.saveCandidateTree(arena, dir)) |_| {
+                        e.logged_tree_size = e.candidates.items.len;
+                    } else |err| {
+                        std.log.scoped(.gepa).warn("Could not save candidate lineage: {t}", .{err});
+                    }
+                }
+            }
+
+            fn saveCandidateTree(e: *const Self, arena: Allocator, dir: LogDirectory) !void {
+                const scores = try arena.alloc(f64, e.candidates.items.len);
+                var best: usize = 0;
+                for (scores, 0..) |*score, index| {
+                    score.* = e.average(index);
+                    if (score.* > scores[best]) best = index;
+                }
+                const fronts = try arena.alloc([]const usize, e.instanceFrontCount());
+                for (fronts, 0..) |*front, index| front.* = e.instanceFront(index);
+                const leaders = try arena.alloc(bool, scores.len);
+                @memset(leaders, false);
+                var programs: std.ArrayList(usize) = .empty;
+                for (fronts) |front| for (front) |index| {
+                    if (leaders[index]) continue;
+                    leaders[index] = true;
+                    try programs.append(arena, index);
+                };
+                reduceFronts(programs.items, scores, fronts, leaders);
+
+                const order = try arena.alloc(usize, e.names.len);
+                for (order, 0..) |*index, i| index.* = i;
+                std.sort.insertion(usize, order, e.names, struct {
+                    fn less(names: []const []const u8, a: usize, b: usize) bool {
+                        return std.mem.lessThan(u8, names[a], names[b]);
+                    }
+                }.less);
+                const path = try std.fs.path.join(arena, &.{ dir.path, "candidate_tree.html" });
+                var target = try std.Io.Dir.cwd().createFileAtomic(dir.io, path, .{
+                    .make_path = true,
+                    .replace = true,
+                });
+                defer target.deinit(dir.io);
+                var buffer: [4096]u8 = undefined;
+                var writer = target.file.writer(dir.io, &buffer);
+                var limited: CheckpointWriter = .{ .sink = &writer.interface, .remaining = dir.max_file_bytes };
+                e.renderCandidateTree(&limited.writer, scores, best, leaders, order) catch |err| {
+                    if (limited.too_large) return error.GepaLogTooLarge;
+                    return err;
+                };
+                try writer.interface.flush();
+                try target.file.sync(dir.io);
+                try target.replace(dir.io);
+            }
+
+            fn renderCandidateTree(
+                e: *const Self,
+                writer: *Writer,
+                scores: []const f64,
+                best: usize,
+                leaders: []const bool,
+                order: []const usize,
+            ) Writer.Error!void {
+                try writer.writeAll(
+                    "<!doctype html><html lang=\"en\"><meta charset=\"utf-8\">" ++
+                        "<title>GEPA Candidate Lineage</title><h1>GEPA Candidate Lineage</h1>\n",
+                );
+                for (e.candidates.items, e.parents.items, scores, leaders, 0..) |candidate, parents, score, leader, i| {
+                    const role = if (i == best) "Best" else if (leader) "Pareto Front" else if (i == 0) "Seed" else "";
+                    try writer.print("<section id=\"candidate-{d}\"><h2>Candidate {d}</h2>", .{ i, i });
+                    try writer.print("<p>Score: <span class=\"score\">{d:.4}</span> ", .{score});
+                    try writer.print("<span class=\"role\">{s}</span></p><p>Parents: <span class=\"parents\">", .{role});
+                    var count: usize = 0;
+                    for (parents) |maybe| if (maybe) |parent| {
+                        if (count != 0) try writer.writeAll(", ");
+                        try writer.print("<a href=\"#candidate-{d}\">{d}</a>", .{ parent, parent });
+                        count += 1;
+                    };
+                    if (count == 0) try writer.writeAll("seed");
+                    try writer.writeAll("</span></p><dl>");
+                    for (order) |index| {
+                        try writer.writeAll("<dt>");
+                        try writeHtmlText(writer, e.names[index]);
+                        try writer.writeAll("</dt><dd><pre>");
+                        try writeHtmlText(writer, candidate[index]);
+                        try writer.writeAll("</pre></dd>");
+                    }
+                    try writer.writeAll("</dl></section>\n");
+                }
+                try writer.writeAll("</html>\n");
+            }
+
+            fn writeBoundedJson(
+                io: std.Io,
+                path: []const u8,
+                limit: usize,
+                data: anytype,
+                kind: enum { checkpoint, run_log },
+            ) !void {
+                var target = try std.Io.Dir.cwd().createFileAtomic(io, path, .{
+                    .make_path = true,
+                    .replace = true,
+                });
+                defer target.deinit(io);
+                var buffer: [4096]u8 = undefined;
+                var writer = target.file.writer(io, &buffer);
+                var limited: CheckpointWriter = .{ .sink = &writer.interface, .remaining = limit };
+                const options: std.json.Stringify.Options = .{
+                    .emit_null_optional_fields = kind == .checkpoint,
+                };
+                std.json.Stringify.value(data, options, &limited.writer) catch |err| {
+                    if (!limited.too_large) return err;
+                    return switch (kind) {
+                        .checkpoint => error.GepaCheckpointTooLarge,
+                        .run_log => error.GepaLogTooLarge,
+                    };
+                };
+                try writer.interface.flush();
+                try target.file.sync(io);
+                try target.replace(io);
+            }
+
+            fn saveCheckpoint(e: *const Self, last_iteration: ?usize) !void {
+                const checkpoint = e.checkpoint orelse return;
+                var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                defer scratch.deinit();
+                const arena = scratch.allocator();
+                const candidates = try arena.alloc(StoredCandidate, e.candidates.items.len);
+                for (candidates, e.checkpoint_runs.items, 0..) |*candidate, runs, idx| {
+                    const encoded = try arena.alloc(StoredRun, runs.len);
+                    for (encoded, runs) |*row, run| {
+                        row.* = try .capture(run, arena, e.gepa.track_best_outputs, checkpoint);
+                    }
+                    candidate.* = .{
+                        .instructions = e.candidates.items[idx],
+                        .parents = e.parents.items[idx],
+                        .ids = if (e.indexedValidation()) e.val_ids.items[idx] else e.all_val_ids,
+                        .runs = encoded,
+                        .discovery = e.discovery.items[idx],
+                        .next_pred = e.next_pred.items[idx],
+                    };
+                }
+                const cache = try arena.alloc(StoredCacheRow, e.evaluation_cache.count());
+                var entries = e.evaluation_cache.iterator();
+                for (cache) |*row| {
+                    const entry = entries.next().?;
+                    row.* = .{
+                        .instructions = entry.key_ptr.candidate,
+                        .id = entry.key_ptr.id,
+                        .run = try .capture(entry.value_ptr.*, arena, true, checkpoint),
+                    };
+                }
+                const snapshot: StoredState = .{
+                    .version = checkpoint_version,
+                    .revision = checkpoint.revision,
+                    .seed = e.gepa.seed,
+                    .train_count = e.trainset.len,
+                    .val_count = e.valset.len,
+                    .train_digest = e.train_digest.?,
+                    .val_digest = e.val_digest.?,
+                    .demos_digest = e.demos_digest.?,
+                    .field_metadata_digest = e.field_metadata_digest.?,
+                    .predict_config_digest = e.predict_config_digest.?,
+                    .lm_options_digest = e.lm_options_digest.?,
+                    .task_adapter = e.ctx.adapter,
+                    .task_json_fallback = e.ctx.json_fallback,
+                    .task_native_function_calling = e.ctx.nativeFunctionCallingEnabled(),
+                    .failure_score_bits = @bitCast(e.gepa.failure_score),
+                    .task_model_digest = e.task_model_digest.?,
+                    .names = e.names,
+                    .frontier = e.gepa.frontier_type,
+                    .sparse = e.indexedValidation(),
+                    .track_outputs = e.gepa.track_best_outputs,
+                    .adapter_rng = e.adapter_rng,
+                    .last_iteration = last_iteration,
+                    .total_evals = e.total_evals,
+                    .candidates = candidates,
+                    .cache = cache,
+                    .run_log = e.run_log.items,
+                };
+                try writeBoundedJson(
+                    checkpoint.io,
+                    checkpoint.path,
+                    checkpoint.max_bytes,
+                    snapshot,
+                    .checkpoint,
+                );
+            }
+
+            fn readCheckpoint(e: *Self) !?StoredState {
+                const checkpoint = e.checkpoint orelse return null;
+                if (checkpoint.path.len == 0 or checkpoint.revision.len == 0 or
+                    !std.unicode.utf8ValidateSlice(checkpoint.revision) or checkpoint.max_bytes == 0)
+                    return error.InvalidGepaCheckpointOptions;
+                inline for (.{ checkpoint.code_classes, checkpoint.noul_classes, checkpoint.score_classes, checkpoint.choice_classes }) |classes| {
+                    for (classes, 0..) |binding, i| {
+                        if (binding.id.len == 0 or !std.unicode.utf8ValidateSlice(binding.id))
+                            return error.InvalidGepaCheckpointOptions;
+                        for (classes[0..i]) |previous| {
+                            if (std.mem.eql(u8, previous.id, binding.id) or previous.identity == binding.identity)
+                                return error.InvalidGepaCheckpointOptions;
+                        }
+                    }
+                }
+                var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                defer scratch.deinit();
+                const bytes = std.Io.Dir.cwd().readFileAlloc(
+                    checkpoint.io,
+                    checkpoint.path,
+                    scratch.allocator(),
+                    .limited(checkpoint.max_bytes),
+                ) catch |err| switch (err) {
+                    error.FileNotFound => return null,
+                    error.StreamTooLong => return error.GepaCheckpointTooLarge,
+                    else => return err,
+                };
+                return try std.json.parseFromSliceLeaky(StoredState, e.out, bytes, .{
+                    .allocate = .alloc_always,
+                });
+            }
+
+            fn checkCheckpoint(e: *const Self, snapshot: *const StoredState) !void {
+                if (snapshot.version != checkpoint_version or
+                    snapshot.train_digest == null or
+                    !std.mem.eql(u8, &snapshot.train_digest.?, &e.train_digest.?) or
+                    snapshot.val_digest == null or
+                    !std.mem.eql(u8, &snapshot.val_digest.?, &e.val_digest.?) or
+                    snapshot.demos_digest == null or
+                    !std.mem.eql(u8, &snapshot.demos_digest.?, &e.demos_digest.?) or
+                    snapshot.field_metadata_digest == null or
+                    !std.mem.eql(u8, &snapshot.field_metadata_digest.?, &e.field_metadata_digest.?) or
+                    snapshot.predict_config_digest == null or
+                    !std.mem.eql(u8, &snapshot.predict_config_digest.?, &e.predict_config_digest.?) or
+                    snapshot.lm_options_digest == null or
+                    !std.mem.eql(u8, &snapshot.lm_options_digest.?, &e.lm_options_digest.?) or
+                    snapshot.task_adapter != @as(?Adapter, e.ctx.adapter) or
+                    snapshot.task_json_fallback != @as(?bool, e.ctx.json_fallback) or
+                    snapshot.task_native_function_calling != @as(?bool, e.ctx.nativeFunctionCallingEnabled()) or
+                    snapshot.task_model_digest == null or
+                    !std.mem.eql(u8, &snapshot.task_model_digest.?, &e.task_model_digest.?) or
+                    snapshot.failure_score_bits != @as(u64, @bitCast(e.gepa.failure_score)) or
+                    !std.mem.eql(u8, snapshot.revision, e.checkpoint.?.revision) or
+                    snapshot.seed != e.gepa.seed or snapshot.frontier != e.gepa.frontier_type or
+                    snapshot.train_count != e.trainset.len or snapshot.val_count != e.valset.len or
+                    !sameCandidate(snapshot.names, e.names) or
+                    snapshot.track_outputs != e.gepa.track_best_outputs)
+                {
+                    return error.IncompatibleGepaCheckpoint;
+                }
+            }
+
+            fn restoreCheckpoint(e: *Self, snapshot: *const StoredState, seed: []const []const u8) !void {
+                if (snapshot.candidates.len == 0 or snapshot.adapter_rng.index > 624 or
+                    (!snapshot.sparse and snapshot.cache.len != 0) or
+                    snapshot.last_iteration == std.math.maxInt(usize) or
+                    !sameCandidate(snapshot.candidates[0].instructions, seed))
+                {
+                    return error.InvalidGepaCheckpoint;
+                }
+                if (e.log_dir != null) {
+                    if (snapshot.last_iteration) |last| {
+                        if (snapshot.run_log.len != last + 1) return error.IncompatibleGepaCheckpoint;
+                    } else if (snapshot.run_log.len != 0) return error.InvalidGepaCheckpoint;
+                    for (snapshot.run_log, 0..) |row, i| {
+                        if (row.i != i) return error.InvalidGepaCheckpoint;
+                    }
+                    try e.run_log.appendSlice(e.out, snapshot.run_log);
+                }
+                // Decide before committing any candidate: all rows and frontiers
+                // must use the same representation throughout the resumed run.
+                if (snapshot.sparse) {
+                    for (snapshot.candidates) |candidate| {
+                        if (candidate.ids.len < e.valset.len) {
+                            e.partial_validation_archive = true;
+                            break;
+                        }
+                    }
+                }
+                const trace = try e.out.create(Trace);
+                trace.* = .{ .arena = e.out };
+                for (snapshot.candidates, 0..) |candidate, idx| {
+                    try e.restoreCandidate(&candidate, idx, snapshot.total_evals, trace, snapshot.sparse);
+                }
+                // Restore only actual cache entries, not archived validation runs.
+                if (e.gepa.cache_evaluation) {
+                    for (snapshot.cache) |entry| {
+                        if (entry.id >= @max(e.trainset.len, e.valset.len) or
+                            entry.instructions.len != e.names.len)
+                            return error.InvalidGepaCheckpoint;
+                        const key: CacheKey = .{
+                            .candidate = entry.instructions,
+                            .digest = candidateDigest(entry.instructions),
+                            .id = entry.id,
+                        };
+                        if (e.evaluation_cache.contains(key)) return error.InvalidGepaCheckpoint;
+                        try e.evaluation_cache.put(e.out, key, try entry.run.restore(e.out, trace, e.checkpoint.?));
+                    }
+                }
+                e.total_evals = snapshot.total_evals;
+                e.adapter_rng = snapshot.adapter_rng;
+                e.i = snapshot.last_iteration orelse 0;
+            }
+
+            fn restoreCandidate(
+                e: *Self,
+                candidate: *const StoredCandidate,
+                idx: usize,
+                total_evals: usize,
+                trace: *const Trace,
+                was_indexed: bool,
+            ) !void {
+                if (candidate.instructions.len != e.names.len or
+                    candidate.next_pred >= e.names.len or
+                    candidate.discovery > total_evals or
+                    candidate.ids.len == 0 or candidate.runs.len != candidate.ids.len or
+                    candidate.parents.len == 0 or candidate.parents.len > 2)
+                    return error.InvalidGepaCheckpoint;
+                if (idx == 0 and (candidate.parents.len != 1 or candidate.discovery != 0))
+                    return error.InvalidGepaCheckpoint;
+                for (candidate.parents) |parent| {
+                    if (parent) |p| {
+                        if (p >= idx) return error.InvalidGepaCheckpoint;
+                    } else if (idx != 0) return error.InvalidGepaCheckpoint;
+                }
+                if (!was_indexed and !std.mem.eql(usize, candidate.ids, e.all_val_ids))
+                    return error.InvalidGepaCheckpoint;
+                // An indexed destination can keep every archived row regardless
+                // of the current policy. A dense destination requires a complete
+                // set in valset order (indexed archives can list hits first).
+                const reorder = was_indexed and !e.indexedValidation() and
+                    !std.mem.eql(usize, candidate.ids, e.all_val_ids);
+                if (reorder and candidate.ids.len != e.valset.len)
+                    return error.InvalidGepaCheckpoint;
+                for (candidate.ids) |id| {
+                    if (id >= e.valset.len) return error.InvalidGepaCheckpoint;
+                }
+                const runs = try e.out.alloc(Run, candidate.runs.len);
+                if (reorder) {
+                    var seen = try std.DynamicBitSetUnmanaged.initEmpty(std.heap.page_allocator, runs.len);
+                    defer seen.deinit(std.heap.page_allocator);
+                    for (candidate.ids, candidate.runs) |id, stored| {
+                        if (seen.isSet(id)) return error.InvalidGepaCheckpoint;
+                        seen.set(id);
+                        runs[id] = try stored.restore(e.out, trace, e.checkpoint.?);
+                    }
+                } else {
+                    for (runs, candidate.runs) |*run, stored| run.* = try stored.restore(e.out, trace, e.checkpoint.?);
+                }
+                e.total_evals = candidate.discovery;
+                try e.commitProgramMode(candidate.instructions, candidate.parents, .{
+                    .ids = if (reorder) e.all_val_ids else candidate.ids,
+                    .runs = runs,
+                    .calls = 0,
+                }, .restore);
+                if (e.indexedValidation() and e.val_ids.items[idx].len != candidate.ids.len)
+                    return error.InvalidGepaCheckpoint;
+                e.next_pred.items[idx] = candidate.next_pred;
+            }
+
+            fn shouldStop(e: *const Self, last_iteration: ?usize, max_calls: usize) !bool {
+                if (e.gepa.stop_callbacks.len > 0) {
+                    const state: StopState = .{
+                        .last_iteration = last_iteration,
+                        .total_metric_calls = e.total_evals,
+                        .num_full_val_evals = e.full_evals,
+                        .max_metric_calls = max_calls,
+                        .candidates = e.candidates.items,
+                        .val_subscores = e.subscores.items,
+                        .val_ids = e.validationIds(),
+                        .parents = e.parents.items,
+                        .discovery_eval_counts = e.discovery.items,
+                    };
+                    for (e.gepa.stop_callbacks) |callback| {
+                        if (try callback.should_stop(callback.ptr, &state)) return true;
+                    }
+                }
+                if (e.stop_path) |path| {
+                    // Like os.path.exists, an inaccessible marker is not a stop.
+                    // Native I/O cancellation is not an existence result.
+                    if (std.Io.Dir.cwd().access(e.log_dir.?.io, path, .{})) |_| {
+                        return true;
+                    } else |err| if (err == error.Canceled) return err;
+                }
+                return e.total_evals >= max_calls;
+            }
 
             fn average(e: *const Self, idx: usize) f64 {
                 const list = e.subscores.items[idx];
@@ -170,7 +2594,9 @@ pub const GEPA = struct {
                 return list;
             }
 
-            fn build(e: *const Self, candidate: []const []const u8) Allocator.Error!*P {
+            const Built = struct { program: *P, predictors: []const predict.NamedParam };
+
+            fn build(e: *const Self, candidate: []const []const u8) Allocator.Error!Built {
                 const copy = try e.out.create(P);
                 copy.* = e.student.*;
                 const preds = try predict.namedPredictors(e.out, copy);
@@ -179,78 +2605,372 @@ pub const GEPA = struct {
                     try p.param.predict.forkSignatureClass(e.out);
                     p.param.predict.instructions = text;
                 }
-                return copy;
+                return .{ .program = copy, .predictors = preds };
             }
 
-            fn failedRun(e: *const Self, trace: *Trace, capture: bool) Run {
-                // Evaluate substitutes an empty Prediction, while bootstrap
-                // trace capture drops failed rows and their trajectories.
+            const RolloutMode = enum { untraced, reflection, child_validation };
+
+            fn failedRun(e: *const Self, trace: *Trace, mode: RolloutMode) Allocator.Error!Run {
+                // Seed Evaluate substitutes an empty Prediction. The batched
+                // child adapter drops crashes, with separate parse diagnostics.
                 trace.steps.clearRetainingCapacity();
                 return .{
-                    .prediction = if (capture) null else Record.empty,
+                    .prediction = if (mode == .untraced) try optimize.RecordPrediction.init(e.out, .empty) else null,
                     .trace = trace,
                     .score = e.gepa.failure_score,
                 };
             }
 
-            fn runOne(e: *const Self, ctx: Context, program: *const P, example: *const Example, capture: bool) Allocator.Error!Run {
+            fn runOne(
+                e: *const Self,
+                ctx: Context,
+                built: *const Built,
+                example: *const Example,
+                mode: RolloutMode,
+            ) (Allocator.Error || error{Canceled})!Run {
                 const trace = try e.out.create(Trace);
                 trace.* = .{ .arena = e.out };
                 var c = ctx;
                 c.arena = e.out;
-                c.trace = if (capture) trace else null;
-                const prediction = optimize.runProgram(P, c, program, example) catch |err| {
+                c.trace = if (mode == .reflection) trace else null;
+                var failure: predict.ParseFailure = .{};
+                const reflect_failure = mode == .reflection and e.gepa.add_format_failure_as_feedback;
+                const log_failure = e.gepa.track_best_outputs and
+                    (mode == .child_validation or (mode == .reflection and e.gepa.cache_evaluation));
+                if (reflect_failure or log_failure) c.parse_failure = &failure;
+                const prediction = optimize.runProgram(P, c, built.program, example) catch |err| {
                     if (err == error.OutOfMemory) return error.OutOfMemory;
-                    return e.failedRun(trace, capture);
+                    if (err == error.Canceled) return error.Canceled;
+                    var run = try e.failedRun(trace, mode);
+                    if (err == error.AdapterParse and failure.signature_class != null) {
+                        if (log_failure) run.failed_completion = failure.failure.completion_text;
+                        if (reflect_failure) run.format_failure = try e.formatFailure(built.predictors, example, &failure);
+                    }
+                    return run;
                 };
-                const feedback = e.gepa.metric(e.out, example, &prediction, if (capture) trace else null, null, null) catch |err| {
+                // DSPy's evaluator scores the prediction without its captured
+                // trajectory. The trace is retained for predictor feedback only.
+                const feedback = e.gepa.metric(e.out, example, &prediction, null, null, null) catch |err| {
                     if (err == error.OutOfMemory) return error.OutOfMemory;
-                    return e.failedRun(trace, capture);
+                    return e.failedRun(trace, mode);
                 };
-                return .{ .prediction = prediction, .trace = trace, .score = feedback.score };
+                return .{
+                    .prediction = prediction,
+                    .trace = trace,
+                    .score = feedback.score,
+                    .objective_scores = feedback.objective_scores,
+                };
+            }
+
+            fn formatFailure(
+                e: *const Self,
+                predictors: []const predict.NamedParam,
+                example: *const Example,
+                failure: *const predict.ParseFailure,
+            ) Allocator.Error!?FormatFailure {
+                const class = failure.signature_class orelse return null;
+                for (predictors) |named| {
+                    const predictor = named.param.predict;
+                    if (predictor.signature_class != class) continue;
+                    return .{
+                        .predictor = predictor,
+                        .inputs = try example.inputs(e.out),
+                        .text = failure.failure.completion_text,
+                    };
+                }
+                return null;
             }
 
             fn evalIds(e: *Self, candidate: []const []const u8, set: []const Example, ids: []const usize, capture: bool) ![]Run {
-                const program = try e.build(candidate);
+                const total = try std.math.add(usize, e.total_evals, ids.len);
+                const runs = try e.rolloutIds(candidate, set, ids, if (capture) .reflection else .untraced);
+                e.total_evals = total;
+                return runs;
+            }
+
+            fn rolloutIds(e: *const Self, candidate: []const []const u8, set: []const Example, ids: []const usize, mode: RolloutMode) ![]Run {
                 const runs = try e.out.alloc(Run, ids.len);
-                if (e.gepa.rollouts) |rollouts| {
+                try e.rolloutIdsInto(candidate, set, ids, mode, runs);
+                return runs;
+            }
+
+            fn rolloutIdsInto(
+                e: *const Self,
+                candidate: []const []const u8,
+                set: []const Example,
+                ids: []const usize,
+                mode: RolloutMode,
+                runs: []Run,
+            ) !void {
+                assert(runs.len == ids.len);
+                const built = try e.build(candidate);
+                if (e.gepa.rollouts) |configured| {
+                    var rollouts = configured;
+                    rollouts.options.cancel_on_task_canceled = true;
                     const Call = struct {
                         engine: *const Self,
-                        program: *const P,
+                        built: *const Built,
                         example: *const Example,
-                        capture: bool,
+                        mode: RolloutMode,
 
                         fn invoke(ptr: *anyopaque, attempt: parallel.Attempt, run: *Run) anyerror!void {
                             const call: *const @This() = @ptrCast(@alignCast(ptr));
                             try attempt.cancellation.check();
                             const en = call.engine;
-                            const c = en.gepa.rollouts.?.context(en.ctx, attempt, false);
-                            run.* = try en.runOne(c, call.program, call.example, call.capture);
+                            const c = try en.gepa.rollouts.?.context(en.ctx, attempt, false);
+                            run.* = try en.runOne(c, call.built, call.example, call.mode);
                         }
                     };
                     const calls = try e.out.alloc(Call, ids.len);
                     const tasks = try e.out.alloc(parallel.TaskFor(Run), ids.len);
                     for (calls, tasks, ids) |*call, *task, id| {
-                        call.* = .{ .engine = e, .program = program, .example = &set[id], .capture = capture };
+                        call.* = .{ .engine = e, .built = &built, .example = &set[id], .mode = mode };
                         task.* = .{ .ptr = call, .invoke = Call.invoke };
                     }
                     try rollouts.run(tasks, runs);
                 } else {
-                    for (runs, ids) |*r, id| r.* = try e.runOne(e.ctx, program, &set[id], capture);
+                    for (runs, ids) |*r, id| r.* = try e.runOne(e.ctx, &built, &set[id], mode);
                 }
-                e.total_evals += ids.len;
-                return runs;
+            }
+
+            const CacheKey = struct {
+                candidate: []const []const u8,
+                digest: u64,
+                id: usize,
+            };
+
+            const CacheContext = struct {
+                pub fn hash(_: CacheContext, key: CacheKey) u64 {
+                    return std.hash.Wyhash.hash(key.digest, std.mem.asBytes(&key.id));
+                }
+
+                pub fn eql(_: CacheContext, a: CacheKey, b: CacheKey) bool {
+                    return a.id == b.id and a.digest == b.digest and
+                        sameCandidate(a.candidate, b.candidate);
+                }
+            };
+
+            fn candidateDigest(candidate: []const []const u8) u64 {
+                var hash = std.hash.Wyhash.init(0);
+                for (candidate) |text| {
+                    hash.update(std.mem.asBytes(&text.len));
+                    hash.update(text);
+                }
+                return hash.final();
+            }
+
+            fn cacheReflection(
+                e: *Self,
+                candidate: []const []const u8,
+                ids: []const usize,
+                runs: []const Run,
+            ) Allocator.Error!void {
+                if (!e.gepa.cache_evaluation) return;
+                try e.cacheRows(candidate, candidateDigest(candidate), ids, runs);
+            }
+
+            fn cacheRows(
+                e: *Self,
+                candidate: []const []const u8,
+                digest: u64,
+                ids: []const usize,
+                runs: []const Run,
+            ) Allocator.Error!void {
+                assert(e.gepa.cache_evaluation);
+                for (ids, runs) |id, run| {
+                    const key: CacheKey = .{ .candidate = candidate, .digest = digest, .id = id };
+                    if (e.evaluation_cache.getPtr(key)) |entry| {
+                        entry.* = run;
+                    } else try e.evaluation_cache.put(e.out, key, run);
+                }
+            }
+
+            const ScoredRows = struct {
+                ids: []const usize,
+                runs: []Run,
+                calls: usize,
+            };
+
+            fn scoreRows(
+                e: *Self,
+                candidate: []const []const u8,
+                ids: []const usize,
+                order: enum { cached_first, requested },
+            ) !ScoredRows {
+                // The seed uses Evaluate, while reflective children use DSPy's
+                // batched adapter, where a parse failure has its own output.
+                const mode: RolloutMode = if (e.candidates.items.len == 0 or order == .requested)
+                    .untraced
+                else
+                    .child_validation;
+                if (!e.gepa.cache_evaluation or e.candidates.items.len == 0) {
+                    const runs = try e.rolloutIds(candidate, e.valset, ids, mode);
+                    if (order == .requested) {
+                        // The merge subsample is bounded and may repeat IDs.
+                        // GEPA evaluates every occurrence, then indexes by ID
+                        // (last rollout wins) before expanding to sample order.
+                        assert(ids.len <= merge_subsample);
+                        for (ids, runs, 0..) |id, *run, i| {
+                            if (std.mem.lastIndexOfScalar(usize, ids[i + 1 ..], id)) |offset| {
+                                run.* = runs[i + 1 + offset];
+                            }
+                        }
+                    }
+                    return .{ .ids = ids, .runs = runs, .calls = ids.len };
+                }
+                const digest = candidateDigest(candidate);
+                const runs = try e.out.alloc(Run, ids.len);
+                const ordered = try e.out.alloc(usize, ids.len);
+                var hits: usize = 0;
+                var misses: usize = 0;
+                for (ids) |id| {
+                    const key: CacheKey = .{ .candidate = candidate, .digest = digest, .id = id };
+                    if (e.evaluation_cache.get(key)) |run| {
+                        ordered[hits] = id;
+                        runs[hits] = run;
+                        hits += 1;
+                    } else {
+                        ordered[ids.len - 1 - misses] = id;
+                        misses += 1;
+                    }
+                }
+                assert(hits + misses == ids.len);
+                const uncached = ordered[hits..];
+                std.mem.reverse(usize, uncached);
+                if (misses != 0) {
+                    try e.rolloutIdsInto(candidate, e.valset, uncached, mode, runs[hits..]);
+                    try e.cacheRows(candidate, digest, uncached, runs[hits..]);
+                }
+                if (order == .requested) {
+                    for (ids, runs) |id, *run| run.* = e.evaluation_cache.get(.{
+                        .candidate = candidate,
+                        .digest = digest,
+                        .id = id,
+                    }).?;
+                }
+                return .{
+                    .ids = if (order == .requested) ids else ordered,
+                    .runs = runs,
+                    .calls = misses,
+                };
+            }
+
+            fn indexedValidation(e: *const Self) bool {
+                return e.gepa.val_evaluation_policy != null or e.gepa.cache_evaluation or e.partial_validation_archive;
+            }
+
+            fn validationIds(e: *const Self) ?[]const []const usize {
+                return if (e.indexedValidation()) e.val_ids.items else null;
+            }
+
+            fn validationBatch(e: *const Self) ![]const usize {
+                const policy = e.gepa.val_evaluation_policy orelse return e.all_val_ids;
+                const ids = if (e.candidates.items.len == 0)
+                    if (policy.seed_batch) |seed| try seed(policy.ptr, e.valset) else return e.all_val_ids
+                else
+                    try policy.next_batch(policy.ptr, &e.validationState(e.i));
+                if (ids.len == 0 or ids.len > policy.max_batch_size)
+                    return error.InvalidValidationBatch;
+                for (ids) |id| if (id >= e.valset.len) return error.InvalidValidationBatch;
+                return ids;
+            }
+
+            fn validationState(e: *const Self, iteration: ?usize) ValidationState {
+                return .{
+                    .valset = e.valset,
+                    .candidates = e.candidates.items,
+                    .val_ids = e.val_ids.items,
+                    .val_subscores = e.subscores.items,
+                    .parents = e.parents.items,
+                    .iteration = iteration orelse 0,
+                    .before_first_iteration = iteration == null,
+                    .total_metric_calls = e.total_evals,
+                };
+            }
+
+            fn validationDiagnosticBest(
+                e: *const Self,
+                policy: ValidationPolicy,
+                state: *const ValidationState,
+            ) !usize {
+                if (policy.get_best_program) |select| {
+                    const best = try select(policy.ptr, state);
+                    if (best >= state.candidates.len) return error.InvalidValidationBest;
+                    return best;
+                }
+                // The default diagnostic policy breaks equal-score ties by coverage.
+                var best: usize = 0;
+                var best_score = e.average(best);
+                for (1..state.candidates.len) |i| {
+                    const score = e.average(i);
+                    if (score > best_score or
+                        (score == best_score and
+                            state.val_ids[i].len > state.val_ids[best].len))
+                    {
+                        best = i;
+                        best_score = score;
+                    }
+                }
+                return best;
+            }
+
+            fn validationDiagnostics(e: *const Self, child: ?usize, iteration: ?usize) !void {
+                const policy = e.gepa.val_evaluation_policy orelse return;
+                const score = policy.get_valset_score;
+                if (policy.get_best_program == null and score == null) return;
+                const state = e.validationState(iteration);
+                // GEPA first computes the update summary, then its detailed log.
+                if (child) |idx| {
+                    if (score) |get| _ = try get(policy.ptr, idx, &state);
+                    if (policy.get_best_program != null)
+                        _ = try e.validationDiagnosticBest(policy, &state);
+                }
+                const best = try e.validationDiagnosticBest(policy, &state);
+                if (score) |get| {
+                    _ = try get(policy.ptr, best, &state);
+                    if (child) |idx| {
+                        _ = try get(policy.ptr, idx, &state);
+                        _ = try get(policy.ptr, idx, &state);
+                    }
+                }
             }
 
             fn addProgram(e: *Self, candidate: []const []const u8, parent_ids: []const ?usize) !void {
-                const all = try e.out.alloc(usize, e.valset.len);
-                for (all, 0..) |*a, k| a.* = k;
+                const requested = try e.validationBatch();
+                const rows = try e.scoreRows(candidate, requested, .cached_first);
+                try e.commitProgram(candidate, parent_ids, rows);
+            }
+
+            fn commitProgram(
+                e: *Self,
+                candidate: []const []const u8,
+                parent_ids: []const ?usize,
+                rows: ScoredRows,
+            ) !void {
+                try e.commitProgramMode(candidate, parent_ids, rows, .live);
+            }
+
+            fn commitProgramMode(
+                e: *Self,
+                candidate: []const []const u8,
+                parent_ids: []const ?usize,
+                rows: ScoredRows,
+                mode: enum { live, restore },
+            ) !void {
+                const requested = rows.ids;
+                assert(requested.len == rows.runs.len);
                 const discovered = e.total_evals;
-                const runs = try e.evalIds(candidate, e.valset, all, false);
-                e.full_evals += 1;
+                e.total_evals = try std.math.add(usize, e.total_evals, rows.calls);
+                var runs = rows.runs;
+                const sparse = e.indexedValidation();
+                const ids = if (sparse) try e.retainValidationRows(requested, &runs) else requested;
                 const idx = e.candidates.items.len;
-                const scores = try e.out.alloc(f64, runs.len);
-                for (scores, runs) |*s, r| s.* = r.score;
+                // Source seeds the metric counter from the number of unique scored IDs.
+                // Subsequent evaluations count every rollout sent to the adapter.
+                if (idx == 0) e.total_evals = ids.len;
+                e.full_evals += 1;
+                try e.objectives.update(e.out, e.gepa.frontier_type, idx, runs, if (sparse) ids else null);
+                const scores = try e.runScores(runs);
                 var next: usize = 0;
                 for (parent_ids) |p| if (p) |pi| {
                     next = @max(next, e.next_pred.items[pi]);
@@ -260,27 +2980,149 @@ pub const GEPA = struct {
                 try e.parents.append(e.out, parent_ids);
                 try e.discovery.append(e.out, discovered);
                 try e.next_pred.append(e.out, next);
-                for (scores, 0..) |s, k| {
-                    if (idx == 0 or s > e.front_score[k]) {
-                        e.front_score[k] = s;
+                const output_override = e.gepa.validation_output_dir;
+                const output_dir = output_override orelse if (e.log_dir) |log|
+                    ValidationOutputDir{ .io = log.io, .path = log.path }
+                else
+                    null;
+                const output_limit = if (output_override == null and e.log_dir != null)
+                    e.log_dir.?.max_file_bytes
+                else
+                    null;
+                if (e.checkpoint != null) try e.checkpoint_runs.append(e.out, runs);
+                for (runs, ids) |run, k| {
+                    const first = e.fronts[k].items.len == 0;
+                    const incumbent = if (first) -std.math.inf(f64) else e.front_score[k];
+                    // The seed initializes its rows directly. A child with an
+                    // unordered score cannot join even a previously unseen row.
+                    const improves = idx == 0 or run.score > incumbent;
+                    if (!improves and run.score != incumbent) continue;
+                    if (mode == .live) if (output_dir) |dir| {
+                        if (idx == 0 or (e.gepa.track_best_outputs and improves)) {
+                            var repr: Writer.Allocating = .init(e.out);
+                            defer repr.deinit();
+                            if (try run.validationOutput(&repr)) |output| {
+                                const iteration = if (idx == 0) 0 else try std.math.add(usize, e.i, 1);
+                                try dir.save(k, iteration, idx, output, output_limit);
+                            }
+                        }
+                    };
+                    if (first and sparse) try e.val_front_order.append(e.out, k);
+                    if (first or improves) {
+                        e.front_score[k] = run.score;
                         e.fronts[k].clearRetainingCapacity();
-                        try e.fronts[k].append(e.out, idx);
-                    } else if (s == e.front_score[k]) {
-                        try e.fronts[k].append(e.out, idx);
                     }
+                    try e.fronts[k].append(e.out, idx);
+                    if (e.best_outputs) |outputs| {
+                        const entry: BestOutput = .{
+                            .candidate_idx = idx,
+                            .output = if (run.failed_completion) |text|
+                                .{ .failed_parse = .{ .completion_text = text, .format_reward = run.score } }
+                            else if (run.prediction) |prediction|
+                                .{ .prediction = prediction }
+                            else
+                                continue,
+                        };
+                        // A missing child output changes the score frontier but
+                        // does not replace or append to the retained outputs.
+                        if (improves) outputs[k].clearRetainingCapacity();
+                        try outputs[k].append(e.out, entry);
+                    }
+                }
+                if (mode == .live and idx != 0) {
+                    try e.validationDiagnostics(idx, e.i);
+                    if (e.currentLog()) |log| log.evaluated_val_indices = ids;
                 }
             }
 
+            fn finishIterationLog(e: *Self, first: usize) !void {
+                const log = e.currentLog() orelse return;
+                const end = e.candidates.items.len;
+                assert(first <= end);
+                if (first == end) return;
+                const accepted = try e.out.alloc(usize, end - first);
+                for (accepted, first..end) |*id, index| id.* = index;
+                const ids = try e.out.dupe(usize, log.evaluated_val_indices.?);
+                std.mem.sort(usize, ids, {}, comptime std.sort.asc(usize));
+                log.new_program_idx = end - 1;
+                log.new_program_indices = accepted;
+                log.evaluated_val_indices = ids;
+            }
+
+            fn retainValidationRows(e: *Self, ids: []const usize, runs: *[]Run) ![]const usize {
+                assert(ids.len == runs.len);
+                // The first occurrence determines order; the last rollout supplies its value.
+                var indices: std.AutoArrayHashMapUnmanaged(usize, usize) = .empty;
+                for (ids, 0..) |id, i| try indices.put(e.out, id, i);
+                for (indices.values(), 0..) |*last, i| {
+                    assert(last.* >= i);
+                    runs.*[i] = runs.*[last.*];
+                    last.* = i;
+                }
+                const retained = indices.keys();
+                runs.* = runs.*[0..retained.len];
+                try e.val_ids.append(e.out, retained);
+                if (e.gepa.use_merge) try e.val_indices.append(e.out, indices);
+                return retained;
+            }
+
+            fn instanceFrontCount(e: *const Self) usize {
+                return if (e.indexedValidation())
+                    e.val_front_order.items.len
+                else
+                    e.fronts.len;
+            }
+
+            fn instanceFront(e: *const Self, index: usize) []const usize {
+                const id = if (e.indexedValidation())
+                    e.val_front_order.items[index]
+                else
+                    index;
+                return e.fronts[id].items;
+            }
+
+            fn activeFrontCount(e: *const Self) usize {
+                return switch (e.gepa.frontier_type) {
+                    .instance => e.instanceFrontCount(),
+                    .objective => e.objectives.named.count(),
+                    .hybrid => e.instanceFrontCount() + e.objectives.named.count(),
+                    .cartesian => e.objectives.cartesian.count(),
+                };
+            }
+
+            fn activeFront(e: *const Self, index: usize) []const usize {
+                assert(index < e.activeFrontCount());
+                return switch (e.gepa.frontier_type) {
+                    .instance => e.instanceFront(index),
+                    .objective => e.objectives.named.values()[index].candidates.items,
+                    .hybrid => if (index < e.instanceFrontCount())
+                        e.instanceFront(index)
+                    else
+                        e.objectives.named.values()[index - e.instanceFrontCount()].candidates.items,
+                    .cartesian => e.objectives.cartesian.values()[index].candidates.items,
+                };
+            }
+
             /// `remove_dominated_programs`: returns the dominated flags.
-            fn dominated(e: *const Self) Allocator.Error![]bool {
+            fn dominated(
+                e: *const Self,
+                eligible: ?[]const usize,
+                ranked_scores: ?[]const f64,
+            ) Allocator.Error![]bool {
                 const n = e.candidates.items.len;
                 const flags = try e.out.alloc(bool, n);
-                @memset(flags, false);
-                var programs: std.ArrayList(usize) = .empty;
-                for (e.fronts) |front| for (front.items) |p| {
-                    if (std.mem.indexOfScalar(usize, programs.items, p) == null) try programs.append(e.out, p);
+                @memset(flags, eligible != null);
+                if (eligible) |ids| for (ids) |id| {
+                    flags[id] = false;
                 };
-                const scores = try e.averages();
+                var programs: std.ArrayList(usize) = .empty;
+                for (0..e.activeFrontCount()) |index| for (e.activeFront(index)) |p| {
+                    if (flags[p]) continue;
+                    if (std.mem.indexOfScalar(usize, programs.items, p) == null)
+                        try programs.append(e.out, p);
+                };
+                if (programs.items.len == 0) return flags;
+                const scores = ranked_scores orelse try e.averages();
                 std.sort.insertion(usize, programs.items, scores, struct {
                     fn less(s: []const f64, a: usize, b: usize) bool {
                         return s[a] < s[b];
@@ -302,9 +3144,10 @@ pub const GEPA = struct {
             }
 
             fn isDominated(e: *const Self, y: usize, flags: []const bool) bool {
-                for (e.fronts) |front| {
-                    if (std.mem.indexOfScalar(usize, front.items, y) == null) continue;
-                    const covered = for (front.items) |p| {
+                for (0..e.activeFrontCount()) |index| {
+                    const front = e.activeFront(index);
+                    if (std.mem.indexOfScalar(usize, front, y) == null) continue;
+                    const covered = for (front) |p| {
                         if (p != y and !flags[p]) break true;
                     } else false;
                     if (!covered) return false;
@@ -313,11 +3156,15 @@ pub const GEPA = struct {
             }
 
             /// `select_program_candidate_from_pareto_front`.
-            fn selectPareto(e: *Self) Allocator.Error!usize {
-                const flags = try e.dominated();
+            fn selectPareto(
+                e: *Self,
+                eligible: ?[]const usize,
+                ranked_scores: ?[]const f64,
+            ) Allocator.Error!usize {
+                const flags = try e.dominated(eligible, ranked_scores);
                 var order: std.ArrayList(usize) = .empty;
                 var freq: std.ArrayList(usize) = .empty;
-                for (e.fronts) |front| for (front.items) |p| {
+                for (0..e.activeFrontCount()) |index| for (e.activeFront(index)) |p| {
                     if (flags[p]) continue;
                     if (std.mem.indexOfScalar(usize, order.items, p)) |k| {
                         freq.items[k] += 1;
@@ -328,8 +3175,71 @@ pub const GEPA = struct {
                 };
                 var sampling: std.ArrayList(usize) = .empty;
                 for (order.items, freq.items) |p, f| for (0..f) |_| try sampling.append(e.out, p);
-                assert(sampling.items.len > 0);
+                if (sampling.items.len == 0) {
+                    const ranked = eligible orelse unreachable;
+                    assert(ranked.len > 0);
+                    return ranked[0];
+                }
                 return sampling.items[e.rng.randbelow(sampling.items.len)];
+            }
+
+            fn selectParent(e: *Self) !usize {
+                assert(e.candidates.items.len > 0);
+                return switch (e.gepa.candidate_selection_strategy) {
+                    .pareto => e.selectPareto(null, null),
+                    .current_best => e.selectBest(),
+                    .epsilon_greedy => if (e.rng.random() < 0.1)
+                        e.rng.randbelow(e.candidates.items.len)
+                    else
+                        e.selectBest(),
+                    .top_k_pareto => e.selectTopPareto(),
+                    .custom => |selector| e.selectCustomParent(selector),
+                };
+            }
+
+            fn selectCustomParent(e: *const Self, selector: CustomCandidateSelector) !usize {
+                const selection: CandidateSelection = .{
+                    .names = e.names,
+                    .candidates = e.candidates.items,
+                    .val_subscores = e.subscores.items,
+                    .val_ids = e.validationIds(),
+                    .parents = e.parents.items,
+                    .discovery_eval_counts = e.discovery.items,
+                    .iteration = e.i,
+                    .total_metric_calls = e.total_evals,
+                    .num_full_val_evals = e.full_evals,
+                    .frontier_type = e.gepa.frontier_type,
+                    .frontier_count = e.activeFrontCount(),
+                    .engine = e,
+                    .get_front = selectionFront,
+                };
+                const index = try selector.select(selector.ptr, &selection);
+                if (index >= e.candidates.items.len) return error.InvalidCandidateSelection;
+                return index;
+            }
+
+            fn selectionFront(ptr: *const anyopaque, index: usize) []const usize {
+                const e: *const Self = @ptrCast(@alignCast(ptr));
+                return e.activeFront(index);
+            }
+
+            // Stable top five; equal scores retain discovery order.
+            fn selectTopPareto(e: *Self) Allocator.Error!usize {
+                var top: [5]usize = undefined;
+                const scores = try e.averages();
+                var len: usize = 0;
+                for (scores, 0..) |score, id| {
+                    var slot: usize = 0;
+                    while (slot < len) : (slot += 1) {
+                        if (score > scores[top[slot]]) break;
+                    }
+                    if (slot == top.len) continue;
+                    len = @min(len + 1, top.len);
+                    std.mem.copyBackwards(usize, top[slot + 1 .. len], top[slot .. len - 1]);
+                    top[slot] = id;
+                }
+                assert(len == @min(top.len, e.candidates.items.len));
+                return e.selectPareto(top[0..len], scores);
             }
 
             fn selectBest(e: *const Self) usize {
@@ -341,28 +3251,52 @@ pub const GEPA = struct {
             }
 
             /// `EpochShuffledBatchSampler.next_minibatch_ids`.
-            fn nextMinibatch(e: *Self) Allocator.Error![]const usize {
-                const mb = e.gepa.reflection_minibatch_size;
+            fn nextMinibatch(e: *Self, parent: usize) ![]const usize {
+                if (e.gepa.batch_sampler) |sampler| {
+                    const sample: BatchSample = .{
+                        .trainset = e.trainset,
+                        .parent_idx = parent,
+                        .iteration = e.i,
+                        .total_metric_calls = e.total_evals,
+                    };
+                    const ids = try sampler.next(sampler.ptr, &sample);
+                    if (ids.len == 0 or ids.len > sampler.max_batch_size)
+                        return error.InvalidBatchSample;
+                    for (ids) |id| if (id >= e.trainset.len) return error.InvalidBatchSample;
+                    return ids;
+                }
+                const mb = e.gepa.epochMinibatchSize();
+                // Padding makes each epoch a whole number of batches. Work
+                // in batch units until slicing, so an iteration need not fit
+                // in a usize after multiplication by the minibatch size.
+                const previous_batches = e.shuffled.items.len / mb;
+                const curr_epoch = if (previous_batches == 0) 0 else e.i / previous_batches;
+                if (e.epoch == null or curr_epoch > e.epoch.?) {
+                    try e.reshuffle();
+                    e.epoch = curr_epoch;
+                }
+                assert(e.shuffled.items.len >= mb and e.shuffled.items.len % mb == 0);
+                const batches = e.shuffled.items.len / mb;
                 if (e.sampler_iteration == e.i) {
-                    e.calls_in_iteration += 1;
+                    assert(e.calls_in_iteration < batches);
+                    e.calls_in_iteration = if (e.calls_in_iteration == batches - 1) 0 else e.calls_in_iteration + 1;
                 } else {
                     e.sampler_iteration = e.i;
                     e.calls_in_iteration = 0;
                 }
-                var base = e.i * mb;
-                const curr_epoch: usize = if (e.epoch == null) 0 else base / @max(e.shuffled.items.len, 1);
-                if (e.shuffled.items.len == 0 or e.epoch == null or curr_epoch > e.epoch.?) {
-                    e.epoch = curr_epoch;
-                    try e.reshuffle();
-                }
-                base = (base + e.calls_in_iteration * mb) % e.shuffled.items.len;
-                const end = @min(base + mb, e.shuffled.items.len);
-                return e.shuffled.items[base..end];
+                const base = e.i % batches;
+                const remaining = batches - base;
+                const batch = if (e.calls_in_iteration < remaining)
+                    base + e.calls_in_iteration
+                else
+                    e.calls_in_iteration - remaining;
+                const offset = batch * mb;
+                return e.shuffled.items[offset..][0..mb];
             }
 
             fn reshuffle(e: *Self) Allocator.Error!void {
                 const n = e.trainset.len;
-                const mb = e.gepa.reflection_minibatch_size;
+                const mb = e.gepa.epochMinibatchSize();
                 e.shuffled = .empty;
                 for (0..n) |k| try e.shuffled.append(e.out, k);
                 e.rng.shuffle(usize, e.shuffled.items);
@@ -386,74 +3320,535 @@ pub const GEPA = struct {
                 }
             }
 
+            fn selectComponents(
+                e: *Self,
+                parent: usize,
+                ids: []const usize,
+                runs: []const Run,
+                single: *[1]usize,
+            ) ![]const usize {
+                assert(e.names.len > 0);
+                assert(ids.len == runs.len);
+                switch (e.gepa.component_selector) {
+                    .round_robin => {
+                        const index = e.next_pred.items[parent];
+                        e.next_pred.items[parent] = (index + 1) % e.names.len;
+                        single[0] = index;
+                        return single;
+                    },
+                    .all => {
+                        const selected = try e.out.alloc(usize, e.names.len);
+                        for (selected, 0..) |*index, i| index.* = i;
+                        return selected;
+                    },
+                    .custom => |selector| {
+                        var scratch = std.heap.ArenaAllocator.init(e.out);
+                        defer scratch.deinit();
+                        var ctx = e.ctx;
+                        ctx.arena = scratch.allocator();
+                        ctx.trace = null;
+                        const input: ComponentSelection = .{
+                            .names = e.names,
+                            .candidates = e.candidates.items,
+                            .val_subscores = e.subscores.items,
+                            .val_ids = e.validationIds(),
+                            .parents = e.parents.items,
+                            .parent_idx = parent,
+                            .total_metric_calls = e.total_evals,
+                            .trainset = e.trainset,
+                            .minibatch_ids = ids,
+                            .runs = runs,
+                        };
+                        const names = try selector.select(selector.ptr, ctx, &input);
+                        if (names.len > e.names.len) return error.InvalidComponentSelection;
+                        const selected = try e.out.alloc(usize, names.len);
+                        for (names, selected, 0..) |name, *slot, i| {
+                            slot.* = for (e.names, 0..) |known, index| {
+                                if (std.mem.eql(u8, known, name)) break index;
+                            } else return error.InvalidComponentSelection;
+                            if (std.mem.indexOfScalar(usize, selected[0..i], slot.*) != null)
+                                return error.InvalidComponentSelection;
+                        }
+                        return selected;
+                    },
+                }
+            }
+
             /// One `ReflectiveMutationProposer.propose` + acceptance.
             fn reflect(e: *Self) !void {
-                const parent = switch (e.gepa.candidate_selection_strategy) {
-                    .pareto => try e.selectPareto(),
-                    .current_best => e.selectBest(),
-                };
-                const ids = try e.nextMinibatch();
+                const parent = try e.selectParent();
+                const ids = try e.nextMinibatch(parent);
                 const parent_candidate = e.candidates.items[parent];
                 const before = try e.evalIds(parent_candidate, e.trainset, ids, true);
+                try e.cacheReflection(parent_candidate, ids, before);
+                var tasks = [_]ReflectionTask{.{ .parent = parent, .ids = ids, .before = before }};
+                const task = &tasks[0];
+                try e.prepareReflection(task);
+                try e.proposeChildren(&tasks);
+                if (task.child) |child| {
+                    task.after = try e.evalIds(child, e.trainset, ids, true);
+                    try e.cacheReflection(child, ids, task.after);
+                }
+                try e.logReflection(&tasks);
+                const child = task.child orelse return;
+                if (try e.accepts(task, child, task.after)) {
+                    const parent_ids = try e.out.dupe(?usize, &.{parent});
+                    try e.addProgram(child, parent_ids);
+                    e.scheduleMerge();
+                }
+            }
+
+            const ReflectionTask = struct {
+                parent: usize,
+                ids: []const usize,
+                before: []const Run = &.{},
+                single: [1]usize = undefined,
+                components: []const usize = &.{},
+                datasets: []const ?[]const Record = &.{},
+                child: ?[]const []const u8 = null,
+                after: []const Run = &.{},
+                margin: f64 = 0,
+                val_ids: []const usize = &.{},
+                validation: ScoredRows = undefined,
+            };
+
+            fn runScores(e: *Self, runs: []const Run) ![]const f64 {
+                const scores = try e.out.alloc(f64, runs.len);
+                for (scores, runs) |*score, run| score.* = run.score;
+                return scores;
+            }
+
+            fn logReflection(e: *Self, tasks: []const ReflectionTask) !void {
+                const log = e.currentLog() orelse return;
+                if (tasks.len == 0) return;
+                const entries = try e.out.alloc(LogTask, tasks.len);
+                for (entries, tasks) |*entry, task| {
+                    entry.* = .{
+                        .parent_idx = task.parent,
+                        .subsample_ids = try e.out.dupe(usize, task.ids),
+                    };
+                    if (task.child == null) continue;
+                    entry.subsample_scores = try e.runScores(task.before);
+                    entry.new_subsample_scores = try e.runScores(task.after);
+                    if (log.subsample_scores == null) {
+                        log.subsample_scores = entry.subsample_scores;
+                        log.new_subsample_scores = entry.new_subsample_scores;
+                    }
+                }
+                log.selected_program_candidate = entries[0].parent_idx;
+                log.subsample_ids = entries[0].subsample_ids;
+                log.n_tasks = entries.len;
+                log.tasks = entries;
+            }
+
+            fn prepareReflection(e: *Self, task: *ReflectionTask) !void {
                 if (e.gepa.skip_perfect_score) {
-                    const perfect = for (before) |r| {
-                        if (r.score < e.gepa.perfect_score) break false;
+                    const perfect = for (task.before) |r| {
+                        if (!(r.score >= e.gepa.perfect_score)) break false;
                     } else true;
                     if (perfect) return;
                 }
-                var components: std.ArrayList(usize) = .empty;
-                switch (e.gepa.component_selector) {
-                    .round_robin => {
-                        const pid = e.next_pred.items[parent];
-                        e.next_pred.items[parent] = (pid + 1) % e.names.len;
-                        try components.append(e.out, pid);
-                    },
-                    .all => for (0..e.names.len) |k| try components.append(e.out, k),
+                task.components = try e.selectComponents(
+                    task.parent,
+                    task.ids,
+                    task.before,
+                    &task.single,
+                );
+                if (task.components.len == 0) return;
+                task.datasets = try e.reflectiveDataset(
+                    e.candidates.items[task.parent],
+                    task.before,
+                    task.ids,
+                    task.components,
+                );
+            }
+
+            fn eligibleForReflection(task: *const ReflectionTask) bool {
+                for (task.datasets) |dataset| if (dataset != null) return true;
+                return false;
+            }
+
+            fn proposeChildren(e: *Self, tasks: []ReflectionTask) !void {
+                if (e.gepa.instruction_proposer == null) {
+                    if (e.gepa.batch_reflection) |backend| return e.proposeBatchChildren(backend, tasks);
                 }
-                const datasets = try e.reflectiveDataset(parent_candidate, before, ids, components.items);
-                var any = false;
-                for (datasets) |d| any = any or d != null;
-                if (!any) return;
-                const texts = (try e.proposeTexts(parent_candidate, components.items, datasets)) orelse
-                    (try e.proposeTexts(parent_candidate, components.items, datasets)) orelse return;
-                const child = try e.out.dupe([]const u8, parent_candidate);
-                var changed = false;
-                for (components.items, texts) |k, t| if (t) |text| {
-                    child[k] = text;
-                    changed = true;
+                for (tasks) |*task| {
+                    if (!eligibleForReflection(task)) continue;
+                    const parent = e.candidates.items[task.parent];
+                    task.child = if (e.gepa.instruction_proposer) |proposer|
+                        try e.proposeCustomChild(proposer, parent, task.components, task.datasets)
+                    else
+                        try e.proposeBuiltinChild(parent, task.components, task.datasets);
+                }
+            }
+
+            fn proposeBatchChildren(e: *Self, backend: BatchReflection, tasks: []ReflectionTask) !void {
+                var slots: [max_proposal_tasks]*ReflectionTask = undefined;
+                var count: usize = 0;
+                for (tasks) |*task| {
+                    if (!eligibleForReflection(task)) continue;
+                    slots[count] = task;
+                    count += 1;
+                }
+                if (count == 0) return;
+                if (try e.tryBatchChildren(backend, slots[0..count])) return;
+                // The failed attempt's scratch is gone. Retry each eligible job
+                // once, isolating ordinary individual failures to that job.
+                for (slots[0..count]) |task| {
+                    const parent = e.candidates.items[task.parent];
+                    const texts = (try e.proposeTexts(parent, task.components, task.datasets)) orelse continue;
+                    task.child = try e.applyBuiltinTexts(parent, task.components, texts);
+                }
+            }
+
+            fn tryBatchChildren(e: *Self, backend: BatchReflection, tasks: []const *ReflectionTask) !bool {
+                var scratch = std.heap.ArenaAllocator.init(e.out);
+                defer scratch.deinit();
+                var context = e.reflection;
+                context.arena = scratch.allocator();
+                context.trace = null;
+                var jobs: [max_proposal_tasks]BatchReflectionJob = undefined;
+                for (jobs[0..tasks.len], tasks) |*job, task| {
+                    job.* = try e.proposalInput(
+                        context.arena,
+                        e.candidates.items[task.parent],
+                        task.components,
+                        task.datasets,
+                    );
+                }
+                const updates = backend.propose(backend.ptr, context, jobs[0..tasks.len]) catch |err| switch (err) {
+                    error.OutOfMemory, error.Canceled => return err,
+                    else => return false,
                 };
-                if (!changed) return;
-                const after = try e.evalIds(child, e.trainset, ids, true);
-                if (sumScores(after) > sumScores(before)) {
-                    const parent_ids = try e.out.alloc(?usize, 1);
-                    parent_ids[0] = parent;
-                    try e.addProgram(child, parent_ids);
-                    if (e.gepa.use_merge) {
-                        e.last_iter_found_new_program = true;
-                        if (e.merges_tested < e.gepa.max_merge_invocations) e.merges_due += 1;
+                if (updates.len != tasks.len) return false;
+                for (tasks, updates) |task, result| {
+                    task.child = try e.applyNamedUpdates(e.candidates.items[task.parent], result);
+                }
+                return true;
+            }
+
+            fn accepts(e: *Self, task: *const ReflectionTask, child: []const []const u8, after: []const Run) !bool {
+                const before = task.before;
+                return switch (e.gepa.acceptance_criterion) {
+                    .strict_improvement => sumScores(after) > sumScores(before),
+                    .improvement_or_equal => sumScores(after) >= sumScores(before),
+                    .custom => |callback| try callback.should_accept(callback.ptr, &.{
+                        .names = e.names,
+                        .child = child,
+                        .parent_idx = task.parent,
+                        .iteration = e.i,
+                        .total_metric_calls = e.total_evals,
+                        .candidates = e.candidates.items,
+                        .val_subscores = e.subscores.items,
+                        .val_ids = e.validationIds(),
+                        .parents = e.parents.items,
+                        .trainset = e.trainset,
+                        .minibatch_ids = task.ids,
+                        .before = before,
+                        .after = after,
+                    }),
+                };
+            }
+
+            fn scheduleMerge(e: *Self) void {
+                if (!e.gepa.use_merge) return;
+                e.last_iter_found_new_program = true;
+                if (e.merges_tested < e.gepa.max_merge_invocations) e.merges_due += 1;
+            }
+
+            fn sameCandidate(a: []const []const u8, b: []const []const u8) bool {
+                assert(a.len == b.len);
+                if (a.ptr == b.ptr) return true;
+                for (a, b) |x, y| if (!std.mem.eql(u8, x, y)) return false;
+                return true;
+            }
+
+            const ProposalSamplingContext = struct {
+                engine: *Self,
+                arena: Allocator,
+
+                fn select(raw: *anyopaque) !usize {
+                    const ctx: *@This() = @ptrCast(@alignCast(raw));
+                    return ctx.engine.selectParent();
+                }
+
+                fn next(raw: *anyopaque, parent: usize) ![]const usize {
+                    const ctx: *@This() = @ptrCast(@alignCast(raw));
+                    const ids = try ctx.engine.nextMinibatch(parent);
+                    // A custom batch sampler can overwrite the same storage
+                    // on the next call within this proposal-sampling callback.
+                    return if (ctx.engine.gepa.batch_sampler != null)
+                        try ctx.arena.dupe(usize, ids)
+                    else
+                        ids;
+                }
+            };
+
+            fn sampleProposals(
+                e: *Self,
+                tmp: Allocator,
+                storage: *[max_proposal_tasks]ReflectionTask,
+            ) ![]ReflectionTask {
+                if (e.gepa.sampling_strategy == .custom) {
+                    const sampler = e.gepa.sampling_strategy.custom;
+                    var context: ProposalSamplingContext = .{ .engine = e, .arena = tmp };
+                    var sampled: [max_proposal_tasks]ProposalTask = @splat(.{
+                        .parent_idx = 0,
+                        .minibatch_ids = &.{},
+                    });
+                    const count = try sampler.sample(sampler.ptr, &.{
+                        .arena = tmp,
+                        .names = e.names,
+                        .trainset = e.trainset,
+                        .state = e.validationState(e.i),
+                        .context = &context,
+                        .select_parent = ProposalSamplingContext.select,
+                        .next_minibatch = ProposalSamplingContext.next,
+                    }, &sampled);
+                    if (count > sampled.len) return error.ProposalTaskLimitExceeded;
+                    for (sampled[0..count], storage[0..count]) |task, *entry| {
+                        if (task.parent_idx >= e.candidates.items.len or
+                            task.minibatch_ids.len == 0 or
+                            task.minibatch_ids.len > sampler.max_minibatch_size)
+                            return error.InvalidProposalTask;
+                        for (task.minibatch_ids) |id| {
+                            if (id >= e.trainset.len) return error.InvalidProposalTask;
+                        }
+                        entry.* = .{ .parent = task.parent_idx, .ids = task.minibatch_ids };
+                    }
+                    return storage[0..count];
+                }
+
+                const shape = e.gepa.sampling_strategy.shape();
+                const tasks = storage[0 .. shape.parents * shape.mutations];
+                for (0..shape.parents) |p| {
+                    const parent = try e.selectParent();
+                    for (tasks[p * shape.mutations ..][0..shape.mutations]) |*task| {
+                        const ids = try e.nextMinibatch(parent);
+                        task.* = .{
+                            .parent = parent,
+                            .ids = if (e.gepa.batch_sampler != null) try tmp.dupe(usize, ids) else ids,
+                        };
                     }
                 }
+                return tasks;
+            }
+
+            fn reflectBatch(e: *Self) !void {
+                var scratch = std.heap.ArenaAllocator.init(e.out);
+                defer scratch.deinit();
+                const tmp = scratch.allocator();
+                var storage: [max_proposal_tasks]ReflectionTask = undefined;
+                const tasks = try e.sampleProposals(tmp, &storage);
+                if (tasks.len == 0) return;
+
+                for (tasks, 0..) |*task, i| {
+                    const candidate = e.candidates.items[task.parent];
+                    task.before = for (tasks[0..i]) |*prior| {
+                        if (!std.mem.eql(usize, task.ids, prior.ids)) continue;
+                        if (sameCandidate(candidate, e.candidates.items[prior.parent]))
+                            break prior.before;
+                    } else try e.evalIds(candidate, e.trainset, task.ids, true);
+                }
+                if (e.gepa.cache_evaluation) for (tasks) |*task| {
+                    try e.cacheReflection(e.candidates.items[task.parent], task.ids, task.before);
+                };
+                for (tasks) |*task| try e.prepareReflection(task);
+                try e.proposeChildren(tasks);
+                for (tasks) |*task| {
+                    const child = task.child orelse continue;
+                    task.after = try e.evalIds(child, e.trainset, task.ids, true);
+                }
+                if (e.gepa.cache_evaluation) for (tasks) |*task| {
+                    const child = task.child orelse continue;
+                    try e.cacheReflection(child, task.ids, task.after);
+                };
+
+                try e.logReflection(tasks);
+                var selected: [max_proposal_tasks]*ReflectionTask = undefined;
+                const retained = try e.selectProposals(tasks, &selected);
+                // Every policy request sees the same pre-commit pool and budget.
+                for (retained) |task| {
+                    const ids = try e.validationBatch();
+                    task.val_ids = if (e.gepa.val_evaluation_policy != null)
+                        try tmp.dupe(usize, ids)
+                    else
+                        ids;
+                }
+                for (retained) |task|
+                    task.validation = try e.scoreRows(task.child.?, task.val_ids, .cached_first);
+                for (retained) |task| {
+                    const parents = try e.out.dupe(?usize, &.{task.parent});
+                    try e.commitProgram(task.child.?, parents, task.validation);
+                    e.scheduleMerge();
+                }
+            }
+
+            fn selectProposals(
+                e: *Self,
+                tasks: []ReflectionTask,
+                selected: *[max_proposal_tasks]*ReflectionTask,
+            ) ![]*ReflectionTask {
+                assert(tasks.len <= max_proposal_tasks);
+                const strategy = e.gepa.selection_strategy;
+                if (strategy == .custom)
+                    return e.selectCustomProposals(strategy.custom, tasks, selected);
+                var count: usize = 0;
+                for (tasks) |*task| {
+                    const child = task.child orelse continue;
+                    if (!try e.accepts(task, child, task.after)) continue;
+                    task.margin = sumScores(task.after) - sumScores(task.before);
+                    // Source's BestImprovement compares against negative infinity initially.
+                    if (strategy == .best and !(task.margin > -std.math.inf(f64))) continue;
+                    var i = count;
+                    if (strategy != .all) while (i > 0) {
+                        if (!(task.margin > selected[i - 1].margin)) break;
+                        selected[i] = selected[i - 1];
+                        i -= 1;
+                    };
+                    selected[i] = task;
+                    count += 1;
+                }
+                const limit = switch (strategy) {
+                    .all => count,
+                    .best => @min(count, 1),
+                    .top_k => |k| if (k < 0)
+                        count -| @abs(k)
+                    else
+                        @min(count, @as(usize, @intCast(k))),
+                    .custom => unreachable,
+                };
+                var unique: usize = 0;
+                for (selected[0..limit]) |task| {
+                    for (selected[0..unique]) |prior| {
+                        if (sameCandidate(prior.child.?, task.child.?)) break;
+                    } else {
+                        selected[unique] = task;
+                        unique += 1;
+                    }
+                }
+                return selected[0..unique];
+            }
+
+            const ProposalDecisions = struct {
+                engine: *Self,
+                tasks: []const *ReflectionTask,
+                verdicts: [max_proposal_tasks]?bool = @splat(null),
+
+                fn decide(ptr: *anyopaque, idx: usize) anyerror!bool {
+                    const memo: *ProposalDecisions = @ptrCast(@alignCast(ptr));
+                    assert(idx < memo.tasks.len);
+                    if (memo.verdicts[idx]) |cached| return cached;
+                    const task = memo.tasks[idx];
+                    const verdict = try memo.engine.accepts(task, task.child.?, task.after);
+                    memo.verdicts[idx] = verdict;
+                    return verdict;
+                }
+            };
+
+            fn selectCustomProposals(
+                e: *Self,
+                selector: CustomProposalSelector,
+                tasks: []ReflectionTask,
+                selected: *[max_proposal_tasks]*ReflectionTask,
+            ) ![]*ReflectionTask {
+                var proposals: [max_proposal_tasks]Proposal = undefined;
+                var by_index: [max_proposal_tasks]*ReflectionTask = undefined;
+                var len: usize = 0;
+                for (tasks) |*task| {
+                    const child = task.child orelse continue;
+                    proposals[len] = .{
+                        .child = child,
+                        .parent_idx = task.parent,
+                        .minibatch_ids = task.ids,
+                        .before = task.before,
+                        .after = task.after,
+                    };
+                    by_index[len] = task;
+                    len += 1;
+                }
+                if (len == 0) return selected[0..0];
+                var memo: ProposalDecisions = .{ .engine = e, .tasks = by_index[0..len] };
+                const batch: ProposalBatch = .{
+                    .names = e.names,
+                    .proposals = proposals[0..len],
+                    .state = e.validationState(e.i),
+                    .decision_context = &memo,
+                    .decide = ProposalDecisions.decide,
+                };
+                var requested: [max_proposal_tasks]usize = undefined;
+                const count = try selector.select(selector.ptr, &batch, &requested);
+                if (count > requested.len) return error.ProposalTaskLimitExceeded;
+                var considered: [max_proposal_tasks]bool = @splat(false);
+                var retained: usize = 0;
+                for (requested[0..count]) |idx| {
+                    if (idx >= len or considered[idx]) continue;
+                    considered[idx] = true;
+                    const task = by_index[idx];
+                    for (selected[0..retained]) |prior| {
+                        if (sameCandidate(prior.child.?, task.child.?)) break;
+                    } else {
+                        selected[retained] = task;
+                        retained += 1;
+                    }
+                }
+                // Source consults the criterion for rejection reporting, except for duplicates.
+                for (considered[0..len], 0..) |was_selected, idx| {
+                    if (!was_selected) _ = try batch.shouldAccept(idx);
+                }
+                return selected[0..retained];
             }
 
             /// `DspyAdapter.make_reflective_dataset`; `null` where no example
             /// produced a usable trace for that predictor.
-            fn reflectiveDataset(e: *Self, candidate: []const []const u8, runs: []const Run, ids: []const usize, components: []const usize) value.ParseError![]?[]const @import("runtime_value.zig").ObjectMap {
-                const program = try e.build(candidate);
-                const preds = try predict.namedPredictors(e.out, program);
-                const result = try e.out.alloc(?[]const @import("runtime_value.zig").ObjectMap, components.len);
+            fn reflectiveDataset(
+                e: *Self,
+                candidate: []const []const u8,
+                runs: []const Run,
+                ids: []const usize,
+                components: []const usize,
+            ) @import("adapter.zig").Error![]?[]const Record {
+                assert(runs.len == ids.len);
+                const preds = (try e.build(candidate)).predictors;
+                const result = try e.out.alloc(?[]const Record, components.len);
                 for (components, result) |k, *slot| {
                     const module = preds[k].param.predict;
-                    var items: std.ArrayList(@import("runtime_value.zig").ObjectMap) = .empty;
+                    var items: std.ArrayList(Record) = .empty;
                     for (runs, ids) |run, id| {
+                        if (run.format_failure) |failure| {
+                            if (predict.sameSignature(failure.predictor, module)) {
+                                try items.append(e.out, try e.failedReflectionExample(failure, module));
+                            }
+                            continue;
+                        }
                         const prediction = run.prediction orelse continue;
                         var matching: std.ArrayList(*const Trace.Step) = .empty;
                         for (run.trace.steps.items) |*step| if (predict.sameSignature(step.predictor, module)) try matching.append(e.out, step);
                         if (matching.items.len == 0) continue;
                         const step = matching.items[e.adapter_rng.randbelow(matching.items.len)];
                         const fb = try e.gepa.metric(e.out, &e.trainset[id], &prediction, run.trace, e.names[k], step);
-                        var item: @import("runtime_value.zig").ObjectMap = .empty;
-                        try item.put(e.out, "Inputs", .{ .object = step.inputs });
-                        try item.put(e.out, "Generated Outputs", .{ .object = step.outputs });
+                        if (e.gepa.warn_on_score_mismatch and !e.score_mismatch_warned and
+                            fb.score != run.score)
+                        {
+                            std.log.scoped(.gepa).warn(
+                                "Predictor feedback score differs from program score; " ++
+                                    "GEPA uses the program score for selection.",
+                                .{},
+                            );
+                            e.score_mismatch_warned = true;
+                        }
+                        var item: Record = .empty;
+                        const custom = e.gepa.instruction_proposer != null;
+                        const inputs = if (custom)
+                            try customInputs(e.out, step)
+                        else
+                            try builtinInputs(e.out, e.gepa.proposal_options, step);
+                        const outputs = if (custom)
+                            try customOutputs(e.out, step)
+                        else
+                            try builtinOutputs(e.out, e.gepa.proposal_options, step);
+                        try item.put(e.out, "Inputs", .{ .object = inputs });
+                        try item.put(e.out, "Generated Outputs", .{ .object = outputs });
                         const text = fb.feedback orelse try std.fmt.allocPrint(e.out, "This trajectory got a score of {s}.", .{try pyFloat(e.out, fb.score)});
                         try item.put(e.out, "Feedback", .{ .string = text });
                         try items.append(e.out, item);
@@ -463,23 +3858,152 @@ pub const GEPA = struct {
                 return result;
             }
 
-            /// `InstructionProposer.__call__`; `null` when a call fails.
-            fn proposeTexts(e: *Self, candidate: []const []const u8, components: []const usize, datasets: []const ?[]const @import("runtime_value.zig").ObjectMap) Allocator.Error!?[]?[]const u8 {
+            fn failedReflectionExample(
+                e: *const Self,
+                failure: FormatFailure,
+                module: *const predict.PredictState,
+            ) @import("adapter.zig").Error!Record {
+                const step: Trace.Step = .{
+                    .predictor = failure.predictor,
+                    .inputs = failure.inputs,
+                    .outputs = .empty,
+                };
+                const inputs = if (e.gepa.instruction_proposer != null)
+                    try customInputs(e.out, &step)
+                else
+                    try builtinInputs(e.out, e.gepa.proposal_options, &step);
+                const text = try std.fmt.allocPrint(
+                    e.out,
+                    "Couldn't parse the output as per the expected output format. " ++
+                        "The model's raw response was:\n```\n{s}\n```\n\n",
+                    .{failure.text},
+                );
+                const view = try module.view(e.out);
+                const messages = try e.ctx.adapter.format(e.out, view, &.{}, &.empty);
+                var feedback: Writer.Allocating = .init(e.out);
+                defer feedback.deinit();
+                const w = &feedback.writer;
+                w.writeAll("Your output failed to parse. Follow this structure:\n") catch
+                    return error.OutOfMemory;
+                for (messages) |message| {
+                    if (message.content != .text) return error.AdapterParse;
+                    w.print("{s}: {s}\n", .{ @tagName(message.role), message.content.text }) catch
+                        return error.OutOfMemory;
+                }
+                var item: Record = .empty;
+                try item.put(e.out, "Inputs", .{ .object = inputs });
+                try item.put(e.out, "Generated Outputs", .{ .string = text });
+                try item.put(e.out, "Feedback", .{ .string = try feedback.toOwnedSlice() });
+                return item;
+            }
+
+            fn proposalInput(
+                e: *Self,
+                arena: Allocator,
+                candidate: []const []const u8,
+                components: []const usize,
+                datasets: []const ?[]const Record,
+            ) Allocator.Error!InstructionProposal {
+                assert(candidate.len == e.names.len);
+                assert(components.len == datasets.len);
+                const named = try arena.alloc(Instruction, candidate.len);
+                for (e.names, candidate, named) |name, text, *entry| {
+                    entry.* = .{ .name = name, .text = text };
+                }
+                const selected = try arena.alloc([]const u8, components.len);
+                const entries = try arena.alloc(ReflectionDataset, components.len);
+                var dataset_count: usize = 0;
+                for (components, datasets, selected) |index, dataset, *name| {
+                    name.* = e.names[index];
+                    if (dataset) |examples| {
+                        entries[dataset_count] = .{ .name = name.*, .examples = examples };
+                        dataset_count += 1;
+                    }
+                }
+                return .{
+                    .candidate = named,
+                    .reflective_dataset = entries[0..dataset_count],
+                    .components_to_update = selected,
+                };
+            }
+
+            fn proposeCustomChild(
+                e: *Self,
+                proposer: InstructionProposer,
+                candidate: []const []const u8,
+                components: []const usize,
+                datasets: []const ?[]const Record,
+            ) !?[]const []const u8 {
+                var scratch = std.heap.ArenaAllocator.init(e.out);
+                defer scratch.deinit();
+                var context = e.reflection;
+                context.arena = scratch.allocator();
+                context.trace = null;
+                const input = try e.proposalInput(context.arena, candidate, components, datasets);
+                const updates = (try invokeProposer(proposer, context, &input)) orelse
+                    (try invokeProposer(proposer, context, &input)) orelse return null;
+                return e.applyNamedUpdates(candidate, updates);
+            }
+
+            fn applyNamedUpdates(
+                e: *Self,
+                candidate: []const []const u8,
+                updates: []const Instruction,
+            ) !?[]const []const u8 {
+                if (updates.len == 0) return null;
+                const child = try e.out.dupe([]const u8, candidate);
+                for (updates) |update| {
+                    const index = for (e.names, 0..) |name, index| {
+                        if (std.mem.eql(u8, name, update.name)) break index;
+                    } else return error.UnknownInstructionComponent;
+                    child[index] = try e.out.dupe(u8, update.text);
+                }
+                return child;
+            }
+
+            fn proposeBuiltinChild(
+                e: *Self,
+                candidate: []const []const u8,
+                components: []const usize,
+                datasets: []const ?[]const Record,
+            ) (Allocator.Error || error{Canceled})!?[]const []const u8 {
+                const texts = (try e.proposeTexts(candidate, components, datasets)) orelse
+                    (try e.proposeTexts(candidate, components, datasets)) orelse return null;
+                return try e.applyBuiltinTexts(candidate, components, texts);
+            }
+
+            fn applyBuiltinTexts(
+                e: *Self,
+                candidate: []const []const u8,
+                components: []const usize,
+                texts: []const ?[]const u8,
+            ) Allocator.Error![]const []const u8 {
+                const child = try e.out.dupe([]const u8, candidate);
+                // At least one dataset reached a successful built-in proposal.
+                for (components, texts) |index, text| {
+                    if (text) |instruction| child[index] = instruction;
+                }
+                return child;
+            }
+
+            /// `InstructionProposer.__call__`; `null` for recoverable proposal failures.
+            fn proposeTexts(
+                e: *Self,
+                candidate: []const []const u8,
+                components: []const usize,
+                datasets: []const ?[]const Record,
+            ) (Allocator.Error || error{Canceled})!?[]?[]const u8 {
                 const texts = try e.out.alloc(?[]const u8, components.len);
-                const proposer: predict.Predict(ProposeInstruction) = .{};
                 for (components, datasets, texts) |k, dataset, *t| {
                     t.* = null;
                     const examples = dataset orelse continue;
                     var c = e.reflection;
                     c.arena = e.out;
-                    c.trace = null;
-                    c.adapter = .json;
-                    const out = proposer.forward(c, .{ .current_instruction = candidate[k], .examples_with_feedback = examples }) catch |err| switch (err) {
+                    const draft = e.gepa.proposal_options.propose(c, candidate[k], examples) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
+                        error.Canceled => return error.Canceled,
                         else => return null,
                     };
-                    const draft = value.pyStrip(out.new_instruction);
-                    if (draft.len == 0) return null;
                     t.* = draft;
                 }
                 return texts;
@@ -488,28 +4012,59 @@ pub const GEPA = struct {
             /// `MergeProposer.propose` + the engine's merge acceptance.
             /// Returns whether a merge was evaluated (the iteration ends).
             fn merge(e: *Self) !bool {
-                const flags = try e.dominated();
+                const log = e.currentLog();
+                if (log) |entry| entry.invoked_merge = true;
+                const flags = try e.dominated(null, null);
                 var dominators: std.ArrayList(usize) = .empty;
                 for (0..e.candidates.items.len) |p| {
                     if (flags[p]) continue;
-                    const on_front = for (e.fronts) |front| {
-                        if (std.mem.indexOfScalar(usize, front.items, p) != null) break true;
+                    const on_front = for (0..e.activeFrontCount()) |index| {
+                        if (std.mem.indexOfScalar(usize, e.activeFront(index), p) != null) break true;
                     } else false;
                     if (on_front) try dominators.append(e.out, p);
                 }
                 const agg = try e.averages();
                 const attempt = (try e.attemptMerge(dominators.items, agg)) orelse return false;
-                try e.triplets.append(e.out, .{ attempt.id1, attempt.id2, attempt.ancestor });
-                const ids = try e.mergeSubsample(e.subscores.items[attempt.id1], e.subscores.items[attempt.id2]);
+                const triplet = [3]usize{ attempt.id1, attempt.id2, attempt.ancestor };
+                try e.triplets.append(e.out, triplet);
+                if (log) |entry| {
+                    entry.merged = true;
+                    entry.merged_entities = triplet;
+                }
+                const ids = ids: {
+                    if (e.gepa.val_evaluation_policy == null and !e.partial_validation_archive)
+                        break :ids try e.mergeSubsample(attempt.id1, attempt.id2, e.all_val_ids);
+                    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                    defer scratch.deinit();
+                    const common = try python_value.indexSetIntersection(
+                        scratch.allocator(),
+                        &e.val_indices.items[attempt.id1],
+                        &e.val_indices.items[attempt.id2],
+                    );
+                    break :ids try e.mergeSubsample(attempt.id1, attempt.id2, common);
+                };
                 if (ids.len == 0) return false;
                 var sum1: f64 = 0;
                 var sum2: f64 = 0;
                 for (ids) |id| {
-                    sum1 += e.subscores.items[attempt.id1][id];
-                    sum2 += e.subscores.items[attempt.id2][id];
+                    sum1 += e.validationScore(attempt.id1, id).?;
+                    sum2 += e.validationScore(attempt.id2, id).?;
                 }
-                const runs = try e.evalIds(attempt.candidate, e.valset, ids, false);
-                if (sumScores(runs) >= @max(sum1, sum2)) {
+                const rows = try e.scoreRows(attempt.candidate, ids, .requested);
+                e.total_evals = try std.math.add(usize, e.total_evals, rows.calls);
+                if (log) |entry| {
+                    const scores1 = try e.out.alloc(f64, ids.len);
+                    const scores2 = try e.out.alloc(f64, ids.len);
+                    for (ids, scores1, scores2) |id, *score1, *score2| {
+                        score1.* = e.validationScore(attempt.id1, id).?;
+                        score2.* = e.validationScore(attempt.id2, id).?;
+                    }
+                    entry.subsample_ids = ids;
+                    entry.id1_subsample_scores = scores1;
+                    entry.id2_subsample_scores = scores2;
+                    entry.new_program_subsample_scores = try e.runScores(rows.runs);
+                }
+                if (sumScores(rows.runs) >= @max(sum1, sum2)) {
                     const parent_ids = try e.out.alloc(?usize, 2);
                     parent_ids[0] = attempt.id1;
                     parent_ids[1] = attempt.id2;
@@ -552,7 +4107,7 @@ pub const GEPA = struct {
                     for (e.descs.items) |d| {
                         if (d.id1 == id1 and d.id2 == id2 and std.mem.eql(usize, d.picks, picks)) continue :attempts;
                     }
-                    if (e.valset.len < merge_overlap_floor) continue;
+                    if (!e.hasValidationOverlap(id1, id2)) continue;
                     try e.descs.append(e.out, .{ .id1 = id1, .id2 = id2, .picks = picks });
                     return .{ .candidate = merged, .id1 = id1, .id2 = id2, .ancestor = ancestor };
                 }
@@ -629,10 +4184,38 @@ pub const GEPA = struct {
                 return false;
             }
 
+            fn validationScore(e: *const Self, candidate: usize, id: usize) ?f64 {
+                const offset = if (e.indexedValidation())
+                    e.val_indices.items[candidate].get(id) orelse return null
+                else
+                    id;
+                return e.subscores.items[candidate][offset];
+            }
+
+            fn hasValidationOverlap(e: *const Self, left: usize, right: usize) bool {
+                const floor = e.gepa.merge_val_overlap_floor;
+                if (e.gepa.val_evaluation_policy == null and !e.partial_validation_archive) return e.valset.len >= floor;
+                if (floor == 0) return true;
+                var count: usize = 0;
+                for (e.val_ids.items[left]) |id| {
+                    if (!e.val_indices.items[right].contains(id)) continue;
+                    count += 1;
+                    if (count == floor) return true;
+                }
+                return false;
+            }
+
             /// `select_eval_subsample_for_merged_program`.
-            fn mergeSubsample(e: *Self, scores1: []const f64, scores2: []const f64) Allocator.Error![]const usize {
+            fn mergeSubsample(
+                e: *Self,
+                left: usize,
+                right: usize,
+                common: []const usize,
+            ) Allocator.Error![]const usize {
                 var buckets: [3]std.ArrayList(usize) = .{ .empty, .empty, .empty };
-                for (scores1, scores2, 0..) |a, b, id| {
+                for (common) |id| {
+                    const a = e.validationScore(left, id).?;
+                    const b = e.validationScore(right, id).?;
                     const k: usize = if (a > b) 0 else if (b > a) 1 else 2;
                     try buckets[k].append(e.out, id);
                 }
@@ -646,15 +4229,15 @@ pub const GEPA = struct {
                 const remaining = merge_subsample - selected.items.len;
                 if (remaining > 0) {
                     var unused: std.ArrayList(usize) = .empty;
-                    for (0..scores1.len) |id| {
+                    for (common) |id| {
                         if (std.mem.indexOfScalar(usize, selected.items, id) == null) try unused.append(e.out, id);
                     }
                     if (unused.items.len >= remaining) {
                         try e.sampleInto(&selected, unused.items, remaining);
-                    } else if (scores1.len > 0) {
+                    } else if (common.len > 0) {
                         for (0..remaining) |_| {
-                            const r = e.rng.random() * @as(f64, @floatFromInt(scores1.len));
-                            try selected.append(e.out, @intFromFloat(@floor(r)));
+                            const r = e.rng.random() * @as(f64, @floatFromInt(common.len));
+                            try selected.append(e.out, common[@intFromFloat(@floor(r))]);
                         }
                     }
                 }
@@ -694,8 +4277,31 @@ pub const GEPA = struct {
         trainset: []const Example,
         options: Options,
     ) !Result(P) {
-        assert(trainset.len > 0);
-        assert(self.reflection_minibatch_size > 0);
+        const budget_count = @as(u2, @intFromBool(self.auto != null)) +
+            @as(u2, @intFromBool(self.max_full_evals != null)) +
+            @as(u2, @intFromBool(self.max_metric_calls != null));
+        if (budget_count == 0) return error.NoBudget;
+        if (budget_count != 1) return error.ConflictingBudgets;
+        if (self.sampling_strategy == .custom) {
+            if (self.sampling_strategy.custom.max_minibatch_size == 0)
+                return error.InvalidProposalTask;
+        } else {
+            const shape = self.sampling_strategy.shape();
+            if (shape.parents == 0 or shape.mutations == 0) return error.EmptyProposalBatch;
+            if (shape.parents > max_proposal_tasks or shape.mutations > max_proposal_tasks or
+                shape.parents * shape.mutations > max_proposal_tasks)
+                return error.ProposalTaskLimitExceeded;
+        }
+        if (trainset.len == 0) return error.EmptyTrainset;
+        if (self.val_evaluation_policy) |policy| {
+            if (policy.max_batch_size == 0) return error.InvalidValidationBatch;
+        }
+        if (self.batch_sampler) |sampler| {
+            if (self.reflection_minibatch_size != null or sampler.max_batch_size == 0)
+                return error.InvalidBatchSamplerConfiguration;
+        }
+        if (self.instruction_proposer == null and self.proposal_options.max_chars == 0)
+            return error.InvalidInstructionLimit;
         // Source computes its budget from the supplied set before applying
         // `valset or trainset`; an empty sampled holdout still evaluates trainset.
         const valset = if (options.valset) |set| if (set.len > 0) set else trainset else trainset;
@@ -703,17 +4309,19 @@ pub const GEPA = struct {
         const owned = try out.create(P);
         owned.* = student;
         const preds = try predict.namedPredictors(out, owned);
-        assert(preds.len > 0);
+        if (preds.len == 0) return error.NoComponents;
         const max_calls: usize = if (self.auto) |a|
             autoBudget(preds.len, switch (a) {
                 .light => 6,
                 .medium => 12,
                 .heavy => 18,
             }, if (options.valset) |set| set.len else trainset.len)
-        else if (self.max_full_evals) |k|
-            k * (trainset.len + if (options.valset) |v| v.len else 0)
-        else
-            self.max_metric_calls orelse return error.NoBudget;
+        else if (self.max_full_evals) |k| blk: {
+            const val_count = if (options.valset) |v| v.len else 0;
+            const total = std.math.add(usize, trainset.len, val_count) catch
+                return error.BudgetOverflow;
+            break :blk std.math.mul(usize, k, total) catch return error.BudgetOverflow;
+        } else self.max_metric_calls.?;
 
         const names = try out.alloc([]const u8, preds.len);
         const seed_candidate = try out.alloc([]const u8, preds.len);
@@ -721,6 +4329,8 @@ pub const GEPA = struct {
             n.* = p.name;
             s.* = p.param.predict.instructions;
         }
+        const all_val_ids = try out.alloc(usize, valset.len);
+        for (all_val_ids, 0..) |*id, k| id.* = k;
         const fronts = try out.alloc(std.ArrayList(usize), valset.len);
         for (fronts) |*f| f.* = .empty;
         var e: Engine(P) = .{
@@ -732,43 +4342,117 @@ pub const GEPA = struct {
             .names = names,
             .trainset = trainset,
             .valset = valset,
+            .all_val_ids = all_val_ids,
             .rng = .init(self.seed),
             .adapter_rng = .init(self.seed),
             .front_score = try out.alloc(f64, valset.len),
             .fronts = fronts,
+            .checkpoint = options.checkpoint,
+            .log_dir = options.log_dir,
         };
-        try e.addProgram(seed_candidate, &.{null});
+        if (e.log_dir) |dir| {
+            if (dir.path.len == 0 or dir.max_file_bytes == 0) return error.InvalidGepaLogDirectory;
+            e.stop_path = try std.fs.path.join(out, &.{ dir.path, "gepa.stop" });
+        }
+        defer if (e.stop_path) |path| out.free(path);
+        if (self.track_best_outputs) {
+            const outputs = try out.alloc(std.ArrayList(BestOutput), valset.len);
+            @memset(outputs, .empty);
+            e.best_outputs = outputs;
+        }
+        const snapshot = try e.readCheckpoint();
+        if (options.checkpoint) |checkpoint| {
+            e.val_digest = CheckpointDigest.dataset(valset) catch return error.UnsupportedGepaValidationValue;
+            e.train_digest = if (trainset.ptr == valset.ptr and trainset.len == valset.len)
+                e.val_digest
+            else
+                CheckpointDigest.dataset(trainset) catch return error.UnsupportedGepaTrainingValue;
+            e.demos_digest = CheckpointDigest.demos(preds, ctx.demos_override) catch return error.UnsupportedGepaDemoValue;
+            e.field_metadata_digest = CheckpointDigest.fieldMetadata(out, preds, checkpoint) catch |err| switch (err) {
+                error.UnsupportedCheckpointValue => return error.UnsupportedGepaFieldDefaultValue,
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+            e.predict_config_digest = CheckpointDigest.predictConfig(out, preds, ctx.predict_config) catch |err| switch (err) {
+                error.UnsupportedCheckpointValue => return error.UnsupportedGepaPredictConfigValue,
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+            e.lm_options_digest = CheckpointDigest.lmOptions(ctx) catch return error.UnsupportedGepaLMOptionsValue;
+            e.task_model_digest = CheckpointDigest.taskModels(preds, ctx, self.rollouts);
+        }
         var started = false;
-        while (e.total_evals < max_calls) {
-            if (started) e.i += 1;
+        if (snapshot) |*stored| {
+            try e.checkCheckpoint(stored);
+            // Source runs the seed again on restart. Keep that evaluation
+            // observable without spending the restored budget or changing scores.
+            const ids = try e.validationBatch();
+            try e.restoreCheckpoint(stored, seed_candidate);
+            _ = try e.rolloutIds(seed_candidate, valset, ids, .untraced);
+            started = stored.last_iteration != null;
+        } else {
+            try e.addProgram(seed_candidate, &.{null});
+        }
+        while (!(try e.shouldStop(if (started) e.i else null, max_calls))) {
+            try e.saveCheckpoint(if (started) e.i else null);
+            try e.saveRunArtifacts();
+            if (started) e.i = try std.math.add(usize, e.i, 1);
             started = true;
+            if (e.log_dir != null) try e.run_log.append(e.out, .{ .i = e.i });
+            const first = e.candidates.items.len;
             if (self.use_merge) {
                 if (e.merges_due > 0 and e.last_iter_found_new_program) {
                     const merged = try e.merge();
                     e.last_iter_found_new_program = false;
-                    if (merged) continue;
+                    if (merged) {
+                        try e.finishIterationLog(first);
+                        continue;
+                    }
                 }
                 e.last_iter_found_new_program = false;
             }
-            try e.reflect();
+            if (self.sampling_strategy == .single and self.selection_strategy == .all)
+                try e.reflect()
+            else
+                try e.reflectBatch();
+            try e.finishIterationLog(first);
         }
+        try e.saveCheckpoint(if (started) e.i else null);
+        try e.saveRunArtifacts();
+        try e.validationDiagnostics(null, if (started) e.i else null);
 
         var best: usize = 0;
         for (0..e.candidates.items.len) |idx| {
             if (e.average(idx) > e.average(best)) best = idx;
         }
-        const program = try e.build(e.candidates.items[best]);
+        const program = (try e.build(e.candidates.items[best])).program;
+        const per_instance = try out.alloc([]const usize, e.fronts.len);
+        for (per_instance, e.fronts) |*row, front| row.* = front.items;
+        const best_outputs: ?[]const []const BestOutput = if (e.best_outputs) |outputs| rows: {
+            const rows = try out.alloc([]const BestOutput, outputs.len);
+            for (rows, outputs) |*row, outputs_for_row| row.* = outputs_for_row.items;
+            break :rows rows;
+        } else null;
+        const objectives = try e.objectives.results(out);
         return .{
             .program = program.*,
             .candidates = e.candidates.items,
             .parents = e.parents.items,
             .val_aggregate_scores = try e.averages(),
+            .val_ids = e.validationIds(),
             .val_subscores = e.subscores.items,
+            .val_aggregate_subscores = if (e.objectives.aggregates.items.len == 0)
+                null
+            else
+                e.objectives.aggregates.items,
+            .per_objective_best_candidates = objectives.leaders,
+            .objective_pareto_front = objectives.scores,
+            .per_val_instance_best_candidates = per_instance,
+            .best_outputs_valset = best_outputs,
             .discovery_eval_counts = e.discovery.items,
             .best_idx = best,
             .total_metric_calls = e.total_evals,
             .num_full_val_evals = e.full_evals,
             .max_metric_calls = max_calls,
+            .seed = self.seed,
         };
     }
 };
@@ -780,16 +4464,20 @@ test "GEPA scoring failures preserve capture-specific outputs while feedback err
     });
     const P = predict.Predict(Sig);
     const FailingMetric = struct {
-        fn failure(_: Allocator, _: *const Example, _: *const Record, _: ?*const Trace, _: ?[]const u8, _: ?*const Trace.Step) value.ParseError!Feedback {
+        fn failure(_: Allocator, _: *const Example, _: *const optimize.RecordPrediction, _: ?*const Trace, _: ?[]const u8, _: ?*const Trace.Step) value.ParseError!Feedback {
             return error.ParseValue;
         }
 
-        fn feedbackFailure(_: Allocator, _: *const Example, _: *const Record, _: ?*const Trace, pred_name: ?[]const u8, _: ?*const Trace.Step) value.ParseError!Feedback {
-            if (pred_name != null) return error.ParseValue;
-            return .{ .score = 1 };
+        fn feedbackFailure(_: Allocator, _: *const Example, _: *const optimize.RecordPrediction, trace: ?*const Trace, pred_name: ?[]const u8, step: ?*const Trace.Step) value.ParseError!Feedback {
+            if (pred_name != null) {
+                if (trace == null or trace.?.steps.items.len != 1 or step != &trace.?.steps.items[0])
+                    return .{ .score = 2 };
+                return error.ParseValue;
+            }
+            return .{ .score = if (trace == null) 0 else 1 };
         }
 
-        fn allocationFailure(_: Allocator, _: *const Example, _: *const Record, _: ?*const Trace, _: ?[]const u8, _: ?*const Trace.Step) value.ParseError!Feedback {
+        fn allocationFailure(_: Allocator, _: *const Example, _: *const optimize.RecordPrediction, _: ?*const Trace, _: ?[]const u8, _: ?*const Trace.Step) value.ParseError!Feedback {
             return error.OutOfMemory;
         }
     };
@@ -822,13 +4510,14 @@ test "GEPA scoring failures preserve capture-specific outputs while feedback err
         .fronts = &fronts,
     };
 
+    const built: GEPA.Engine(P).Built = .{ .program = &program, .predictors = &.{} };
     for ([_]bool{ false, true }) |capture| {
-        const run = try engine.runOne(engine.ctx, &program, &examples[0], capture);
+        const run = try engine.runOne(engine.ctx, &built, &examples[0], if (capture) .reflection else .untraced);
         try std.testing.expectEqual(@as(f64, 0.125), run.score);
         if (capture) {
             try std.testing.expect(run.prediction == null);
         } else {
-            try std.testing.expectEqual(@as(usize, 0), run.prediction.?.count());
+            try std.testing.expectEqual(@as(usize, 0), run.prediction.?.fields().count());
         }
         try std.testing.expectEqual(@as(usize, 0), run.trace.steps.items.len);
     }
@@ -837,31 +4526,337 @@ test "GEPA scoring failures preserve capture-specific outputs while feedback err
     var program_failure: @import("lm.zig").ScriptedLM = .{ .responses = &.{} };
     engine.ctx.lm = program_failure.lm();
     for ([_]bool{ false, true }) |capture| {
-        const run = try engine.runOne(engine.ctx, &program, &examples[0], capture);
+        const run = try engine.runOne(engine.ctx, &built, &examples[0], if (capture) .reflection else .untraced);
         try std.testing.expectEqual(@as(f64, 0.125), run.score);
         if (capture) {
             try std.testing.expect(run.prediction == null);
         } else {
-            try std.testing.expectEqual(@as(usize, 0), run.prediction.?.count());
+            try std.testing.expectEqual(@as(usize, 0), run.prediction.?.fields().count());
         }
         try std.testing.expectEqual(@as(usize, 0), run.trace.steps.items.len);
     }
 
     engine.ctx = ctx;
     engine.gepa.metric = FailingMetric.feedbackFailure;
-    const successful = try engine.runOne(engine.ctx, &program, &examples[0], true);
+    const successful = try engine.runOne(engine.ctx, &built, &examples[0], .reflection);
+    try std.testing.expectEqual(@as(f64, 0), successful.score);
     try std.testing.expectEqualStrings("ok", successful.prediction.?.get("answer").?.string);
     try std.testing.expectEqual(@as(usize, 1), successful.trace.steps.items.len);
     try std.testing.expectError(error.ParseValue, engine.reflectiveDataset(&.{program.state.instructions}, &.{successful}, &.{0}, &.{0}));
 
     engine.gepa.metric = FailingMetric.allocationFailure;
     for ([_]bool{ false, true }) |capture| {
-        try std.testing.expectError(error.OutOfMemory, engine.runOne(engine.ctx, &program, &examples[0], capture));
+        try std.testing.expectError(error.OutOfMemory, engine.runOne(engine.ctx, &built, &examples[0], if (capture) .reflection else .untraced));
     }
     try std.testing.expectEqual(@as(usize, 5), script.index);
 }
 
-test "GEPA empty validation evaluates the entire training set" {
+test "GEPA compile aborts a canceled program rollout instead of scoring it" {
+    const Sig = signature.Signature(struct {
+        pub const instructions = "Answer.";
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: []const u8 };
+    });
+    const Program = struct {
+        pub const Input = Sig.Input;
+        pub const Output = Sig.Output;
+
+        predictor: predict.Predict(Sig) = .{},
+        calls: *usize,
+
+        pub fn forward(self: *const @This(), _: Context, _: Input) error{Canceled}!Output {
+            self.calls.* += 1;
+            return error.Canceled;
+        }
+
+        fn metric(_: Allocator, _: *const Example, _: *const optimize.RecordPrediction, _: ?*const Trace, _: ?[]const u8, _: ?*const Trace.Step) value.ParseError!Feedback {
+            unreachable; // A canceled rollout must not reach the metric.
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const rows = [_]Example{
+        try Example.fromJson(arena, "{\"question\":\"first\"}", &.{"question"}),
+        try Example.fromJson(arena, "{\"question\":\"second\"}", &.{"question"}),
+    };
+    var lm: @import("lm.zig").ScriptedLM = .{ .responses = &.{} };
+    const ctx: Context = .{ .arena = arena, .lm = lm.lm() };
+    const Pool = parallel.Parallel(GEPA.Run, .{ .workers = 1, .tasks = 2, .attempts = 2, .failures = 2 });
+    var pool: Pool = undefined;
+    try pool.init(std.testing.io, .{});
+    defer pool.deinit();
+    for ([_]bool{ false, true }) |concurrent| {
+        var calls: usize = 0;
+        const optimizer: GEPA = .{
+            .metric = Program.metric,
+            .max_metric_calls = 2,
+            .rollouts = if (concurrent) .{ .runner = pool.runner(), .contexts = &.{ ctx, ctx } } else null,
+        };
+        try std.testing.expectError(error.Canceled, optimizer.compile(Program, arena, ctx, .{ .calls = &calls }, &rows, .{ .valset = &rows }));
+        try std.testing.expectEqual(@as(usize, 1), calls);
+    }
+}
+
+test "GEPA compile does not retry a canceled reflection LM" {
+    const lm = @import("lm.zig");
+    const P = predict.Predict(signature.Signature(struct {
+        pub const instructions = "Seed.";
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: []const u8 };
+    }));
+    const Reflection = struct {
+        calls: usize = 0,
+
+        fn complete(ptr: *anyopaque, _: Allocator, request: lm.Request) lm.Error![]const lm.Completion {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (std.mem.indexOf(u8, request.messages[0].content.text, "new_instruction") == null)
+                return error.LMFailure;
+            self.calls += 1;
+            return error.Canceled;
+        }
+
+        fn batch(_: *anyopaque, _: Context, _: []const GEPA.BatchReflectionJob) ![]const []const GEPA.Instruction {
+            return error.ReflectionFailed;
+        }
+
+        fn metric(_: Allocator, _: *const Example, _: *const optimize.RecordPrediction, _: ?*const Trace, _: ?[]const u8, _: ?*const Trace.Step) value.ParseError!Feedback {
+            return .{ .score = 0, .feedback = "Improve." };
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const rows = [_]Example{try Example.fromJson(arena, "{\"question\":\"q\"}", &.{"question"})};
+    for ([_]bool{ false, true }) |batch_fallback| {
+        const responses: [3][]const u8 = @splat("{\"answer\":\"seed\"}");
+        var task: lm.ScriptedLM = .{ .responses = &responses };
+        var reflection: Reflection = .{};
+        const optimizer: GEPA = .{
+            .metric = Reflection.metric,
+            .max_metric_calls = 3,
+            .reflection_minibatch_size = 1,
+            .use_merge = false,
+            .batch_reflection = if (batch_fallback) .{ .ptr = &reflection, .propose = Reflection.batch } else null,
+        };
+        const ctx: Context = .{ .arena = arena, .adapter = .json, .lm = task.lm() };
+        const reflection_ctx: Context = .{ .arena = arena, .lm = .{
+            .ptr = &reflection,
+            .vtable = &.{ .complete = Reflection.complete },
+        } };
+        try std.testing.expectError(error.Canceled, optimizer.compile(P, arena, ctx, .{}, &rows, .{
+            .valset = &rows,
+            .reflection = reflection_ctx,
+        }));
+        try std.testing.expectEqual(1, reflection.calls);
+        try std.testing.expectEqual(2, task.index);
+    }
+}
+
+test "GEPA custom selection can choose off frontier without advancing the shared RNG" {
+    const Selector = struct {
+        fn select(ptr: *anyopaque, state: *const GEPA.CandidateSelection) !usize {
+            const index: *const usize = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualSlices(usize, &.{1}, state.front(0).?);
+            try std.testing.expectEqual(@as(?[]const usize, null), state.front(1));
+            return index.*;
+        }
+    };
+    var index: usize = 0;
+    var candidates = [_][]const []const u8{ &.{"seed"}, &.{"child"} };
+    var leaders = [_]usize{1};
+    var fronts = [_]std.ArrayList(usize){.fromOwnedSlice(&leaders)};
+    var engine: GEPA.Engine(void) = .{
+        .gepa = .{
+            .metric = undefined,
+            .candidate_selection_strategy = .{ .custom = .{
+                .ptr = &index,
+                .select = Selector.select,
+            } },
+        },
+        .out = std.testing.failing_allocator,
+        .ctx = undefined,
+        .reflection = undefined,
+        .student = undefined,
+        .names = &.{"self"},
+        .trainset = &.{},
+        .valset = &.{},
+        .rng = .init(13),
+        .adapter_rng = .init(0),
+        .candidates = .fromOwnedSlice(&candidates),
+        .front_score = &.{},
+        .fronts = &fronts,
+    };
+    var expected_rng = engine.rng;
+    try std.testing.expectEqual(@as(usize, 0), try engine.selectParent());
+    index = candidates.len;
+    try std.testing.expectError(error.InvalidCandidateSelection, engine.selectParent());
+    try std.testing.expectEqual(expected_rng.nextU32(), engine.rng.nextU32());
+}
+
+// Pinned GEPA selectors, including the shared RNG position after each draw.
+test "GEPA candidate selection preserves exploration, filtered frontiers, and RNG state" {
+    const cases = [_]struct {
+        strategy: GEPA.Selection,
+        seed: u32,
+        scores: []const f64,
+        fronts: []const []const usize,
+        draws: [12]usize,
+        rng_after: [12]u32,
+    }{
+        .{
+            .strategy = .epsilon_greedy,
+            .seed = 31,
+            .scores = &.{ 0.2, 0.8, 0.8 },
+            .fronts = &.{ &.{1}, &.{2} },
+            .draws = .{ 0, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1, 1 },
+            .rng_after = .{ 3281255694, 604968615, 185835555, 2298718664, 3055913604, 599541520, 4216431881, 142230572, 586600295, 2300649693, 1923075604, 1771975039 },
+        },
+        .{
+            .strategy = .epsilon_greedy,
+            .seed = 0,
+            .scores = &.{0.5},
+            .fronts = &.{&.{0}},
+            .draws = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+            .rng_after = .{ 3255389356, 1806341205, 1112038970, 2195908194, 1739178872, 3366389305, 1302718217, 2046968324, 2505606783, 3900315155, 2167613558, 1210484339 },
+        },
+        .{
+            .strategy = .top_k_pareto,
+            .seed = 7,
+            .scores = &.{ 0.2, 0.8, 0.8, 0.6, 0.5, 0.6, 0.1 },
+            .fronts = &.{ &.{ 0, 1, 2 }, &.{ 1, 6 }, &.{ 3, 5 }, &.{4}, &.{6} },
+            .draws = .{ 5, 1, 4, 1, 1, 1, 5, 1, 1, 1, 1, 4 },
+            .rng_after = .{ 4071050724, 1695753998, 2795742288, 311111475, 3527346212, 1570621944, 2503055453, 3907149204, 161042648, 369140570, 1862494042, 1796035739 },
+        },
+        .{
+            .strategy = .top_k_pareto,
+            .seed = 15,
+            .scores = &.{ 0.2, 0.8, 0.8, 0.6, 0.5, 0.6, 0.1 },
+            .fronts = &.{&.{ 0, 6 }},
+            .draws = .{ 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 },
+            .rng_after = .{ 4145683452, 4145683452, 4145683452, 4145683452, 4145683452, 4145683452, 4145683452, 4145683452, 4145683452, 4145683452, 4145683452, 4145683452 },
+        },
+    };
+    for (cases) |case| {
+        var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer storage.deinit();
+        const arena = storage.allocator();
+        const candidates = try arena.alloc([]const []const u8, case.scores.len);
+        @memset(candidates, &.{});
+        const scores = try arena.alloc([]const f64, case.scores.len);
+        for (scores, 0..) |*row, idx| row.* = case.scores[idx..][0..1];
+        const fronts = try arena.alloc(std.ArrayList(usize), case.fronts.len);
+        for (fronts, case.fronts) |*front, ids| {
+            front.* = .empty;
+            try front.appendSlice(arena, ids);
+        }
+        var engine: GEPA.Engine(void) = .{
+            .gepa = .{ .metric = undefined, .candidate_selection_strategy = case.strategy },
+            .out = arena,
+            .ctx = undefined,
+            .reflection = undefined,
+            .student = undefined,
+            .names = &.{},
+            .trainset = &.{},
+            .valset = &.{},
+            .rng = .init(case.seed),
+            .adapter_rng = .init(0),
+            .candidates = .fromOwnedSlice(candidates),
+            .subscores = .fromOwnedSlice(scores),
+            .front_score = &.{},
+            .fronts = fronts,
+        };
+        for (case.draws, case.rng_after) |draw, rng_after| {
+            try std.testing.expectEqual(draw, try engine.selectParent());
+            var snapshot = engine.rng;
+            try std.testing.expectEqual(rng_after, snapshot.nextU32());
+        }
+    }
+}
+
+// Frozen gepa 0.1.4 state and selectors, seed 17. Sparse keys arrive in later candidates.
+test "GEPA objective frontiers select different parents without changing the RNG clock" {
+    const rows: [4][3][]const ObjectiveScore = .{
+        .{ &.{ .{ .name = "q", .score = 3 }, .{ .name = "cost", .score = 0 } }, &.{.{ .name = "q", .score = 0 }}, &.{.{ .name = "ok", .score = 1 }} },
+        .{ &.{ .{ .name = "q", .score = 1 }, .{ .name = "cost", .score = 1 } }, &.{ .{ .name = "q", .score = 4 }, .{ .name = "cost", .score = 2 } }, &.{.{ .name = "ok", .score = 1 }} },
+        .{ &.{ .{ .name = "q", .score = 0 }, .{ .name = "cost", .score = 2 } }, &.{.{ .name = "q", .score = 0 }}, &.{.{ .name = "ok", .score = 1 }} },
+        .{ &.{ .{ .name = "q", .score = 2 }, .{ .name = "cost", .score = 3 } }, &.{ .{ .name = "q", .score = 2 }, .{ .name = "cost", .score = -1 } }, &.{.{ .name = "ok", .score = 2 }} },
+    };
+    const scores: []const []const f64 = &.{ &.{ 1, 0, 0.5 }, &.{ 0, 1, 0.5 }, &.{ 0.8, 0.8, 0.8 }, &.{ 0, 0, 1 } };
+    const cases = [_]struct {
+        mode: GEPA.Frontier,
+        leaders: []const usize,
+        draws: [16]usize,
+        next: [16]u32,
+    }{
+        .{ .mode = .instance, .leaders = &.{ 0, 1, 3 }, .draws = .{ 3, 1, 1, 1, 1, 0, 3, 3, 3, 3, 1, 0, 0, 0, 1, 3 }, .next = .{ 1778837931, 3464710496, 4125293655, 1243931546, 750280511, 3290406397, 3024601294, 2320078575, 2840618605, 1195188523, 473142372, 3940602561, 1069030695, 1650002322, 3501197581, 1802024078 } },
+        .{ .mode = .objective, .leaders = &.{ 1, 2, 3 }, .draws = .{ 3, 2, 2, 2, 2, 1, 3, 3, 3, 3, 2, 1, 1, 1, 2, 3 }, .next = .{ 1778837931, 3464710496, 4125293655, 1243931546, 750280511, 3290406397, 3024601294, 2320078575, 2840618605, 1195188523, 473142372, 3940602561, 1069030695, 1650002322, 3501197581, 1802024078 } },
+        .{ .mode = .hybrid, .leaders = &.{ 0, 1, 3, 1, 2, 3 }, .draws = .{ 3, 3, 1, 1, 1, 1, 2, 2, 3, 2, 1, 0, 0, 1, 3, 2 }, .next = .{ 1778837931, 3464710496, 4125293655, 1243931546, 750280511, 3290406397, 3024601294, 2320078575, 2840618605, 1195188523, 473142372, 3940602561, 1069030695, 1650002322, 3501197581, 1802024078 } },
+        .{ .mode = .cartesian, .leaders = &.{ 0, 3, 1, 3, 1 }, .draws = .{ 1, 1, 3, 3, 3, 3, 1, 3, 0, 0, 3, 1, 1, 3, 1, 3 }, .next = .{ 1778837931, 3464710496, 4125293655, 1243931546, 750280511, 3290406397, 2840618605, 473142372, 3940602561, 1069030695, 1650002322, 3501197581, 1083980018, 3692404330, 3446169948, 2751033102 } },
+    };
+    var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    for (cases) |case| {
+        var fronts: [3]std.ArrayList(usize) = .{ .fromOwnedSlice(try arena.dupe(usize, &.{0})), .fromOwnedSlice(try arena.dupe(usize, &.{1})), .fromOwnedSlice(try arena.dupe(usize, &.{3})) };
+        var engine: GEPA.Engine(void) = .{
+            .gepa = .{ .metric = undefined, .frontier_type = case.mode },
+            .out = arena,
+            .ctx = undefined,
+            .reflection = undefined,
+            .student = undefined,
+            .names = &.{},
+            .trainset = &.{},
+            .valset = &.{},
+            .rng = .init(17),
+            .adapter_rng = .init(0),
+            .front_score = &.{},
+            .fronts = &fronts,
+        };
+        try engine.candidates.appendNTimes(arena, &.{}, rows.len);
+        try engine.subscores.appendSlice(arena, scores);
+        for (rows, 0..) |entries, i| {
+            var runs: [3]GEPA.Run = undefined;
+            for (&runs, entries, scores[i]) |*run, row, score| run.* = .{ .prediction = null, .trace = undefined, .score = score, .objective_scores = row };
+            try engine.objectives.update(arena, case.mode, i, &runs, null);
+        }
+        try std.testing.expectEqual(case.leaders.len, engine.activeFrontCount());
+        for (case.leaders, 0..) |leader, i| try std.testing.expectEqualSlices(usize, &.{leader}, engine.activeFront(i));
+        for ([_]GEPA.Selection{ .pareto, .top_k_pareto }) |selection| {
+            engine.gepa.candidate_selection_strategy = selection;
+            engine.rng = .init(17);
+            for (case.draws, case.next) |draw, word| {
+                try std.testing.expectEqual(draw, try engine.selectParent());
+                var snapshot = engine.rng;
+                try std.testing.expectEqual(word, snapshot.nextU32());
+            }
+        }
+    }
+}
+
+test "GEPA objective batches require scores only for non-instance frontiers" {
+    var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    const empty: GEPA.Run = .{ .prediction = null, .trace = undefined, .score = 1 };
+    var state: GEPA.Objectives = .{};
+    try std.testing.expectError(error.MissingObjectiveScores, state.update(arena, .hybrid, 0, &.{empty}, null));
+    try state.update(arena, .instance, 0, &.{empty}, null);
+    var scored = empty;
+    scored.objective_scores = &.{.{ .name = "quality", .score = 0.5 }};
+    try state.update(arena, .instance, 1, &.{ scored, empty }, null);
+    try state.update(arena, .instance, 2, &.{scored}, null);
+    try state.update(arena, .instance, 3, &.{empty}, null);
+    const result = try state.results(arena);
+    try std.testing.expectEqualSlices(usize, &.{ 1, 2 }, result.leaders.?[0].candidates);
+    try std.testing.expectEqual(@as(f64, 0.5), state.aggregates.items[1][0].score);
+    try std.testing.expectEqual(@as(usize, 0), state.aggregates.items[0].len);
+    try std.testing.expectEqual(@as(usize, 0), state.aggregates.items[3].len);
+    scored.objective_scores = &.{ scored.objective_scores[0], scored.objective_scores[0] };
+    try std.testing.expectError(error.DuplicateObjective, state.update(arena, .instance, 4, &.{scored}, null));
+}
+
+test "GEPA requires one budget and evaluates the seed even with a zero budget" {
     var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer memory.deinit();
     const arena = memory.allocator();
@@ -870,7 +4865,7 @@ test "GEPA empty validation evaluates the entire training set" {
         pub const Output = struct { answer: []const u8 };
     });
     const Metric = struct {
-        fn score(_: Allocator, example: *const Example, prediction: *const Record, _: ?*const Trace, _: ?[]const u8, _: ?*const Trace.Step) value.ParseError!Feedback {
+        fn score(_: Allocator, example: *const Example, prediction: *const optimize.RecordPrediction, _: ?*const Trace, _: ?[]const u8, _: ?*const Trace.Step) value.ParseError!Feedback {
             return .{ .score = @floatFromInt(@intFromBool(std.mem.eql(
                 u8,
                 example.record.get("answer").?.string,
@@ -885,12 +4880,1281 @@ test "GEPA empty validation evaluates the entire training set" {
         try Example.fromJson(arena, "{\"question\":\"q\",\"answer\":\"ok\"}", &.{"question"}),
         try Example.fromJson(arena, "{\"question\":\"r\",\"answer\":\"ok\"}", &.{"question"}),
     };
-    const optimizer: GEPA = .{ .metric = Metric.score, .max_metric_calls = 1 };
-    const result = try optimizer.compile(predict.Predict(Sig), arena, .{ .arena = arena, .lm = script.lm() }, .{}, &examples, .{ .valset = &.{} });
+    const Program = predict.Predict(Sig);
+    const ctx: Context = .{ .arena = arena, .lm = script.lm() };
+    const options: GEPA.Options = .{ .valset = &.{} };
+    const invalid: []const GEPA = &.{
+        .{ .metric = Metric.score, .auto = .light, .max_full_evals = 0 },
+        .{ .metric = Metric.score, .auto = .light, .max_metric_calls = 0 },
+        .{ .metric = Metric.score, .max_full_evals = 0, .max_metric_calls = 0 },
+        .{ .metric = Metric.score, .auto = .light, .max_full_evals = 0, .max_metric_calls = 0 },
+    };
+    for (invalid) |optimizer| {
+        try std.testing.expectError(
+            error.ConflictingBudgets,
+            optimizer.compile(Program, arena, ctx, .{}, &examples, options),
+        );
+    }
+    const missing: GEPA = .{ .metric = Metric.score };
+    try std.testing.expectError(
+        error.NoBudget,
+        missing.compile(Program, arena, ctx, .{}, &examples, options),
+    );
+    const overflowing: GEPA = .{ .metric = Metric.score, .max_full_evals = std.math.maxInt(usize) };
+    try std.testing.expectError(
+        error.BudgetOverflow,
+        overflowing.compile(Program, arena, ctx, .{}, &examples, options),
+    );
+    const optimizer: GEPA = .{ .metric = Metric.score, .max_metric_calls = 0 };
+    const Plain = struct {
+        pub const Input = Sig.Input;
+        pub const Output = Sig.Output;
+        pub fn forward(_: *const @This(), _: Context, input: Input) error{}!Output {
+            return .{ .answer = input.question };
+        }
+    };
+    try std.testing.expectError(error.EmptyTrainset, optimizer.compile(Program, arena, ctx, .{}, &.{}, options));
+    try std.testing.expectError(error.NoComponents, optimizer.compile(Plain, arena, ctx, .{}, &examples, options));
+    try std.testing.expectEqual(@as(usize, 0), script.index);
+    const result = try optimizer.compile(Program, arena, ctx, .{}, &examples, options);
+    try std.testing.expect(result.best_outputs_valset == null);
     try std.testing.expectEqualSlices(f64, &.{ 1, 0 }, result.val_subscores[0]);
     try std.testing.expectEqual(@as(f64, 0.5), result.val_aggregate_scores[0]);
     try std.testing.expectEqual(@as(usize, 2), result.total_metric_calls);
-    try std.testing.expectEqual(@as(usize, 1), result.max_metric_calls);
+    try std.testing.expectEqual(@as(usize, 0), result.max_metric_calls);
+}
+
+test "GEPA ranks before deduplicating and snapshots all validation batches before commit" {
+    const P = predict.Predict(signature.Signature(struct {
+        pub const instructions = "Seed.";
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: i64 };
+    }));
+    const Script = struct {
+        next: usize = 0,
+        batch_count: usize = 0,
+        ids: [1]usize = undefined,
+
+        fn metric(
+            _: Allocator,
+            _: *const Example,
+            p: *const optimize.RecordPrediction,
+            _: ?*const Trace,
+            _: ?[]const u8,
+            _: ?*const Trace.Step,
+        ) @import("value.zig").ParseError!Feedback {
+            return .{ .score = @floatFromInt(p.get("answer").?.integer), .feedback = "Improve." };
+        }
+
+        fn propose(ptr: *anyopaque, ctx: Context, input: *const GEPA.InstructionProposal) ![]const GEPA.Instruction {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const texts = [_][]const u8{ "A", "B", "B", "C" };
+            const text = texts[self.next];
+            self.next += 1;
+            return ctx.arena.dupe(GEPA.Instruction, &.{.{
+                .name = input.components_to_update[0],
+                .text = text,
+            }});
+        }
+
+        fn invalidProposalTask(
+            _: *anyopaque,
+            _: *const GEPA.ProposalSample,
+            tasks: []GEPA.ProposalTask,
+        ) !usize {
+            tasks[0] = .{ .parent_idx = 0, .minibatch_ids = &.{0} };
+            tasks[1] = .{ .parent_idx = 0, .minibatch_ids = &.{2} };
+            return 2;
+        }
+
+        fn batch(ptr: *anyopaque, state: *const GEPA.ValidationState) ![]const usize {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(1, state.candidates.len);
+            try std.testing.expectEqual(8, state.total_metric_calls);
+            self.ids[0] = self.batch_count;
+            self.batch_count += 1;
+            return &self.ids;
+        }
+    };
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const example = try Example.fromJson(arena, "{\"question\":\"q\"}", &.{"question"});
+    var script: Script = .{};
+    var model: @import("lm.zig").ScriptedLM = .{ .responses = &.{
+        "{\"answer\":0}", "{\"answer\":0}", "{\"answer\":1}", "{\"answer\":1}",
+        "{\"answer\":3}", "{\"answer\":5}", "{\"answer\":5}", "{\"answer\":3}",
+        "{\"answer\":4}", "{\"answer\":6}",
+    } };
+    const optimizer: GEPA = .{
+        .metric = Script.metric,
+        .max_metric_calls = 3,
+        .reflection_minibatch_size = 1,
+        .instruction_proposer = .{ .ptr = &script, .propose = Script.propose },
+        .candidate_selection_strategy = .current_best,
+        .sampling_strategy = .{ .pxn = .{ .parents = 2, .mutations = 2 } },
+        .selection_strategy = .{ .top_k = 3 },
+        .skip_perfect_score = false,
+        .use_merge = false,
+        .val_evaluation_policy = .{ .ptr = &script, .next_batch = Script.batch, .max_batch_size = 1 },
+    };
+    const examples = [_]Example{ example, example };
+    const ctx: Context = .{ .arena = arena, .lm = model.lm(), .adapter = .json };
+    var invalid = optimizer;
+    invalid.sampling_strategy = .{ .same_parent = 0 };
+    try std.testing.expectError(error.EmptyProposalBatch, invalid.compile(P, arena, ctx, .{}, &examples, .{}));
+    invalid.sampling_strategy = .{ .pxn = .{ .parents = 2, .mutations = 17 } };
+    try std.testing.expectError(error.ProposalTaskLimitExceeded, invalid.compile(P, arena, ctx, .{}, &examples, .{}));
+    invalid.sampling_strategy = .{ .custom = .{ .ptr = &script, .sample = Script.invalidProposalTask } };
+    try std.testing.expectError(error.InvalidProposalTask, invalid.compile(P, arena, ctx, .{}, &examples, .{}));
+    // Validate the whole batch before running even the valid first task.
+    try std.testing.expectEqual(2, model.index);
+    model.index = 0;
+    const fit = try optimizer.compile(P, arena, ctx, .{}, &examples, .{});
+    try std.testing.expectEqualStrings("B", fit.candidates[1][0]);
+    try std.testing.expectEqualStrings("A", fit.candidates[2][0]);
+    try std.testing.expectEqualSlices(usize, &.{0}, fit.val_ids.?[1]);
+    try std.testing.expectEqualSlices(usize, &.{1}, fit.val_ids.?[2]);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 8, 9 }, fit.discovery_eval_counts);
+    try std.testing.expectEqual(10, fit.total_metric_calls);
+
+    // B was traced against both IDs; A was traced only against row zero.
+    // Validation must hit B's cached row and still evaluate A's uncached row.
+    var cached = optimizer;
+    cached.cache_evaluation = true;
+    script = .{};
+    model.index = 0;
+    const reused = try cached.compile(P, arena, ctx, .{}, &examples, .{});
+    try std.testing.expectEqualSlices(f64, &.{5}, reused.val_subscores[1]);
+    try std.testing.expectEqualSlices(f64, &.{4}, reused.val_subscores[2]);
+    try std.testing.expectEqualSlices(usize, &.{ 0, 8, 8 }, reused.discovery_eval_counts);
+    try std.testing.expectEqual(9, reused.total_metric_calls);
+}
+
+test "GEPA batch reflection preserves eligible job order and scores individual fallback survivors" {
+    const lm = @import("lm.zig");
+    const P = predict.Predict(signature.Signature(struct {
+        pub const instructions = "Seed.";
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: i64 };
+    }));
+    const Mode = enum { success, hole, failed, short, long, canceled, oom, custom };
+    const Script = struct {
+        mode: Mode,
+        batches: usize = 0,
+        individuals: [2]u8 = undefined,
+        singles: usize = 0,
+        customs: usize = 0,
+
+        fn sample(ptr: *anyopaque, _: *const GEPA.ProposalSample, tasks: []GEPA.ProposalTask) !usize {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            tasks[0] = .{ .parent_idx = 0, .minibatch_ids = &.{0} };
+            var i: usize = 1;
+            if (self.mode == .hole) {
+                // Perfect parent: no reflection job, child, or child rollout.
+                tasks[i] = .{ .parent_idx = 0, .minibatch_ids = &.{2} };
+                i += 1;
+            }
+            tasks[i] = .{ .parent_idx = 0, .minibatch_ids = &.{1} };
+            return i + 1;
+        }
+
+        fn batch(ptr: *anyopaque, ctx: Context, jobs: []const GEPA.BatchReflectionJob) ![]const []const GEPA.Instruction {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.batches += 1;
+            try std.testing.expectEqual(2, jobs.len);
+            const results = try ctx.arena.alloc([]const GEPA.Instruction, 3);
+            for (jobs, [_][]const u8{ "q0", "q1" }, [_][]const u8{ "Weaker.", "Winner." }, results[0..2]) |job, q, text, *result| {
+                try std.testing.expectEqualStrings("Seed.", job.candidate[0].text);
+                const dataset = job.reflective_dataset[0];
+                try std.testing.expectEqualStrings(job.components_to_update[0], dataset.name);
+                const inputs = dataset.examples[0].get("Inputs").?.object;
+                try std.testing.expectEqualStrings(q, inputs.get("question").?.string);
+                result.* = try ctx.arena.dupe(GEPA.Instruction, &.{.{ .name = dataset.name, .text = try ctx.arena.dupe(u8, text) }});
+            }
+            results[2] = &.{};
+            return switch (self.mode) {
+                .success, .hole => results[0..2],
+                .short => results[0..1],
+                .long => results,
+                .failed => error.ReflectionFailed,
+                .canceled => error.Canceled,
+                .oom => error.OutOfMemory,
+                .custom => unreachable,
+            };
+        }
+
+        fn custom(ptr: *anyopaque, ctx: Context, input: *const GEPA.InstructionProposal) ![]const GEPA.Instruction {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.customs += 1;
+            return ctx.arena.dupe(GEPA.Instruction, &.{.{
+                .name = input.components_to_update[0],
+                .text = if (self.customs == 1) "Weaker." else "Winner.",
+            }});
+        }
+
+        fn complete(ptr: *anyopaque, arena: Allocator, request: lm.Request) lm.Error![]const lm.Completion {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const instructions = request.messages[0].content.text;
+            const user = request.messages[request.messages.len - 1].content.text;
+            const q0 = std.mem.indexOf(u8, user, "q0") != null;
+            const q1 = std.mem.indexOf(u8, user, "q1") != null;
+            const text: []const u8 = if (std.mem.indexOf(u8, instructions, "new_instruction") != null) blk: {
+                if (self.singles >= self.individuals.len) return error.LMFailure;
+                self.individuals[self.singles] = if (q0) '0' else if (q1) '1' else '?';
+                self.singles += 1;
+                if (!q1) return error.LMFailure;
+                break :blk "{\"new_instruction\":\"Winner.\"}";
+            } else if (std.mem.indexOf(u8, instructions, "Winner.") != null)
+                (if (q1) "{\"answer\":2}" else "{\"answer\":0}")
+            else if (std.mem.indexOf(u8, instructions, "Weaker.") != null)
+                (if (q0) "{\"answer\":1}" else "{\"answer\":0}")
+            else if (!q0 and !q1)
+                "{\"answer\":2}"
+            else
+                "{\"answer\":0}";
+            return arena.dupe(lm.Completion, &.{.{ .text = text }});
+        }
+
+        fn metric(
+            _: Allocator,
+            _: *const Example,
+            p: *const optimize.RecordPrediction,
+            _: ?*const Trace,
+            _: ?[]const u8,
+            _: ?*const Trace.Step,
+        ) value.ParseError!Feedback {
+            return .{ .score = @as(f64, @floatFromInt(p.get("answer").?.integer)) / 2, .feedback = "Improve." };
+        }
+    };
+    var memory = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const data = [_]Example{
+        try Example.fromJson(arena, "{\"question\":\"q0\"}", &.{"question"}),
+        try Example.fromJson(arena, "{\"question\":\"q1\"}", &.{"question"}),
+        try Example.fromJson(arena, "{\"question\":\"perfect\"}", &.{"question"}),
+    };
+    for (std.enums.values(Mode)) |mode| {
+        var script: Script = .{ .mode = mode };
+        const ctx: Context = .{ .arena = arena, .adapter = .json, .lm = .{
+            .ptr = &script,
+            .vtable = &.{ .complete = Script.complete },
+        } };
+        const optimizer: GEPA = .{
+            .metric = Script.metric,
+            .max_metric_calls = 5,
+            .use_merge = false,
+            .sampling_strategy = .{ .custom = .{ .ptr = &script, .sample = Script.sample } },
+            .batch_reflection = .{ .ptr = &script, .propose = Script.batch },
+            .instruction_proposer = if (mode == .custom) .{ .ptr = &script, .propose = Script.custom } else null,
+        };
+        const outcome = optimizer.compile(P, arena, ctx, .{}, &data, .{ .valset = data[0..2] });
+        try std.testing.expectEqual(@as(usize, if (mode == .custom) 0 else 1), script.batches);
+        if (mode == .canceled or mode == .oom) {
+            try std.testing.expectError(if (mode == .oom) error.OutOfMemory else error.Canceled, outcome);
+            try std.testing.expectEqual(0, script.singles);
+            continue;
+        }
+        const fit = try outcome;
+        const fallback = mode == .failed or mode == .short or mode == .long;
+        try std.testing.expectEqualStrings(if (fallback) "01" else "", script.individuals[0..script.singles]);
+        try std.testing.expectEqual(@as(usize, if (mode == .custom) 2 else 0), script.customs);
+        try std.testing.expectEqual(@as(usize, if (fallback) 7 else if (mode == .hole) 11 else 10), fit.total_metric_calls);
+        try std.testing.expectEqual(@as(usize, if (fallback) 2 else 3), fit.candidates.len);
+        if (!fallback) try std.testing.expectEqualSlices(f64, &.{ 0.5, 0 }, fit.val_subscores[1]);
+        try std.testing.expectEqualStrings("Winner.", fit.candidates[fit.best_idx][0]);
+        try std.testing.expectEqualSlices(f64, &.{ 0, 1 }, fit.val_subscores[fit.best_idx]);
+    }
+}
+
+test "GEPA stops after seed evaluation before reflecting or calling later stoppers" {
+    const Sig = signature.Signature(struct {
+        pub const instructions = "Original.";
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: []const u8 };
+    });
+    const Callbacks = struct {
+        fn metric(
+            _: Allocator,
+            _: *const Example,
+            _: *const optimize.RecordPrediction,
+            _: ?*const Trace,
+            _: ?[]const u8,
+            _: ?*const Trace.Step,
+        ) value.ParseError!Feedback {
+            return .{ .score = 0 };
+        }
+
+        fn afterSeed(_: *anyopaque, state: *const GEPA.StopState) !bool {
+            try std.testing.expectEqual(@as(?usize, null), state.last_iteration);
+            try std.testing.expectEqual(@as(usize, 1), state.total_metric_calls);
+            return true;
+        }
+
+        fn unexpected(_: *anyopaque, _: *const GEPA.StopState) !bool {
+            return error.CallbackShouldHaveShortCircuited;
+        }
+    };
+    var storage: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    var script: @import("lm.zig").ScriptedLM = .{
+        .responses = &.{ "{\"answer\":\"seed\"}", "{\"answer\":\"would reflect\"}" },
+    };
+    const example = try Example.fromJson(arena, "{\"question\":\"q\"}", &.{"question"});
+    const optimizer: GEPA = .{
+        .metric = Callbacks.metric,
+        .max_metric_calls = 8,
+        .stop_callbacks = &.{
+            .{ .ptr = &script, .should_stop = Callbacks.afterSeed },
+            .{ .ptr = &script, .should_stop = Callbacks.unexpected },
+        },
+    };
+    const result = try optimizer.compile(predict.Predict(Sig), arena, .{
+        .arena = arena,
+        .lm = script.lm(),
+        .adapter = .json,
+    }, .{}, &.{example}, .{});
+    try std.testing.expectEqual(@as(usize, 1), script.index);
+    try std.testing.expectEqual(@as(usize, 1), result.total_metric_calls);
+}
+
+test "GEPA epoch sampler pads and rotates whole minibatches at full-width iteration indices" {
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    const Metric = struct {
+        fn score(_: Allocator, _: *const Example, _: *const optimize.RecordPrediction, _: ?*const Trace, _: ?[]const u8, _: ?*const Trace.Step) value.ParseError!Feedback {
+            return .{ .score = 0 };
+        }
+    };
+    var script: @import("lm.zig").ScriptedLM = .{ .responses = &.{} };
+    const context: Context = .{ .arena = arena, .lm = script.lm() };
+    const example = try Example.fromJson(arena, "{\"question\":\"q\"}", &.{"question"});
+    const train: [5]Example = @splat(example);
+    const student: struct { placeholder: bool = false } = .{};
+    var engine: GEPA.Engine(@TypeOf(student)) = .{
+        .gepa = .{ .metric = Metric.score, .reflection_minibatch_size = 0 },
+        .out = arena,
+        .ctx = context,
+        .reflection = context,
+        .student = &student,
+        .names = &.{},
+        .trainset = &train,
+        .valset = &.{},
+        .rng = .init(0),
+        .adapter_rng = .init(0),
+        .front_score = &.{},
+        .fronts = &.{},
+    };
+    const end = std.math.maxInt(usize);
+    const iterations = [_]usize{ 0, 0, 1, 1, 1, 2, 3, 3, end, end };
+    const expected = [_][3]usize{
+        .{ 2, 1, 0 }, .{ 4, 3, 3 }, .{ 4, 3, 3 }, .{ 2, 1, 0 }, .{ 4, 3, 3 },
+        .{ 0, 2, 1 }, .{ 3, 4, 4 }, .{ 0, 2, 1 }, .{ 2, 3, 3 }, .{ 1, 0, 4 },
+    };
+    for (iterations, expected) |iteration, row| {
+        engine.i = iteration;
+        try std.testing.expectEqualSlices(usize, &row, try engine.nextMinibatch(0));
+    }
+}
+
+test "GEPA preserves base Score with wide integer evidence and leaves plain objects unboxed" {
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const a = memory.allocator();
+    const wide = "18446744073709551619";
+    const raw = "{\"value\":-0.25,\"confidence\":0.875,\"level\":" ++
+        wide ++ ",\"probabilities\":{\"-" ++ wide ++ "\":0.75,\"2\":0.25}}";
+    const boxed = try Score.validateJson(a, raw, .strict);
+    const plain = try @import("json_repair.zig").parseJson(a, raw);
+    var fields: Record = .empty;
+    try fields.put(a, "score", boxed);
+    try fields.put(a, "plain", plain);
+    const rows = try a.dupe(Record, &.{fields});
+    const prediction = try optimize.RecordPrediction.fromCompletions(a, rows);
+    const checkpoint: GEPA.Checkpoint = .{ .io = std.testing.io, .path = "", .revision = "" };
+    const trace: Trace = .{ .arena = a };
+    const run: GEPA.Run = .{ .score = 1, .prediction = prediction, .trace = &trace };
+    const captured = try GEPA.StoredRun.capture(run, a, true, checkpoint);
+    const encoded = try std.json.Stringify.valueAlloc(a, captured, .{});
+    const decoded = try std.json.parseFromSliceLeaky(GEPA.StoredRun, a, encoded, .{ .allocate = .alloc_always });
+    const restored = (try decoded.restore(a, &trace, checkpoint)).prediction.?;
+    const score = restored.get("score").?.custom.get(Score).?;
+    try std.testing.expectEqual(@as(f64, -0.25), score.value);
+    try std.testing.expectEqual(@as(f64, 0.875), score.confidence);
+    try std.testing.expectEqualStrings(wide, score.level.?.value.number_string);
+    const entries = python_value.view(score.probabilities.?).?.dictionary;
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqualStrings("-" ++ wide, entries[0].key.number_string);
+    try std.testing.expectEqual(@as(f64, 0.75), entries[0].value.float);
+    try std.testing.expectEqual(@as(i64, 2), entries[1].key.integer);
+    try std.testing.expectEqual(@as(f64, 0.25), entries[1].value.float);
+    try std.testing.expect(restored.get("plain").? == .object);
+    try std.testing.expect(try value.pyEqual(restored.get("score").?, restored.completions().?[0].get("score").?));
+}
+
+test "GEPA round-trips base Choice without boxing plain dictionaries" {
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const a = memory.allocator();
+    const wide = "18446744073709551619";
+    const raw = "{\"value\":" ++ wide ++ ",\"confidence\":0.875,\"probabilities\":{\"雪\":0.75,\"007\":0.25}}";
+    const Mixed = @import("decision.zig").ChoiceWithOptions(&.{
+        .{ .value = .{ .number_string = wide }, .description_json = "\"wide\"" },
+        .{ .value = .{ .integer = 1 }, .description_json = "\"small\"" },
+    });
+    var fields: Record = .empty;
+    try fields.put(a, "choice", try Choice.validateJson(a, raw, .strict));
+    try fields.put(a, "configured", try (Mixed{ .confidence = 1, .value = .{ .number_string = wide } }).toRuntime(a));
+    try fields.put(a, "plain", try @import("json_repair.zig").parseJson(a, raw));
+    try fields.put(a, "nullable", try Choice.validateJson(a, "{\"value\":null,\"confidence\":0}", .strict));
+    const rows = try a.dupe(Record, &.{fields});
+    const prediction = try optimize.RecordPrediction.fromCompletions(a, rows);
+    const checkpoint: GEPA.Checkpoint = .{
+        .io = std.testing.io,
+        .path = "",
+        .revision = "",
+        .choice_classes = &.{.bind(Mixed, "mixed")},
+    };
+    const trace: Trace = .{ .arena = a };
+    const run: GEPA.Run = .{ .score = 1, .prediction = prediction, .trace = &trace };
+    const captured = try GEPA.StoredRun.capture(run, a, true, checkpoint);
+    const encoded = try std.json.Stringify.valueAlloc(a, captured, .{});
+    const decoded = try std.json.parseFromSliceLeaky(GEPA.StoredRun, a, encoded, .{ .allocate = .alloc_always });
+    const restored = (try decoded.restore(a, &trace, checkpoint)).prediction.?;
+    for ([_]Record{ restored.fields().*, restored.completions().?[0] }) |row| {
+        const configured = row.get("configured").?.custom.get(Mixed).?;
+        try std.testing.expectEqualStrings(wide, configured.value.number_string);
+        const choice = row.get("choice").?.custom.get(Choice).?;
+        try std.testing.expectEqualStrings(wide, choice.value.number_string);
+        try std.testing.expectEqual(@as(f64, 0.875), choice.confidence);
+        const probabilities = choice.probabilities.?.object;
+        try std.testing.expectEqual(@as(f64, 0.75), probabilities.get("雪").?.float);
+        try std.testing.expectEqual(@as(f64, 0.25), probabilities.get("007").?.float);
+        const nullable = row.get("nullable").?.custom.get(Choice).?;
+        try std.testing.expect(nullable.value == .null and nullable.probabilities == null);
+        try std.testing.expect(row.get("plain").? == .object);
+    }
+}
+
+test "GEPA checkpoint refuses mismatched runs and does not publish oversized states" {
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const io = std.testing.io;
+    const directory = try temporary.dir.realPathFileAlloc(io, ".", arena);
+    const path = try std.fs.path.join(arena, &.{ directory, "state.json" });
+    const P = predict.Predict(signature.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: []const u8 };
+    }));
+    const Metric = struct {
+        fn score(
+            _: Allocator,
+            _: *const Example,
+            pred: *const optimize.RecordPrediction,
+            _: ?*const Trace,
+            _: ?[]const u8,
+            _: ?*const Trace.Step,
+        ) value.ParseError!Feedback {
+            const answer = pred.get("answer").?.string;
+            return .{ .score = if (std.mem.eql(u8, answer, "first")) 1 else 0 };
+        }
+    };
+    const data = [_]Example{try Example.fromJson(arena, "{\"question\":\"q\"}", &.{"question"})};
+    var model: @import("lm.zig").ScriptedLM = .{ .responses = &.{
+        "<answer>first</answer>",
+        "<answer>first</answer>",
+        "<answer>resumed</answer>",
+    } };
+    const ctx: Context = .{ .arena = arena, .lm = model.lm() };
+    const optimizer: GEPA = .{
+        .metric = Metric.score,
+        .max_metric_calls = 0,
+        .track_best_outputs = true,
+    };
+    var options: GEPA.Options = .{ .checkpoint = .{
+        .io = io,
+        .path = path,
+        .revision = "seed-case",
+        .max_bytes = 10,
+    } };
+    try std.testing.expectError(
+        error.GepaCheckpointTooLarge,
+        optimizer.compile(P, arena, ctx, .{}, &data, options),
+    );
+    try std.testing.expectError(error.FileNotFound, temporary.dir.access(io, "state.json", .{}));
+    options.checkpoint.?.max_bytes = 1024 * 1024;
+    _ = try optimizer.compile(P, arena, ctx, .{}, &data, options);
+
+    options.checkpoint.?.revision = "different-seed-case";
+    try std.testing.expectError(
+        error.IncompatibleGepaCheckpoint,
+        optimizer.compile(P, arena, ctx, .{}, &data, options),
+    );
+    try std.testing.expectEqual(@as(usize, 2), model.index);
+    options.checkpoint.?.revision = "seed-case";
+    const resumed = try optimizer.compile(P, arena, ctx, .{}, &data, options);
+    try std.testing.expectEqual(@as(usize, 3), model.index);
+    try std.testing.expectEqual(@as(usize, 1), resumed.total_metric_calls);
+    try std.testing.expectEqualSlices(f64, &.{1}, resumed.val_aggregate_scores);
+    const retained = resumed.best_outputs_valset.?[0][0].output.prediction;
+    try std.testing.expectEqualStrings("first", retained.get("answer").?.string);
+}
+
+test "GEPA log size failures leave the last complete candidate file intact" {
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const io = std.testing.io;
+    const path = try temporary.dir.realPathFileAlloc(io, ".", arena);
+    const P = predict.Predict(signature.Signature(struct {
+        pub const instructions = "Seed";
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: []const u8 };
+    }));
+    const Metric = struct {
+        fn score(
+            _: Allocator,
+            _: *const Example,
+            _: *const optimize.RecordPrediction,
+            _: ?*const Trace,
+            _: ?[]const u8,
+            _: ?*const Trace.Step,
+        ) value.ParseError!Feedback {
+            return .{ .score = 0 };
+        }
+    };
+    const data = [_]Example{try Example.fromJson(arena, "{\"question\":\"q\"}", &.{"question"})};
+    var model: @import("lm.zig").ScriptedLM = .{ .responses = &.{
+        "<answer>first</answer>",
+        "<answer>second</answer>",
+        "<answer>oversized prediction</answer>",
+        "<answer>seed with marker</answer>",
+    } };
+    const ctx: Context = .{ .arena = arena, .lm = model.lm() };
+    var optimizer: GEPA = .{ .metric = Metric.score, .max_metric_calls = 0 };
+    var options: GEPA.Options = .{ .log_dir = .{ .io = io, .path = path } };
+    _ = try optimizer.compile(P, arena, ctx, .{}, &data, options);
+    try std.testing.expectError(error.FileNotFound, temporary.dir.access(io, "run_log.json", .{}));
+    // The prediction fits, but the new candidates.json does not.
+    options.log_dir.?.max_file_bytes = 28;
+    var second: P = .{};
+    second.state.instructions = "Another candidate";
+    try std.testing.expectError(
+        error.GepaLogTooLarge,
+        optimizer.compile(P, arena, ctx, second, &data, options),
+    );
+    const bytes = try temporary.dir.readFileAlloc(io, "candidates.json", arena, .limited(512));
+    try std.testing.expectEqualStrings("[{\"self\":\"Seed\"}]", bytes);
+
+    const output = "generated_best_outputs_valset/task_0/iter_0_prog_0.json";
+    const last_output = try temporary.dir.readFileAlloc(io, output, arena, .limited(256));
+    options.log_dir.?.max_file_bytes = 4;
+    try std.testing.expectError(
+        error.GepaLogTooLarge,
+        optimizer.compile(P, arena, ctx, .{}, &data, options),
+    );
+    const preserved_output = try temporary.dir.readFileAlloc(io, output, arena, .limited(256));
+    try std.testing.expectEqualStrings(last_output, preserved_output);
+
+    const marker = try temporary.dir.createFile(io, "gepa.stop", .{});
+    marker.close(io);
+    optimizer.max_metric_calls = 3;
+    options.log_dir.?.max_file_bytes = 512;
+    const stopped = try optimizer.compile(P, arena, ctx, .{}, &data, options);
+    try std.testing.expectEqual(@as(usize, 1), stopped.total_metric_calls);
+    try std.testing.expectEqual(@as(usize, 4), model.index);
+    try temporary.dir.access(io, "gepa.stop", .{});
+    try std.testing.expectError(error.FileNotFound, temporary.dir.access(io, "run_log.json", .{}));
+}
+
+test "GEPA compile logs validation predictions with and without tracking" {
+    const P = predict.Predict(signature.Signature(struct {
+        pub const instructions = "Seed.";
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: []const u8 };
+    }));
+    const Callbacks = struct {
+        fn metric(_: Allocator, _: *const Example, pred: *const optimize.RecordPrediction, _: ?*const Trace, _: ?[]const u8, _: ?*const Trace.Step) value.ParseError!Feedback {
+            return .{ .score = if (std.mem.eql(u8, pred.get("answer").?.string, "high")) 1 else 0 };
+        }
+
+        fn propose(_: *anyopaque, _: Context, _: *const GEPA.InstructionProposal) ![]const GEPA.Instruction {
+            return &.{.{ .name = "self", .text = "Winner." }};
+        }
+
+        fn expectOutput(io: std.Io, dir: std.Io.Dir, path: []const u8, answer: []const u8, arena: Allocator) !void {
+            const bytes = try dir.readFileAlloc(io, path, arena, .limited(256));
+            const parsed = try std.json.parseFromSliceLeaky(struct { answer: []const u8 }, arena, bytes, .{});
+            try std.testing.expectEqualStrings(answer, parsed.answer);
+        }
+    };
+    var storage: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    const io = std.testing.io;
+    const data = [_]Example{try Example.fromJson(arena, "{\"question\":\"q\"}", &.{"question"})};
+    const seed_output = "generated_best_outputs_valset/task_0/iter_0_prog_0.json";
+    const child_output = "generated_best_outputs_valset/task_0/iter_1_prog_1.json";
+    const Mode = enum { seed_only, tracked, overridden };
+    for (std.enums.values(Mode)) |mode| {
+        const track = mode != .seed_only;
+        var temporary = std.testing.tmpDir(.{});
+        defer temporary.cleanup();
+        const path = try temporary.dir.realPathFileAlloc(io, ".", arena);
+        const override_path = try std.fs.path.join(arena, &.{ path, "override" });
+        var script: @import("lm.zig").ScriptedLM = .{ .responses = &.{
+            "<answer>low</answer>",  "<answer>low</answer>",
+            "<answer>high</answer>", "<answer>high</answer>",
+        } };
+        const optimizer: GEPA = .{
+            .metric = Callbacks.metric,
+            .max_metric_calls = 4,
+            .reflection_minibatch_size = 1,
+            .use_merge = false,
+            .track_best_outputs = track,
+            .validation_output_dir = if (mode == .overridden) .{ .io = io, .path = override_path } else null,
+            .instruction_proposer = .{ .ptr = &script, .propose = Callbacks.propose },
+        };
+        const result = try optimizer.compile(P, arena, .{
+            .arena = arena,
+            .lm = script.lm(),
+            .json_fallback = false,
+        }, .{}, &data, .{ .valset = &data, .log_dir = .{ .io = io, .path = path } });
+        try std.testing.expectEqual(@as(usize, 4), result.total_metric_calls);
+        try std.testing.expectEqual(@as(usize, 4), script.index);
+        try std.testing.expectEqualStrings("Winner.", result.candidates[result.best_idx][0]);
+        if (mode == .overridden) {
+            try std.testing.expectError(error.FileNotFound, temporary.dir.access(io, seed_output, .{}));
+            try std.testing.expectError(error.FileNotFound, temporary.dir.access(io, child_output, .{}));
+            var overridden = try temporary.dir.openDir(io, "override", .{});
+            defer overridden.close(io);
+            try Callbacks.expectOutput(io, overridden, seed_output, "low", arena);
+            try Callbacks.expectOutput(io, overridden, child_output, "high", arena);
+            continue;
+        }
+        try Callbacks.expectOutput(io, temporary.dir, seed_output, "low", arena);
+        if (track) {
+            try Callbacks.expectOutput(io, temporary.dir, child_output, "high", arena);
+        } else {
+            try std.testing.expectError(error.FileNotFound, temporary.dir.access(io, child_output, .{}));
+        }
+    }
+}
+
+test "GEPA validation files distinguish seed failure and child parse failure" {
+    const P = predict.Predict(signature.Signature(struct {
+        pub const instructions = "Seed.";
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: []const u8 };
+    }));
+    const Callbacks = struct {
+        fn metric(_: Allocator, example: *const Example, pred: *const optimize.RecordPrediction, _: ?*const Trace, _: ?[]const u8, _: ?*const Trace.Step) value.ParseError!Feedback {
+            if (std.mem.eql(u8, example.record.get("question").?.string, "seed-crash")) return error.ParseValue;
+            return .{ .score = if (std.mem.eql(u8, pred.get("answer").?.string, "high")) 1 else 0 };
+        }
+
+        fn propose(_: *anyopaque, _: Context, _: *const GEPA.InstructionProposal) ![]const GEPA.Instruction {
+            return &.{.{ .name = "self", .text = "Winner." }};
+        }
+
+        fn sample(_: *anyopaque, _: *const GEPA.BatchSample) ![]const usize {
+            return &.{ 0, 1 };
+        }
+    };
+    var storage: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    const io = std.testing.io;
+    const validation = [_]Example{
+        try Example.fromJson(arena, "{\"question\":\"broken-case\"}", &.{"question"}),
+        try Example.fromJson(arena, "{\"question\":\"good-case\"}", &.{"question"}),
+        try Example.fromJson(arena, "{\"question\":\"seed-crash\"}", &.{"question"}),
+    };
+    const low = "<answer>low</answer>";
+    const high = "<answer>high</answer>";
+    const broken = "not-an-answer";
+    for ([_]bool{ false, true }) |cached| {
+        var temporary = std.testing.tmpDir(.{});
+        defer temporary.cleanup();
+        const path = try temporary.dir.realPathFileAlloc(io, ".", arena);
+        const cached_responses = [_][]const u8{ low, low, low, low, low, broken, high, high };
+        const fresh_responses = [_][]const u8{ low, low, low, low, low, broken, high, broken, high, high };
+        var script: @import("lm.zig").ScriptedLM = .{
+            .responses = if (cached) &cached_responses else &fresh_responses,
+        };
+        const optimizer: GEPA = .{
+            .metric = Callbacks.metric,
+            .failure_score = 0.25,
+            .max_metric_calls = 7,
+            .batch_sampler = .{ .ptr = &script, .max_batch_size = 2, .next = Callbacks.sample },
+            .use_merge = false,
+            .cache_evaluation = cached,
+            .track_best_outputs = true,
+            .instruction_proposer = .{ .ptr = &script, .propose = Callbacks.propose },
+        };
+        const result = try optimizer.compile(P, arena, .{ .arena = arena, .lm = script.lm(), .json_fallback = false }, .{}, validation[0..2], .{
+            .valset = &validation,
+            .log_dir = .{ .io = io, .path = path },
+        });
+        try std.testing.expectEqual(script.responses.len, result.total_metric_calls);
+        try std.testing.expectEqual(script.responses.len, script.index);
+        // The failed child ties on row 2 but has no output to publish.
+        try std.testing.expectEqualSlices(usize, &.{ 0, 1 }, result.per_val_instance_best_candidates[2]);
+        const outputs = result.best_outputs_valset.?;
+        try std.testing.expectEqual(@as(usize, 1), outputs[2].len);
+        try std.testing.expectEqual(@as(usize, 0), outputs[2][0].candidate_idx);
+        try std.testing.expectEqual(@as(usize, 0), outputs[2][0].output.prediction.fields().count());
+        try std.testing.expectEqual(@as(usize, 1), outputs[1].len);
+        try std.testing.expectEqual(@as(usize, 1), outputs[1][0].candidate_idx);
+        try std.testing.expectEqualStrings("high", outputs[1][0].output.prediction.get("answer").?.string);
+        try std.testing.expectEqual(@as(usize, 1), outputs[0].len);
+        try std.testing.expectEqual(@as(usize, 1), outputs[0][0].candidate_idx);
+        const diagnostic = outputs[0][0].output.failed_parse;
+        try std.testing.expectEqualStrings("not-an-answer", diagnostic.completion_text);
+        try std.testing.expectEqual(@as(f64, 0.25), diagnostic.format_reward);
+        try std.testing.expectEqualStrings("Winner.", result.candidates[result.best_idx][0]);
+        const dir = "generated_best_outputs_valset/";
+        const empty = try temporary.dir.readFileAlloc(io, dir ++ "task_2/iter_0_prog_0.json", arena, .limited(256));
+        try std.testing.expectEqualStrings("{}", empty);
+        const output = try temporary.dir.readFileAlloc(io, dir ++ "task_0/iter_1_prog_1.json", arena, .limited(256));
+        const failed = try std.json.parseFromSliceLeaky([]const u8, arena, output, .{});
+        try std.testing.expectEqualStrings("FailedPrediction(completion_text='not-an-answer', format_reward=0.25)", failed);
+        try std.testing.expectError(error.FileNotFound, temporary.dir.access(io, dir ++ "task_2/iter_1_prog_1.json", .{}));
+    }
+}
+
+test "GEPA merge scores repeated rows by the last rollout and preserves failure provenance" {
+    const Left = predict.Predict(signature.Signature(struct {
+        pub const instructions = "Left seed.";
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { tag: []const u8 };
+    }));
+    const Right = predict.Predict(signature.Signature(struct {
+        pub const instructions = "Right seed.";
+        pub const Input = struct { question: []const u8, tag: []const u8 };
+        pub const Output = struct { answer: []const u8 };
+    }));
+    const Program = struct {
+        left: Left = .{},
+        right: Right = .{},
+
+        pub const Input = Left.Input;
+        pub const Output = Right.Output;
+
+        pub fn forward(self: *const @This(), ctx: Context, input: Input) predict.Error!Output {
+            const tag = (try self.left.forward(ctx, input)).tag;
+            return self.right.forward(ctx, .{ .question = input.question, .tag = tag });
+        }
+    };
+    const Model = struct {
+        const lm = @import("lm.zig");
+
+        merge_rows: [9]usize = undefined,
+        count: usize = 0,
+        sample_id: [1]usize = .{0},
+
+        fn complete(ptr: *anyopaque, arena: Allocator, request: lm.Request) lm.Error![]const lm.Completion {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const system = request.messages[0].content.text;
+            const user = request.messages[request.messages.len - 1].content.text;
+            const tag = "<question>\nq";
+            const start = (std.mem.indexOf(u8, user, tag) orelse return error.LMFailure) + tag.len;
+            const row = std.fmt.charToDigit(user[start], 10) catch return error.LMFailure;
+            const text: []const u8 = blk: {
+                if (std.mem.indexOf(u8, system, "Left seed.") != null) break :blk "<tag>base</tag>";
+                if (std.mem.indexOf(u8, system, "Left upgraded.") != null) break :blk "<tag>upgraded</tag>";
+                const left = std.mem.indexOf(u8, user, "<tag>\nupgraded\n</tag>") != null;
+                const right = std.mem.indexOf(u8, system, "Right upgraded.") != null;
+                if (left and right) {
+                    if (self.count == self.merge_rows.len) return error.LMFailure;
+                    self.merge_rows[self.count] = row;
+                    self.count += 1;
+                    if (self.count == 5) break :blk "bad-subsample";
+                    if (self.count > 5 and row == self.merge_rows[4]) break :blk "bad-validation";
+                    break :blk "<answer>merged</answer>";
+                }
+                break :blk if ((left and row == 0) or (right and row == 1)) "<answer>high</answer>" else "<answer>low</answer>";
+            };
+            return arena.dupe(lm.Completion, &.{.{ .text = text }});
+        }
+
+        fn metric(_: Allocator, _: *const Example, pred: *const optimize.RecordPrediction, _: ?*const Trace, _: ?[]const u8, _: ?*const Trace.Step) value.ParseError!Feedback {
+            const answer = pred.get("answer").?.string;
+            return .{ .score = if (std.mem.eql(u8, answer, "merged")) 1 else if (std.mem.eql(u8, answer, "high")) 0.1875 else 0.125 };
+        }
+
+        fn select(_: *anyopaque, _: *const GEPA.CandidateSelection) !usize {
+            return 0;
+        }
+
+        fn sample(ptr: *anyopaque, info: *const GEPA.BatchSample) ![]const usize {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.sample_id[0] = info.iteration;
+            return &self.sample_id;
+        }
+
+        fn propose(_: *anyopaque, _: Context, input: *const GEPA.InstructionProposal) ![]const GEPA.Instruction {
+            const name = input.components_to_update[0];
+            return if (std.mem.eql(u8, name, "left"))
+                &.{.{ .name = "left", .text = "Left upgraded." }}
+            else
+                &.{.{ .name = "right", .text = "Right upgraded." }};
+        }
+    };
+    var storage: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    const io = std.testing.io;
+    var rows: [4]Example = undefined;
+    for (&rows, 0..) |*row, i| {
+        const json = try std.fmt.allocPrint(arena, "{{\"question\":\"q{d}\"}}", .{i});
+        row.* = try Example.fromJson(arena, json, &.{"question"});
+    }
+    for ([_]bool{ false, true }) |cached| {
+        var directory = std.testing.tmpDir(.{});
+        defer directory.cleanup();
+        const path = try directory.dir.realPathFileAlloc(io, ".", arena);
+        var model: Model = .{};
+        const ctx: Context = .{
+            .arena = arena,
+            .lm = .{ .ptr = &model, .vtable = &.{ .complete = Model.complete } },
+            .json_fallback = false,
+        };
+        const optimizer: GEPA = .{
+            .metric = Model.metric,
+            .max_metric_calls = 17,
+            .failure_score = 0.25,
+            .merge_val_overlap_floor = 4,
+            .cache_evaluation = cached,
+            .track_best_outputs = true,
+            .candidate_selection_strategy = .{ .custom = .{ .ptr = &model, .select = Model.select } },
+            .batch_sampler = .{ .ptr = &model, .max_batch_size = 1, .next = Model.sample },
+            .instruction_proposer = .{ .ptr = &model, .propose = Model.propose },
+        };
+        const result = try optimizer.compile(Program, arena, ctx, .{}, &rows, .{
+            .valset = &rows,
+            .log_dir = .{ .io = io, .path = path },
+        });
+        try std.testing.expectEqual(@as(usize, 3), result.best_idx);
+        try std.testing.expectEqualSlices(?usize, &.{ 1, 2 }, result.parents[3]);
+        try std.testing.expectEqual(@as(usize, if (cached) 19 else 25), result.total_metric_calls);
+        try std.testing.expectEqual(@as(usize, if (cached) 5 else 9), model.count);
+        const failed = model.merge_rows[4];
+        const log_bytes = try directory.dir.readFileAlloc(io, "run_log.json", arena, .limited(16 * 1024));
+        const log = try std.json.parseFromSliceLeaky([]GEPA.IterationLog, arena, log_bytes, .{});
+        const subsample = log[2].subsample_ids.?;
+        try std.testing.expectEqualSlices(usize, model.merge_rows[0..5], subsample);
+        for (subsample, log[2].new_program_subsample_scores.?) |id, score| {
+            try std.testing.expectEqual(@as(f64, if (id == failed) 0.25 else 1), score);
+        }
+        const outputs = result.best_outputs_valset.?[failed];
+        try std.testing.expectEqual(@as(usize, 1), outputs.len);
+        try std.testing.expectEqual(@as(usize, 3), outputs[0].candidate_idx);
+        const rel = try std.fmt.allocPrint(arena, "generated_best_outputs_valset/task_{d}/iter_3_prog_3.json", .{failed});
+        const bytes = try directory.dir.readFileAlloc(io, rel, arena, .limited(256));
+        if (cached) {
+            try std.testing.expectEqual(@as(usize, 0), outputs[0].output.prediction.fields().count());
+            try std.testing.expectEqualStrings("{}", bytes);
+        } else {
+            const failure = outputs[0].output.failed_parse;
+            try std.testing.expectEqualStrings("bad-validation", failure.completion_text);
+            try std.testing.expectEqual(@as(f64, 0.25), failure.format_reward);
+            const artifact = try std.json.parseFromSliceLeaky([]const u8, arena, bytes, .{});
+            try std.testing.expectEqualStrings("FailedPrediction(completion_text='bad-validation', format_reward=0.25)", artifact);
+        }
+    }
+}
+
+test "GEPA best outputs keep ties and replace an older frontier without extra evaluations" {
+    var memory: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer memory.deinit();
+    const arena = memory.allocator();
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const output_path = try temporary.dir.realPathFileAlloc(std.testing.io, ".", arena);
+    const P = predict.Predict(signature.Signature(struct {
+        pub const Input = struct { question: []const u8 };
+        pub const Output = struct { answer: []const u8 };
+    }));
+    const Metric = struct {
+        fn score(_: Allocator, _: *const Example, pred: *const optimize.RecordPrediction, _: ?*const Trace, _: ?[]const u8, _: ?*const Trace.Step) value.ParseError!Feedback {
+            return .{ .score = if (pred.get("answer").?.string[0] == 'h') 1 else 0 };
+        }
+    };
+    var script: @import("lm.zig").ScriptedLM = .{ .responses = &.{
+        "<answer>low0</answer>",  "<answer>high0</answer>",
+        "<answer>high1</answer>", "<answer>high1</answer>",
+        "<answer>high2</answer>", "<answer>low2</answer>",
+    } };
+    const ctx: Context = .{ .arena = arena, .lm = script.lm(), .json_fallback = false };
+    const examples = [_]Example{
+        try Example.fromJson(arena, "{\"question\":\"q\"}", &.{"question"}),
+        try Example.fromJson(arena, "{\"question\":\"r\"}", &.{"question"}),
+    };
+    const program: P = .{};
+    var front_scores: [2]f64 = undefined;
+    var fronts: [2]std.ArrayList(usize) = @splat(.empty);
+    var outputs: [2]std.ArrayList(GEPA.BestOutput) = @splat(.empty);
+    var engine: GEPA.Engine(P) = .{
+        .gepa = .{
+            .metric = Metric.score,
+            .track_best_outputs = true,
+            .validation_output_dir = .{ .io = std.testing.io, .path = output_path },
+        },
+        .out = arena,
+        .ctx = ctx,
+        .reflection = ctx,
+        .student = &program,
+        .names = &.{"self"},
+        .trainset = &examples,
+        .valset = &examples,
+        .rng = .init(0),
+        .adapter_rng = .init(0),
+        .front_score = &front_scores,
+        .fronts = &fronts,
+        .all_val_ids = &.{ 0, 1 },
+        .best_outputs = &outputs,
+    };
+    try engine.addProgram(&.{"first"}, &.{null});
+    try engine.addProgram(&.{"second"}, &.{0});
+    engine.i = 1;
+    try engine.addProgram(&.{"third"}, &.{1});
+    const expected = [_][]const usize{ &.{ 1, 2 }, &.{ 0, 1 } };
+    const answers = [_][]const []const u8{ &.{ "high1", "high2" }, &.{ "high0", "high1" } };
+    for (fronts, outputs, expected, answers) |front, row, ids, texts| {
+        try std.testing.expectEqualSlices(usize, ids, front.items);
+        try std.testing.expectEqual(ids.len, row.items.len);
+        for (row.items, ids, texts) |entry, id, text| {
+            try std.testing.expectEqual(id, entry.candidate_idx);
+            try std.testing.expectEqualStrings(text, entry.output.prediction.get("answer").?.string);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 6), script.index);
+
+    const Artifact = struct { path: []const u8, answer: []const u8 };
+    for ([_]Artifact{
+        .{ .path = "task_0/iter_0_prog_0.json", .answer = "low0" },
+        .{ .path = "task_1/iter_0_prog_0.json", .answer = "high0" },
+        .{ .path = "task_0/iter_1_prog_1.json", .answer = "high1" },
+    }) |artifact| {
+        const path = try std.fs.path.join(arena, &.{ "generated_best_outputs_valset", artifact.path });
+        const bytes = try temporary.dir.readFileAlloc(std.testing.io, path, arena, .limited(4096));
+        const parsed = try std.json.parseFromSliceLeaky(struct { answer: []const u8 }, arena, bytes, .{});
+        try std.testing.expectEqualStrings(artifact.answer, parsed.answer);
+    }
+    for ([_][]const u8{ "task_1/iter_1_prog_1.json", "task_0/iter_2_prog_2.json", "task_1/iter_2_prog_2.json" }) |name| {
+        const path = try std.fs.path.join(arena, &.{ "generated_best_outputs_valset", name });
+        try std.testing.expectError(error.FileNotFound, temporary.dir.access(std.testing.io, path, .{}));
+    }
+}
+
+test "GEPA custom dataset separates History and stringifies ordinary values" {
+    var storage = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    const Sig = signature.Signature(struct {
+        pub const Input = struct {
+            question: bool,
+            prior: History,
+            thought: signature.Reasoning,
+        };
+        pub const Output = struct { answer: bool };
+    });
+    const predictor: predict.Predict(Sig) = .{};
+    var event: Record = .empty;
+    try event.put(arena, "answer", .{ .bool = false });
+    const history: History = .{ .messages = &.{event} };
+    var trace: Trace = .{ .arena = arena };
+    var inputs: Record = .empty;
+    try inputs.put(arena, "question", .{ .bool = true });
+    try inputs.put(arena, "prior", try history.toValue(arena));
+    try inputs.put(arena, "thought", .{ .string = "plan" });
+    var outputs: Record = .empty;
+    try outputs.put(arena, "answer", .{ .bool = false });
+    try trace.record(&predictor.state, &inputs, &outputs);
+
+    const step = &trace.steps.items[0];
+    const projected = try customInputs(arena, step);
+    try std.testing.expectEqualStrings("True", projected.get("question").?.string);
+    try std.testing.expectEqualStrings("plan", projected.get("thought").?.string);
+    try std.testing.expectEqualStrings(
+        "```json\n  0: {'answer': False}\n```",
+        projected.get("Context").?.string,
+    );
+    try std.testing.expect(projected.get("prior") == null);
+    const generated = try customOutputs(arena, step);
+    try std.testing.expectEqualStrings("False", generated.get("answer").?.string);
+}
+
+fn invokeProposer(
+    proposer: GEPA.InstructionProposer,
+    context: Context,
+    input: *const GEPA.InstructionProposal,
+) (Allocator.Error || error{Canceled})!?[]const GEPA.Instruction {
+    return proposer.propose(proposer.ptr, context, input) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Canceled => error.Canceled,
+        else => null,
+    };
+}
+
+fn compactHistoryItem(arena: Allocator, name: []const u8, item: Value) value.ParseError!?Value {
+    if (item != .object) return null;
+    if (std.mem.eql(u8, name, "repl_entry")) {
+        if (item.object.get("__dspy_repl__")) |tag| {
+            if (tag == .string and std.mem.eql(u8, tag.string, "entry")) {
+                return history_mod.compactReplEntry(arena, &item.object, 500);
+            }
+        }
+    }
+    if (!item.object.contains("tool_calls")) return null;
+    if (!item.object.contains("tool_call_results")) return null;
+    return compactToolObservations(arena, item);
+}
+
+fn compactToolObservations(arena: Allocator, item: Value) value.ParseError!?Value {
+    const ToolCalls = @import("tool.zig").ToolCalls;
+    var calls = try ToolCalls.fromValue(arena, item);
+    const results = calls.tool_call_results orelse return null;
+    var replacements: ?[]@import("tool.zig").ToolCallResult = null;
+    for (results.tool_call_results, 0..) |observation, index| {
+        const text = try reflectionString(arena, null, observation.value);
+        const limit = 500;
+        if (text.len <= limit) continue;
+        const view = std.unicode.Utf8View.init(text) catch return error.ParseValue;
+        var iterator = view.iterator();
+        for (0..limit) |_| if (iterator.nextCodepointSlice() == null) break;
+        const prefix_len = iterator.i;
+        if (prefix_len == text.len) continue;
+        const cut = std.unicode.utf8CountCodepoints(text[prefix_len..]) catch unreachable;
+        var cut_buffer: [51]u8 = undefined;
+        var total_buffer: [51]u8 = undefined;
+        if (replacements == null) replacements = try arena.dupe(
+            @import("tool.zig").ToolCallResult,
+            results.tool_call_results,
+        );
+        replacements.?[index].value = .{ .string = try std.fmt.allocPrint(
+            arena,
+            "{s} [{s} of {s} characters cut]",
+            .{ text[0..prefix_len], pyjson.groupedDecimal(&cut_buffer, cut), pyjson.groupedDecimal(&total_buffer, cut + limit) },
+        ) };
+    }
+    calls.tool_call_results = .{ .tool_call_results = replacements orelse return null };
+    return try calls.toValue(arena);
+}
+
+test "GEPA reflects truncated Unicode tool results without changing history" {
+    var storage: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    const text = try arena.alloc(u8, 2 * 1501);
+    for (0..1501) |i| @memcpy(text[2 * i ..][0..2], "é");
+    const ToolCalls = @import("tool.zig").ToolCalls;
+    const calls: ToolCalls = .{
+        .tool_calls = &.{.{ .id = "one", .name = "lookup", .args = .empty }},
+        .tool_call_results = .{ .tool_call_results = &.{
+            .{ .call_id = "one", .name = "lookup", .value = .{ .string = text }, .is_error = true },
+            .{ .name = "exact", .value = .{ .string = text[0..1000] } },
+        } },
+    };
+    var event: Record = .empty;
+    try event.put(arena, "actions", try calls.toValue(arena));
+    try event.put(arena, "notes", .{ .string = text });
+    const history: History = .{ .messages = &.{event} };
+    const options: ConfiguredInstructionProposer = .{ .truncate_history_outputs = true };
+    const prepared = try History.fromValue(arena, try options.prepareHistory(arena, history));
+    const actual = try ToolCalls.fromValue(arena, prepared.messages[0].get("actions").?);
+    const original = try ToolCalls.fromValue(arena, history.messages[0].get("actions").?);
+    const observations = actual.tool_call_results.?.tool_call_results;
+    const compact = observations[0].value.string;
+    try std.testing.expectEqualStrings(text[0..1000], compact[0..1000]);
+    try std.testing.expectEqualStrings(" [1,001 of 1,501 characters cut]", compact[1000..]);
+    try std.testing.expect(observations[0].is_error);
+    try std.testing.expectEqualStrings(text[0..1000], observations[1].value.string);
+    try std.testing.expectEqualStrings(text, prepared.messages[0].get("notes").?.string);
+    try std.testing.expectEqualStrings(text, original.tool_call_results.?.tool_call_results[0].value.string);
+}
+
+test "GEPA keeps the REPL replay limit and compacts only the tagged observation" {
+    var storage: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer storage.deinit();
+    const arena = storage.allocator();
+    const history = try History.fromValue(arena, try @import("json_repair.zig").parseJson(arena,
+        \\{"messages":[{"repl_entry":{"__dspy_repl__":"entry","code":"show()","output":"雪雪雪雪🙂🙂🙂🙂","max_output_chars":4}},
+        \\{"repl_entry":{"output":"plain text","max_output_chars":2}}]}
+    ));
+    const options: ConfiguredInstructionProposer = .{ .truncate_history_outputs = true };
+    const prepared = try History.fromValue(arena, try options.prepareHistory(arena, history));
+    const entry = prepared.messages[0].get("repl_entry").?.object;
+    try std.testing.expectEqualStrings(
+        "雪雪\n\n... (4 characters omitted) ...\n\n🙂🙂",
+        entry.get("output").?.string,
+    );
+    try std.testing.expectEqual(@as(i64, 4), entry.get("max_output_chars").?.integer);
+    try std.testing.expectEqualStrings(
+        "plain text",
+        prepared.messages[1].get("repl_entry").?.object.get("output").?.string,
+    );
+    try std.testing.expectEqualStrings(
+        "雪雪雪雪🙂🙂🙂🙂",
+        history.messages[0].get("repl_entry").?.object.get("output").?.string,
+    );
+}
+
+fn isHistory(field: signature.Field) bool {
+    return field.dspy_type and std.mem.eql(u8, field.type_name, "History");
+}
+
+fn prepareHistoryValue(
+    arena: Allocator,
+    options: ConfiguredInstructionProposer,
+    item: Value,
+) value.ParseError!Value {
+    if (!options.truncate_history_outputs) return item;
+    const history = History.fromValue(arena, item) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.ParseValue,
+    };
+    return options.prepareHistory(arena, history);
+}
+
+fn builtinInputs(
+    arena: Allocator,
+    options: ConfiguredInstructionProposer,
+    step: *const Trace.Step,
+) value.ParseError!Record {
+    const fields = step.predictor.fields[0..step.predictor.input_count];
+    var history_key: ?[]const u8 = null;
+    var inputs: Record = .empty;
+    for (fields) |field| {
+        if (!isHistory(field)) continue;
+        const input = step.inputs.get(field.name) orelse continue;
+        if (input == .null) continue;
+        if (history_key != null) return error.ParseValue;
+        history_key = field.name;
+        try inputs.put(arena, "Context", try prepareHistoryValue(arena, options, input));
+    }
+    const key = history_key orelse return step.inputs;
+    for (step.inputs.keys(), step.inputs.values()) |name, input| {
+        if (std.mem.eql(u8, key, name)) continue;
+        try inputs.put(arena, name, input);
+    }
+    return inputs;
+}
+
+fn builtinOutputs(
+    arena: Allocator,
+    options: ConfiguredInstructionProposer,
+    step: *const Trace.Step,
+) value.ParseError!Record {
+    if (!options.truncate_history_outputs) return step.outputs;
+    var outputs = step.outputs;
+    var copied = false;
+    for (step.predictor.fields[step.predictor.input_count..]) |field| {
+        if (!isHistory(field)) continue;
+        const output = step.outputs.get(field.name) orelse continue;
+        if (output == .null) continue;
+        if (!copied) outputs = try step.outputs.clone(arena);
+        copied = true;
+        try outputs.put(arena, field.name, try prepareHistoryValue(arena, options, output));
+    }
+    return outputs;
+}
+
+fn customInputs(arena: Allocator, step: *const Trace.Step) value.ParseError!Record {
+    const fields = step.predictor.fields[0..step.predictor.input_count];
+    var history_key: ?[]const u8 = null;
+    var inputs: Record = .empty;
+    for (fields) |field| {
+        if (!field.dspy_type or !std.mem.eql(u8, field.type_name, "History")) continue;
+        const input = step.inputs.get(field.name) orelse continue;
+        if (input == .null) continue;
+        if (history_key != null) return error.ParseValue;
+        history_key = field.name;
+        try inputs.put(arena, "Context", .{ .string = try historyText(arena, input) });
+    }
+    for (step.inputs.keys(), step.inputs.values()) |key, input| {
+        if (history_key) |name| {
+            if (std.mem.eql(u8, name, key)) continue;
+        }
+        const field = findField(fields, key);
+        const projected = if (field != null and field.?.dspy_type and input != .null)
+            input
+        else
+            Value{ .string = try reflectionString(arena, field, input) };
+        try inputs.put(arena, key, projected);
+    }
+    return inputs;
+}
+
+fn customOutputs(arena: Allocator, step: *const Trace.Step) value.ParseError!Record {
+    const fields = step.predictor.fields[step.predictor.input_count..];
+    var outputs: Record = .empty;
+    for (step.outputs.keys(), step.outputs.values()) |key, output| {
+        const text = try reflectionString(arena, findField(fields, key), output);
+        try outputs.put(arena, key, .{ .string = text });
+    }
+    return outputs;
+}
+
+fn findField(fields: []const signature.Field, name: []const u8) ?signature.Field {
+    for (fields) |field| {
+        if (std.mem.eql(u8, field.name, name)) return field;
+    }
+    return null;
+}
+
+fn reflectionString(
+    arena: Allocator,
+    field: ?signature.Field,
+    item: Value,
+) value.ParseError![]const u8 {
+    if (field) |declared| {
+        if (declared.python_str) |render| return render(arena, item) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.ParseValue,
+        };
+    }
+    if (item == .string) return item.string;
+    var writer: Writer.Allocating = .init(arena);
+    defer writer.deinit();
+    pyjson.writeStr(&writer.writer, item) catch |err| return reflectionWriteError(err);
+    return writer.toOwnedSlice();
+}
+
+fn historyText(arena: Allocator, item: Value) value.ParseError![]const u8 {
+    const history = History.fromValue(arena, item) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.ParseValue,
+    };
+    var writer: Writer.Allocating = .init(arena);
+    defer writer.deinit();
+    const w = &writer.writer;
+    w.writeAll("```json\n") catch return error.OutOfMemory;
+    for (history.messages, 0..) |message, index| {
+        w.print("  {d}: ", .{index}) catch return error.OutOfMemory;
+        pyjson.writeRepr(w, .{ .object = message }, 0) catch |err| {
+            return reflectionWriteError(err);
+        };
+        w.writeByte('\n') catch return error.OutOfMemory;
+    }
+    w.writeAll("```") catch return error.OutOfMemory;
+    return writer.toOwnedSlice();
+}
+
+fn reflectionWriteError(err: pyjson.Error) value.ParseError {
+    return switch (err) {
+        error.WriteFailed => error.OutOfMemory,
+        else => error.ParseValue,
+    };
 }
 
 fn sumScores(runs: []const GEPA.Run) f64 {
