@@ -122,9 +122,10 @@ pub fn main(init: std.process.Init) !void {
     const calls = try suite.parseCalls(arena, transcript);
     const n = dszig.lm.ReplayLM.completionCount(calls);
 
-    // Reserved bytes include arena chunks, which grow geometrically and so
-    // jump in steps; requested bytes are what the suite asked for, the
-    // quantity tracemalloc reports for DSPy.
+    // Reserved bytes include the suite arena's chunks, which grow
+    // geometrically and so jump in steps. Requested bytes are what the suite
+    // asked for, the quantity tracemalloc reports for DSPy, as an upper bound:
+    // scratch arenas DSZig builds on `gpa` count their whole chunks.
     var reserved: Meter = .{};
     var requested: Meter = .{};
     var reserving: Counting = .{ .child = init.gpa, .meter = &reserved };

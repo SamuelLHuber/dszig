@@ -17,7 +17,7 @@ Use the repository-pinned Zig 0.17.0 toolchain. From your Zig project,
 check out the release using Git credentials with access to this repository:
 
 ```sh
-git clone --depth 1 --branch 'v3.5.0+dszig.1' https://github.com/SamuelLHuber/dszig.git vendor/dszig
+git clone --depth 1 --branch 'v3.5.0+dszig.2' https://github.com/SamuelLHuber/dszig.git vendor/dszig
 ```
 
 Add `.dszig = .{ .path = "vendor/dszig" },` to `.dependencies` in
@@ -31,9 +31,28 @@ const dep = b.dependency("dszig", .{ .target = target, .optimize = optimize });
 exe.root_module.addImport("dszig", dep.module("dszig"));
 ```
 
-The version core tracks the upstream DSPy release. `+dszig.1` identifies
-DSZig's first build of that version; pin an exact tag because SemVer ignores
-build metadata for precedence.
+### Versions and releases
+
+Releases are tagged `v<DSPy version>+dszig.<N>`, the way RKE2 and K3s track
+Kubernetes: the version core is the DSPy release DSZig targets, and
+`+dszig.N` counts DSZig builds of it, starting at 1 and restarting at 1 when
+the DSPy target changes. Pin an exact tag because SemVer ignores build
+metadata for precedence. Released tags are immutable; a fix is the next `N`.
+`v3.5.0+dszig.1` was a pre-release cut before the release flow existed.
+
+`tools/release/check_version.py` (run by CI) fails unless `build.zig.zon`,
+`target_dspy` in `examples/live_suite.zig`, the DSPy pin in
+`tools/dspy_reference/pyproject.toml` and `uv.lock`, and the install command
+above name the same version. To release:
+
+1. Bump `.version` in `build.zig.zon` and the install command, merge to main.
+2. On an up-to-date, clean main run `dz-release` (`tools/release/cut.sh`). It
+   checks that the tag is the next unreleased build, runs `zig fmt`, the
+   ReleaseSafe and Debug tests, examples and simulations and the DSPy
+   cross-check, then pushes the annotated tag.
+3. The tag push runs `.github/workflows/release.yml`: it rechecks the scheme
+   and that the tag is on main, reruns the full CI matrix, and publishes the
+   GitHub release with a source archive and its SHA-256.
 
 ## Example
 
@@ -4563,8 +4582,11 @@ Segments end where DSPy starts the next pipeline's first LM call.
 DSPy's own progress printing and logging stay enabled (stdout to /dev/null,
 logging disabled). Peak heap is the bytes the program requested: `tracemalloc`
 for DSPy, and for DSZig a counting allocator in front of the suite's arena and
-general-purpose allocator. Reserved heap also counts the arena's chunks, which
-grow geometrically, so it moves in steps when a run crosses a chunk boundary.
+general-purpose allocator. DSZig's figure is an upper bound: scratch arenas
+that DSZig creates internally on the general-purpose allocator count their
+whole chunks, unused capacity included. Reserved heap also counts the suite
+arena's chunks, which grow geometrically, so it moves in steps when a run
+crosses a chunk boundary.
 Measured 2026-11-23 on an 8-vCPU Intel Xeon Linux VM:
 
 Transcript: `tests/fixtures/dspy_3_5_0_mock_suite.json`, 687 LM calls; DSZig fast x20, dspy 3.5.0 (Python 3.11.17) x5. Medians; no network.
