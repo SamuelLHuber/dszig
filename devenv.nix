@@ -61,6 +61,8 @@ in
     dz-examples.exec = ''zig build examples --summary all "$@"'';
     dz-dspy.exec = ''tools/dspy_reference/check.sh'';
     # Framework-overhead benchmark: both runtimes replay the same full-suite transcript.
+    # Tag and push the next v<DSPy version>+dszig.<N> release after every local gate.
+    dz-release.exec = ''bash tools/release/cut.sh "$@"'';
     dz-bench.exec = ''
       set -euo pipefail
       transcript="$(realpath "''${1:-tests/fixtures/dspy_3_5_0_mock_suite.json}")"
@@ -176,7 +178,7 @@ in
     ''
     + ''
       echo "dszig: zig $(zig version), $(python3 --version), uv $(uv --version | cut -d' ' -f2)"
-      echo "  dz-test, dz-examples, dz-dspy (cross-check with DSPy 3.5.0), dz-check (what CI runs), dz-bench, dz-upstream, dz-live / dz-live-smoke (real model via SecretSpec)"
+      echo "  dz-test, dz-examples, dz-dspy (cross-check with DSPy 3.5.0), dz-check (what CI runs), dz-bench, dz-release, dz-upstream, dz-live / dz-live-smoke (real model via SecretSpec)"
     '';
 
   enterTest = ''
