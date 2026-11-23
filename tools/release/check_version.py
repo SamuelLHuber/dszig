@@ -37,6 +37,12 @@ def tags():
     return out.stdout.split()
 
 
+def released_tags():
+    # A local tag left by `cut.sh --no-push` is not a release; origin decides.
+    out = subprocess.run(["git", "-C", str(ROOT), "ls-remote", "--tags", "--refs", "origin", "v*"], check=True, capture_output=True, text=True)
+    return [line.split("refs/tags/", 1)[1] for line in out.stdout.splitlines()]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--tag")
@@ -70,9 +76,12 @@ def main():
             if not SCHEME.fullmatch(tag[1:]):
                 sys.exit(f"error: existing tag {tag} breaks the version scheme")
         if args.new:
+            released = released_tags()
+            if args.tag in released:
+                sys.exit(f"error: {args.tag} is already released; released tags are immutable, bump +dszig.N")
             if args.tag in existing:
-                sys.exit(f"error: {args.tag} already exists; released tags are immutable, bump +dszig.N")
-            builds = [int(t.split("+dszig.")[1]) for t in existing if t.startswith(f"v{core}+dszig.")]
+                sys.exit(f"error: unpushed local tag {args.tag} exists; push it or delete it with git tag -d")
+            builds = [int(t.split("+dszig.")[1]) for t in released if t.startswith(f"v{core}+dszig.")]
             expected = max(builds, default=0) + 1
             if int(build) != expected:
                 sys.exit(f"error: next DSZig build of DSPy {core} is +dszig.{expected}, not +dszig.{build}")
