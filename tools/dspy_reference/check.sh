@@ -14,6 +14,9 @@ here="$(cd "$(dirname "$0")" && pwd)"
 root="$here/../.."
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
+# Direct Debug commands bypass build.zig: same x86_64 LLVM rule as -Dllvm.
+zig_backend=()
+if [ "$(uname -m)" = x86_64 ]; then zig_backend=(-fllvm); fi
 
 cd "$here"
 uv sync --locked --quiet
@@ -25,8 +28,8 @@ if ! uv run --locked fewshot_options_oracle.py "$tmp/fewshot_options.json" >"$tm
   cat "$tmp/fewshot_options.log" >&2
   exit 1
 fi
-(cd "$root" && zig run --dep dszig -Mroot=tools/fewshot_options_consumer.zig -Mdszig=src/root.zig -- "$tmp/fewshot_options.json")
-(cd "$root" && zig build-exe --dep dszig -Mroot=tools/gepa_restart_consumer.zig -Mdszig=src/root.zig -femit-bin="$tmp/gepa_restart_consumer")
+(cd "$root" && zig run "${zig_backend[@]}" --dep dszig -Mroot=tools/fewshot_options_consumer.zig -Mdszig=src/root.zig -- "$tmp/fewshot_options.json")
+(cd "$root" && zig build-exe "${zig_backend[@]}" --dep dszig -Mroot=tools/gepa_restart_consumer.zig -Mdszig=src/root.zig -femit-bin="$tmp/gepa_restart_consumer")
 uv run --locked gepa_restart_oracle.py "$tmp/gepa_restart_consumer"
 uv run --locked gen_fixtures.py "$tmp/fixtures" 2>/dev/null
 uv run --locked gen_optuna.py "$tmp/fixtures"

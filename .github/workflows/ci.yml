@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:
 
 # Every action is pinned to a commit SHA; Zig, the devenv toolchain and the
 # DSPy reference environment are pinned by version and checksum (see README).
@@ -21,6 +22,9 @@ jobs:
       - name: Install Zig 0.17.0 (sha256-verified)
         run: .github/scripts/install-zig.sh
       - run: zig fmt --check .
+        if: matrix.os == 'ubuntu-latest' && matrix.optimize == 'Debug'
+      - name: Version scheme (v<DSPy version>+dszig.<N>)
+        run: python3 tools/release/check_version.py
         if: matrix.os == 'ubuntu-latest' && matrix.optimize == 'Debug'
       - name: Tests (unit, DSPy golden, behaviour, compile-fail)
         run: zig build test -Doptimize=${{ matrix.optimize }} --summary all

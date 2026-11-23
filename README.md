@@ -17,7 +17,7 @@ Use the repository-pinned Zig 0.17.0 toolchain. From your Zig project,
 check out the release using Git credentials with access to this repository:
 
 ```sh
-git clone --depth 1 --branch 'v3.5.0+dszig.1' https://github.com/SamuelLHuber/dszig.git vendor/dszig
+git clone --depth 1 --branch 'v3.5.0+dszig.2' https://github.com/SamuelLHuber/dszig.git vendor/dszig
 ```
 
 Add `.dszig = .{ .path = "vendor/dszig" },` to `.dependencies` in
@@ -31,9 +31,28 @@ const dep = b.dependency("dszig", .{ .target = target, .optimize = optimize });
 exe.root_module.addImport("dszig", dep.module("dszig"));
 ```
 
-The version core tracks the upstream DSPy release. `+dszig.1` identifies
-DSZig's first build of that version; pin an exact tag because SemVer ignores
-build metadata for precedence.
+### Versions and releases
+
+Releases are tagged `v<DSPy version>+dszig.<N>`, the way RKE2 and K3s track
+Kubernetes: the version core is the DSPy release DSZig targets, and
+`+dszig.N` counts DSZig builds of it, starting at 1 and restarting at 1 when
+the DSPy target changes. Pin an exact tag because SemVer ignores build
+metadata for precedence. Released tags are immutable; a fix is the next `N`.
+`v3.5.0+dszig.1` was a pre-release cut before the release flow existed.
+
+`tools/release/check_version.py` (run by CI) fails unless `build.zig.zon`,
+`target_dspy` in `examples/live_suite.zig`, the DSPy pin in
+`tools/dspy_reference/pyproject.toml` and `uv.lock`, and the install command
+above name the same version. To release:
+
+1. Bump `.version` in `build.zig.zon` and the install command, merge to main.
+2. On an up-to-date, clean main run `dz-release` (`tools/release/cut.sh`). It
+   checks that the tag is the next unreleased build, runs `zig fmt`, the
+   ReleaseSafe and Debug tests, examples and simulations and the DSPy
+   cross-check, then pushes the annotated tag.
+3. The tag push runs `.github/workflows/release.yml`: it rechecks the scheme
+   and that the tag is on main, reruns the full CI matrix, and publishes the
+   GitHub release with a source archive and its SHA-256.
 
 ## Example
 
@@ -4561,34 +4580,40 @@ evaluation, serialization and the replay lookup. Each run is verified first
 artifacts), so accuracy is equal by construction on this transcript.
 Segments end where DSPy starts the next pipeline's first LM call.
 DSPy's own progress printing and logging stay enabled (stdout to /dev/null,
-logging disabled). Peak heap is `tracemalloc` for DSPy and a counting
-allocator around every DSZig allocation. Measured 2026-11-15 on an 8-vCPU
-Intel Xeon Linux VM:
+logging disabled). Peak heap is the bytes the program requested: `tracemalloc`
+for DSPy, and for DSZig a counting allocator in front of the suite's arena and
+general-purpose allocator. DSZig's figure is an upper bound: scratch arenas
+that DSZig creates internally on the general-purpose allocator count their
+whole chunks, unused capacity included. Reserved heap also counts the suite
+arena's chunks, which grow geometrically, so it moves in steps when a run
+crosses a chunk boundary.
+Measured 2026-11-23 on an 8-vCPU Intel Xeon Linux VM:
 
 Transcript: `tests/fixtures/dspy_3_5_0_mock_suite.json`, 687 LM calls; DSZig fast x20, dspy 3.5.0 (Python 3.11.17) x5. Medians; no network.
 
 | Segment | DSPy ms | DSZig ms | Speedup |
 |---|---:|---:|---:|
-| cases | 22.9 | 0.16 | 141x |
-| rag | 52.5 | 0.24 | 222x |
-| dates | 115.6 | 0.43 | 266x |
-| dates_search | 346.0 | 1.37 | 252x |
-| dates_mipro | 396.2 | 1.56 | 254x |
-| dates_mipro_aware | 211.1 | 0.85 | 249x |
-| rag_react | 161.2 | 1.48 | 109x |
-| dates_copro | 367.5 | 1.14 | 324x |
-| dates_simba | 282.1 | 2.10 | 134x |
-| dates_gepa | 264.2 | 1.64 | 161x |
-| total | 2282.9 | 10.97 | 208x |
+| cases | 23.8 | 0.15 | 155x |
+| rag | 55.5 | 0.23 | 246x |
+| dates | 123.6 | 0.42 | 294x |
+| dates_search | 380.4 | 1.37 | 278x |
+| dates_mipro | 438.5 | 1.60 | 274x |
+| dates_mipro_aware | 221.6 | 0.88 | 251x |
+| rag_react | 170.3 | 1.29 | 132x |
+| dates_copro | 376.7 | 1.25 | 302x |
+| dates_simba | 294.6 | 2.21 | 133x |
+| dates_gepa | 297.0 | 1.82 | 163x |
+| total | 2418.0 | 11.17 | 216x |
 
 | Metric | DSPy | DSZig |
 |---|---:|---:|
-| Throughput (LM calls/s of framework work) | 301 | 62,639 |
-| Per-call overhead p50 (us) | 2,925.3 | 11.5 |
-| Per-call overhead p99 (us) | 8,045.9 | 88.0 |
-| Startup: `import dspy` vs none (ms) | 365 | 0 |
-| Peak heap, one run (MiB) | 6.5 (tracemalloc) | 2.8 (counting allocator) |
-| Peak RSS, process (MiB) | 123 | 18 |
+| Throughput (LM calls/s of framework work) | 284 | 61,477 |
+| Per-call overhead p50 (us) | 3,071.6 | 12.5 |
+| Per-call overhead p99 (us) | 9,099.9 | 68.8 |
+| Startup: `import dspy` vs none (ms) | 410 | 0 |
+| Peak heap, one run (MiB) | 6.5 (tracemalloc) | 2.2 (requested) |
+| Heap reserved incl. arena chunks, one run (MiB) | n/a | 4.2 |
+| Peak RSS, process (MiB) | 123 | 21 |
 
 Real-model accuracy and latency come from the live transcripts (see Real
 inference); there the model dominates latency in both runtimes.
