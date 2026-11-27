@@ -13,6 +13,11 @@ const Call = dszig.lm.ReplayLM.Call;
 
 pub const target_dspy = "3.5.0";
 pub const temperature = 0.0;
+/// The suite arena is reserved once at startup and never grows; a run that
+/// outgrows it fails with OutOfMemory. A full run uses about 3 MiB on the mock
+/// transcript and 8.5 MiB on the committed gpt-4o-mini recordings, so this
+/// leaves over 3x headroom for longer real completions.
+pub const arena_bytes_max = 32 * 1024 * 1024;
 
 pub const Typed = dszig.Signature(struct {
     pub const Input = struct { text: []const u8, tags: []const []const u8 };

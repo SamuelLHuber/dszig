@@ -132,10 +132,16 @@ pub fn main(init: std.process.Init) !void {
     var gpa: Counting = .{ .child = reserving.allocator(), .meter = &requested };
     const totals = try arena.alloc(u64, reps);
     const stamps = try arena.alloc(u64, reps * n);
+    // The suite arena is reserved once at startup and never grows: a run
+    // that outgrows it fails with OutOfMemory instead of reserving more.
+    const arena_buffer = try reserving.allocator().alloc(u8, suite.arena_bytes_max);
+    defer reserving.allocator().free(arena_buffer);
+    var arena_used_peak: usize = 0;
     for (0..reps) |rep| {
-        var run_arena: std.heap.ArenaAllocator = .init(reserving.allocator());
-        defer run_arena.deinit();
-        const used = try run_arena.allocator().alloc(bool, n);
+        var run_fixed: std.heap.FixedBufferAllocator = .init(arena_buffer);
+        const run_arena = run_fixed.threadSafeAllocator();
+        defer arena_used_peak = @max(arena_used_peak, run_fixed.end_index);
+        const used = try run_arena.alloc(bool, n);
         @memset(used, false);
         var replay: dszig.lm.ReplayLM = .{
             .calls = calls,
@@ -148,8 +154,8 @@ pub fn main(init: std.process.Init) !void {
         };
         const start = std.Io.Clock.awake.now(io);
         var timed: TimedLM = .{ .inner = replay.lm(), .io = io, .start = start, .stamps = stamps[rep * n ..][0..n] };
-        var arena_requests: Counting = .{ .child = run_arena.allocator(), .meter = &requested };
-        // Arena deinit frees everything without passing through the meter.
+        var arena_requests: Counting = .{ .child = run_arena, .meter = &requested };
+        // Dropping the fixed buffer's contents bypasses the meter.
         const live_before = requested.live;
         defer requested.live = live_before;
         const result = try suite.run(arena_requests.allocator(), gpa.allocator(), timed.lm());
@@ -173,8 +179,8 @@ pub fn main(init: std.process.Init) !void {
         for (stamps[rep * n ..][0..n], 0..) |s, i| try w.print("{s}{e}", .{ if (i == 0) "" else ", ", seconds(s) });
         try w.writeAll("]");
     }
-    try w.print("], \"heap_peak_bytes\": {d}, \"heap_reserved_peak_bytes\": {d}, \"maxrss_kb\": {d}}}\n", .{
-        requested.peak, reserved.peak, usage.maxrss,
+    try w.print("], \"heap_peak_bytes\": {d}, \"heap_reserved_peak_bytes\": {d}, \"arena_bytes_max\": {d}, \"arena_used_peak_bytes\": {d}, \"maxrss_kb\": {d}}}\n", .{
+        requested.peak, reserved.peak, suite.arena_bytes_max, arena_used_peak, usage.maxrss,
     });
     try w.flush();
 }

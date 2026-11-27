@@ -4584,36 +4584,40 @@ logging disabled). Peak heap is the bytes the program requested: `tracemalloc`
 for DSPy, and for DSZig a counting allocator in front of the suite's arena and
 general-purpose allocator. DSZig's figure is an upper bound: scratch arenas
 that DSZig creates internally on the general-purpose allocator count their
-whole chunks, unused capacity included. Reserved heap also counts the suite
-arena's chunks, which grow geometrically, so it moves in steps when a run
-crosses a chunk boundary.
+whole chunks, unused capacity included. The suite arena is a
+`FixedBufferAllocator` over `arena_bytes_max` (32 MiB) reserved once at
+startup, so it never grows and a run that outgrows it fails with
+`OutOfMemory`; reserved heap counts that whole buffer. A full run uses about
+3 MiB of it on the mock transcript and 8.5 MiB on the gpt-4o-mini recordings. Untouched pages of the
+buffer are not resident, so they do not show in RSS.
 Measured 2026-11-23 on an 8-vCPU Intel Xeon Linux VM:
 
 Transcript: `tests/fixtures/dspy_3_5_0_mock_suite.json`, 687 LM calls; DSZig fast x20, dspy 3.5.0 (Python 3.11.17) x5. Medians; no network.
 
 | Segment | DSPy ms | DSZig ms | Speedup |
 |---|---:|---:|---:|
-| cases | 23.8 | 0.15 | 155x |
-| rag | 55.5 | 0.23 | 246x |
-| dates | 123.6 | 0.42 | 294x |
-| dates_search | 380.4 | 1.37 | 278x |
-| dates_mipro | 438.5 | 1.60 | 274x |
-| dates_mipro_aware | 221.6 | 0.88 | 251x |
-| rag_react | 170.3 | 1.29 | 132x |
-| dates_copro | 376.7 | 1.25 | 302x |
-| dates_simba | 294.6 | 2.21 | 133x |
-| dates_gepa | 297.0 | 1.82 | 163x |
-| total | 2418.0 | 11.17 | 216x |
+| cases | 23.3 | 0.10 | 240x |
+| rag | 52.3 | 0.21 | 250x |
+| dates | 115.3 | 0.40 | 291x |
+| dates_search | 394.0 | 1.28 | 307x |
+| dates_mipro | 442.3 | 1.49 | 298x |
+| dates_mipro_aware | 213.2 | 0.82 | 261x |
+| rag_react | 163.3 | 1.26 | 129x |
+| dates_copro | 367.9 | 1.17 | 313x |
+| dates_simba | 286.5 | 1.49 | 193x |
+| dates_gepa | 271.1 | 1.27 | 213x |
+| total | 2283.0 | 9.57 | 239x |
 
 | Metric | DSPy | DSZig |
 |---|---:|---:|
-| Throughput (LM calls/s of framework work) | 284 | 61,477 |
-| Per-call overhead p50 (us) | 3,071.6 | 12.5 |
-| Per-call overhead p99 (us) | 9,099.9 | 68.8 |
-| Startup: `import dspy` vs none (ms) | 410 | 0 |
-| Peak heap, one run (MiB) | 6.5 (tracemalloc) | 2.2 (requested) |
-| Heap reserved incl. arena chunks, one run (MiB) | n/a | 4.2 |
-| Peak RSS, process (MiB) | 123 | 21 |
+| Throughput (LM calls/s of framework work) | 301 | 71,770 |
+| Per-call overhead p50 (us) | 2,992.2 | 11.8 |
+| Per-call overhead p99 (us) | 8,468.9 | 65.6 |
+| Startup: `import dspy` vs none (ms) | 389 | 0 |
+| Peak heap, one run (MiB) | 6.5 (tracemalloc) | 2.2 (requested, upper bound) |
+| Heap reserved incl. fixed suite arena (MiB) | n/a | 32.2 |
+| Fixed suite arena used / reserved at startup (MiB) | n/a | 2.9 / 32 |
+| Peak RSS, process (MiB) | 124 | 21 |
 
 Real-model accuracy and latency come from the live transcripts (see Real
 inference); there the model dominates latency in both runtimes.
