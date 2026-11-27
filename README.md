@@ -6345,6 +6345,35 @@ DSPy 3.5 routes `openai/*` models through the Responses API, so `dz-live` record
 DSZig with `DSZIG_LIVE_API=responses`; a Chat Completions recording returns native
 tool calls where Responses returns text and does not cross-replay.
 
+### DSPy 3.5.0 real-model parity (gpt-5.6-luna, gpt-6-luna)
+
+Both reasoning models accept only temperature 1 (or none), so these recordings
+run the suite with `DSZIG_LIVE_TEMPERATURE=1 DSZIG_LIVE_COPRO_TEMPERATURE=1`
+(DSZig also sets `DSZIG_LIVE_REASONING=1`, matching DSPy's capability flags).
+The non-default settings are written into each transcript and every replay
+reads them back. Each recording replays through the other runtime with every
+request byte-matched and consumed; `check.sh` runs all four.
+
+| Pipeline | 5.6-luna DSPy | 5.6-luna DSZig | 6-luna DSPy | 6-luna DSZig |
+|---|---|---|---|---|
+| RAG + BootstrapFewShot | 100% → 100% | 100% → 100% | 100% → 100% | 100% → 100% |
+| Dates + BootstrapFewShot | 0% → 100% | 0% → 100% | 0% → 100% | 0% → 100% |
+| Dates + BootstrapFewShotWithRandomSearch | 0% → 100% | 0% → 100% | 0% → 100% | 0% → 100% |
+| Dates + MIPROv2 | 0% → 100% | 0% → 100% | 0% → 100% | 0% → 100% |
+| Dates + MIPROv2 (program-aware proposer) | 0% → 100% | 0% → 100% | 0% → 0% | 0% → 100% |
+| RAG ReAct + BootstrapFewShot | 80% → 80% | 80% → 80% | 80% → 80% | 80% → 80% |
+| Dates + COPRO (init_temperature 1) | 0% → 0% | 0% → 0% | 0% → 100% | 0% → 100% |
+| Dates + SIMBA (small configuration) | 0% → 0% | 0% → 0% | 0% → 0% | 0% → 0% |
+| Dates + GEPA | 0% → 100% | 0% → 100% | 0% → 100% | 0% → 100% |
+| Real calls | 667 | 667 | 667 | 666 |
+
+At temperature 1 the independent runs sample different completions, so their
+scores agree only within sampling noise: the one difference (6-luna, program-aware
+MIPROv2) comes from sampling, and each runtime reproduces the other's 0% or 100%
+exactly when replaying its completions. These recordings exposed one ordering
+bug: DSPy appends natively returned reasoning after the parsed output fields,
+which GEPA's reflection prompt shows; DSZig now does the same.
+
 The committed `dspy_3.5.0.json` and `dszig_3.5.0.json` recordings use the public
 OpenAI endpoint with `gpt-4o-mini`: 679 DSPy calls and 680 native calls.
 `devenv shell -- dz-live` completed both authenticated recordings, both

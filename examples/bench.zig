@@ -158,7 +158,7 @@ pub fn main(init: std.process.Init) !void {
         // Dropping the fixed buffer's contents bypasses the meter.
         const live_before = requested.live;
         defer requested.live = live_before;
-        const result = try suite.run(arena_requests.allocator(), gpa.allocator(), timed.lm());
+        const result = try suite.run(arena_requests.allocator(), gpa.allocator(), timed.lm(), try .fromTranscript(transcript));
         totals[rep] = elapsedNs(io, start);
         if (timed.count != n) return error.CallCountMismatch;
         if (!replay.exhausted()) return error.TranscriptNotExhausted;
