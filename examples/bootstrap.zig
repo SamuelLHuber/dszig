@@ -8,22 +8,25 @@ const std = @import("std");
 const dszig = @import("dszig");
 const rag = @import("rag_program");
 
+var workspace_buffer: [4 * 1024 * 1024]u8 = undefined;
+var workspace: dszig.Workspace = .init(&workspace_buffer);
+
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
 
     var keyword = rag.keywordLM();
-    const ctx: dszig.Context = .{ .arena = arena, .lm = keyword.lm(), .retriever = rag.corpus.retriever() };
+    const ctx: dszig.Context = .{ .arena = arena, .workspace = &workspace, .lm = keyword.lm(), .retriever = rag.corpus.retriever() };
     const trainset = try rag.trainset(arena);
 
-    const baseline = try dszig.optimize.evaluate(rag.RAG, init.gpa, ctx, &rag.RAG{}, trainset, rag.keywordMetric, 10);
+    const baseline = try dszig.optimize.evaluate(rag.RAG, ctx, &rag.RAG{}, trainset, rag.keywordMetric, 10);
     var optimizer: dszig.BootstrapFewShot = .{
         .metric = rag.keywordMetric,
         .max_bootstrapped_demos = 2,
         .max_labeled_demos = 3,
     };
     const result = try optimizer.compile(rag.RAG, arena, init.gpa, ctx, .{}, null, trainset);
-    const optimized = try dszig.optimize.evaluate(rag.RAG, init.gpa, ctx, &result.program, trainset, rag.keywordMetric, 10);
+    const optimized = try dszig.optimize.evaluate(rag.RAG, ctx, &result.program, trainset, rag.keywordMetric, 10);
 
     var buf: [1024]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(init.io, &buf);

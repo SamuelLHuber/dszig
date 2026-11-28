@@ -171,7 +171,6 @@ pub const COPRO = struct {
         self: COPRO,
         comptime P: type,
         out: Allocator,
-        gpa: Allocator,
         ctx: Context,
         prompt: ?Context,
         student: P,
@@ -212,7 +211,6 @@ pub const COPRO = struct {
                     const score = (try optimize.evaluateWith(
                         P,
                         self.concurrent_evaluation,
-                        gpa,
                         ctx,
                         &clone,
                         trainset,
@@ -380,7 +378,7 @@ test "COPRO returns input errors at the proposal and evaluation boundaries" {
         .rules = &.{},
         .default = "<proposed_instruction>\nTry.\n</proposed_instruction>\n\n<proposed_prefix_for_output_field>\nTry:\n</proposed_prefix_for_output_field>",
     };
-    const ctx: Context = .{ .arena = a, .lm = keyword.lm() };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = a, .lm = keyword.lm() };
     const train = [_]Example{try Example.fromJson(a, "{\"question\":\"x\",\"answer\":\"x\"}", &.{"question"})};
     const Plain = struct {
         pub const Input = TestQA.Input;
@@ -391,15 +389,15 @@ test "COPRO returns input errors at the proposal and evaluation boundaries" {
         }
     };
     var optimizer: COPRO = .{ .metric = yesMetric, .breadth = 1, .depth = 1 };
-    try testing.expectError(error.InvalidBreadth, optimizer.compile(TestProgram, a, testing.allocator, ctx, null, .{}, &train));
+    try testing.expectError(error.InvalidBreadth, optimizer.compile(TestProgram, a, ctx, null, .{}, &train));
     optimizer.breadth = 2;
-    try testing.expectError(error.NoCandidates, optimizer.compile(Plain, a, testing.allocator, ctx, null, .{}, &train));
+    try testing.expectError(error.NoCandidates, optimizer.compile(Plain, a, ctx, null, .{}, &train));
     try testing.expectEqual(@as(usize, 0), history.requests.items.len);
     optimizer.depth = 0;
-    try testing.expectError(error.NoCandidates, optimizer.compile(TestProgram, a, testing.allocator, ctx, null, .{}, &train));
+    try testing.expectError(error.NoCandidates, optimizer.compile(TestProgram, a, ctx, null, .{}, &train));
     try testing.expectEqual(@as(usize, 1), history.requests.items.len);
     optimizer.depth = 1;
-    try testing.expectError(error.EmptyDevset, optimizer.compile(TestProgram, a, testing.allocator, ctx, null, .{}, &.{}));
+    try testing.expectError(error.EmptyDevset, optimizer.compile(TestProgram, a, ctx, null, .{}, &.{}));
     try testing.expectEqual(@as(usize, 2), history.requests.items.len);
 }
 
@@ -434,12 +432,11 @@ test "COPRO stops candidate evaluation at the caller's error limit" {
         try Example.fromJson(a, "{\"question\":\"fail\"}", &.{"question"}),
         try Example.fromJson(a, "{\"question\":\"pass\"}", &.{"question"}),
     };
-    const ctx: Context = .{ .arena = a, .lm = model.lm(), .max_errors = 1 };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = a, .lm = model.lm(), .max_errors = 1 };
     var opt: COPRO = .{ .metric = MetricFailure.score, .breadth = 2, .depth = 1 };
     try testing.expectError(error.ParseValue, opt.compile(
         predict.Predict(TestQA),
         a,
-        testing.allocator,
         ctx,
         null,
         .{},
@@ -447,7 +444,7 @@ test "COPRO stops candidate evaluation at the caller's error limit" {
     ));
     try testing.expectEqual(@as(usize, 2), history.requests.items.len);
     opt.max_errors = 2;
-    const result = try opt.compile(predict.Predict(TestQA), a, testing.allocator, ctx, null, .{}, &rows);
+    const result = try opt.compile(predict.Predict(TestQA), a, ctx, null, .{}, &rows);
     try testing.expectEqual(@as(usize, 2), result.total_calls);
     try testing.expectEqual(@as(f64, 50), result.candidates[0].score);
 }
@@ -480,10 +477,10 @@ test "COPRO replaces duplicate prompt scores when either score is NaN" {
             case.second,
             "{\"answer\":\"no\"}",
         } };
-        const ctx: Context = .{ .arena = arena, .lm = model.lm(), .adapter = .json };
+        const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = model.lm(), .adapter = .json };
         const train = [_]Example{try Example.fromJson(arena, "{\"question\":\"x\"}", &.{"question"})};
         const optimizer: COPRO = .{ .metric = ScoreUndefined.score, .breadth = 3, .depth = 1 };
-        const result = try optimizer.compile(TestProgram, arena, testing.allocator, ctx, null, .{}, &train);
+        const result = try optimizer.compile(TestProgram, arena, ctx, null, .{}, &train);
 
         try testing.expectEqual(@as(usize, 5), model.index);
         try testing.expectEqual(@as(usize, 3), result.total_calls);
@@ -524,10 +521,10 @@ test "COPRO refuses nonfinite tracked statistics after evaluating the whole batc
             "{\"answer\":\"yes\"}",
             "{\"answer\":\"no\"}",
         } };
-        const ctx: Context = .{ .arena = arena, .lm = model.lm(), .adapter = .json };
+        const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = model.lm(), .adapter = .json };
         const train = [_]Example{try Example.fromJson(arena, "{\"question\":\"x\"}", &.{"question"})};
         const optimizer: COPRO = .{ .metric = MetricByAnswer.score, .breadth = 3, .depth = 1, .track_stats = true };
-        const result = optimizer.compile(TestProgram, arena, testing.allocator, ctx, null, .{}, &train);
+        const result = optimizer.compile(TestProgram, arena, ctx, null, .{}, &train);
         try testing.expectEqual(@as(usize, 5), model.index);
         try testing.expectError(error.NonFiniteScoreStatistics, result);
     }
@@ -545,10 +542,10 @@ test "COPRO climbs from the basic instruction to the best proposal" {
         },
         .default = "<answer>\nno\n</answer>",
     };
-    const ctx: Context = .{ .arena = a, .lm = keyword.lm() };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = a, .lm = keyword.lm() };
     const trainset = [_]Example{try Example.fromJson(a, "{\"question\": \"ok?\", \"answer\": \"yes\"}", &.{"question"})};
     const optimizer: COPRO = .{ .metric = yesMetric, .breadth = 3, .depth = 2 };
-    const result = try optimizer.compile(TestProgram, a, testing.allocator, ctx, null, .{}, &trainset);
+    const result = try optimizer.compile(TestProgram, a, ctx, null, .{}, &trainset);
     try testing.expectEqualStrings("Say YES loudly.", result.program.generate.state.instructions);
     try testing.expectEqualStrings("Answer:", result.program.generate.state.prefixes[1]);
     // Depth 0: two identical proposals plus the basic instruction; depth 1:
@@ -561,7 +558,7 @@ test "COPRO climbs from the basic instruction to the best proposal" {
 
     var tracked_optimizer = optimizer;
     tracked_optimizer.track_stats = true;
-    const tracked = try tracked_optimizer.compile(TestProgram, a, testing.allocator, ctx, null, .{}, &trainset);
+    const tracked = try tracked_optimizer.compile(TestProgram, a, ctx, null, .{}, &trainset);
     try testing.expectEqual(result.total_calls, tracked.total_calls);
     try testing.expectEqual(@as(f64, 100), tracked.stats.?[0].latest[1].average);
     try testing.expectEqual(@as(f64, 0), tracked.stats.?[0].latest[1].stddev);
@@ -596,12 +593,12 @@ test "COPRO keeps and runs tied snapshots with identical prompt text from differ
         },
         .default = "<answer>\nno\n</answer>",
     };
-    const ctx: Context = .{ .arena = arena, .lm = model.lm() };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = model.lm() };
     const train = [_]Example{
         try Example.fromJson(arena, "{\"question\":\"ok?\",\"answer\":\"yes\"}", &.{"question"}),
     };
     const optimizer: COPRO = .{ .metric = yesMetric, .breadth = 3, .depth = 2 };
-    const result = try optimizer.compile(Pair, arena, testing.allocator, ctx, null, .{}, &train);
+    const result = try optimizer.compile(Pair, arena, ctx, null, .{}, &train);
     // DSPy retains both occurrences of (Try, initial), despite equal scores
     // and equal visible predictor signatures. The winner is (Try, Best).
     const candidates = result.candidate_programs;

@@ -69,7 +69,7 @@ test "custom RLM retains observations across runtime buffer reuse and closes on 
             "<answer>17</answer>",
         },
     };
-    const ctx: dszig.Context = .{ .arena = arena, .lm = model.lm() };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = model.lm() };
     const Processor = struct {
         fn trim(_: *anyopaque, _: Allocator, draft: []dszig.value.Record) !dszig.rlm.HistoryProcessor.Edit {
             if (draft.len == 0) return .keep;
@@ -263,7 +263,7 @@ test "Chat prediction preserves bracketed text that is not a Unicode field heade
         const completion = try std.fmt.allocPrint(arena, "[[ ## answer ## ]]\n{s}\n{s}\n{s}\n[[ ## completed ## ]]", .{ intro, line, caveat });
         var scripted: dszig.lm.ScriptedLM = .{ .responses = &.{completion} };
         const result = try program.forward(
-            .{ .arena = arena, .lm = scripted.lm(), .adapter = .chat, .json_fallback = false },
+            .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = scripted.lm(), .adapter = .chat, .json_fallback = false },
             .{ .question = "Can I deploy?" },
         );
         const expected = if (is_header) intro else try std.mem.join(arena, "\n", &.{ intro, line, caveat });
@@ -316,7 +316,7 @@ test "prediction and traces retain ordered provider token scores without adding 
     {
         var scratch: std.heap.ArenaAllocator = .init(testing.allocator);
         defer scratch.deinit();
-        const ctx: dszig.Context = .{ .arena = scratch.allocator(), .lm = model, .lm_options = .{ .n = 2 }, .trace = &trace };
+        const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = scratch.allocator(), .lm = model, .lm_options = .{ .n = 2 }, .trace = &trace };
         const prediction = try program.call(ctx, .{ .question = "q" });
         try testing.expectEqualStrings("4", prediction.fields().answer);
         try testing.expectEqualStrings("6", prediction.completions().?[1].answer);
@@ -368,7 +368,7 @@ test "prediction and traces retain ordered provider token scores without adding 
         break :block try dszig.bootstrap_trace.bootstrapTraceData(
             @TypeOf(program),
             retained.allocator(),
-            .{ .arena = scratch.allocator(), .lm = model, .lm_options = .{ .n = 2 } },
+            .{ .workspace = dszig.workspace.forTests(), .arena = scratch.allocator(), .lm = model, .lm_options = .{ .n = 2 } },
             &program,
             &.{example},
             .{},
@@ -457,7 +457,7 @@ test "Predict output caps and nucleus sampling override defaults without leaking
         var recording: dszig.lm.RecordingLM = .{ .inner = provider.lm(), .arena = arena };
         var cache: dszig.CachedLM = .{ .gpa = testing.allocator, .inner = recording.lm(), .max_entries = 10 };
         defer cache.deinit();
-        const ctx: dszig.Context = .{ .arena = arena, .lm = cache.lm(), .json_fallback = false };
+        const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = cache.lm(), .json_fallback = false };
         const Case = struct {
             program: *const dszig.Predict(Sig),
             context_cap: ??u32 = null,
@@ -607,7 +607,7 @@ test "Predict seed overrides advance each candidate and distinguish cache and re
         var recording: dszig.lm.RecordingLM = .{ .inner = provider.lm(), .arena = arena };
         var cache: dszig.CachedLM = .{ .gpa = testing.allocator, .inner = recording.lm(), .max_entries = cases.len };
         defer cache.deinit();
-        var ctx: dszig.Context = .{ .arena = arena, .lm = cache.lm(), .json_fallback = false };
+        var ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = cache.lm(), .json_fallback = false };
         ctx.lm_options.seed = .{ .integer = 73 };
         var physical: usize = 0;
         for (cases) |case| {
@@ -897,7 +897,7 @@ test "typed Predict top_k reaches hosted wire dialects and preserves cache and r
         var recording: dszig.lm.RecordingLM = .{ .inner = lm, .arena = arena };
         var cache: dszig.CachedLM = .{ .gpa = testing.allocator, .inner = recording.lm(), .max_entries = rows.len };
         defer cache.deinit();
-        var ctx: dszig.Context = .{ .arena = arena, .lm = cache.lm(), .lm_options = .{ .top_k = .{ .integer = 3 } }, .json_fallback = false };
+        var ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = cache.lm(), .lm_options = .{ .top_k = .{ .integer = 3 } }, .json_fallback = false };
         for (rows, 0..) |row, i| {
             const program = if (i == 0) &plain else &configured;
             ctx.predict_config = row.config;
@@ -1044,7 +1044,7 @@ test "typed Predict user attribution follows provider policy and separates cache
         var recording: dszig.lm.RecordingLM = .{ .inner = lm, .arena = arena };
         var cache: dszig.CachedLM = .{ .gpa = testing.allocator, .inner = recording.lm(), .max_entries = rows.len };
         defer cache.deinit();
-        var ctx: dszig.Context = .{ .arena = arena, .lm = cache.lm(), .lm_options = .{ .user_id = "actor-context" }, .json_fallback = false };
+        var ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = cache.lm(), .lm_options = .{ .user_id = "actor-context" }, .json_fallback = false };
         for (rows, 0..) |row, i| {
             const program = if (i == 0) &plain else &configured;
             ctx.predict_config = row.override;
@@ -1214,7 +1214,7 @@ test "typed Predict service tiers reach generation providers and separate cache 
         var recording: dszig.lm.RecordingLM = .{ .inner = lm, .arena = arena };
         var cache: dszig.CachedLM = .{ .gpa = testing.allocator, .inner = recording.lm(), .max_entries = rows.len };
         defer cache.deinit();
-        var ctx: dszig.Context = .{ .arena = arena, .lm = cache.lm(), .lm_options = .{ .service_tier = "standard" }, .json_fallback = false };
+        var ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = cache.lm(), .lm_options = .{ .service_tier = "standard" }, .json_fallback = false };
         for (rows, 0..) |row, i| {
             ctx.predict_config = row.override;
             var serving = try io.concurrent(Fixture.serve, .{ io, &listener, dialect, row });
@@ -1346,7 +1346,7 @@ test "typed Predict store follows provider policy over HTTP and distinguishes ca
         var recording: dszig.lm.RecordingLM = .{ .inner = provider, .arena = arena };
         var cache: dszig.CachedLM = .{ .gpa = testing.allocator, .inner = recording.lm(), .max_entries = rows.len };
         defer cache.deinit();
-        var ctx: dszig.Context = .{ .arena = arena, .lm = cache.lm(), .lm_options = .{ .store = false }, .json_fallback = false };
+        var ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = cache.lm(), .lm_options = .{ .store = false }, .json_fallback = false };
         for (rows) |row| {
             ctx.predict_config = row.override;
             errdefer std.debug.print("store loopback failed ({s}, {s})\n", .{ @tagName(dialect), @tagName(row.expected) });
@@ -1397,7 +1397,7 @@ test "typed Predict store follows provider policy over HTTP and distinguishes ca
     errdefer std.debug.print("store Anthropic refuse-policy check failed\n", .{});
     var header_calls: usize = 0;
     anthropic.header_provider = .{ .context = &header_calls, .prepare = Fixture.prepare };
-    var strict: dszig.Context = .{ .arena = arena, .lm = anthropic.lm(), .json_fallback = false };
+    var strict: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = anthropic.lm(), .json_fallback = false };
     try testing.expectError(error.LMFailure, configured.call(strict, inputs));
     try testing.expectEqual(@as(usize, 0), header_calls);
     strict.predict_config = &.{ .store = false };
@@ -1614,7 +1614,7 @@ test "typed Predict stop overrides distinguish Chat cache and replay requests" {
     var recording: dszig.lm.RecordingLM = .{ .inner = provider.lm(), .arena = arena };
     var cache: dszig.CachedLM = .{ .gpa = testing.allocator, .inner = recording.lm(), .max_entries = 8 };
     defer cache.deinit();
-    const ctx: dszig.Context = .{ .arena = arena, .lm = cache.lm(), .lm_options = .{ .stop = &.{"context"} }, .json_fallback = false };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = cache.lm(), .lm_options = .{ .stop = &.{"context"} }, .json_fallback = false };
     const plain: dszig.Predict(Sig) = .{};
     var configured = plain;
     configured.state.config = &.{ .stop = &.{ "first", "second" } };
@@ -1825,7 +1825,7 @@ test "Chat prediction slices inline headers in Python character units" {
         const completion = try std.fmt.allocPrint(arena, "{s}[[ ## answer ## ]] OK", .{prefix});
         var scripted: dszig.lm.ScriptedLM = .{ .responses = &.{completion} };
         const result = try program.forward(
-            .{ .arena = arena, .lm = scripted.lm(), .adapter = .chat, .json_fallback = false },
+            .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = scripted.lm(), .adapter = .chat, .json_fallback = false },
             .{ .question = "Status?" },
         );
         try testing.expectEqualStrings(answer, result.answer);
@@ -1877,7 +1877,7 @@ test "JSON prediction recovers the first balanced object after an unmatched pref
     const nested = "[{\"meta\":{\"answer\":\"inner\"},\"answer\":\"outer\"},{\"answer\":\"later\"}]";
     const unmatched = try std.fmt.allocPrint(arena, "[\"{s}\"]", .{opens});
     var lm: dszig.lm.ScriptedLM = .{ .responses = &.{ prefixed, nested, unmatched } };
-    const ctx: dszig.Context = .{ .arena = arena, .lm = lm.lm(), .adapter = .json };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = lm.lm(), .adapter = .json };
     const input: Sig.Input = .{ .question = "Where?" };
 
     try testing.expectEqualStrings("Paris", (try program.forward(ctx, input)).answer);
@@ -1906,7 +1906,7 @@ test "JSON prediction repairs a long truncated string with mixed escapes" {
     @memcpy(completion[completion.len - tail.len ..], tail);
 
     var lm: dszig.lm.ScriptedLM = .{ .responses = &.{completion} };
-    const result = try program.forward(.{ .arena = arena, .lm = lm.lm(), .adapter = .json }, .{ .question = "Decode" });
+    const result = try program.forward(.{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = lm.lm(), .adapter = .json }, .{ .question = "Decode" });
     try testing.expectEqual(count * decoded.len + tail.len, result.answer.len);
     for (0..count) |i| try testing.expectEqualStrings(decoded, result.answer[i * decoded.len ..][0..decoded.len]);
     try testing.expectEqualStrings(tail, result.answer[count * decoded.len ..]);
@@ -1938,7 +1938,7 @@ test "JSON prediction repairs a truncated string with many closing braces" {
         prefix ++ "prefix}x}x}x",
         prefix ++ "prefix}xy}xy: tail",
     } };
-    const ctx: dszig.Context = .{ .arena = arena, .lm = lm.lm(), .adapter = .json };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = lm.lm(), .adapter = .json };
     const input: Sig.Input = .{ .question = "Decode" };
     for ([_][]const u8{ body, "prefix}x\\:y}x\\}xy雪", "prefix", "prefix" }) |expected| {
         try testing.expectEqualStrings(expected, (try program.forward(ctx, input)).answer);
@@ -1978,7 +1978,7 @@ test "JSON prediction repairs a missing object close after a long quoted value" 
         prefix ++ short ++ "\"\u{2003}junk\"\u{2003},",
         prefix ++ short ++ "\"\u{2003}}",
     } };
-    const ctx: dszig.Context = .{ .arena = arena, .lm = lm.lm(), .adapter = .json };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = lm.lm(), .adapter = .json };
     const input: Sig.Input = .{ .question = "Decode" };
     for ([_][]const u8{ body, short, "prefix", short ++ "\"\u{2003}junk\"", short }) |expected| {
         try testing.expectEqualStrings(expected, (try program.forward(ctx, input)).answer);
@@ -2013,7 +2013,7 @@ test "JSON prediction repairs a quoted array item with many closing brackets" {
         prefix ++ "left]x\\\\\"",
         prefix ++ "left]x\",\"right]z\"",
     } };
-    const ctx: dszig.Context = .{ .arena = arena, .lm = lm.lm(), .adapter = .json };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = lm.lm(), .adapter = .json };
     const input: Sig.Input = .{ .question = "Decode" };
     for ([_][]const []const u8{
         &.{expected},
@@ -2055,7 +2055,7 @@ test "JSON prediction repairs escaped keys containing many colons" {
         "{\"answer\":{\"a:b\" \"oops\" , \"tail\":6",
         "{\"answer\":{\"a:b:7",
     } };
-    const ctx: dszig.Context = .{ .arena = arena, .lm = lm.lm(), .adapter = .json };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = lm.lm(), .adapter = .json };
     const input: Sig.Input = .{ .question = "Decode" };
     for ([_]dszig.Dict(i64){
         .{ .keys = &.{key}, .values = &.{42} },
@@ -2096,7 +2096,7 @@ test "JSON prediction repairs keys with many opening smart quotes" {
         "{\"answer\":{“a:b“c:d\\\\”:4",
         "{\"answer\":{“a:b“c”\u{2003}}",
     } };
-    const ctx: dszig.Context = .{ .arena = arena, .lm = lm.lm(), .adapter = .json };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = lm.lm(), .adapter = .json };
     const input: Sig.Input = .{ .question = "Decode" };
     const program: dszig.Predict(Sig) = .{};
     for ([_]dszig.Dict(i64){
@@ -2137,7 +2137,7 @@ test "JSON prediction repairs repeated bare quotes in regex character classes" {
         "{\"answer\":\"[a\"b\"",
         "{\"answer\":\"[a\"b][c\"d]雪\"",
     } };
-    const ctx: dszig.Context = .{ .arena = arena, .lm = lm.lm(), .adapter = .json };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = lm.lm(), .adapter = .json };
     const program: dszig.Predict(Sig) = .{};
     for ([_][]const u8{
         expected,
@@ -2179,7 +2179,7 @@ test "JSON prediction repairs embedded commas before a shared quoted suffix" {
         "{\"answer\":\"seed\\t,! \"note\"\u{2003},! 'detail'\u{2003}}",
         "{\"answer\":\"seed\\t,\"next\"\u{2003}: 7}",
     } };
-    const ctx: dszig.Context = .{ .arena = arena, .lm = lm.lm(), .adapter = .json };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = lm.lm(), .adapter = .json };
     const program: dszig.Predict(Sig) = .{};
     for ([_][]const u8{
         expected,
@@ -2217,7 +2217,7 @@ test "JSON prediction preserves repeated inline fences in a malformed value" {
         "{\"answer\":\"seed\\t}\n```[1], \"extra\": 7}",
         "{\"answer\":\"seed\\t}\n```txt\n\"bare\"more\n}\n```txt\nend\"}",
     } };
-    const ctx: dszig.Context = .{ .arena = arena, .lm = lm.lm(), .adapter = .json };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = lm.lm(), .adapter = .json };
     const program: dszig.Predict(Sig) = .{};
     for ([_][]const u8{
         expected,
@@ -2249,7 +2249,7 @@ test "typed JSON prediction follows DSPy nested integer string coercion" {
         padded,
         too_long,
     } };
-    const ctx: dszig.Context = .{ .arena = arena, .lm = lm.lm(), .adapter = .json };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = lm.lm(), .adapter = .json };
     const program: dszig.Predict(Sig) = .{};
     try testing.expectError(error.AdapterParse, program.forward(ctx, .{ .question = "Malformed fraction" }));
     const numbers = (try program.forward(ctx, .{ .question = "Valid padded numbers" })).numbers;
@@ -2357,7 +2357,7 @@ test "concurrent trace bootstrap retains ordered failures across joined scratch 
     var contexts: [2]dszig.Context = undefined;
     for (&contexts, &scratch.allocators, &buffers, &models) |*ctx, *allocator, *buffer, *model| {
         allocator.* = .init(buffer);
-        ctx.* = .{ .arena = allocator.allocator(), .lm = model.lm(), .adapter = .json };
+        ctx.* = .{ .workspace = dszig.workspace.forTests(), .arena = allocator.allocator(), .lm = model.lm(), .adapter = .json };
     }
     const dataset = [_]dszig.Example{
         try dszig.Example.fromJson(out, "{\"question\":\"q0\"}", &.{"question"}),
@@ -2437,7 +2437,7 @@ test "trace metric failure reports successful evaluation before unpacking fails"
     try testing.expectError(error.UnpackPredictionAndTrace, dszig.bootstrap_trace.bootstrapTraceData(
         BootstrapTraceSingle,
         arena,
-        .{ .arena = arena, .lm = lm.lm(), .adapter = .json },
+        .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = lm.lm(), .adapter = .json },
         &program,
         &.{example},
         .{
@@ -2498,7 +2498,7 @@ test "fixed tuple Predict preserves nested values and rejects incorrect cardinal
     for ([_]dszig.Adapter{ .chat, .json, .xml }, completions) |adapter, completion| {
         var scripted: dszig.lm.ScriptedLM = .{ .responses = &.{completion} };
         const output = try predict.forward(
-            .{ .arena = arena, .lm = scripted.lm(), .adapter = adapter },
+            .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = scripted.lm(), .adapter = adapter },
             .{ .source = .{ 10, 20 } },
         );
         try testing.expectEqual([2][2]i64{ .{ 1, 1 }, .{ 3, 4 } }, output.matrix);
@@ -2602,7 +2602,7 @@ test "Evaluate uses Python decimal ties-to-even without intermediate rounding or
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var unused: dszig.lm.ScriptedLM = .{ .responses = &.{} };
-    const ctx: dszig.Context = .{ .arena = arena, .lm = unused.lm() };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = unused.lm() };
     // Exact result encodings from actual DSPy 3.5 Evaluate with one example.
     const cases = [_]struct { metric: f64, bits: u64 }{
         .{ .metric = 0.02675, .bits = 0x4005_5c28_f5c2_8f5c },
@@ -2618,11 +2618,11 @@ test "Evaluate uses Python decimal ties-to-even without intermediate rounding or
     var example: dszig.Example = .{ .record = .empty, .input_keys = &.{"score"} };
     for (cases) |case| {
         try example.record.put(arena, "score", .{ .float = case.metric });
-        const result = try dszig.optimize.evaluate(P, testing.allocator, ctx, &.{}, &.{example}, P.metric, 1);
+        const result = try dszig.optimize.evaluate(P, ctx, &.{}, &.{example}, P.metric, 1);
         try testing.expectEqual(case.bits, @as(u64, @bitCast(result.score)));
     }
     try example.record.put(arena, "score", .{ .float = std.math.nan(f64) });
-    const result = try dszig.optimize.evaluate(P, testing.allocator, ctx, &.{}, &.{example}, P.metric, 1);
+    const result = try dszig.optimize.evaluate(P, ctx, &.{}, &.{example}, P.metric, 1);
     try testing.expect(std.math.isNan(result.score));
 }
 
@@ -2646,7 +2646,7 @@ test "native input decoding needs no projection allocation and never admits labe
         &.{ "text", "unknown", "number", "text" },
     );
     var unused: dszig.lm.ScriptedLM = .{ .responses = &.{} };
-    const ctx: dszig.Context = .{ .arena = testing.failing_allocator, .lm = unused.lm() };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = testing.failing_allocator, .lm = unused.lm() };
     var product: i64 = -1;
     const program: P = .{ .product = &product };
     // Input decoding itself allocates nothing; a retained Prediction would.
@@ -2706,7 +2706,7 @@ test "prepared native predictions preserve mutable metrics and retained results"
     try state.output.ensureTotalCapacity(testing.allocator, 2);
     defer state.output.deinit(testing.allocator);
     var unused: dszig.lm.ScriptedLM = .{ .responses = &.{} };
-    const ctx: dszig.Context = .{ .arena = testing.failing_allocator, .lm = unused.lm() };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = testing.failing_allocator, .lm = unused.lm() };
     const program: P = .{};
     var output: P.Output = undefined;
 
@@ -2720,7 +2720,7 @@ test "prepared native predictions preserve mutable metrics and retained results"
     try testing.expectEqualStrings("abc", prediction.get("echo").?.string);
     const retained = try dszig.optimize.runProgram(
         P,
-        .{ .arena = arena, .lm = unused.lm() },
+        .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = unused.lm() },
         &program,
         &example,
     );
@@ -2760,7 +2760,7 @@ test "prepared prediction failures clear stale records and partial conversions" 
     defer state.output.deinit(testing.allocator);
     const prediction = &state.output;
     var unused: dszig.lm.ScriptedLM = .{ .responses = &.{} };
-    const ctx: dszig.Context = .{ .arena = testing.failing_allocator, .lm = unused.lm() };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = testing.failing_allocator, .lm = unused.lm() };
     const program: P = .{};
     var output: P.Output = undefined;
 
@@ -2834,7 +2834,7 @@ test "evaluation metrics observe each run's LM usage and retained clones survive
         .metadata = &metadata,
     };
     var storage: dszig.usage_tracker.Storage = .{ .arena = arena, .io = testing.io };
-    const plain: dszig.Context = .{ .arena = scratch.allocator(), .lm = engine.lm() };
+    const plain: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = scratch.allocator(), .lm = engine.lm() };
     var tracked = plain;
     tracked.track_usage = .{ .storage = &storage, .limits = .{ .models = 1, .entries = 2 } };
     const program: P = .{};
@@ -2844,7 +2844,7 @@ test "evaluation metrics observe each run's LM usage and retained clones survive
     };
 
     // Every evaluated example hands the metric its own invocation's usage.
-    const evaluation = try dszig.optimize.evaluate(P, testing.allocator, tracked, &program, &devset, Seen.metric, 1);
+    const evaluation = try dszig.optimize.evaluate(P, tracked, &program, &devset, Seen.metric, 1);
     try testing.expectEqual(@as(usize, 2), Seen.count);
     try testing.expectEqualSlices(i64, &.{ 3, 5 }, &Seen.tokens);
     try testing.expectEqual(@as(f64, 3 * 1 + 5 * 2), evaluation.sum);
@@ -2967,8 +2967,7 @@ test "Evaluate borrows stable native model outputs without allocating boxes" {
     const program: P = .{};
     const result = try dszig.optimize.evaluate(
         P,
-        testing.failing_allocator,
-        .{ .arena = testing.failing_allocator, .lm = unused.lm() },
+        .{ .workspace = dszig.workspace.forTests(), .arena = testing.failing_allocator, .lm = unused.lm() },
         &program,
         &examples,
         P.metric,
@@ -3132,7 +3131,7 @@ test "prepared native output storage supports indexed fields and reuse" {
     var storage: dszig.value.RecordStorage(9) = undefined;
     try storage.init();
     var unused: dszig.lm.ScriptedLM = .{ .responses = &.{} };
-    const ctx: dszig.Context = .{ .arena = testing.failing_allocator, .lm = unused.lm() };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = testing.failing_allocator, .lm = unused.lm() };
     const program: P = .{};
     var output: P.Output = undefined;
 
@@ -3172,7 +3171,7 @@ test "Evaluate counts program and metric failures together and keeps allocation 
     defer memory.deinit();
     const arena = memory.allocator();
     var unused: dszig.lm.ScriptedLM = .{ .responses = &.{} };
-    const ctx: dszig.Context = .{ .arena = arena, .lm = unused.lm() };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = unused.lm() };
     const devset = [_]dszig.Example{
         try dszig.Example.fromJson(arena, "{\"question\":\"metric_fail\"}", &.{"question"}),
         try dszig.Example.fromJson(arena, "{\"question\":\"good1\"}", &.{"question"}),
@@ -3180,7 +3179,7 @@ test "Evaluate counts program and metric failures together and keeps allocation 
     };
     var calls: usize = 0;
     const program: P = .{ .calls = &calls };
-    const result = try dszig.optimize.evaluate(P, testing.allocator, ctx, &program, &devset, P.metric, 2);
+    const result = try dszig.optimize.evaluate(P, ctx, &program, &devset, P.metric, 2);
     try testing.expectEqual(@as(f64, 66.67), result.score);
     try testing.expectEqual(@as(f64, 2), result.sum);
     try testing.expectEqual(@as(usize, 3), result.total);
@@ -3189,20 +3188,20 @@ test "Evaluate counts program and metric failures together and keeps allocation 
 
     for ([_]usize{ 0, 1 }) |max_errors| {
         calls = 0;
-        try testing.expectError(error.ParseValue, dszig.optimize.evaluate(P, testing.allocator, ctx, &program, &devset, P.metric, max_errors));
+        try testing.expectError(error.ParseValue, dszig.optimize.evaluate(P, ctx, &program, &devset, P.metric, max_errors));
         try testing.expectEqual(@as(usize, 1), calls);
     }
 
     const program_failure = try dszig.Example.fromJson(arena, "{\"question\":\"program_fail\"}", &.{"question"});
     calls = 0;
-    try testing.expectError(error.ParseValue, dszig.optimize.evaluate(P, testing.allocator, ctx, &program, &.{ program_failure, devset[0], devset[1] }, P.metric, 2));
+    try testing.expectError(error.ParseValue, dszig.optimize.evaluate(P, ctx, &program, &.{ program_failure, devset[0], devset[1] }, P.metric, 2));
     try testing.expectEqual(@as(usize, 2), calls);
 
     for ([_][]const u8{ "metric_oom", "program_oom" }) |question| {
         var failure = try dszig.Example.fromJson(arena, "{\"question\":\"unused\"}", &.{"question"});
         try failure.record.put(arena, "question", .{ .string = question });
         calls = 0;
-        try testing.expectError(error.OutOfMemory, dszig.optimize.evaluate(P, testing.allocator, ctx, &program, &.{ failure, devset[1] }, P.metric, 100));
+        try testing.expectError(error.OutOfMemory, dszig.optimize.evaluate(P, ctx, &program, &.{ failure, devset[1] }, P.metric, 100));
         try testing.expectEqual(@as(usize, 1), calls);
     }
 }
@@ -3350,7 +3349,7 @@ test "BootstrapFewShot propagates cancellation without spending the retry budget
     const arena = memory.allocator();
     var calls: usize = 0;
     var mock: dszig.lm.ReplayLM = .{ .calls = &.{}, .used = &.{} };
-    const ctx: dszig.Context = .{ .arena = arena, .lm = mock.lm() };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = mock.lm() };
     const row = try dszig.Example.fromJson(arena, "{\"question\":\"q\",\"answer\":\"a\"}", &.{"question"});
     var optimizer: dszig.BootstrapFewShot = .{
         .max_rounds = 2,
@@ -3410,7 +3409,7 @@ test "BootstrapFewShot counts failed demo comparisons and retains earlier filter
     var teacher: Program = .{ .calls = &calls };
     teacher.first.state.demos = &first_demos;
     teacher.second.state.demos = &second_demos;
-    const ctx: dszig.Context = .{ .arena = arena };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena };
     var optimizer: dszig.BootstrapFewShot = .{ .max_labeled_demos = 0, .max_errors = 2 };
     const result = try optimizer.compile(Program, arena, testing.allocator, ctx, .{}, teacher, &.{ bad, good });
     try testing.expectEqual(@as(usize, 1), calls);
@@ -3469,7 +3468,7 @@ test "BootstrapFewShot binds trace demos before mapping predictors and outside t
     defer memory.deinit();
     const arena = memory.allocator();
     var script: dszig.lm.ScriptedLM = .{ .responses = &.{} };
-    const ctx: dszig.Context = .{ .arena = arena, .lm = script.lm() };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = script.lm() };
     const row = try dszig.Example.fromJson(arena, "{\"question\":\"q\"}", &.{"question"});
     var optimizer: dszig.BootstrapFewShot = .{ .max_labeled_demos = 0, .max_errors = 10 };
 
@@ -3533,17 +3532,17 @@ test "BootstrapFewShot scores never drop across three generations" {
     var out: std.heap.ArenaAllocator = .init(testing.allocator);
     defer out.deinit();
     var learner: LearningLM = .{};
-    const ctx: dszig.Context = .{ .arena = out.allocator(), .lm = learner.lm(), .retriever = rag.corpus.retriever() };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = out.allocator(), .lm = learner.lm(), .retriever = rag.corpus.retriever() };
     const trainset = try rag.trainset(out.allocator());
     var optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 4, .max_labeled_demos = 0 };
 
     var teacher: rag.RAG = .{};
     var scores: [4]f64 = undefined;
-    scores[0] = (try dszig.optimize.evaluate(rag.RAG, testing.allocator, ctx, &teacher, trainset, rag.keywordMetric, 10)).score;
+    scores[0] = (try dszig.optimize.evaluate(rag.RAG, ctx, &teacher, trainset, rag.keywordMetric, 10)).score;
     for (scores[1..]) |*score| {
         const result = try optimizer.compile(rag.RAG, out.allocator(), testing.allocator, ctx, .{}, teacher, trainset);
         teacher = result.program;
-        score.* = (try dszig.optimize.evaluate(rag.RAG, testing.allocator, ctx, &teacher, trainset, rag.keywordMetric, 10)).score;
+        score.* = (try dszig.optimize.evaluate(rag.RAG, ctx, &teacher, trainset, rag.keywordMetric, 10)).score;
     }
     try testing.expectEqualSlices(f64, &.{ 40.0, 80.0, 100.0, 100.0 }, &scores);
     for (scores[1..], scores[0 .. scores.len - 1]) |now, before| try testing.expect(now >= before);
@@ -3554,7 +3553,7 @@ test "teacher_settings runs bootstrapping under the teacher's LM" {
     defer out.deinit();
     var silent: dszig.lm.ScriptedLM = .{ .responses = &.{} };
     var keyword = rag.keywordLM();
-    const ctx: dszig.Context = .{ .arena = out.allocator(), .lm = silent.lm(), .retriever = rag.corpus.retriever() };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = out.allocator(), .lm = silent.lm(), .retriever = rag.corpus.retriever() };
     const trainset = try rag.trainset(out.allocator());
     var optimizer: dszig.BootstrapFewShot = .{
         .metric = rag.keywordMetric,
@@ -3586,7 +3585,7 @@ test "BootstrapFewShot zero rounds retains labeled demos and zero errors propaga
         }
     };
     var failing: FailingLM = .{};
-    const ctx: dszig.Context = .{ .arena = arena, .lm = .{ .ptr = &failing, .vtable = &.{ .complete = FailingLM.complete } } };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = .{ .ptr = &failing, .vtable = &.{ .complete = FailingLM.complete } } };
     const trainset = [_]dszig.Example{
         try dszig.Example.fromJson(arena, "{\"question\":\"q0\",\"answer\":\"a0\"}", &.{"question"}),
         try dszig.Example.fromJson(arena, "{\"question\":\"q1\",\"answer\":\"a1\"}", &.{"question"}),
@@ -3630,7 +3629,7 @@ test "BootstrapFewShot zero threshold accepts a zero score while null rejects it
     defer out.deinit();
     const arena = out.allocator();
     var keyword = rag.keywordLM();
-    const ctx: dszig.Context = .{ .arena = arena, .lm = keyword.lm(), .retriever = rag.corpus.retriever() };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = keyword.lm(), .retriever = rag.corpus.retriever() };
     // The real shared mock answers Germany with Munich, not the gold Berlin.
     const trainset = (try rag.trainset(arena))[3..4];
     var optimizer: dszig.BootstrapFewShot = .{
@@ -3839,7 +3838,7 @@ test "BootstrapFewShot reads borrowed settings for retries and later examples" {
     var settings: dszig.optimize.TeacherSettings = .{ .lm = initial.lm() };
     Metric.settings = &settings;
     Metric.next = retry.lm();
-    const ctx: dszig.Context = .{ .arena = arena, .lm = outer.lm() };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = outer.lm() };
     var optimizer: dszig.BootstrapFewShot = .{
         .metric = Metric.score,
         .max_rounds = 2,
@@ -3899,12 +3898,12 @@ test "Evaluate matches DSPy scores for the RAG fixture" {
     const eval_json = @embedFile("fixtures/bootstrap_rag_eval.json");
     const expected = try std.json.parseFromSliceLeaky(dszig.Value, out.allocator(), eval_json, .{});
     var keyword = rag.keywordLM();
-    const ctx: dszig.Context = .{ .arena = out.allocator(), .lm = keyword.lm(), .retriever = rag.corpus.retriever() };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = out.allocator(), .lm = keyword.lm(), .retriever = rag.corpus.retriever() };
     const trainset = try rag.trainset(out.allocator());
-    const baseline = try dszig.optimize.evaluate(rag.RAG, testing.allocator, ctx, &rag.RAG{}, trainset, rag.keywordMetric, 10);
+    const baseline = try dszig.optimize.evaluate(rag.RAG, ctx, &rag.RAG{}, trainset, rag.keywordMetric, 10);
     var optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 2, .max_labeled_demos = 3 };
     const result = try optimizer.compile(rag.RAG, out.allocator(), testing.allocator, ctx, .{}, null, trainset);
-    const optimized = try dszig.optimize.evaluate(rag.RAG, testing.allocator, ctx, &result.program, trainset, rag.keywordMetric, 10);
+    const optimized = try dszig.optimize.evaluate(rag.RAG, ctx, &result.program, trainset, rag.keywordMetric, 10);
     try testing.expectEqual(expected.object.get("baseline").?.float, baseline.score);
     try testing.expectEqual(expected.object.get("optimized").?.float, optimized.score);
 }
@@ -3917,7 +3916,7 @@ test "the same forward pass yields identical traces" {
     const program: rag.RAG = .{};
     var traces: [2]dszig.Trace = .{ .{ .arena = arena }, .{ .arena = arena } };
     for (&traces) |*trace| {
-        const ctx: dszig.Context = .{ .arena = arena, .lm = keyword.lm(), .retriever = rag.corpus.retriever(), .trace = trace };
+        const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = keyword.lm(), .retriever = rag.corpus.retriever(), .trace = trace };
         const output = try program.forward(ctx, .{ .question = "What is the capital of France?" });
         try testing.expectEqualStrings("Paris", output.answer);
         try testing.expectEqualStrings("The context says Paris is the capital of France.", output.reasoning.?.content);
@@ -3932,7 +3931,7 @@ test "compile is deterministic and does not mutate its inputs" {
     var out: std.heap.ArenaAllocator = .init(testing.allocator);
     defer out.deinit();
     var keyword = rag.keywordLM();
-    const ctx: dszig.Context = .{ .arena = out.allocator(), .lm = keyword.lm(), .retriever = rag.corpus.retriever() };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = out.allocator(), .lm = keyword.lm(), .retriever = rag.corpus.retriever() };
     const trainset = try rag.trainset(out.allocator());
     var optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 2, .max_labeled_demos = 3 };
     const student: rag.RAG = .{};
@@ -3969,13 +3968,13 @@ test "optimize, evaluate and save run in fixed buffers" {
     var out: std.heap.FixedBufferAllocator = .init(&out_buf);
     var scratch: std.heap.FixedBufferAllocator = .init(&scratch_buf);
     var keyword = rag.keywordLM();
-    const ctx: dszig.Context = .{ .arena = out.allocator(), .lm = keyword.lm(), .retriever = rag.corpus.retriever() };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = out.allocator(), .lm = keyword.lm(), .retriever = rag.corpus.retriever() };
     const trainset = try rag.trainset(out.allocator());
     var optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 2, .max_labeled_demos = 3 };
     const result = try optimizer.compile(rag.RAG, out.allocator(), scratch.allocator(), ctx, .{}, null, trainset);
     // Per-attempt scratch is released after every example.
     try testing.expectEqual(@as(usize, 0), scratch.end_index);
-    const eval = try dszig.optimize.evaluate(rag.RAG, scratch.allocator(), ctx, &result.program, trainset, rag.keywordMetric, 10);
+    const eval = try dszig.optimize.evaluate(rag.RAG, ctx, &result.program, trainset, rag.keywordMetric, 10);
     try testing.expectEqual(@as(f64, 80.0), eval.score);
     try testing.expectEqual(@as(usize, 0), scratch.end_index);
     _ = try dszig.state.saveAlloc(out.allocator(), &result.program);
@@ -3992,7 +3991,7 @@ fn compileAndSave(gpa: Allocator) !void {
     var out: std.heap.ArenaAllocator = .init(gpa);
     defer out.deinit();
     var keyword = rag.keywordLM();
-    const ctx: dszig.Context = .{ .arena = out.allocator(), .lm = keyword.lm(), .retriever = rag.corpus.retriever() };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = out.allocator(), .lm = keyword.lm(), .retriever = rag.corpus.retriever() };
     const trainset = try rag.trainset(out.allocator());
     var optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 2, .max_labeled_demos = 3 };
     const result = try optimizer.compile(rag.RAG, out.allocator(), gpa, ctx, .{}, null, trainset);
@@ -4003,7 +4002,7 @@ test "random search scores every seed, ranks them and keeps the best" {
     var out: std.heap.ArenaAllocator = .init(testing.allocator);
     defer out.deinit();
     var learner: LearningLM = .{};
-    const ctx: dszig.Context = .{ .arena = out.allocator(), .lm = learner.lm(), .retriever = rag.corpus.retriever() };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = out.allocator(), .lm = learner.lm(), .retriever = rag.corpus.retriever() };
     const trainset = try rag.trainset(out.allocator());
     const search: dszig.BootstrapFewShotWithRandomSearch = .{
         .metric = rag.keywordMetric,
@@ -4019,7 +4018,7 @@ test "random search scores every seed, ranks them and keeps the best" {
         if (i > 0) try testing.expect(result.candidates[i - 1].score >= c.score);
     }
     for (seen) |s| try testing.expect(s);
-    const best = try dszig.optimize.evaluate(rag.RAG, testing.allocator, ctx, &result.program, trainset, rag.keywordMetric, 10);
+    const best = try dszig.optimize.evaluate(rag.RAG, ctx, &result.program, trainset, rag.keywordMetric, 10);
     try testing.expectEqual(result.candidates[0].score, best.score);
 }
 
@@ -4054,11 +4053,10 @@ test "detailed evaluation preserves successful predictions after scratch reuse" 
         try dszig.Example.fromJson(arena, "{\"question\":\"metric_error\"}", inputs),
         try dszig.Example.fromJson(arena, "{\"question\":\"last\"}", inputs),
     };
-    const ctx: dszig.Context = .{ .arena = arena, .lm = undefined, .max_errors = 2 };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = undefined, .max_errors = 2 };
     try testing.expectError(error.ParseValue, dszig.optimize.evaluateDetailed(
         P,
         arena,
-        testing.allocator,
         ctx,
         &.{},
         &devset,
@@ -4068,7 +4066,6 @@ test "detailed evaluation preserves successful predictions after scratch reuse" 
     const result = try dszig.optimize.evaluateDetailed(
         P,
         arena,
-        testing.allocator,
         ctx,
         &.{},
         &devset,
@@ -4118,7 +4115,7 @@ test "random search with concurrent evaluation ranks the same candidates as seri
     var out: std.heap.ArenaAllocator = .init(testing.allocator);
     defer out.deinit();
     var learner: LearningLM = .{};
-    const ctx: dszig.Context = .{ .arena = out.allocator(), .lm = learner.lm(), .retriever = rag.corpus.retriever() };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = out.allocator(), .lm = learner.lm(), .retriever = rag.corpus.retriever() };
     const trainset = try rag.trainset(out.allocator());
     var search: dszig.BootstrapFewShotWithRandomSearch = .{
         .metric = rag.keywordMetric,
@@ -4132,7 +4129,7 @@ test "random search with concurrent evaluation ranks the same candidates as seri
     const Evaluator = dszig.parallel.Evaluator(rag.RAG, limits);
     var learners: [limits.attempts]LearningLM = @splat(.{});
     var contexts: [limits.attempts]dszig.Context = undefined;
-    for (&contexts, &learners) |*context, *model| context.* = .{ .arena = undefined, .lm = model.lm(), .retriever = rag.corpus.retriever() };
+    for (&contexts, &learners) |*context, *model| context.* = .{ .workspace = dszig.workspace.forTests(), .arena = undefined, .lm = model.lm(), .retriever = rag.corpus.retriever() };
     const buffers = try out.allocator().alloc([65536]u8, limits.attempts);
     var backing: [limits.attempts][]u8 = undefined;
     for (&backing, buffers) |*slice, *buffer| slice.* = buffer;
@@ -4142,7 +4139,6 @@ test "random search with concurrent evaluation ranks the same candidates as seri
     defer evaluator.deinit();
     try testing.expectError(error.EmptyDevset, dszig.optimize.evaluate(
         rag.RAG,
-        testing.failing_allocator,
         ctx,
         &.{},
         &.{},
@@ -4186,7 +4182,6 @@ test "random search with concurrent evaluation ranks the same candidates as seri
     try testing.expectError(error.ProgramTypeMismatch, dszig.optimize.evaluateWith(
         Other,
         search.concurrent_evaluation,
-        testing.allocator,
         ctx,
         &.{},
         trainset,
@@ -4199,7 +4194,7 @@ test "random search stops at stop_at_score" {
     var out: std.heap.ArenaAllocator = .init(testing.allocator);
     defer out.deinit();
     var learner: LearningLM = .{};
-    const ctx: dszig.Context = .{ .arena = out.allocator(), .lm = learner.lm(), .retriever = rag.corpus.retriever() };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = out.allocator(), .lm = learner.lm(), .retriever = rag.corpus.retriever() };
     const trainset = try rag.trainset(out.allocator());
     const search: dszig.BootstrapFewShotWithRandomSearch = .{
         .metric = rag.keywordMetric,
@@ -4340,7 +4335,7 @@ test "random search inherits the outer budget for bootstrap and candidate evalua
     const arena = memory.allocator();
     const P = FewShotOptionsProgram;
     const trainset = try fewShotOptionsExamples(arena, 2);
-    const ctx: dszig.Context = .{ .arena = arena, .max_errors = 1 };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .max_errors = 1 };
     var search = fewShotOptionsSearch(Metric.score);
     search.teacher_settings.max_errors = 9;
     for ([_]i64{ -3, -1 }) |seed| {
@@ -4450,7 +4445,7 @@ test "random search validates zero bootstrap range only for consumed random seed
     defer out.deinit();
     const arena = out.allocator();
     var silent: dszig.lm.ScriptedLM = .{ .responses = &.{} };
-    const ctx: dszig.Context = .{ .arena = arena, .lm = silent.lm() };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = silent.lm() };
     const student = try fewShotOptionsStudent(arena);
     const trainset = try fewShotOptionsExamples(arena, 6);
     const valset = try fewShotOptionsExamples(arena, 5);
@@ -4507,7 +4502,7 @@ test "random search restrict is a seed set applied before any candidate is built
     defer out.deinit();
     const arena = out.allocator();
     var silent: dszig.lm.ScriptedLM = .{ .responses = &.{} };
-    const ctx: dszig.Context = .{ .arena = arena, .lm = silent.lm() };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = silent.lm() };
     const student = try fewShotOptionsStudent(arena);
     const trainset = try fewShotOptionsExamples(arena, 6);
     const valset = try fewShotOptionsExamples(arena, 5);
@@ -4605,7 +4600,7 @@ test "random search evaluates sparse late seeds in range order without changing 
     var out: std.heap.ArenaAllocator = .init(testing.allocator);
     defer out.deinit();
     const arena = out.allocator();
-    const ctx: dszig.Context = .{ .arena = arena };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena };
     const P = FewShotOptionsProgram;
     const student = try fewShotOptionsStudent(arena);
     const trainset = try fewShotOptionsExamples(arena, 6);
@@ -4677,7 +4672,7 @@ test "random search labeled_sample changes only the labeled seed" {
     defer out.deinit();
     const arena = out.allocator();
     var silent: dszig.lm.ScriptedLM = .{ .responses = &.{} };
-    const ctx: dszig.Context = .{ .arena = arena, .lm = silent.lm() };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = silent.lm() };
     const student = try fewShotOptionsStudent(arena);
     const trainset = try fewShotOptionsExamples(arena, 6);
     const valset = try fewShotOptionsExamples(arena, 5);
@@ -4724,7 +4719,7 @@ test "random search consumes its teacher only at a selected bootstrap seed" {
     defer out.deinit();
     const arena = out.allocator();
     var silent: dszig.lm.ScriptedLM = .{ .responses = &.{} };
-    const ctx: dszig.Context = .{ .arena = arena, .lm = silent.lm() };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = silent.lm() };
     const student = try fewShotOptionsStudent(arena);
     const trainset = try fewShotOptionsExamples(arena, 6);
     const valset = try fewShotOptionsExamples(arena, 5);
@@ -4782,7 +4777,7 @@ test "BetterTogether keys and default prompt carry typed compile options" {
     const P = FewShotOptionsProgram;
     const optimizers = dszig.better_together.optimizers;
     var model: dszig.lm.OpenAI = .{ .client = undefined, .base_url = "http://unused", .model = "base" };
-    const ctx: dszig.Context = .{ .arena = arena, .lm = model.lm() };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = model.lm() };
     const trainset = try fewShotOptionsExamples(arena, 6);
     const meta: dszig.BetterTogether = .{
         .metric = fewShotOptionsMetric,
@@ -5107,7 +5102,7 @@ test "typed prediction uses DSPy Unicode field names and strict schema titles" {
         };
         var recording: dszig.lm.RecordingLM = .{ .inner = model.lm(), .arena = arena };
         const program: dszig.Predict(Task) = .{};
-        const result = try program.forward(.{ .arena = arena, .lm = recording.lm(), .adapter = case.adapter }, .{ .question = "q" });
+        const result = try program.forward(.{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = recording.lm(), .adapter = case.adapter }, .{ .question = "q" });
         try testing.expectEqualStrings("pastry", result.@"éclair");
         try testing.expectEqualStrings("plain", result.answer_text);
         try testing.expectEqualStrings("sharp", result.@"ßeta");
@@ -5286,7 +5281,7 @@ test "ReAct typed submit returns every nested list nullable enum and bounded out
     } };
     var agent = try dszig.ReAct(StructuredSubmit, &.{}).init(arena);
     agent.max_iters = 1;
-    const output = try agent.forward(.{ .arena = arena, .lm = scripted.lm() }, .{ .question = "Return the result." });
+    const output = try agent.forward(.{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = scripted.lm() }, .{ .question = "Return the result." });
     try testing.expectEqualStrings("Paris", output.answer);
     try testing.expectEqualStrings("Paris", output.details.city);
     try testing.expectEqual(@as(i64, 9), output.details.zip_code);
@@ -5320,7 +5315,7 @@ test "ReAct rejects malformed typed final values before returning any output" {
         });
         var scripted: dszig.lm.ScriptedLM = .{ .responses = &.{completion} };
         var history: dszig.History = .{};
-        try testing.expectError(error.ReActSubmitFailed, agent.runWithOptions(.{ .arena = arena, .lm = scripted.lm() }, &inputs, .{ .history = &history }));
+        try testing.expectError(error.ReActSubmitFailed, agent.runWithOptions(.{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = scripted.lm() }, &inputs, .{ .history = &history }));
         try testing.expectEqual(@as(usize, 1), scripted.index);
         try testing.expectEqual(@as(usize, 1), history.messages.len);
         const calls = try dszig.react.ToolCalls.fromValue(arena, history.messages[0].get("tool_calls").?);
@@ -5345,7 +5340,7 @@ test "ReAct reuses structured History across calls without replacing prior event
         "<next_thought>\nFirst result.\n</next_thought>\n<tool_calls>\n{\"tool_calls\":[{\"id\":\"submit-paris\",\"name\":\"submit\",\"args\":{\"answer\":\"Paris\"}}]}\n</tool_calls>",
         "<next_thought>\nSecond result.\n</next_thought>\n<tool_calls>\n{\"tool_calls\":[{\"id\":\"submit-berlin\",\"name\":\"submit\",\"args\":{\"answer\":\"Berlin\"}}]}\n</tool_calls>",
     }, .history = &requests };
-    const ctx: dszig.Context = .{ .arena = arena, .lm = scripted.lm() };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = scripted.lm() };
     var agent = try dszig.ReAct(QA, &.{}).init(arena);
     agent.max_iters = 1;
     var history: dszig.History = .{};
@@ -5660,7 +5655,7 @@ test "prediction replays tagged REPL observations as inert text" {
         .history = &requests,
     };
     var program: dszig.Predict(Action) = .{};
-    const output = try program.forward(.{ .arena = arena, .lm = lm.lm() }, .{
+    const output = try program.forward(.{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = lm.lm() }, .{
         .iteration = "3/3",
         .history = history,
     });

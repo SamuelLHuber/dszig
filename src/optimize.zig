@@ -257,7 +257,6 @@ pub const EvaluationOptions = struct {
 pub fn evaluateDetailed(
     comptime P: type,
     out: Allocator,
-    gpa: Allocator,
     ctx: Context,
     program: *const P,
     devset: []const Example,
@@ -266,7 +265,7 @@ pub fn evaluateDetailed(
 ) !DetailedEvaluation {
     if (devset.len == 0) return error.EmptyDevset;
     const rows = try out.alloc(EvaluationRow, devset.len);
-    const summary = try evaluateScores(P, gpa, ctx, program, devset, metric, options, .{
+    const summary = try evaluateScores(P, ctx, program, devset, metric, options, .{
         .rows = .{ .out = out, .items = rows },
     });
     return .{ .summary = summary, .rows = rows };
@@ -282,19 +281,17 @@ const EvaluationRetention = struct {
 /// `error.EmptyDevset` before invoking the program or metric.
 pub fn evaluate(
     comptime P: type,
-    gpa: Allocator,
     ctx: Context,
     program: *const P,
     devset: []const Example,
     metric: Metric,
     max_errors: usize,
 ) !Evaluation {
-    return evaluateScores(P, gpa, ctx, program, devset, metric, .{ .max_errors = max_errors }, .{});
+    return evaluateScores(P, ctx, program, devset, metric, .{ .max_errors = max_errors }, .{});
 }
 
 fn evaluateScores(
     comptime P: type,
-    gpa: Allocator,
     ctx: Context,
     program: *const P,
     devset: []const Example,
@@ -314,9 +311,10 @@ fn evaluateScores(
     var sum: f64 = 0;
     var errors: usize = 0;
     const max_errors = options.max_errors orelse ctx.max_errors;
+    const workspace = ctx.workspace orelse return error.WorkspaceRequired;
     for (devset, 0..) |*example, index| {
-        var scratch: std.heap.ArenaAllocator = .init(gpa);
-        defer scratch.deinit();
+        var scratch = workspace.open();
+        defer scratch.close();
         var c = ctx;
         c.arena = scratch.allocator();
         c.trace = null;
@@ -365,20 +363,18 @@ pub const ConcurrentEvaluation = struct {
 pub fn evaluateWith(
     comptime P: type,
     concurrent: ?ConcurrentEvaluation,
-    gpa: Allocator,
     ctx: Context,
     program: *const P,
     devset: []const Example,
     metric: Metric,
     max_errors: usize,
 ) !Evaluation {
-    return evaluateWithScores(P, concurrent, gpa, ctx, program, devset, metric, max_errors, null);
+    return evaluateWithScores(P, concurrent, ctx, program, devset, metric, max_errors, null);
 }
 
 fn evaluateWithScores(
     comptime P: type,
     concurrent: ?ConcurrentEvaluation,
-    gpa: Allocator,
     ctx: Context,
     program: *const P,
     devset: []const Example,
@@ -388,7 +384,6 @@ fn evaluateWithScores(
 ) !Evaluation {
     const bound = concurrent orelse return evaluateScores(
         P,
-        gpa,
         ctx,
         program,
         devset,
@@ -1030,7 +1025,6 @@ pub const BootstrapFewShotWithRandomSearch = struct {
             const result = try evaluateWithScores(
                 P,
                 self.concurrent_evaluation,
-                gpa,
                 ctx,
                 &program,
                 val,

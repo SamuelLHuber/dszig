@@ -92,6 +92,18 @@ pub const Workspace = struct {
     };
 };
 
+/// Test-only workspace, reserved statically once. Serial test code shares it;
+/// nested scopes stay LIFO. Concurrent workers bind their own workspaces.
+pub fn forTests() *Workspace {
+    if (!@import("builtin").is_test) @compileError("Workspace.forTests is for tests");
+    const state = struct {
+        var buffer: [16 * 1024 * 1024]u8 = undefined;
+        var workspace: ?Workspace = null;
+    };
+    if (state.workspace == null) state.workspace = .init(&state.buffer);
+    return &state.workspace.?;
+}
+
 const testing = std.testing;
 
 test "scopes release in LIFO order and never grow past the buffer" {

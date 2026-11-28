@@ -272,7 +272,7 @@ pub const InferRules = struct {
                 const updated = try std.fmt.allocPrint(out, "{s}{s}{s}", .{ text, rule_instruction_suffix, rules });
                 setAliasedInstruction(targets, p.param.predict, updated);
             }
-            const score = try self.evaluateProgram(P, gpa, ctx, &candidate, valset);
+            const score = try self.evaluateProgram(P, ctx, &candidate, valset);
             const saved = try out.alloc([]const u8, predictors.len);
             for (saved, predictors) |*text, p| text.* = p.param.predict.instructions;
             entry.* = .{ .instructions = saved, .score = score };
@@ -329,7 +329,6 @@ pub const InferRules = struct {
     pub fn evaluateProgram(
         self: *const InferRules,
         comptime P: type,
-        gpa: Allocator,
         ctx: Context,
         program: *const P,
         dataset: []const Example,
@@ -338,7 +337,7 @@ pub const InferRules = struct {
         if (dataset.len == 0) return error.EmptyValidationSet;
         const max_errors = self.max_errors orelse ctx.max_errors;
         if (self.metric) |metric| {
-            return (try optimize.evaluateWith(P, self.concurrent_evaluation, gpa, ctx, program, dataset, metric, max_errors)).score;
+            return (try optimize.evaluateWith(P, self.concurrent_evaluation, ctx, program, dataset, metric, max_errors)).score;
         }
         // Source allows metric=None at construction. It still runs the program
         // for each example, then fails calling the missing metric; failed items
@@ -353,7 +352,7 @@ pub const InferRules = struct {
             }
         };
         const wrapper: MissingMetric = .{ .program = program };
-        return (try optimize.evaluate(MissingMetric, gpa, ctx, &wrapper, dataset, unusedMetric, max_errors)).score;
+        return (try optimize.evaluate(MissingMetric, ctx, &wrapper, dataset, unusedMetric, max_errors)).score;
     }
 };
 
@@ -629,7 +628,7 @@ test "InferRules real-source CoT prompts teacher options runtime count persisten
     var state: TestState = .{ .history = .{ .arena = a } };
     var student_lm: TestLM = .{ .state = &state };
     var teacher_lm: TestLM = .{ .state = &state, .teacher = true };
-    const ctx: Context = .{ .arena = a, .lm = student_lm.lm(), .adapter = .chat, .lm_options = .{ .temperature = 0.25 } };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = a, .lm = student_lm.lm(), .adapter = .chat, .lm_options = .{ .temperature = 0.25 } };
     var program = try RulesInductionProgram.init(a, 7, .{ .lm = teacher_lm.lm(), .adapter = .xml });
     for ([_][]const u8{ "first", "second", "third" }, 0..) |text, index| {
         const output = try program.forward(ctx, .{ .examples_text = text });
@@ -706,7 +705,7 @@ test "InferRules splits once bootstraps once snapshots resets strict ties and fi
     var state: TestState = .{ .history = .{ .arena = a } };
     var student_lm: TestLM = .{ .state = &state };
     var teacher_lm: TestLM = .{ .state = &state, .teacher = true };
-    const ctx: Context = .{ .arena = a, .lm = student_lm.lm() };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = a, .lm = student_lm.lm() };
     var student: TestProgram = .{};
     var optimizer = try InferRules.init(a, .{
         .metric = testMetric,
@@ -769,7 +768,7 @@ test "InferRules eagerly captures persistent rules metadata settings binding and
     var student_lm: TestLM = .{ .state = &state };
     var teacher_lm: TestLM = .{ .state = &state, .teacher = true };
     var replacement_lm: TestLM = .{ .state = &state };
-    const ctx: Context = .{ .arena = a, .lm = student_lm.lm() };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = a, .lm = student_lm.lm() };
     var original_settings: optimize.TeacherSettings = .{ .lm = teacher_lm.lm(), .adapter = .xml };
     const replacement_settings: optimize.TeacherSettings = .{ .lm = replacement_lm.lm(), .adapter = .xml };
     var optimizer = try InferRules.init(a, .{
@@ -829,7 +828,7 @@ test "InferRules distinct signature earlier winner retains identity but acquires
     const a = memory.allocator();
     var state: TestState = .{ .history = .{ .arena = a }, .good_rules = &.{"rule-1"} };
     var model: TestLM = .{ .state = &state };
-    const ctx: Context = .{ .arena = a, .lm = model.lm() };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = a, .lm = model.lm() };
     var student: TestProgram = .{};
     var optimizer = try InferRules.init(a, .{ .metric = testMetric, .num_candidates = 3, .max_bootstrapped_demos = 0, .max_labeled_demos = 0 });
     const result = try optimizer.compile(TestProgram, a, testing.allocator, ctx, &student, null, try testExamples(a, 2), try testExamples(a, 1));
@@ -849,7 +848,7 @@ test "InferRules shared signature classes mutate caller teacher bootstrap and ea
     const a = memory.allocator();
     var state: TestState = .{ .history = .{ .arena = a }, .good_rules = &.{"rule-1"} };
     var model: TestLM = .{ .state = &state };
-    const ctx: Context = .{ .arena = a, .lm = model.lm() };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = a, .lm = model.lm() };
     var student: TestSharedProgram = .{};
     var teacher: TestSharedProgram = .{};
     var optimizer = try InferRules.init(a, .{ .metric = testMetric, .num_candidates = 3, .max_bootstrapped_demos = 0, .max_labeled_demos = 0 });
@@ -875,7 +874,7 @@ test "InferRules second induction failure retains precisely the preceding source
     inline for (.{ TestProgram, TestSharedProgram }) |P| {
         var state: TestState = .{ .history = .{ .arena = a }, .failures = &.{ null, .other } };
         var model: TestLM = .{ .state = &state };
-        const ctx: Context = .{ .arena = a, .lm = model.lm() };
+        const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = a, .lm = model.lm() };
         var student: P = .{};
         var optimizer = try InferRules.init(a, .{ .metric = testMetric, .num_candidates = 2, .max_bootstrapped_demos = 0, .max_labeled_demos = 0 });
         try testing.expectError(error.UnacceptedRulesInductionFailure, optimizer.compile(P, a, testing.allocator, ctx, &student, null, try testExamples(a, 2), try testExamples(a, 1)));
@@ -908,7 +907,7 @@ test "InferRules explicit validation empty failure timing negative candidates em
     const a = memory.allocator();
     var state: TestState = .{ .history = .{ .arena = a } };
     var model: TestLM = .{ .state = &state };
-    const ctx: Context = .{ .arena = a, .lm = model.lm() };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = a, .lm = model.lm() };
     var optimizer = try InferRules.init(a, .{ .metric = testMetric, .num_candidates = 1, .max_bootstrapped_demos = 0, .max_labeled_demos = 0 });
     var student: TestProgram = .{};
     _ = try optimizer.compile(TestProgram, a, testing.allocator, ctx, &student, null, try testExamples(a, 3), try testExamples(a, 1));
@@ -954,7 +953,7 @@ test "InferRules all NaN and negative infinity evaluations return genuine null" 
     const a = memory.allocator();
     var state: TestState = .{ .history = .{ .arena = a } };
     var model: TestLM = .{ .state = &state };
-    const ctx: Context = .{ .arena = a, .lm = model.lm() };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = a, .lm = model.lm() };
     for ([_]optimize.Metric{ nanMetric, negativeInfinityMetric }) |metric| {
         var optimizer = try InferRules.init(a, .{ .metric = metric, .num_candidates = 2, .max_bootstrapped_demos = 0, .max_labeled_demos = 0 });
         var student: TestProgram = .{};
@@ -972,7 +971,7 @@ test "InferRules only classified source errors shrink the final training example
     const a = memory.allocator();
     var state: TestState = .{ .history = .{ .arena = a }, .failures = &.{ .value_error, .bad_request_error, .context_window_exceeded } };
     var model: TestLM = .{ .state = &state };
-    const ctx: Context = .{ .arena = a, .lm = model.lm() };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = a, .lm = model.lm() };
     const predictor: predict.Predict(TestFirst) = .{};
     var optimizer = try InferRules.init(a, .{ .failure_classifier = .{ .ptr = &state, .classify = TestState.classify } });
     const rules = try optimizer.induceNaturalLanguageRules(a, testing.allocator, ctx, &predictor.state, try testExamples(a, 4));
@@ -1007,14 +1006,14 @@ test "InferRules missing metric runs prediction before evaluation errors" {
     const a = memory.allocator();
     var state: TestState = .{ .history = .{ .arena = a } };
     var model: TestLM = .{ .state = &state };
-    const ctx: Context = .{ .arena = a, .lm = model.lm(), .max_errors = 1 };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = a, .lm = model.lm(), .max_errors = 1 };
     const student: TestProgram = .{};
     var optimizer = try InferRules.init(a, .{});
     const dataset = try testExamples(a, 2);
-    try testing.expectError(error.MissingMetric, optimizer.evaluateProgram(TestProgram, testing.allocator, ctx, &student, dataset));
+    try testing.expectError(error.MissingMetric, optimizer.evaluateProgram(TestProgram, ctx, &student, dataset));
     try testing.expectEqual(@as(usize, 2), state.history.requests.items.len);
     optimizer.max_errors = 3;
-    try testing.expectEqual(@as(f64, 0), try optimizer.evaluateProgram(TestProgram, testing.allocator, ctx, &student, dataset));
+    try testing.expectEqual(@as(f64, 0), try optimizer.evaluateProgram(TestProgram, ctx, &student, dataset));
     try testing.expectEqual(@as(usize, 6), state.history.requests.items.len);
-    try testing.expectError(error.EmptyValidationSet, optimizer.evaluateProgram(TestProgram, testing.allocator, ctx, &student, &.{}));
+    try testing.expectError(error.EmptyValidationSet, optimizer.evaluateProgram(TestProgram, ctx, &student, &.{}));
 }

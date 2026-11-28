@@ -40,6 +40,8 @@ pub const Settings = struct {
 /// transcript and 9 MiB on the committed gpt-5.6-luna and gpt-6-luna
 /// recordings, so this leaves over 3x headroom for longer real completions.
 pub const arena_bytes_max = 32 * 1024 * 1024;
+/// Fixed scratch for per-example and per-step scopes, reserved once at startup.
+pub const workspace_bytes_max = 8 * 1024 * 1024;
 
 pub const Typed = dszig.Signature(struct {
     pub const Input = struct { text: []const u8, tags: []const []const u8 };
@@ -158,8 +160,8 @@ pub const Result = struct {
     dates_gepa: Pipeline,
 };
 
-pub fn run(arena: Allocator, gpa: Allocator, lm: dszig.LM, settings: Settings) !Result {
-    const base: dszig.Context = .{ .arena = arena, .lm = lm, .lm_options = .{ .temperature = settings.temperature } };
+pub fn run(arena: Allocator, gpa: Allocator, workspace: *dszig.Workspace, lm: dszig.LM, settings: Settings) !Result {
+    const base: dszig.Context = .{ .arena = arena, .workspace = workspace, .lm = lm, .lm_options = .{ .temperature = settings.temperature } };
     var result: Result = undefined;
     result.cases = .{
         try runCase(dszig.ChainOfThought(rag.QA), base, .chat, "cot_qa_chat", qa_demos, qa_input),
@@ -290,7 +292,7 @@ fn pipeline(
     devset: []const dszig.Example,
     metric: dszig.optimize.Metric,
 ) !Pipeline {
-    const baseline = try dszig.optimize.evaluate(P, gpa, ctx, &student, devset, metric, 10);
+    const baseline = try dszig.optimize.evaluate(P, ctx, &student, devset, metric, 10);
     if (@TypeOf(optimizer) == dszig.MIPROv2) {
         const aware = optimizer.num_candidates == 2;
         const options: dszig.MIPROv2.Options = .{
@@ -301,7 +303,7 @@ fn pipeline(
             .program_code = dates_program_code,
         };
         const compiled = try optimizer.compile(P, arena, gpa, ctx, null, student, null, trainset, options);
-        const optimized = try dszig.optimize.evaluate(P, gpa, ctx, &compiled.program, devset, metric, 10);
+        const optimized = try dszig.optimize.evaluate(P, ctx, &compiled.program, devset, metric, 10);
         return .{
             .baseline = baseline.score,
             .optimized = optimized.score,
@@ -313,7 +315,7 @@ fn pipeline(
     }
     if (@TypeOf(optimizer) == dszig.SIMBA) {
         const compiled = try optimizer.compile(P, arena, ctx, student, trainset, .{ .program_code = dates_class_source });
-        const optimized = try dszig.optimize.evaluate(P, gpa, ctx, &compiled.program, devset, metric, 10);
+        const optimized = try dszig.optimize.evaluate(P, ctx, &compiled.program, devset, metric, 10);
         return .{
             .baseline = baseline.score,
             .optimized = optimized.score,
@@ -324,7 +326,7 @@ fn pipeline(
     }
     if (@TypeOf(optimizer) == dszig.GEPA) {
         const compiled = try optimizer.compile(P, arena, ctx, student, trainset, .{ .valset = devset });
-        const optimized = try dszig.optimize.evaluate(P, gpa, ctx, &compiled.program, devset, metric, 10);
+        const optimized = try dszig.optimize.evaluate(P, ctx, &compiled.program, devset, metric, 10);
         return .{
             .baseline = baseline.score,
             .optimized = optimized.score,
@@ -334,8 +336,8 @@ fn pipeline(
         };
     }
     if (@TypeOf(optimizer) == dszig.COPRO) {
-        const compiled = try optimizer.compile(P, arena, gpa, ctx, null, student, trainset);
-        const optimized = try dszig.optimize.evaluate(P, gpa, ctx, &compiled.program, devset, metric, 10);
+        const compiled = try optimizer.compile(P, arena, ctx, null, student, trainset);
+        const optimized = try dszig.optimize.evaluate(P, ctx, &compiled.program, devset, metric, 10);
         const scores = try arena.alloc(f64, compiled.candidates.len);
         for (scores, compiled.candidates) |*s, c| s.* = c.score;
         return .{
@@ -352,7 +354,7 @@ fn pipeline(
         var instance = optimizer;
         break :bootstrap try instance.compile(P, arena, gpa, ctx, student, null, trainset);
     };
-    const optimized = try dszig.optimize.evaluate(P, gpa, ctx, &compiled.program, devset, metric, 10);
+    const optimized = try dszig.optimize.evaluate(P, ctx, &compiled.program, devset, metric, 10);
     const candidates = if (search) summaries: {
         const rows = try arena.alloc(CandidateSummary, compiled.candidates.len);
         for (compiled.candidates, rows) |candidate, *row| {

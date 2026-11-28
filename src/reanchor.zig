@@ -299,7 +299,7 @@ fn serialScores(
     assert(result.len == examples.len);
     var scratch: std.heap.ArenaAllocator = .init(gpa);
     defer scratch.deinit();
-    const detailed = try optimize.evaluateDetailed(P, scratch.allocator(), gpa, ctx, program, examples, metric, .{ .max_errors = 1 });
+    const detailed = try optimize.evaluateDetailed(P, scratch.allocator(), ctx, program, examples, metric, .{ .max_errors = 1 });
     for (result, detailed.rows) |*score, row| score.* = row.score;
 }
 
@@ -1065,7 +1065,7 @@ fn compileCase(
     defer cache.deinit();
     var student: predict.Predict(Sig) = .{};
     if (fields_json) |json| student.state.decision_fields = try json_repair.parseJson(arena, json);
-    const ctx: Context = .{ .arena = arena, .lm = cache.lm() };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = cache.lm() };
     const program = try optimizer.compile(predict.Predict(Sig), arena, testing.allocator, ctx, &student, trainset, valset);
     return .{ .student = student, .program = program };
 }
@@ -1336,22 +1336,23 @@ test "compile refuses empty training sets, decision-free students, and uncached 
     var optimizer: ReAnchor = .{ .metric = noulMetric, .io = testing.io };
     const student: predict.Predict(NoulSig) = .{};
     const P = predict.Predict(NoulSig);
-    try testing.expectError(error.EmptyTrainset, optimizer.compile(P, arena, testing.allocator, .{ .arena = arena, .lm = keyword.lm() }, &student, &.{}, null));
-    try testing.expectError(error.NoLM, optimizer.compile(P, arena, testing.allocator, .{ .arena = arena }, &student, trainset, null));
-    try testing.expectError(error.UncachedPredictors, optimizer.compile(P, arena, testing.allocator, .{ .arena = arena, .lm = keyword.lm() }, &student, trainset, null));
+    try testing.expectError(error.EmptyTrainset, optimizer.compile(P, arena, testing.allocator, .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = keyword.lm() }, &student, &.{}, null));
+    try testing.expectError(error.NoLM, optimizer.compile(P, arena, testing.allocator, .{ .workspace = @import("workspace.zig").forTests(), .arena = arena }, &student, trainset, null));
+    try testing.expectError(error.UncachedPredictors, optimizer.compile(P, arena, testing.allocator, .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = keyword.lm() }, &student, trainset, null));
     try testing.expectEqual(@as(usize, 1), optimizer.uncached.len);
     try testing.expectEqualStrings("self", optimizer.uncached[0]);
     var disabled: @import("cache.zig").CachedLM = .{ .gpa = testing.allocator, .inner = keyword.lm(), .max_entries = 0 };
     defer disabled.deinit();
-    try testing.expectError(error.UncachedPredictors, optimizer.compile(P, arena, testing.allocator, .{ .arena = arena, .lm = disabled.lm() }, &student, trainset, null));
+    try testing.expectError(error.UncachedPredictors, optimizer.compile(P, arena, testing.allocator, .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = disabled.lm() }, &student, trainset, null));
     // A bound cached model satisfies the check without a settings model.
     var cached: @import("cache.zig").CachedLM = .{ .gpa = testing.allocator, .inner = keyword.lm() };
     defer cached.deinit();
     var bound = student;
     bound.state.lm = cached.lm();
     bound.state.config = &.{ .cache = false };
-    try testing.expectError(error.UncachedPredictors, optimizer.compile(P, arena, testing.allocator, .{ .arena = arena }, &bound, trainset, null));
+    try testing.expectError(error.UncachedPredictors, optimizer.compile(P, arena, testing.allocator, .{ .workspace = @import("workspace.zig").forTests(), .arena = arena }, &bound, trainset, null));
     _ = try optimizer.compile(P, arena, testing.allocator, .{
+        .workspace = @import("workspace.zig").forTests(),
         .arena = arena,
         .predict_config = &.{ .cache = @as(?bool, null) },
     }, &bound, trainset, null);
@@ -1361,9 +1362,9 @@ test "compile refuses empty training sets, decision-free students, and uncached 
         pub const Input = struct { question: []const u8 };
         pub const Output = struct { answer: []const u8 };
     }));
-    try testing.expectError(error.NoDecisionPredictors, optimizer.compile(Plain, arena, testing.allocator, .{ .arena = arena, .lm = keyword.lm() }, &Plain{}, trainset, null));
+    try testing.expectError(error.NoDecisionPredictors, optimizer.compile(Plain, arena, testing.allocator, .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = keyword.lm() }, &Plain{}, trainset, null));
     optimizer.require_cache = false;
-    _ = try optimizer.compile(P, arena, testing.allocator, .{ .arena = arena, .lm = keyword.lm() }, &student, trainset, null);
+    _ = try optimizer.compile(P, arena, testing.allocator, .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = keyword.lm() }, &student, trainset, null);
 }
 
 test "ReAnchor rejects inconsistent scoring LMs before collecting evidence or scoring" {
@@ -1379,8 +1380,8 @@ test "ReAnchor rejects inconsistent scoring LMs before collecting evidence or sc
     var other: lm_mod.ScriptedLM = .{ .responses = &(@as([32][]const u8, @splat(response))) };
     var cached: @import("cache.zig").CachedLM = .{ .gpa = testing.allocator, .inner = source.lm() };
     defer cached.deinit();
-    const ctx: Context = .{ .arena = arena, .lm = cached.lm() };
-    var scoring: [1]Context = .{.{ .arena = arena, .lm = other.lm() }};
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = cached.lm() };
+    var scoring: [1]Context = .{.{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = other.lm() }};
     var evaluator: E = undefined;
     const scratch = try arena.alloc(u8, 64 * 1024);
     try evaluator.init(testing.io, .{}, &.{scratch});
@@ -1398,8 +1399,8 @@ test "ReAnchor rejects inconsistent scoring LMs before collecting evidence or sc
     // An explicit override wins even when the predictor has a different LM.
     var student: P = .{};
     student.state.lm = other.lm();
-    scoring[0] = .{ .arena = arena, .lm_override = cached.lm() };
-    const evidence_ctx: Context = .{ .arena = arena, .lm_override = cached.lm() };
+    scoring[0] = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm_override = cached.lm() };
+    const evidence_ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm_override = cached.lm() };
     _ = try optimizer.compile(P, arena, testing.allocator, evidence_ctx, &student, trainset, null);
     try testing.expectEqual(@as(f64, 1), optimizer.report.?.train_score);
     try testing.expectEqual(@as(usize, 1), source.index);

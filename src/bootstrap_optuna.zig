@@ -195,7 +195,6 @@ pub const BootstrapFewShotWithOptuna = struct {
             const evaluation = try optimize.evaluateWith(
                 P,
                 self.concurrent_evaluation,
-                gpa,
                 ctx,
                 &program,
                 val,
@@ -372,7 +371,7 @@ test "heterogeneous Bootstrap maps teacher traces, scores its own output and pre
     defer mem.deinit();
     const arena = mem.allocator();
     const train = [_]Example{try .fromJson(arena, "{\"question\":\"0\",\"hint\":\"teacher input\",\"answer\":\"0\"}", &.{ "question", "hint" })};
-    const ctx: predict.Context = .{ .arena = arena };
+    const ctx: predict.Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena };
     var bootstrap: optimize.BootstrapFewShot = .{
         .metric = distinctTeacherMetric,
         .max_bootstrapped_demos = 1,
@@ -404,7 +403,7 @@ test "heterogeneous Bootstrap teachers improve RandomSearch and Optuna student c
     defer mem.deinit();
     const arena = mem.allocator();
     const train = [_]Example{try .fromJson(arena, "{\"question\":\"0\",\"hint\":\"teacher input\",\"answer\":\"0\"}", &.{ "question", "hint" })};
-    const ctx: predict.Context = .{ .arena = arena };
+    const ctx: predict.Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena };
     const teacher: DistinctTeacher = .{};
     const search: optimize.BootstrapFewShotWithRandomSearch = .{
         .metric = distinctTeacherMetric,
@@ -456,7 +455,7 @@ test "BootstrapOptuna selects one demo in predictor order and retains every tria
     defer if (inputs_live) inputs.deinit();
     const arena = inputs.allocator();
     var silent: @import("lm.zig").ScriptedLM = .{ .responses = &.{} };
-    const ctx: predict.Context = .{ .arena = arena, .lm = silent.lm() };
+    const ctx: predict.Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = silent.lm() };
     const trainset = try testExamples(arena, &.{ "0", "1", "2", "3", "4", "5" });
     const valset = try testExamples(arena, &.{ "0", "0", "1" });
     var student: TestProgram = .{};
@@ -509,7 +508,7 @@ test "BootstrapOptuna absent and empty validation both fall back to training" {
     defer out.deinit();
     const arena = out.allocator();
     var silent: @import("lm.zig").ScriptedLM = .{ .responses = &.{} };
-    const ctx: predict.Context = .{ .arena = arena, .lm = silent.lm() };
+    const ctx: predict.Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = silent.lm() };
     const trainset = try testExamples(arena, &.{ "0", "1", "2", "3", "4", "5" });
     const optimizer: BootstrapFewShotWithOptuna = .{ .metric = sourceMetric, .seed = 9, .max_labeled_demos = 5, .num_candidate_programs = 20 };
     const absent = try optimizer.compile(TestProgram, arena, testing.allocator, testing.io, ctx, .{}, null, 3, trainset, null);
@@ -531,7 +530,7 @@ test "BootstrapOptuna ties keep the first program and do not mutate the teacher"
     defer out.deinit();
     const arena = out.allocator();
     var silent: @import("lm.zig").ScriptedLM = .{ .responses = &.{} };
-    const ctx: predict.Context = .{ .arena = arena, .lm = silent.lm() };
+    const ctx: predict.Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = silent.lm() };
     const trainset = try testExamples(arena, &.{ "0", "1", "2", "3", "4", "5" });
     var teacher: TestProgram = .{};
     teacher.z.state.demos = &.{(try testExamples(arena, &.{"88"}))[0].record};
@@ -554,7 +553,7 @@ test "BootstrapOptuna zero rounds preserves labeled candidates and defaults rema
     defer out.deinit();
     const arena = out.allocator();
     var silent: @import("lm.zig").ScriptedLM = .{ .responses = &.{} };
-    const ctx: predict.Context = .{ .arena = arena, .lm = silent.lm() };
+    const ctx: predict.Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = silent.lm() };
     const trainset = try testExamples(arena, &.{ "0", "1", "2", "3", "4", "5" });
     const valset = try testExamples(arena, &.{ "0", "0", "1" });
     const optimizer: BootstrapFewShotWithOptuna = .{ .metric = sourceMetric, .seed = 9, .max_labeled_demos = 5, .max_rounds = 0, .num_candidate_programs = 20 };
@@ -593,7 +592,7 @@ test "BootstrapOptuna source errors precede study lookup and NaN never wins" {
     defer out.deinit();
     const arena = out.allocator();
     var silent: @import("lm.zig").ScriptedLM = .{ .responses = &.{} };
-    const ctx: predict.Context = .{ .arena = arena, .lm = silent.lm() };
+    const ctx: predict.Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = silent.lm() };
     const trainset = try testExamples(arena, &.{ "0", "1", "2", "3", "4", "5" });
     const optimizer: BootstrapFewShotWithOptuna = .{ .metric = sourceMetric, .seed = 9, .num_candidate_programs = 0 };
     try testing.expectError(error.StudentCompiled, optimizer.compile(TestProgram, arena, testing.allocator, testing.io, ctx, .{ .compiled = true }, null, 3, &.{}, null));
@@ -616,7 +615,7 @@ test "BootstrapOptuna catches individual evaluation failures but never swallows 
     defer out.deinit();
     const arena = out.allocator();
     var silent: @import("lm.zig").ScriptedLM = .{ .responses = &.{} };
-    const ctx: predict.Context = .{ .arena = arena, .lm = silent.lm() };
+    const ctx: predict.Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = silent.lm() };
     const trainset = try testExamples(arena, &.{ "0", "1", "2", "3", "4", "5" });
     const partial_val = try testExamples(arena, &.{"fail"});
     const optimizer: BootstrapFewShotWithOptuna = .{ .metric = tiedMetric, .seed = 9, .max_labeled_demos = 5, .num_candidate_programs = 3 };
@@ -659,7 +658,7 @@ test "BootstrapOptuna inherits the caller limit in bootstrap and trial evaluatio
         .max_labeled_demos = 1,
         .seed = 0,
     };
-    const ctx: predict.Context = .{ .arena = a, .lm = model.lm(), .max_errors = 1 };
+    const ctx: predict.Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = a, .lm = model.lm(), .max_errors = 1 };
     try testing.expectError(error.ParseValue, opt.compile(
         P,
         a,
@@ -693,7 +692,7 @@ test "BootstrapOptuna keeps supplied teacher demos but resets the implicit teach
     defer out.deinit();
     const arena = out.allocator();
     var silent: @import("lm.zig").ScriptedLM = .{ .responses = &.{} };
-    const ctx: predict.Context = .{ .arena = arena, .lm = silent.lm() };
+    const ctx: predict.Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = silent.lm() };
     const trainset = try testExamples(arena, &.{ "0", "1", "2", "3", "4", "5" });
     var teacher: TestProgram = .{ .compiled = true };
     teacher.z.state.demos = &.{(try testExamples(arena, &.{"88"}))[0].record};
@@ -729,7 +728,7 @@ test "BootstrapOptuna unseeded compilation uses supplied entropy and seeded prob
     defer out.deinit();
     const arena = out.allocator();
     var silent: @import("lm.zig").ScriptedLM = .{ .responses = &.{} };
-    const ctx: predict.Context = .{ .arena = arena, .lm = silent.lm() };
+    const ctx: predict.Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = silent.lm() };
     const trainset = try testExamples(arena, &.{ "0", "1", "2", "3", "4", "5" });
     const optimizer: BootstrapFewShotWithOptuna = .{ .metric = tiedMetric };
     try testing.expectError(error.EntropyUnavailable, optimizer.compile(TestProgram, arena, testing.allocator, io, ctx, .{}, null, 3, trainset, null));
@@ -751,7 +750,7 @@ test "BootstrapOptuna retains NaN trial programs without advancing the startup c
     defer out.deinit();
     const arena = out.allocator();
     var silent: @import("lm.zig").ScriptedLM = .{ .responses = &.{} };
-    const ctx: predict.Context = .{ .arena = arena, .lm = silent.lm() };
+    const ctx: predict.Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = silent.lm() };
     const trainset = try testExamples(arena, &.{ "0", "1", "2", "3", "4", "5" });
     const valset = try testExamples(arena, &.{ "0", "0", "1" });
     const optimizer: BootstrapFewShotWithOptuna = .{ .metric = mixedNanMetric, .seed = 9, .max_labeled_demos = 5, .num_candidate_programs = 30 };

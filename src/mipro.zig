@@ -888,7 +888,7 @@ pub const MIPROv2 = struct {
         var scratch: std.heap.ArenaAllocator = .init(gpa);
         defer scratch.deinit();
 
-        const default_score = try self.score(P, out, gpa, ctx, &program, valset, valset.len, rng);
+        const default_score = try self.score(P, out, ctx, &program, valset, valset.len, rng);
         var logs: std.ArrayList(TrialLog) = .empty;
         var programs: std.ArrayList(P) = .empty;
         if (self.track_stats) try programs.ensureTotalCapacity(out, program_limit);
@@ -940,7 +940,7 @@ pub const MIPROv2 = struct {
                 if (demos.len > 0) p.param.predict.demos = demos[i][chosen[i * stride + 1]];
             }
             const batch = if (minibatch) options.minibatch_size else valset.len;
-            const s = try self.score(P, out, gpa, ctx, &candidate, valset, batch, rng);
+            const s = try self.score(P, out, ctx, &candidate, valset, batch, rng);
             if (!minibatch and s > best_score) {
                 best_score = s;
                 best = candidate;
@@ -990,7 +990,7 @@ pub const MIPROv2 = struct {
                     }
                 }
                 const target = pick orelse return error.NoCandidate;
-                const full_score = try self.score(P, out, gpa, ctx, &target.program, valset, valset.len, rng);
+                const full_score = try self.score(P, out, ctx, &target.program, valset, valset.len, rng);
                 if (std.math.isNan(full_score)) return error.NaNStudyObservation;
                 full_count += 1;
                 if (!self.track_stats) try full_scores.append(out, full_score);
@@ -1078,10 +1078,10 @@ pub const MIPROv2 = struct {
 
     /// `eval_candidate_program`: a minibatch drawn with `rng` unless
     /// `batch_size` covers `valset`; any failure scores 0.0, as in DSPy.
-    fn score(self: MIPROv2, comptime P: type, out: Allocator, gpa: Allocator, ctx: Context, program: *const P, valset: []const Example, batch_size: usize, rng: *pyrandom.Random) Allocator.Error!f64 {
+    fn score(self: MIPROv2, comptime P: type, out: Allocator, ctx: Context, program: *const P, valset: []const Example, batch_size: usize, rng: *pyrandom.Random) Allocator.Error!f64 {
         const devset = if (batch_size >= valset.len) valset else try createMinibatch(out, rng, valset, batch_size);
         const max_errors = self.max_errors orelse ctx.max_errors;
-        const result = optimize.evaluateWith(P, self.concurrent_evaluation, gpa, ctx, program, devset, self.metric, max_errors) catch |err| switch (err) {
+        const result = optimize.evaluateWith(P, self.concurrent_evaluation, ctx, program, devset, self.metric, max_errors) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return 0.0,
         };
@@ -1119,7 +1119,7 @@ test "MIPRO zero-size dataset summary skips refinement but uses the initial obse
         "{\"summary\":\"Facts.\"}",
     } };
     const sample = try Example.fromJson(arena, "{\"q\":\"unseen row\"}", &.{"q"});
-    const ctx: Context = .{ .arena = arena, .lm = model.lm(), .adapter = .json };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = model.lm(), .adapter = .json };
     try testing.expectEqualStrings("Facts.", try datasetSummary(arena, ctx, &.{sample}, 0));
 
     const requests = history.requests.items;
@@ -1164,12 +1164,12 @@ test "MIPRO compile demo overrides select zero-shot and seed zero samples indepe
         var unused: lm_mod.ScriptedLM = .{ .responses = &.{} };
         var config = optimizer;
         config.task_model = task.lm();
-        const bound = try config.init(.{ .arena = arena, .lm = prompt.lm() });
+        const bound = try config.init(.{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = prompt.lm() });
         const result = try bound.compile(
             P,
             arena,
             arena,
-            .{ .arena = arena, .lm = unused.lm() },
+            .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = unused.lm() },
             null,
             student,
             student,
@@ -1211,8 +1211,8 @@ test "MIPRO compile demo overrides select zero-shot and seed zero samples indepe
             P,
             arena,
             arena,
-            .{ .arena = arena, .lm = task.lm() },
-            .{ .arena = arena, .lm = prompt.lm() },
+            .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = task.lm() },
+            .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = prompt.lm() },
             student,
             student,
             rows[0..2],
@@ -1274,8 +1274,8 @@ test "MIPRO refuses a mismatched evaluator before using either model" {
         Program,
         arena,
         testing.allocator,
-        .{ .arena = arena, .lm = task.lm() },
-        .{ .arena = arena, .lm = prompt.lm() },
+        .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = task.lm() },
+        .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = prompt.lm() },
         .{},
         null,
         &rows,
@@ -1388,8 +1388,8 @@ test "MIPRO inherits the compile context error limit for demos and trial evaluat
                 P,
                 arena,
                 testing.allocator,
-                .{ .arena = arena, .lm = task.lm(), .max_errors = 1 },
-                .{ .arena = arena, .lm = prompt.lm() },
+                .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = task.lm(), .max_errors = 1 },
+                .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = prompt.lm() },
                 .{},
                 @as(P, .{}),
                 if (bootstrap) &rows else rows[1..],
@@ -1457,8 +1457,8 @@ test "MIPRO refuses empty candidate spaces without indexing or sampling them" {
             P,
             arena,
             arena,
-            .{ .arena = arena, .lm = task.lm() },
-            .{ .arena = arena, .lm = prompt.lm() },
+            .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = task.lm() },
+            .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = prompt.lm() },
             student,
             student,
             &.{row},
@@ -1540,7 +1540,7 @@ test "MIPRO distinguishes failed NaN objectives from explicit Optuna observation
         var task: @import("lm.zig").ScriptedLM = .{ .responses = responses };
         const minibatch = case == .promotion or case == .invalid_promotion;
         var rng = pyrandom.Random.init(9);
-        const run = optimizer.search(P, arena, testing.allocator, .{ .arena = arena, .lm = task.lm() }, .{}, &.{&.{ "base", "beta", "gamma" }}, &.{}, rows[0..if (minibatch) @as(usize, 2) else 1], switch (case) {
+        const run = optimizer.search(P, arena, testing.allocator, .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = task.lm() }, .{}, &.{&.{ "base", "beta", "gamma" }}, &.{}, rows[0..if (minibatch) @as(usize, 2) else 1], switch (case) {
             .startup => 12,
             .promotion => 3,
             else => 1,

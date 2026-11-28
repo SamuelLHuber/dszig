@@ -377,7 +377,10 @@ pub fn main(init: std.process.Init) !void {
         .temperature = try float(init.environ_map.get("DSZIG_LIVE_TEMPERATURE"), "DSZIG_LIVE_TEMPERATURE", 0.0),
         .copro_init_temperature = try float(init.environ_map.get("DSZIG_LIVE_COPRO_TEMPERATURE"), "DSZIG_LIVE_COPRO_TEMPERATURE", 1.4),
     };
-    const result = try suite.run(arena, init.gpa, recorder.lm(), settings);
+    const workspace_buffer = try init.gpa.alloc(u8, suite.workspace_bytes_max);
+    defer init.gpa.free(workspace_buffer);
+    var workspace: dszig.Workspace = .init(workspace_buffer);
+    const result = try suite.run(arena, init.gpa, &workspace, recorder.lm(), settings);
     const json = try suite.writeTranscript(arena, "dszig", model, recorder.lm(), recorder.calls.items, result, settings);
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = out_path, .data = json });
     for (result.cases) |c| {

@@ -153,7 +153,7 @@ pub const COPRO = struct {
     /// Source scores on trainset, ignores standard teacher/valset, and accepts
     /// eval_kwargs. Native evaluation settings live in the typed optimizer.
     pub fn compile(self: *COPRO, comptime P: type, request: Request(P)) !P {
-        const result = try self.optimizer.compile(P, request.out, request.gpa, request.ctx, self.prompt, request.student, request.trainset);
+        const result = try self.optimizer.compile(P, request.out, request.ctx, self.prompt, request.student, request.trainset);
         return result.program;
     }
 };

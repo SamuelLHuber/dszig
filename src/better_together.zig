@@ -401,7 +401,6 @@ pub const BetterTogether = struct {
             const evaluation = optimize.evaluateWith(
                 P,
                 options.concurrent_evaluation,
-                request.gpa,
                 request.ctx,
                 &program,
                 set,
@@ -729,7 +728,7 @@ test "BetterTogether signed seeds reproduce both DSPy trainset shuffles" {
         var model: lm.OpenAI = .{ .client = undefined, .base_url = "http://unused", .model = "base" };
         try predict.setLM(out, &student, model.lm());
         var probe: Probe = .{};
-        const result = try testOptimizer().compileWith(TestProgram, out, testing.allocator, testing.io, .{ .arena = out }, &student, &trainset, .{
+        const result = try testOptimizer().compileWith(TestProgram, out, testing.allocator, testing.io, .{ .workspace = @import("workspace.zig").forTests(), .arena = out }, &student, &trainset, .{
             .seed = case.seed,
             .strategy = "probe -> probe",
             .valset_ratio = 0,
@@ -753,7 +752,7 @@ test "BetterTogether retains first validation tie and distinct memoized LM snaps
         try optimize.Example.fromJson(out, "{\"question\":\"q\"}", &.{"question"}),
     };
     var change: TestOptimizer = .{};
-    const result = try testOptimizer().compileWith(TestProgram, out, testing.allocator, testing.io, .{ .arena = out }, &student, &examples, .{ .seed = 9, .strategy = "improve -> improve", .valset = &examples }, .{ .improve = &change });
+    const result = try testOptimizer().compileWith(TestProgram, out, testing.allocator, testing.io, .{ .workspace = @import("workspace.zig").forTests(), .arena = out }, &student, &examples, .{ .seed = 9, .strategy = "improve -> improve", .valset = &examples }, .{ .improve = &change });
     try testing.expectEqual(@as(i64, 0), result.program.stage);
     try testing.expect(result.program.compiled);
     try testing.expect(!result.flag_compilation_error_occurred);
@@ -803,7 +802,7 @@ test "BetterTogether inherits the validation error limit unless explicitly overr
             out,
             testing.allocator,
             testing.io,
-            .{ .arena = out, .max_errors = 1 },
+            .{ .workspace = @import("workspace.zig").forTests(), .arena = out, .max_errors = 1 },
             &student,
             rows[1..],
             .{ .seed = 0, .strategy = "improve", .valset = &rows, .max_errors = limit },
@@ -834,12 +833,12 @@ test "BetterTogether passes a raw teacher program prevalidates overrides and rea
     };
     var probe: TestTeacherProbe = .{};
     const invalid = [_]CompileArgs{.{ .key = "probe", .valset = .{ .value = null } }};
-    try testing.expectError(error.InvalidCompileArgument, testOptimizer().compileWith(TestProgram, out, testing.allocator, testing.io, .{ .arena = out }, &student, &examples, .{ .seed = 9, .strategy = "probe", .valset_ratio = 0, .optimizer_compile_args = &invalid }, .{ .probe = &probe }));
+    try testing.expectError(error.InvalidCompileArgument, testOptimizer().compileWith(TestProgram, out, testing.allocator, testing.io, .{ .workspace = @import("workspace.zig").forTests(), .arena = out }, &student, &examples, .{ .seed = 9, .strategy = "probe", .valset_ratio = 0, .optimizer_compile_args = &invalid }, .{ .probe = &probe }));
     try testing.expectEqual(@as(u32, 0), probe.calls);
 
     const oversized_teachers = [_]finetune.Teacher{ .student, .student, .student };
     const oversized_args = [_]CompileArgs{.{ .key = "probe", .teacher = .{ .list = &oversized_teachers } }};
-    try testing.expectError(error.MetaTeacherLimit, testOptimizer().compileWith(TestProgram, out, testing.allocator, testing.io, .{ .arena = out }, &student, &examples, .{ .seed = 9, .strategy = "probe", .valset_ratio = 0, .optimizer_compile_args = &oversized_args }, .{ .probe = &probe }));
+    try testing.expectError(error.MetaTeacherLimit, testOptimizer().compileWith(TestProgram, out, testing.allocator, testing.io, .{ .workspace = @import("workspace.zig").forTests(), .arena = out }, &student, &examples, .{ .seed = 9, .strategy = "probe", .valset_ratio = 0, .optimizer_compile_args = &oversized_args }, .{ .probe = &probe }));
     try testing.expectEqual(@as(u32, 0), probe.calls);
 
     probe.instruction = "teacher visible mutation";
@@ -848,7 +847,7 @@ test "BetterTogether passes a raw teacher program prevalidates overrides and rea
         .key = "probe",
         .teacher = .{ .program = finetune.Teacher.init(TestProgram, &raw_teacher).program },
     }};
-    const result = try testOptimizer().compileWith(TestProgram, out, testing.allocator, testing.io, .{ .arena = out }, &student, &examples, .{ .seed = 9, .strategy = "probe", .valset_ratio = 0, .teachers = &teachers, .optimizer_compile_args = &raw }, .{ .probe = &probe });
+    const result = try testOptimizer().compileWith(TestProgram, out, testing.allocator, testing.io, .{ .workspace = @import("workspace.zig").forTests(), .arena = out }, &student, &examples, .{ .seed = 9, .strategy = "probe", .valset_ratio = 0, .teachers = &teachers, .optimizer_compile_args = &raw }, .{ .probe = &probe });
     try testing.expect(result.flag_compilation_error_occurred);
     try testing.expectEqual(@as(u32, 1), probe.calls);
     try testing.expect(probe.typed == &raw_teacher);
@@ -873,7 +872,7 @@ test "BetterTogether bounds overridden validation before optimizer execution" {
     optimizer.limits.max_examples = 1;
     var change: TestOptimizer = .{};
     const arguments = [_]CompileArgs{.{ .key = "change", .valset = .{ .value = &examples } }};
-    try testing.expectError(error.MetaExampleLimit, optimizer.compileWith(TestProgram, out, testing.allocator, testing.io, .{ .arena = out }, &student, examples[0..1], .{ .seed = 9, .strategy = "change", .valset_ratio = 0, .optimizer_compile_args = &arguments }, .{ .change = &change }));
+    try testing.expectError(error.MetaExampleLimit, optimizer.compileWith(TestProgram, out, testing.allocator, testing.io, .{ .workspace = @import("workspace.zig").forTests(), .arena = out }, &student, examples[0..1], .{ .seed = 9, .strategy = "change", .valset_ratio = 0, .optimizer_compile_args = &arguments }, .{ .change = &change }));
     try testing.expectEqual(@as(i64, 0), student.stage);
 }
 
@@ -891,7 +890,7 @@ test "BetterTogether refuses instruction mutation through a const teacher" {
     };
     const teachers = [_]finetune.Teacher{finetune.Teacher.init(TestProgram, &teacher)};
     var change: TestOptimizer = .{ .instruction = "must not overwrite const teacher" };
-    const result = try testOptimizer().compileWith(TestProgram, out, testing.allocator, testing.io, .{ .arena = out }, &student, &examples, .{ .seed = 9, .strategy = "change", .valset_ratio = 0, .teachers = &teachers }, .{ .change = &change });
+    const result = try testOptimizer().compileWith(TestProgram, out, testing.allocator, testing.io, .{ .workspace = @import("workspace.zig").forTests(), .arena = out }, &student, &examples, .{ .seed = 9, .strategy = "change", .valset_ratio = 0, .teachers = &teachers }, .{ .change = &change });
     try testing.expect(result.flag_compilation_error_occurred);
     try testing.expectEqual(@as(usize, 1), result.candidate_programs.len);
     try testing.expectEqualStrings(instructions, teacher.first.state.instructions);
@@ -910,7 +909,7 @@ test "BetterTogether keeps last unvalidated success restores all LMs and preserv
     };
     var change: TestOptimizer = .{ .replacement = replacement.lm() };
     var failure: TestOptimizer = .{ .fail = true, .instruction = "shared class mutation" };
-    const result = try testOptimizer().compileWith(TestProgram, out, testing.allocator, testing.io, .{ .arena = out }, &student, &examples, .{ .seed = 9, .strategy = "improve -> improve -> fail", .valset_ratio = 0 }, .{ .improve = &change, .fail = &failure });
+    const result = try testOptimizer().compileWith(TestProgram, out, testing.allocator, testing.io, .{ .workspace = @import("workspace.zig").forTests(), .arena = out }, &student, &examples, .{ .seed = 9, .strategy = "improve -> improve -> fail", .valset_ratio = 0 }, .{ .improve = &change, .fail = &failure });
     try testing.expect(result.flag_compilation_error_occurred);
     try testing.expectEqual(@as(i64, 2), result.program.stage);
     try testing.expectEqualStrings("improve -> improve", result.candidate_programs[2].strategy);

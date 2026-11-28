@@ -16,6 +16,7 @@ const adapter_mod = @import("adapter.zig");
 const lm_mod = @import("lm.zig");
 const signature = @import("signature.zig");
 const value = @import("value.zig");
+const Workspace = @import("workspace.zig").Workspace;
 const tool_mod = @import("tool.zig");
 const inference = @import("inference.zig");
 const usage_mod = @import("usage_tracker.zig");
@@ -112,6 +113,9 @@ pub const PredictConfig = struct {
 pub const Context = struct {
     /// Per-call scratch: prompts, completions, parsed outputs.
     arena: Allocator,
+    /// Caller-reserved fixed scratch for internal per-example and per-step
+    /// scopes (TigerStyle static allocation). Owned by one thread at a time.
+    workspace: ?*Workspace = null,
     /// Settings-level fallback; bound predictors can run without one.
     lm: lm_mod.LM = lm_mod.LM.unconfigured,
     /// Privileged per-call override. Explicit null selects the settings LM.
