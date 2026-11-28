@@ -4100,7 +4100,7 @@ test "detailed evaluation preserves successful predictions after scratch reuse" 
     try testing.expectEqual(result.summary, concurrent.summary);
     var bytes: std.Io.Writer.Allocating = .init(testing.allocator);
     defer bytes.deinit();
-    try concurrent.writeCsv(testing.allocator, &bytes.writer, "reward");
+    try concurrent.writeCsv(dszig.workspace.forTests(), &bytes.writer, "reward");
     try testing.expectEqualStrings(
         "question,answer,reward\r\n" ++
             "first,first,1.0\r\n" ++

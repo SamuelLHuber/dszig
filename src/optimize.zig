@@ -12,6 +12,7 @@ const Allocator = std.mem.Allocator;
 const predict = @import("predict.zig");
 const pyrandom = @import("pyrandom.zig");
 const value = @import("value.zig");
+const Workspace = @import("workspace.zig").Workspace;
 const Context = predict.Context;
 const Trace = predict.Trace;
 const Record = value.Record;
@@ -151,16 +152,15 @@ pub const DetailedEvaluation = struct {
     /// metric's column name and owns the destination and its flushing.
     pub fn writeJson(
         self: DetailedEvaluation,
-        gpa: Allocator,
+        workspace: *Workspace,
         writer: *std.Io.Writer,
         metric_name: []const u8,
     ) !void {
-        var scratch: std.heap.ArenaAllocator = .init(gpa);
-        defer scratch.deinit();
         try writer.writeByte('[');
         for (self.rows, 0..) |row, index| {
             if (index != 0) try writer.writeAll(", ");
-            _ = scratch.reset(.retain_capacity);
+            var scratch = workspace.open();
+            defer scratch.close();
             const record = try evaluationOutput(scratch.allocator(), row, metric_name);
             try @import("pyjson.zig").writeJsonDepth(writer, .{ .object = record }, .compact, 1, true);
         }
@@ -170,12 +170,12 @@ pub const DetailedEvaluation = struct {
     /// Write a CSV table, with columns in first-seen order across all rows.
     pub fn writeCsv(
         self: DetailedEvaluation,
-        gpa: Allocator,
+        workspace: *Workspace,
         writer: *std.Io.Writer,
         metric_name: []const u8,
     ) !void {
-        var table: std.heap.ArenaAllocator = .init(gpa);
-        defer table.deinit();
+        var table = workspace.open();
+        defer table.close();
         const arena = table.allocator();
         const records = try arena.alloc(Record, self.rows.len);
         var columns: Record = .empty;
@@ -188,7 +188,7 @@ pub const DetailedEvaluation = struct {
             try writeCsvCell(writer, key, columns.count() == 1);
         }
         try writer.writeAll("\r\n");
-        var cell: std.Io.Writer.Allocating = .init(gpa);
+        var cell: std.Io.Writer.Allocating = .init(arena);
         defer cell.deinit();
         for (records) |*record| {
             for (columns.keys(), 0..) |key, index| {
