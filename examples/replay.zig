@@ -46,7 +46,7 @@ pub fn main(init: std.process.Init) !void {
     };
     const suite_buffer = try arena.alloc(u8, suite.arena_bytes_max);
     var suite_arena: std.heap.FixedBufferAllocator = .init(suite_buffer);
-    const result = try suite.run(suite_arena.threadSafeAllocator(), init.gpa, replay.lm());
+    const result = try suite.run(suite_arena.threadSafeAllocator(), init.gpa, replay.lm(), try .fromTranscript(transcript));
     if (!replay.exhausted()) return error.TranscriptNotExhausted;
     try suite.verifyTranscript(arena, transcript, result);
     var buffer: [512]u8 = undefined;

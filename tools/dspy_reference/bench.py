@@ -44,8 +44,9 @@ class TimedReplayLM(live_suite.ReplayLM):
 
 def run_once(transcript, boundaries):
     start = time.perf_counter()
+    sampling = live_suite.settings(transcript)
     lm = TimedReplayLM(transcript["calls"], supports_reasoning=transcript["supports_reasoning"],
-                       capabilities=transcript, clock_start=start)
+                       capabilities=transcript, temperature=sampling["temperature"], clock_start=start)
     original = live_suite.pipeline
 
     def timed_pipeline(*args, **kwargs):
@@ -54,7 +55,7 @@ def run_once(transcript, boundaries):
 
     live_suite.pipeline = timed_pipeline
     try:
-        result = live_suite.run_suite(lm)
+        result = live_suite.run_suite(lm, copro_init_temperature=sampling["copro_init_temperature"])
     finally:
         live_suite.pipeline = original
     total = time.perf_counter() - start

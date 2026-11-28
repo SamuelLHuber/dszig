@@ -15,6 +15,13 @@ from dspy.lm15 import CitationPart, ContinuationState, Message, TextPart, Thinki
 import reference as ref
 
 TEMPERATURE = 0.0
+COPRO_INIT_TEMPERATURE = 1.4
+
+
+def settings(transcript):
+    """Sampling settings a transcript was recorded with (see live_suite.zig Settings)."""
+    return {"temperature": transcript.get("temperature", TEMPERATURE),
+            "copro_init_temperature": transcript.get("copro_init_temperature", COPRO_INIT_TEMPERATURE)}
 DATES = json.loads((pathlib.Path(__file__).resolve().parents[2] / "examples" / "dates.json").read_text(encoding="utf-8"))
 
 
@@ -65,7 +72,7 @@ def cases():
     ]
 
 
-def run_suite(lm):
+def run_suite(lm, copro_init_temperature=COPRO_INIT_TEMPERATURE):
     """Run every case and every optimizer pipeline on `lm`."""
     out = {"cases": []}
     for name, make, adapter, demos, inputs in cases():
@@ -104,7 +111,7 @@ def run_suite(lm):
         rag_agent, dspy.BootstrapFewShot(metric=ref.keyword_metric, max_bootstrapped_demos=2, max_labeled_demos=0),
         ref.trainset(), ref.trainset(), ref.keyword_metric,
     )
-    copro = dspy.COPRO(metric=exact_metric, breadth=COPRO_BREADTH, depth=COPRO_DEPTH)
+    copro = dspy.COPRO(metric=exact_metric, breadth=COPRO_BREADTH, depth=COPRO_DEPTH, init_temperature=copro_init_temperature)
     out["dates_copro"] = pipeline(
         DateQA, copro, date_examples("train"), date_examples("dev"), exact_metric,
         eval_kwargs={"num_threads": 1, "display_progress": False},
@@ -324,10 +331,10 @@ class RecordingLM(dspy.LM):
     """A real dspy.LM that also appends every call to `self.calls`. `copy()`
     is shallow, so rollout copies share the list."""
 
-    def __init__(self, model, **kwargs):
+    def __init__(self, model, temperature=TEMPERATURE, **kwargs):
         self._execution_controls = ref.ExecutionControls()
         callbacks = [*kwargs.pop("callbacks", []), self._execution_controls]
-        super().__init__(model, temperature=TEMPERATURE, cache=False, num_retries=8, callbacks=callbacks, **kwargs)
+        super().__init__(model, temperature=temperature, cache=False, num_retries=8, callbacks=callbacks, **kwargs)
         self.calls = []
 
     def update_history(self, entry):
@@ -339,8 +346,8 @@ class ReplayLM(ref.ReferenceLM):
     """Answers each request with the first unused recorded call whose
     messages are identical; any other request is a mismatch."""
 
-    def __init__(self, calls, supports_reasoning=False, capabilities=None):
-        super().__init__(model="dszig/replay", model_type="chat", temperature=TEMPERATURE, max_tokens=None, cache=False)
+    def __init__(self, calls, supports_reasoning=False, capabilities=None, temperature=TEMPERATURE):
+        super().__init__(model="dszig/replay", model_type="chat", temperature=temperature, max_tokens=None, cache=False)
         self._reasoning_supported = supports_reasoning
         self._capabilities = capabilities or {}
         self.calls = calls

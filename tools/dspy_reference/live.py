@@ -24,8 +24,13 @@ def main():
     if model_type is None:
         sys.exit("DSZIG_LIVE_API must be chat_completions or responses")
     client = {"api_base": os.environ["OPENAI_BASE_URL"]} if os.environ.get("OPENAI_BASE_URL") else {}
-    lm = live_suite.RecordingLM(model, model_type=model_type, **client)
-    result = live_suite.run_suite(lm)
+    temperature = float(os.environ.get("DSZIG_LIVE_TEMPERATURE", live_suite.TEMPERATURE))
+    copro_temperature = float(os.environ.get("DSZIG_LIVE_COPRO_TEMPERATURE", live_suite.COPRO_INIT_TEMPERATURE))
+    lm = live_suite.RecordingLM(model, temperature=temperature, model_type=model_type, **client)
+    result = live_suite.run_suite(lm, copro_init_temperature=copro_temperature)
+    sampling = {**({"temperature": temperature} if temperature != live_suite.TEMPERATURE else {}),
+                **({"copro_init_temperature": copro_temperature}
+                   if copro_temperature != live_suite.COPRO_INIT_TEMPERATURE else {})}
     transcript = {"target_dspy": dspy.__version__, "runtime": f"dspy {dspy.__version__}", "model": model,
                   "supports_reasoning": lm.supports_reasoning,
                   "supports_response_format": "response_format" in lm.supported_params,
@@ -33,7 +38,7 @@ def main():
                   "supports_function_calling": lm.supports_function_calling,
                   "records_tool_result_names": True,
                   "supported_params": sorted(lm.supported_params),
-                  "calls": lm.calls, **result}
+                  **sampling, "calls": lm.calls, **result}
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(transcript, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     scores = "; ".join(f"{p} {result[p]['baseline']}% -> {result[p]['optimized']}%" for p in ("rag", "dates", "dates_search", "dates_mipro", "dates_mipro_aware", "dates_copro", "rag_react", "dates_simba", "dates_gepa"))

@@ -2,7 +2,7 @@
 //! (tools/dspy_reference/gen_suite_replay.py). This is mock-provider parity,
 //! not live-model evidence. Every request must byte-match DSPy's recording,
 //! every call must be consumed, and outputs, scores and artifacts must agree.
-//! Historical real-model recordings remain unchanged under fixtures/live/.
+//! check.sh replays the real-model recordings under fixtures/live/.
 
 const std = @import("std");
 const dszig = @import("dszig");
@@ -42,7 +42,7 @@ test "DSZig reproduces DSPy 3.5.0's independently recorded deterministic suite" 
         .supports_decision_requests = if (transcript.object.get("supports_decision_requests")) |value| value.bool else false,
     };
 
-    const result = try suite.run(arena, testing.allocator, replay.lm());
+    const result = try suite.run(arena, testing.allocator, replay.lm(), try .fromTranscript(transcript));
     try testing.expectEqual(@as(usize, 0), replay.misses);
     try testing.expect(replay.exhausted());
 
@@ -55,7 +55,7 @@ test "DSZig reproduces DSPy 3.5.0's independently recorded deterministic suite" 
             try testing.expectEqualStrings(try compact(arena, outputs), try compact(arena, .{ .object = got.outputs.? }));
         }
     }
-    const mine_json = try suite.writeTranscript(arena, "dszig", "replay", replay.lm(), calls, result);
+    const mine_json = try suite.writeTranscript(arena, "dszig", "replay", replay.lm(), calls, result, .{});
     const mine_root = try std.json.parseFromSliceLeaky(dszig.Value, arena, mine_json, .{});
     inline for (suite.pipeline_names) |name| {
         const want = transcript.object.get(name).?.object;

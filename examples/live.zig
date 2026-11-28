@@ -373,8 +373,12 @@ pub fn main(init: std.process.Init) !void {
         try w.flush();
         return;
     }
-    const result = try suite.run(arena, init.gpa, recorder.lm());
-    const json = try suite.writeTranscript(arena, "dszig", model, recorder.lm(), recorder.calls.items, result);
+    const settings: suite.Settings = .{
+        .temperature = try float(init.environ_map.get("DSZIG_LIVE_TEMPERATURE"), "DSZIG_LIVE_TEMPERATURE", 0.0),
+        .copro_init_temperature = try float(init.environ_map.get("DSZIG_LIVE_COPRO_TEMPERATURE"), "DSZIG_LIVE_COPRO_TEMPERATURE", 1.4),
+    };
+    const result = try suite.run(arena, init.gpa, recorder.lm(), settings);
+    const json = try suite.writeTranscript(arena, "dszig", model, recorder.lm(), recorder.calls.items, result, settings);
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = out_path, .data = json });
     for (result.cases) |c| {
         try w.print("{s}: {s}\n", .{ c.name, if (c.err) |e| @errorName(e) else "ok" });
@@ -674,6 +678,14 @@ fn smokeCall(arena: std.mem.Allocator, call: *const dszig.lm.ReplayLM.Call) !dsz
         try row.put(arena, "adaptations", .{ .array = adaptations });
     }
     return .{ .object = row };
+}
+
+fn float(raw: ?[]const u8, name: []const u8, default: f64) !f64 {
+    const text = raw orelse return default;
+    return std.fmt.parseFloat(f64, text) catch {
+        std.log.err("{s} must be a number", .{name});
+        std.process.exit(2);
+    };
 }
 
 fn enabled(raw: ?[]const u8, name: []const u8) bool {

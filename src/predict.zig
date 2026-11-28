@@ -1099,7 +1099,12 @@ fn runAdapterMany(ctx: Context, predictor: ?*const PredictState, signature_class
         }
         o.* = .empty;
         try o.ensureTotalCapacity(ctx.arena, original.outputs.len);
-        for (original.outputs) |f| {
+        // DSPy `_call_postprocess` appends fields removed for native
+        // features (native reasoning, native tool calls) after the parse.
+        for ([_]bool{ false, true }) |removed_pass| for (original.outputs) |f| {
+            const removed = (f.native_reasoning and native) or
+                (use_native_tools and std.mem.eql(u8, f.name, tool_output.?.name));
+            if (removed != removed_pass) continue;
             const is_tool_output = if (tool_output) |field| std.mem.eql(u8, f.name, field.name) else false;
             const v = if (f.native_citations and c.citations.len != 0)
                 try (try @import("citation.zig").Citations.fromParts(ctx.arena, c.citations)).toRuntime(ctx.arena)
@@ -1115,7 +1120,7 @@ fn runAdapterMany(ctx: Context, predictor: ?*const PredictState, signature_class
                     (try signature.outputDefault(ctx.arena, f)) orelse
                     if (has_tool_calls or (use_native_tools and is_tool_output)) @as(@import("runtime_value.zig").Value, .null) else return error.AdapterParse;
             o.putAssumeCapacity(f.name, v);
-        }
+        };
     }
     return .{ .records = outputs, .responses = completions };
 }
@@ -2676,6 +2681,9 @@ test "native reasoning preserves absent summaries and records actual content" {
     const with = try cot.forward(ctx, .{ .question = "Capital?" });
     try testing.expectEqualStrings(native.summary.?, with.reasoning.?.content);
     try testing.expectEqualStrings(native.summary.?, (try signature.Reasoning.fromValue(trace.steps.items[1].outputs.get("reasoning").?)).content);
+    // DSPy appends natively returned reasoning after the parsed fields.
+    try testing.expectEqualStrings("answer", trace.steps.items[1].outputs.keys()[0]);
+    try testing.expectEqualStrings("reasoning", trace.steps.items[1].outputs.keys()[1]);
     native.summary = "";
     const empty = try cot.forward(ctx, .{ .question = "Capital?" });
     try testing.expectEqual(@as(?signature.Reasoning, null), empty.reasoning);

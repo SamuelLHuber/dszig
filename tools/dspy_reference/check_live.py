@@ -21,9 +21,10 @@ def main():
     if transcript.get("target_dspy") != live_suite.dspy.__version__:
         sys.exit(f"transcript targets {transcript.get('target_dspy', transcript.get('runtime'))!r}, "
                  f"not locked DSPy {live_suite.dspy.__version__}; historical evidence cannot be relabeled")
+    sampling = live_suite.settings(transcript)
     lm = live_suite.ReplayLM(transcript["calls"], supports_reasoning=transcript["supports_reasoning"],
-                            capabilities=transcript)
-    result = live_suite.run_suite(lm)
+                            capabilities=transcript, temperature=sampling["temperature"])
+    result = live_suite.run_suite(lm, copro_init_temperature=sampling["copro_init_temperature"])
     failures = []
     if lm.misses:
         failures.append(f"{len(lm.misses)} requests had no recorded twin")

@@ -12,11 +12,33 @@ const Record = dszig.value.Record;
 const Call = dszig.lm.ReplayLM.Call;
 
 pub const target_dspy = "3.5.0";
-pub const temperature = 0.0;
+/// Sampling settings of a recording. The defaults reproduce the deterministic
+/// mock suite; models that accept only temperature 1 (gpt-5.6-luna,
+/// gpt-6-luna) record with `temperature = 1` and COPRO's `init_temperature = 1`.
+/// Non-default values are written into the transcript so replays reuse them.
+pub const Settings = struct {
+    temperature: f64 = 0.0,
+    copro_init_temperature: f64 = 1.4,
+
+    pub fn fromTranscript(transcript: Value) error{InvalidTranscript}!Settings {
+        var settings: Settings = .{};
+        if (transcript.object.get("temperature")) |v| settings.temperature = try number(v);
+        if (transcript.object.get("copro_init_temperature")) |v| settings.copro_init_temperature = try number(v);
+        return settings;
+    }
+
+    fn number(v: Value) error{InvalidTranscript}!f64 {
+        return switch (v) {
+            .float => |f| f,
+            .integer => |i| @floatFromInt(i),
+            else => error.InvalidTranscript,
+        };
+    }
+};
 /// The suite arena is reserved once at startup and never grows; a run that
 /// outgrows it fails with OutOfMemory. A full run uses about 3 MiB on the mock
-/// transcript and 8.5 MiB on the committed gpt-4o-mini recordings, so this
-/// leaves over 3x headroom for longer real completions.
+/// transcript and 9 MiB on the committed gpt-5.6-luna and gpt-6-luna
+/// recordings, so this leaves over 3x headroom for longer real completions.
 pub const arena_bytes_max = 32 * 1024 * 1024;
 
 pub const Typed = dszig.Signature(struct {
@@ -136,8 +158,8 @@ pub const Result = struct {
     dates_gepa: Pipeline,
 };
 
-pub fn run(arena: Allocator, gpa: Allocator, lm: dszig.LM) !Result {
-    const base: dszig.Context = .{ .arena = arena, .lm = lm, .lm_options = .{ .temperature = temperature } };
+pub fn run(arena: Allocator, gpa: Allocator, lm: dszig.LM, settings: Settings) !Result {
+    const base: dszig.Context = .{ .arena = arena, .lm = lm, .lm_options = .{ .temperature = settings.temperature } };
     var result: Result = undefined;
     result.cases = .{
         try runCase(dszig.ChainOfThought(rag.QA), base, .chat, "cot_qa_chat", qa_demos, qa_input),
@@ -179,7 +201,12 @@ pub fn run(arena: Allocator, gpa: Allocator, lm: dszig.LM) !Result {
     result.dates_mipro_aware = try pipeline(DateQA, .{}, arena, gpa, ctx, aware, dates_train, dates_dev, exactMetric);
     const react_optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 2, .max_labeled_demos = 0 };
     result.rag_react = try pipeline(RagAgent, try RagAgent.init(arena), arena, gpa, ctx, react_optimizer, rag_set, rag_set, rag.keywordMetric);
-    const copro: dszig.COPRO = .{ .metric = exactMetric, .breadth = copro_breadth, .depth = copro_depth };
+    const copro: dszig.COPRO = .{
+        .metric = exactMetric,
+        .breadth = copro_breadth,
+        .depth = copro_depth,
+        .init_temperature = settings.copro_init_temperature,
+    };
     result.dates_copro = try pipeline(DateQA, .{}, arena, gpa, ctx, copro, dates_train, dates_dev, exactMetric);
     const simba: dszig.SIMBA = .{
         .metric = exactMetric,
@@ -540,7 +567,7 @@ pub fn parseCalls(arena: Allocator, transcript: Value) ![]const Call {
 
 /// Transcript JSON in the layout tools/dspy_reference/live.py writes.
 /// Capabilities are the actual LM's advertised native features.
-pub fn writeTranscript(arena: Allocator, runtime: []const u8, model: []const u8, lm: dszig.LM, calls: []const Call, result: Result) ![]const u8 {
+pub fn writeTranscript(arena: Allocator, runtime: []const u8, model: []const u8, lm: dszig.LM, calls: []const Call, result: Result, settings: Settings) ![]const u8 {
     var call_values: dszig.Array = .init(arena);
     for (calls) |call| {
         var messages: dszig.Array = .init(arena);
@@ -620,6 +647,10 @@ pub fn writeTranscript(arena: Allocator, runtime: []const u8, model: []const u8,
     try root.put(arena, "supports_function_calling", .{ .bool = lm.supports_function_calling });
     try root.put(arena, "records_tool_result_names", .{ .bool = true });
     if (lm.supports_decision_requests) try root.put(arena, "supports_decision_requests", .{ .bool = true });
+    const defaults: Settings = .{};
+    if (settings.temperature != defaults.temperature) try root.put(arena, "temperature", .{ .float = settings.temperature });
+    if (settings.copro_init_temperature != defaults.copro_init_temperature)
+        try root.put(arena, "copro_init_temperature", .{ .float = settings.copro_init_temperature });
     try root.put(arena, "calls", .{ .array = call_values });
     try appendResult(arena, &root, result);
     var aw: std.Io.Writer.Allocating = .init(arena);
