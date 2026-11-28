@@ -1,5 +1,6 @@
 //! DSPy Image stores a URL reference or a data URI. Only explicit I/O helpers
 //! fetch or open media; inline media validation is deferred to formatting.
+const Workspace = @import("workspace.zig").Workspace;
 const std = @import("std");
 const file_module = @import("file.zig");
 const File = file_module.File;
@@ -83,12 +84,13 @@ pub const Image = struct {
     /// The resulting URI belongs to arena.
     pub fn fromUrl(
         arena: Allocator,
+        workspace: *Workspace,
         client: *std.http.Client,
         url: []const u8,
         options: UrlOptions,
     ) !Image {
-        var scratch: std.heap.ArenaAllocator = .init(client.allocator);
-        defer scratch.deinit();
+        var scratch = workspace.open();
+        defer scratch.close();
         const response = try media_download.download(scratch.allocator(), client, url, options);
         defer client.allocator.free(response.body);
         const mime = response.content_type orelse "";

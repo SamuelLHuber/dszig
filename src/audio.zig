@@ -1,5 +1,6 @@
 //! DSPy 3.5 Audio for already encoded audio. Only explicit I/O constructors
 //! access files or URLs. No constructor decodes, sniffs, or transcodes audio.
+const Workspace = @import("workspace.zig").Workspace;
 const std = @import("std");
 const file_model = @import("file.zig");
 const media_download = @import("media_download.zig");
@@ -185,12 +186,13 @@ pub const Audio = struct {
     /// provided. Redirect targets must also be trusted. Both fields are owned.
     pub fn fromUrl(
         allocator: Allocator,
+        workspace: *Workspace,
         client: *std.http.Client,
         url: []const u8,
         options: UrlOptions,
     ) !Audio {
-        var scratch: std.heap.ArenaAllocator = .init(client.allocator);
-        defer scratch.deinit();
+        var scratch = workspace.open();
+        defer scratch.close();
         const response = try media_download.download(scratch.allocator(), client, url, options);
         defer client.allocator.free(response.body);
         const format_name = try formatFromMime(response.content_type orelse "audio/wav");

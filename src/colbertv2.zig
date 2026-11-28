@@ -3,6 +3,7 @@
 //! Cache keys are native identities, not Python diskcache-compatible hashes.
 //!
 //! Upstream (DSPy 3.5.0): dspy/dsp/colbertv2.py
+const Workspace = @import("workspace.zig").Workspace;
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Writer = std.Io.Writer;
@@ -71,13 +72,15 @@ pub const Result = struct {
 pub const ColBERTv2 = struct {
     client: *std.http.Client,
     cache: *request_cache.Cache,
+    /// Fixed scratch for request URLs, bodies and responses.
+    workspace: *Workspace,
     /// Borrowed unless init appends a truthy port into its supplied arena.
     url: []const u8 = "http://0.0.0.0",
     post_requests: bool = false,
     max_response_bytes: usize = 4 * 1024 * 1024,
     timeout_ns: ?u64 = 10_000_000_000,
 
-    pub fn init(arena: Allocator, client: *std.http.Client, cache: *request_cache.Cache, options: Options) !ColBERTv2 {
+    pub fn init(arena: Allocator, client: *std.http.Client, cache: *request_cache.Cache, workspace: *Workspace, options: Options) !ColBERTv2 {
         var url = options.url;
         if (options.port) |port| switch (port) {
             .string => |text| {
@@ -90,6 +93,7 @@ pub const ColBERTv2 = struct {
         return .{
             .client = client,
             .cache = cache,
+            .workspace = workspace,
             .url = url,
             .post_requests = options.post_requests,
             .max_response_bytes = options.max_response_bytes,
@@ -168,8 +172,8 @@ pub const ColBERTv2 = struct {
     }
 
     fn fetch(self: *ColBERTv2, query: []const u8, k: i64) !*request_cache.Payload {
-        var scratch: std.heap.ArenaAllocator = .init(self.client.allocator);
-        defer scratch.deinit();
+        var scratch = self.workspace.open();
+        defer scratch.close();
         const arena = scratch.allocator();
         const url = if (self.post_requests) self.url else try getRequestUrl(arena, self.url, query, k);
         const body = if (self.post_requests) try postRequestBody(arena, query, k) else null;
