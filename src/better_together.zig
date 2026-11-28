@@ -406,7 +406,10 @@ pub const BetterTogether = struct {
                 set,
                 self.metric,
                 options.max_errors orelse request.ctx.max_errors,
-            ) catch break :score 0; // Source scores failed evaluations as zero.
+            ) catch |err| switch (err) {
+                error.WorkspaceRequired => return err,
+                else => break :score 0, // Source scores failed evaluations as zero.
+            };
             break :score evaluation.score;
         } else null;
         return .{
