@@ -84,13 +84,13 @@ pub const Image = struct {
     /// The resulting URI belongs to arena.
     pub fn fromUrl(
         arena: Allocator,
-        workspace: *Workspace,
         client: *std.http.Client,
         url: []const u8,
         options: UrlOptions,
     ) !Image {
-        var scratch = workspace.open();
-        defer scratch.close();
+        // Headers and redirect URLs only; the body stays on client.allocator.
+        var scratch_buffer: [64 * 1024]u8 = undefined;
+        var scratch: std.heap.FixedBufferAllocator = .init(&scratch_buffer);
         const response = try media_download.download(scratch.allocator(), client, url, options);
         defer client.allocator.free(response.body);
         const mime = response.content_type orelse "";

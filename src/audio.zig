@@ -186,13 +186,13 @@ pub const Audio = struct {
     /// provided. Redirect targets must also be trusted. Both fields are owned.
     pub fn fromUrl(
         allocator: Allocator,
-        workspace: *Workspace,
         client: *std.http.Client,
         url: []const u8,
         options: UrlOptions,
     ) !Audio {
-        var scratch = workspace.open();
-        defer scratch.close();
+        // Headers and redirect URLs only; the body stays on client.allocator.
+        var scratch_buffer: [64 * 1024]u8 = undefined;
+        var scratch: std.heap.FixedBufferAllocator = .init(&scratch_buffer);
         const response = try media_download.download(scratch.allocator(), client, url, options);
         defer client.allocator.free(response.body);
         const format_name = try formatFromMime(response.content_type orelse "audio/wav");
