@@ -55,9 +55,11 @@ pub const Workspace = struct {
             assert(ws.depth == scope.depth);
             assert(scope.mark <= ws.fixed.buffer.len);
             ws.depth -= 1;
+            // Outer frees are ignored while this scope is open, so nothing
+            // below the mark is released early.
+            assert(ws.fixed.end_index >= scope.mark);
             ws.used_peak = @max(ws.used_peak, ws.fixed.end_index);
-            // Freeing the newest pre-scope allocation can leave end_index below the mark.
-            ws.fixed.end_index = @min(ws.fixed.end_index, scope.mark);
+            ws.fixed.end_index = scope.mark;
             scope.* = undefined;
         }
 
@@ -86,7 +88,9 @@ pub const Workspace = struct {
 
         fn free(ptr: *anyopaque, memory: []u8, alignment: Alignment, ret_addr: usize) void {
             const scope: *Scope = @ptrCast(@alignCast(ptr));
-            // Releasing an outer allocation early is harmless; close resets anyway.
+            // An outer scope's bytes stay reserved until it closes; reclaiming
+            // them under an open inner scope would strand them below its mark.
+            if (scope.ws.depth != scope.depth) return;
             scope.ws.fixed.allocator().rawFree(memory, alignment, ret_addr);
         }
     };
@@ -128,14 +132,17 @@ test "scopes release in LIFO order and never grow past the buffer" {
     try testing.expectEqual(@as(usize, 256), ws.capacity());
 }
 
-test "closing after freeing the newest pre-scope allocation keeps the lower index" {
+test "outer frees under an open inner scope wait for the outer close" {
     var buffer: [64]u8 = undefined;
     var ws: Workspace = .init(&buffer);
     var outer = ws.open();
     const first = try outer.allocator().alloc(u8, 16);
     var inner = ws.open();
     outer.allocator().free(first);
+    _ = try inner.allocator().alloc(u8, 32);
     inner.close();
-    try testing.expectEqual(@as(usize, 0), ws.used());
+    try testing.expectEqual(@as(usize, 16), ws.used());
+    _ = try outer.allocator().alloc(u8, 48);
     outer.close();
+    try testing.expectEqual(@as(usize, 0), ws.used());
 }
