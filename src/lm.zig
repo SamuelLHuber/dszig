@@ -1431,9 +1431,7 @@ pub const LM = struct {
         if (index == 0 or base.fields.config.seed == .null)
             return lm.invokeSdkCandidate(arena, base);
 
-        var scratch: std.heap.ArenaAllocator = .init(arena);
-        defer scratch.deinit();
-        const seed = try candidateSeed(scratch.allocator(), base.fields.config.seed, index);
+        const seed = try candidateSeed(arena, base.fields.config.seed, index);
         const candidate = base.withSeed(arena, seed) catch |err|
             return if (err == error.OutOfMemory) error.OutOfMemory else error.LMFailure;
         defer candidate.release();

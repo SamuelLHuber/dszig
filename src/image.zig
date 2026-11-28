@@ -111,11 +111,7 @@ pub const Image = struct {
         const opened_stat = try file.stat(io);
         if (opened_stat.kind != .file) return error.InvalidImagePath;
         if (opened_stat.size > max_bytes) return error.StreamTooLong;
-        // A local path that looks like a data URI can produce allocated MIME
-        // scratch; keep that storage separate from the final URI.
-        var scratch: std.heap.ArenaAllocator = .init(arena);
-        defer scratch.deinit();
-        const guessed = try guessMime(scratch.allocator(), path) orelse
+        const guessed = try guessMime(arena, path) orelse
             return error.UnknownImageMimeType;
         if (!std.unicode.utf8ValidateSlice(guessed)) return error.InvalidImage;
         return encodeFile(arena, io, file, guessed, @intCast(opened_stat.size), max_bytes);
