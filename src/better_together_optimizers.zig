@@ -153,7 +153,7 @@ pub const COPRO = struct {
     /// Source scores on trainset, ignores standard teacher/valset, and accepts
     /// eval_kwargs. Native evaluation settings live in the typed optimizer.
     pub fn compile(self: *COPRO, comptime P: type, request: Request(P)) !P {
-        const result = try self.optimizer.compile(P, request.out, request.gpa, request.ctx, self.prompt, request.student, request.trainset);
+        const result = try self.optimizer.compile(P, request.out, request.ctx, self.prompt, request.student, request.trainset);
         return result.program;
     }
 };
@@ -259,8 +259,9 @@ pub const BootstrapFinetune = struct {
         // Traces, formatting and group discovery expire after native BFF has
         // joined every job. Retained models borrow original LM configuration
         // and the separate slots, not this per-attempt scratch.
-        var scratch: std.heap.ArenaAllocator = .init(request.gpa);
-        defer scratch.deinit();
+        const workspace = request.ctx.workspace orelse return error.WorkspaceRequired;
+        var scratch = workspace.open();
+        defer scratch.close();
         const arena = scratch.allocator();
         // Compute the exact number of LM/predictor training groups without
         // tracing or starting jobs. No heap allocation is used for alias checks.

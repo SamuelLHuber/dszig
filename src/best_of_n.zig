@@ -395,7 +395,7 @@ test "BestOfN distinguishes exact integer thresholds from rounded binary64" {
         var script: lm_mod.ScriptedLM = .{ .responses = &.{ "<answer>0</answer>", "<answer>1</answer>" } };
         var trace: Trace = .{ .arena = arena };
         var best = BestOfN(QA).init(.{}, .{ .n = 2, .reward_fn = Reward.score, .threshold = case.threshold });
-        const answer = (try best.forward(.{ .arena = arena, .lm = script.lm(), .trace = &trace }, .{ .question = "Q" })).?;
+        const answer = (try best.forward(.{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm(), .trace = &trace }, .{ .question = "Q" })).?;
         try testing.expectEqual(case.calls, script.index);
         try testing.expectEqual(case.winner, answer.answer);
         try testing.expectEqual(@as(usize, 1), trace.steps.items.len);
@@ -417,7 +417,7 @@ test "BestOfN first ties and selected trace survive reward trace reallocation an
         .reward_fn = TestProgram.reward,
         .threshold = .{ .float = std.math.inf(f64) },
     });
-    const ctx: Context = .{ .arena = arena, .lm = script.lm(), .trace = &trace };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm(), .trace = &trace };
     const result = (try best.forward(ctx, .{ .scores = &.{ 0.5, 0.5, 0.25 }, .reward_trace = true })).?;
     try testing.expectEqual(@as(usize, 0), result.attempt);
     try testing.expectEqual(@as(usize, 2), trace.steps.items.len);
@@ -525,7 +525,7 @@ test "BestOfN null results preserve NaN negative infinity and empty attempt sema
     const arena = memory.allocator();
     var script: lm_mod.ScriptedLM = .{ .responses = &.{} };
     var trace: Trace = .{ .arena = arena };
-    const ctx: Context = .{ .arena = arena, .lm = script.lm(), .trace = &trace };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm(), .trace = &trace };
     var best = BestOfN(TestProgram).init(.{}, .{
         .n = 2,
         .reward_fn = TestProgram.reward,
@@ -555,7 +555,7 @@ test "BestOfN program and reward failure budgets persist and check the attempt i
     defer memory.deinit();
     const arena = memory.allocator();
     var script: lm_mod.ScriptedLM = .{ .responses = &.{} };
-    const ctx: Context = .{ .arena = arena, .lm = script.lm() };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm() };
     for ([_]bool{ false, true }) |reward_fails| {
         var best = BestOfN(TestProgram).init(.{}, .{
             .n = 1,
@@ -602,7 +602,7 @@ test "BestOfN a final failed program or reward retains the earlier best and its 
             .reward_fn = TestProgram.reward,
             .threshold = .{ .float = std.math.inf(f64) },
         });
-        const result = (try best.forward(.{ .arena = arena, .lm = script.lm(), .trace = &trace }, .{
+        const result = (try best.forward(.{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm(), .trace = &trace }, .{
             .scores = &.{ 0.6, 0.2, 0.0 },
             .program_failures = if (reward_fails) &.{} else &.{2},
             .reward_failures = if (reward_fails) &.{2} else &.{},
@@ -620,7 +620,7 @@ test "BestOfN threshold errors spend the budget without discarding the best resu
     const arena = memory.allocator();
     var script: lm_mod.ScriptedLM = .{ .responses = &.{} };
     var trace: Trace = .{ .arena = arena };
-    const ctx: Context = .{ .arena = arena, .lm = script.lm(), .trace = &trace };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm(), .trace = &trace };
     var best = BestOfN(TestProgram).init(.{}, .{
         .n = 2,
         .reward_fn = TestProgram.reward,
@@ -677,7 +677,7 @@ test "BestOfN LM setup errors do not spend the budget or get hidden by an empty 
     };
     var memory: std.heap.ArenaAllocator = .init(testing.allocator);
     defer memory.deinit();
-    const ctx: Context = .{ .arena = memory.allocator() };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = memory.allocator() };
     var model: lm_mod.ScriptedLM = .{ .responses = &.{} };
     var best = BestOfN(Pair).init(.{}, .{ .n = 1, .reward_fn = Pair.reward, .threshold = .{ .integer = 1 } });
     try testing.expectError(error.NoLM, best.forward(ctx, .{ .question = "q" }));
@@ -753,7 +753,7 @@ test "BestOfN interruption aborts without spending budget or publishing the earl
         var trace: Trace = .{ .arena = arena };
         var best = BestOfN(QA).init(.{}, .{ .n = 3, .threshold = .{ .integer = 9 }, .reward_fn = Reward.score });
         try testing.expectError(interruption, best.forward(
-            .{ .arena = arena, .lm = lm.lm(), .trace = &trace },
+            .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = lm.lm(), .trace = &trace },
             .{ .question = "q" },
         ));
         try testing.expectEqual(@as(usize, 2), lm.index);

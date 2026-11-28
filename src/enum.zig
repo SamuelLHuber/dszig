@@ -451,12 +451,10 @@ fn EnumClass(comptime name: []const u8, comptime entries: []const Entry, comptim
                         if (lower == .lt or upper == .gt) return error.ParseValue;
                     }
                 }
-                var scratch: std.heap.ArenaAllocator = .init(arena);
-                defer scratch.deinit();
                 const parsed: ?Value = if (strict)
                     if (input == .integer or input == .number_string) input else null
                 else
-                    value.coerceInteger(scratch.allocator(), input) catch |err| switch (err) {
+                    value.coerceInteger(arena, input) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
                         error.ParseValue => null,
                     };

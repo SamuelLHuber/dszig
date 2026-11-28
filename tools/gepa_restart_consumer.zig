@@ -360,6 +360,7 @@ fn runReactHistory(init: std.process.Init, dir: []const u8, phase: []const u8) !
         .batch_sampler = .{ .ptr = &model, .max_batch_size = 1, .next = Callbacks.sample },
         .instruction_proposer = .{ .ptr = &model, .propose = Callbacks.propose },
     }).compile(Agent, arena, .{
+        .workspace = &workspace,
         .arena = arena,
         .lm = model.lm(),
         .json_fallback = false,
@@ -490,6 +491,10 @@ fn demoRecords(arena: std.mem.Allocator, answer: []const u8) ![]const dz.value.R
     demos[0] = (try dz.Example.fromJson(arena, try std.fmt.allocPrint(arena, "{{\"question\":\"demo-question\",\"answer\":\"{s}\"}}", .{answer}), &.{"question"})).record;
     return demos;
 }
+
+/// Fixed scratch for internal scopes, reserved statically.
+var workspace_buffer: [16 * 1024 * 1024]u8 = undefined;
+var workspace: dz.Workspace = .init(&workspace_buffer);
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -755,7 +760,7 @@ fn run(comptime Program: type, init: std.process.Init, args: []const [:0]const u
     }
     var student: Program = .{};
     if (tool_mode) student.state.fields = &tool_fields;
-    var ctx: dz.Context = .{ .arena = arena, .lm = workload.model.lm(), .adapter = if (response_format_mode) .json else if (changed_adapter) .chat else .xml, .json_fallback = changed_fallback };
+    var ctx: dz.Context = .{ .workspace = &workspace, .arena = arena, .lm = workload.model.lm(), .adapter = if (response_format_mode) .json else if (changed_adapter) .chat else .xml, .json_fallback = changed_fallback };
     if (tool_mode) ctx.use_native_function_calling = if (tool_capability_mode) true else if (changed_tools) false else if (resume_run) null else true;
     const chat_low = "[[ ## answer ## ]]\nlow\n\n[[ ## completed ## ]]";
     var extraction_lm: dz.lm.ScriptedLM = .{
@@ -1421,6 +1426,7 @@ fn runMerge(init: std.process.Init, dir: []const u8, phase: []const u8) !void {
         },
         .instruction_proposer = .{ .ptr = &workload, .propose = MergeWorkload.propose },
     }).compile(MergeWorkload.Program, arena, .{
+        .workspace = &workspace,
         .arena = arena,
         .lm = .{ .ptr = &workload, .vtable = &.{ .complete = MergeWorkload.complete } },
         .json_fallback = false,

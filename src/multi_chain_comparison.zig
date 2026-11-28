@@ -399,7 +399,7 @@ test "comparison requires exact count and preserves malformed proposal error pre
     var history: lm.History = .{ .arena = arena };
     var script: lm.ScriptedLM = .{ .responses = &.{}, .history = &history };
     var trace: predict.Trace = .{ .arena = arena };
-    const ctx: predict.Context = .{ .arena = arena, .lm = script.lm(), .trace = &trace };
+    const ctx: predict.Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm(), .trace = &trace };
     const compare: MultiChainComparison(OracleSignature, 2) = .{};
     var records = [_]Record{
         try completionRecord(arena, "{\"answer\":1}"),
@@ -424,7 +424,7 @@ test "comparison uses typed Predict with captured upstream prompt temperature tr
     var history: lm.History = .{ .arena = arena };
     var script: lm.ScriptedLM = .{ .responses = &.{ response, response, response, response }, .history = &history };
     var trace: predict.Trace = .{ .arena = arena };
-    const ctx: predict.Context = .{ .arena = arena, .lm = script.lm(), .trace = &trace, .json_fallback = false };
+    const ctx: predict.Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm(), .trace = &trace, .json_fallback = false };
     var compare: MultiChainComparison(OracleSignature, 2) = .{};
     const completions = [_]Record{
         try completionRecord(arena, "{\"rationale\":\"One\\nignored\",\"analysis\":\"not the answer\",\"answer\":41}"),
@@ -517,7 +517,7 @@ test "comparison input collisions override attempts without coercion and retain 
     var trace: predict.Trace = .{ .arena = arena };
     const compare: Compare = .{};
     const records = [_]Record{try completionRecord(arena, "{\"answer\":\"generated\"}")};
-    const out = try compare.forward(.{ .arena = arena, .lm = script.lm(), .trace = &trace }, &records, .{ .question = "Q" });
+    const out = try compare.forward(.{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm(), .trace = &trace }, &records, .{ .question = "Q" });
     try testing.expectEqualStrings("ok", out.answer);
     const inputs = trace.steps.items[0].inputs;
     try testing.expectEqual(@as(i64, 17), inputs.get("reasoning_attempt_1").?.integer);
@@ -560,7 +560,7 @@ test "comparison output collisions preserve metadata and reproduce upstream reve
         try completionRecord(arena, "{\"last\":\"b\"}"),
         try completionRecord(arena, "{\"last\":\"c\"}"),
     };
-    const out = try compare.forward(.{ .arena = arena, .lm = script.lm(), .trace = &trace }, &records, .{ .question = "Q" });
+    const out = try compare.forward(.{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm(), .trace = &trace }, &records, .{ .question = "Q" });
     try testing.expectEqual(@as(i64, 2), out.reasoning_attempt_2);
     try testing.expect(out.reasoning_attempt_1);
     try testing.expectEqualStrings("final", out.last);
@@ -590,7 +590,7 @@ test "comparison existing rationale output keeps its type default metadata and o
     var trace: predict.Trace = .{ .arena = arena };
     const compare: Compare = .{};
     const records = [_]Record{try completionRecord(arena, "{\"answer\":\"ignored\",\"rationale\":7}")};
-    const out = try compare.forward(.{ .arena = arena, .lm = script.lm(), .trace = &trace }, &records, .{ .question = "Q" });
+    const out = try compare.forward(.{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm(), .trace = &trace }, &records, .{ .question = "Q" });
     try testing.expectEqual(@as(i64, 9), out.rationale);
     try testing.expectEqualStrings("«I'm trying to 7 I'm not sure but my prediction is 7»", trace.steps.items[0].inputs.get("reasoning_attempt_1").?.string);
 }
@@ -713,7 +713,7 @@ test "comparison zero attempts accepts empty original input and retains output d
     compare.predict.state.instructions = "Optimizer instructions.";
     compare.predict.state.descs = &.{ "Optimizer rationale", "Optimizer answer" };
     compare.predict.state.prefixes = &.{ "Optimizer rationale:", "Optimizer answer:" };
-    const out = try compare.forward(.{ .arena = arena, .lm = script.lm() }, &.{}, .{});
+    const out = try compare.forward(.{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm() }, &.{}, .{});
     try testing.expectEqualStrings("default", out.answer);
     const system = history.last().?.messages[0].content.text;
     try testing.expect(std.mem.indexOf(u8, system, "Optimizer instructions.") != null);

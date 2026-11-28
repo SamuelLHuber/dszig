@@ -136,6 +136,9 @@ pub fn main(init: std.process.Init) !void {
     // that outgrows it fails with OutOfMemory instead of reserving more.
     const arena_buffer = try reserving.allocator().alloc(u8, suite.arena_bytes_max);
     defer reserving.allocator().free(arena_buffer);
+    const workspace_buffer = try reserving.allocator().alloc(u8, suite.workspace_bytes_max);
+    defer reserving.allocator().free(workspace_buffer);
+    var workspace: dszig.Workspace = .init(workspace_buffer);
     var arena_used_peak: usize = 0;
     for (0..reps) |rep| {
         var run_fixed: std.heap.FixedBufferAllocator = .init(arena_buffer);
@@ -158,7 +161,7 @@ pub fn main(init: std.process.Init) !void {
         // Dropping the fixed buffer's contents bypasses the meter.
         const live_before = requested.live;
         defer requested.live = live_before;
-        const result = try suite.run(arena_requests.allocator(), gpa.allocator(), timed.lm(), try .fromTranscript(transcript));
+        const result = try suite.run(arena_requests.allocator(), gpa.allocator(), &workspace, timed.lm(), try .fromTranscript(transcript));
         totals[rep] = elapsedNs(io, start);
         if (timed.count != n) return error.CallCountMismatch;
         if (!replay.exhausted()) return error.TranscriptNotExhausted;

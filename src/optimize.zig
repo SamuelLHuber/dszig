@@ -12,6 +12,7 @@ const Allocator = std.mem.Allocator;
 const predict = @import("predict.zig");
 const pyrandom = @import("pyrandom.zig");
 const value = @import("value.zig");
+const Workspace = @import("workspace.zig").Workspace;
 const Context = predict.Context;
 const Trace = predict.Trace;
 const Record = value.Record;
@@ -151,16 +152,15 @@ pub const DetailedEvaluation = struct {
     /// metric's column name and owns the destination and its flushing.
     pub fn writeJson(
         self: DetailedEvaluation,
-        gpa: Allocator,
+        workspace: *Workspace,
         writer: *std.Io.Writer,
         metric_name: []const u8,
     ) !void {
-        var scratch: std.heap.ArenaAllocator = .init(gpa);
-        defer scratch.deinit();
         try writer.writeByte('[');
         for (self.rows, 0..) |row, index| {
             if (index != 0) try writer.writeAll(", ");
-            _ = scratch.reset(.retain_capacity);
+            var scratch = workspace.open();
+            defer scratch.close();
             const record = try evaluationOutput(scratch.allocator(), row, metric_name);
             try @import("pyjson.zig").writeJsonDepth(writer, .{ .object = record }, .compact, 1, true);
         }
@@ -170,12 +170,12 @@ pub const DetailedEvaluation = struct {
     /// Write a CSV table, with columns in first-seen order across all rows.
     pub fn writeCsv(
         self: DetailedEvaluation,
-        gpa: Allocator,
+        workspace: *Workspace,
         writer: *std.Io.Writer,
         metric_name: []const u8,
     ) !void {
-        var table: std.heap.ArenaAllocator = .init(gpa);
-        defer table.deinit();
+        var table = workspace.open();
+        defer table.close();
         const arena = table.allocator();
         const records = try arena.alloc(Record, self.rows.len);
         var columns: Record = .empty;
@@ -188,7 +188,7 @@ pub const DetailedEvaluation = struct {
             try writeCsvCell(writer, key, columns.count() == 1);
         }
         try writer.writeAll("\r\n");
-        var cell: std.Io.Writer.Allocating = .init(gpa);
+        var cell: std.Io.Writer.Allocating = .init(arena);
         defer cell.deinit();
         for (records) |*record| {
             for (columns.keys(), 0..) |key, index| {
@@ -253,11 +253,12 @@ pub const EvaluationOptions = struct {
 };
 
 /// Serial evaluation retaining predictions in devset order. Predictions and
-/// rows live in `out` (an arena); each row borrows its example from `devset`.
+/// rows live in `out`; each row borrows its example from `devset`. `out` must
+/// not be a scope of `ctx.workspace`: rows are written while per-example
+/// scopes are open.
 pub fn evaluateDetailed(
     comptime P: type,
     out: Allocator,
-    gpa: Allocator,
     ctx: Context,
     program: *const P,
     devset: []const Example,
@@ -266,7 +267,7 @@ pub fn evaluateDetailed(
 ) !DetailedEvaluation {
     if (devset.len == 0) return error.EmptyDevset;
     const rows = try out.alloc(EvaluationRow, devset.len);
-    const summary = try evaluateScores(P, gpa, ctx, program, devset, metric, options, .{
+    const summary = try evaluateScores(P, ctx, program, devset, metric, options, .{
         .rows = .{ .out = out, .items = rows },
     });
     return .{ .summary = summary, .rows = rows };
@@ -282,19 +283,17 @@ const EvaluationRetention = struct {
 /// `error.EmptyDevset` before invoking the program or metric.
 pub fn evaluate(
     comptime P: type,
-    gpa: Allocator,
     ctx: Context,
     program: *const P,
     devset: []const Example,
     metric: Metric,
     max_errors: usize,
 ) !Evaluation {
-    return evaluateScores(P, gpa, ctx, program, devset, metric, .{ .max_errors = max_errors }, .{});
+    return evaluateScores(P, ctx, program, devset, metric, .{ .max_errors = max_errors }, .{});
 }
 
 fn evaluateScores(
     comptime P: type,
-    gpa: Allocator,
     ctx: Context,
     program: *const P,
     devset: []const Example,
@@ -314,9 +313,10 @@ fn evaluateScores(
     var sum: f64 = 0;
     var errors: usize = 0;
     const max_errors = options.max_errors orelse ctx.max_errors;
+    const workspace = ctx.workspace orelse return error.WorkspaceRequired;
     for (devset, 0..) |*example, index| {
-        var scratch: std.heap.ArenaAllocator = .init(gpa);
-        defer scratch.deinit();
+        var scratch = workspace.open();
+        defer scratch.close();
         var c = ctx;
         c.arena = scratch.allocator();
         c.trace = null;
@@ -365,20 +365,19 @@ pub const ConcurrentEvaluation = struct {
 pub fn evaluateWith(
     comptime P: type,
     concurrent: ?ConcurrentEvaluation,
-    gpa: Allocator,
     ctx: Context,
     program: *const P,
     devset: []const Example,
     metric: Metric,
     max_errors: usize,
 ) !Evaluation {
-    return evaluateWithScores(P, concurrent, gpa, ctx, program, devset, metric, max_errors, null);
+    return evaluateWithScores(P, concurrent, ctx, program, devset, metric, max_errors, null);
 }
 
-fn evaluateWithScores(
+/// `evaluateWith`, writing each example's score into `subscores`.
+pub fn evaluateWithScores(
     comptime P: type,
     concurrent: ?ConcurrentEvaluation,
-    gpa: Allocator,
     ctx: Context,
     program: *const P,
     devset: []const Example,
@@ -388,7 +387,6 @@ fn evaluateWithScores(
 ) !Evaluation {
     const bound = concurrent orelse return evaluateScores(
         P,
-        gpa,
         ctx,
         program,
         devset,
@@ -663,12 +661,12 @@ pub const BootstrapFewShot = struct {
     /// Compile `student` (must be uncompiled). A distinct native teacher type
     /// is allowed if its ordered predictor names and signatures match the
     /// student's; the metric receives the teacher's own prediction and trace.
-    /// Result demos live in `out`; per-attempt scratch comes from `gpa`.
+    /// Result demos live in `out`; per-attempt scratch comes from
+    /// `ctx.workspace`.
     pub fn compile(
         self: *BootstrapFewShot,
         comptime P: type,
         out: Allocator,
-        gpa: Allocator,
         ctx: Context,
         student_in: P,
         teacher_in: anytype,
@@ -679,9 +677,9 @@ pub const BootstrapFewShot = struct {
         try predict.resetPredictors(out, &student);
         const T = teacherType(P, @TypeOf(teacher_in));
         if (try teacherProgram(T, teacher_in)) |teacher| {
-            return self.compilePreparedTeacher(P, T, out, gpa, ctx, student, teacher, trainset);
+            return self.compilePreparedTeacher(P, T, out, ctx, student, teacher, trainset);
         }
-        return self.compilePreparedTeacher(P, P, out, gpa, ctx, student, student_in, trainset);
+        return self.compilePreparedTeacher(P, P, out, ctx, student, student_in, trainset);
     }
 
     fn compilePreparedTeacher(
@@ -689,7 +687,6 @@ pub const BootstrapFewShot = struct {
         comptime P: type,
         comptime T: type,
         out: Allocator,
-        gpa: Allocator,
         ctx: Context,
         student_in: P,
         teacher_in: T,
@@ -723,8 +720,6 @@ pub const BootstrapFewShot = struct {
         try storage.init();
         var state: RecordPrediction.State = .{ .output = storage.record };
         var output: T.Output = undefined;
-        var teacher_memory: std.heap.ArenaAllocator = .init(gpa);
-        defer teacher_memory.deinit();
 
         for (trainset, 0..) |*example, example_idx| {
             if (n_bootstrapped >= self.max_bootstrapped_demos) break;
@@ -734,8 +729,6 @@ pub const BootstrapFewShot = struct {
                 const ok = try self.bootstrapOne(
                     T,
                     out,
-                    gpa,
-                    teacher_memory.allocator(),
                     ctx,
                     &teacher,
                     teacher_preds,
@@ -783,8 +776,6 @@ pub const BootstrapFewShot = struct {
         self: *BootstrapFewShot,
         comptime P: type,
         out: Allocator,
-        gpa: Allocator,
-        teacher_arena: Allocator,
         ctx: Context,
         teacher: *P,
         teacher_preds: []const predict.NamedParam,
@@ -795,8 +786,9 @@ pub const BootstrapFewShot = struct {
         output: *P.Output,
         state: *RecordPrediction.State,
     ) !bool {
-        var scratch: std.heap.ArenaAllocator = .init(gpa);
-        defer scratch.deinit();
+        const workspace = ctx.workspace orelse return error.WorkspaceRequired;
+        var scratch = workspace.open();
+        defer scratch.close();
         const arena = scratch.allocator();
         var trace: Trace = .{ .arena = arena };
         // Source catches the failure after exiting the teacher settings scope.
@@ -840,7 +832,8 @@ pub const BootstrapFewShot = struct {
                     for (teacher_preds, cached) |p, *cache| {
                         const filtered = p.param.predict.demos;
                         if (filtered.len < cache.len) {
-                            cache.* = try teacher_arena.dupe(Record, filtered);
+                            // Filters persist across attempts, so they live with the result.
+                            cache.* = try out.dupe(Record, filtered);
                         }
                     }
                 }
@@ -1030,7 +1023,6 @@ pub const BootstrapFewShotWithRandomSearch = struct {
             const result = try evaluateWithScores(
                 P,
                 self.concurrent_evaluation,
-                gpa,
                 ctx,
                 &program,
                 val,
@@ -1125,6 +1117,6 @@ pub const BootstrapFewShotWithRandomSearch = struct {
         };
         // Only bootstrap consumes the teacher. Earlier reset/labeled candidates
         // may satisfy stop_at_score before an invalid Source list is encountered.
-        return (try optimizer.compile(P, arena, gpa, ctx, student, teacher, shuffled orelse trainset)).program;
+        return (try optimizer.compile(P, arena, ctx, student, teacher, shuffled orelse trainset)).program;
     }
 };

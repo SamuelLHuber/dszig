@@ -150,7 +150,7 @@ test "bounded Python RLM preserves valid turns and requires a typed guest submit
         "<plan>Try an unsupported action</plan>\n<code>\n```python\ntotal = 99\nimport os\n```\n</code>",
         "<plan>Submit the existing total</plan>\n<code>\n```python\nSUBMIT(answer=total)\n```\n</code>",
     } };
-    const result = try program.forward(.{ .arena = arena, .lm = model.lm(), .json_fallback = false }, .{ .n = 6 });
+    const result = try program.forward(.{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = model.lm(), .json_fallback = false }, .{ .n = 6 });
     try std.testing.expectEqual(@as(i64, 7), result.outputs.answer);
     try std.testing.expectEqualStrings("7\n", result.trajectory[0].output);
     try std.testing.expect(std.mem.startsWith(u8, result.trajectory[1].output, "[Error] "));

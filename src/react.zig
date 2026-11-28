@@ -715,7 +715,7 @@ test "ReAct forward retains final history and termination metadata" {
         else
             &.{submit} };
         const agent = try ReActIters(Sig, &.{}, 1).init(arena);
-        const output = try agent.forward(.{ .arena = arena, .lm = script.lm(), .adapter = .json, .json_fallback = false }, .{});
+        const output = try agent.forward(.{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm(), .adapter = .json, .json_fallback = false }, .{});
         const record = try value.toRecord(arena, @TypeOf(output), output);
         try testing.expectEqualStrings("retained", record.get("answer").?.string);
         try testing.expect(record.contains("history"));
@@ -775,7 +775,7 @@ test "ReAct submit validates Code models but retains custom string results" {
     } };
     const agent = try ReActIters(Sig, &.{}, 1).init(arena);
     const inputs: Record = .empty;
-    const prediction = try agent.run(.{ .arena = arena, .lm = script.lm(), .adapter = .json, .json_fallback = false }, &inputs);
+    const prediction = try agent.run(.{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm(), .adapter = .json, .json_fallback = false }, &inputs);
     const out = try value.fromRecord(arena, Sig.Output, &prediction.outputs);
     try testing.expectEqualStrings("run()", out.result.code);
     try testing.expectEqualStrings("x", out.snippets[0].code);
@@ -840,7 +840,7 @@ test "ReAct typed tools and submit preserve exact wide integers" {
     } };
     const agent = try ReActIters(Sig, &.{ typed, basic }, 2).init(arena);
     const inputs = try value.toRecord(arena, Sig.Input, .{ .seed = std.math.maxInt(u64) });
-    const prediction = try agent.run(.{ .arena = arena, .lm = script.lm(), .adapter = .json, .json_fallback = false }, &inputs);
+    const prediction = try agent.run(.{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm(), .adapter = .json, .json_fallback = false }, &inputs);
     const out = try value.fromRecord(arena, Sig.Output, &prediction.outputs);
     try testing.expectEqual(std.math.maxInt(u64), out.answer);
     try testing.expectEqual(std.math.maxInt(u128), out.payload.id);

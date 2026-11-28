@@ -1205,9 +1205,9 @@ test "required Reasoning and default CoT distinguish null forms from explicit em
         "{\"answer\":\"yes\"}",
         "{\"plan\":{\"content\":\"\"},\"answer\":\"yes\"}",
     } };
-    const context: @import("predict.zig").Context = .{ .arena = arena, .lm = script.lm(), .json_fallback = false };
+    const context: @import("predict.zig").Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm(), .json_fallback = false };
     try testing.expectError(error.AdapterParse, cot.forward(context, .{}));
-    const json_context: @import("predict.zig").Context = .{ .arena = arena, .lm = script.lm(), .adapter = .json, .json_fallback = false };
+    const json_context: @import("predict.zig").Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm(), .adapter = .json, .json_fallback = false };
     try testing.expectError(error.AdapterParse, cot.forward(json_context, .{}));
     const json_content = try cot.forward(json_context, .{});
     try testing.expectEqualStrings("", json_content.reasoning.?.content);

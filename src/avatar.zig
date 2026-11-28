@@ -488,7 +488,7 @@ test "Avatar evolves the actor per tool result and restores it only on success" 
     var program = try P.init(arena, &tools);
     // An instruction set on the actor alone does not survive a success.
     program.actor.state.instructions = "ACTOR ONLY";
-    const output = try program.call(.{ .arena = arena, .lm = recording.lm() }, .{ .question = "Q1" }, .{ .max_iters = 1 });
+    const output = try program.call(.{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = recording.lm() }, .{ .question = "Q1" }, .{ .max_iters = 1 });
 
     try testing.expectEqualStrings("done", output.answer);
     // The budget of one never stopped the loop, and Finish is not an action.
@@ -526,7 +526,7 @@ test "Avatar failures keep completed evolution and refuse reuse until reset" {
     var script: @import("lm.zig").ScriptedLM = .{ .responses = &.{ testAction(1, "search", "\"alpha\""), testAction(2, "missing", "\"beta\"") } };
     var program = try P.init(arena, &tools);
     program.actor.state.instructions = "ACTOR ONLY";
-    const ctx: Context = .{ .arena = arena, .lm = script.lm() };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm() };
     try testing.expectError(error.AvatarUnknownTool, program.call(ctx, .{ .question = "Q" }, .{}));
     try testing.expectEqual(@as(usize, 1), search.calls);
     try testing.expect(program.evolved());
@@ -580,7 +580,7 @@ test "Avatar refuses an action beyond its capacity before running the tool" {
     const P = AvatarWithOptions(TestQA, .{ .actions_max = 1, .tools_max = 1 });
     var script: @import("lm.zig").ScriptedLM = .{ .responses = &.{ testAction(1, "search", "\"alpha\""), testAction(2, "search", "\"beta\""), "<answer>invented</answer>" } };
     const program = try P.init(arena, &tools);
-    try testing.expectError(error.AvatarActionsExhausted, program.forward(.{ .arena = arena, .lm = script.lm() }, .{ .question = "Q" }));
+    try testing.expectError(error.AvatarActionsExhausted, program.forward(.{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm() }, .{ .question = "Q" }));
     try testing.expectEqual(@as(usize, 1), search.calls);
     try testing.expectEqual(@as(usize, 2), script.index);
     // forward ran on a copy, so the shared program is untouched.
@@ -588,7 +588,7 @@ test "Avatar refuses an action beyond its capacity before running the tool" {
 
     // At capacity, finishing is still possible.
     script = .{ .responses = &.{ testAction(1, "search", "\"alpha\""), testAction(2, "Finish", "\"\""), "<answer>done</answer>" } };
-    const output = try program.forward(.{ .arena = arena, .lm = script.lm() }, .{ .question = "Q" });
+    const output = try program.forward(.{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm() }, .{ .question = "Q" });
     try testing.expectEqual(@as(usize, 1), output.actions.len);
     try testing.expectEqualStrings("done", output.answer);
     const two = [_]Tool{ tools[0], tools[0] };

@@ -254,7 +254,7 @@ test "native program binding preserves typed, Example-input, whole-Example and t
     defer pool.deinit();
     var scratch = std.heap.FixedBufferAllocator.init(&.{});
     var model: dszig.lm.ScriptedLM = .{ .responses = &.{} };
-    const context: dszig.Context = .{ .arena = scratch.allocator(), .lm = model.lm() };
+    const context: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = scratch.allocator(), .lm = model.lm() };
     const contexts: [4]dszig.Context = @splat(context);
     var example: dszig.Example = .{ .record = .empty, .input_keys = &.{"number"} };
     defer example.record.deinit(testing.allocator);
@@ -714,7 +714,7 @@ test "concurrent evaluation rejects distinct generic programs with colliding dis
     defer memory.deinit();
     const arena = memory.allocator();
     var unused: dszig.lm.ScriptedLM = .{ .responses = &.{} };
-    const contexts: [1]dszig.Context = @splat(.{ .arena = arena, .lm = unused.lm() });
+    const contexts: [1]dszig.Context = @splat(.{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = unused.lm() });
     var bytes: [0]u8 = undefined;
     const backing = [_][]u8{&bytes};
     var evaluator: parallel.Evaluator(A, .{ .workers = 1, .tasks = 1, .attempts = 1, .failures = 1 }) = undefined;
@@ -726,7 +726,6 @@ test "concurrent evaluation rejects distinct generic programs with colliding dis
     try testing.expectError(error.ProgramTypeMismatch, dszig.optimize.evaluateWith(
         B,
         bound,
-        testing.allocator,
         contexts[0],
         &b,
         &devset,
@@ -738,7 +737,6 @@ test "concurrent evaluation rejects distinct generic programs with colliding dis
     const result = try dszig.optimize.evaluateWith(
         A,
         bound,
-        testing.allocator,
         contexts[0],
         &a,
         &devset,
@@ -783,7 +781,7 @@ test "parallel Evaluate sums out-of-order completions in devset order like seria
     defer memory.deinit();
     const arena = memory.allocator();
     var unused: dszig.lm.ScriptedLM = .{ .responses = &.{} };
-    const contexts: [4]dszig.Context = @splat(.{ .arena = arena, .lm = unused.lm() });
+    const contexts: [4]dszig.Context = @splat(.{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = unused.lm() });
     var buffers: [4][256]u8 = undefined;
     const backing = [_][]u8{ &buffers[0], &buffers[1], &buffers[2], &buffers[3] };
     var evaluator: Evaluator = undefined;
@@ -803,7 +801,7 @@ test "parallel Evaluate sums out-of-order completions in devset order like seria
     const program: Scored = .{ .gate = &gate, .io = testing.io };
     const concurrent = try evaluator.evaluate(&contexts, &program, &devset, Scored.metric, options);
     gate.set(testing.io);
-    const serial = try dszig.optimize.evaluate(Scored, testing.allocator, contexts[0], &program, &devset, Scored.metric, 10);
+    const serial = try dszig.optimize.evaluate(Scored, contexts[0], &program, &devset, Scored.metric, 10);
     try testing.expectEqual(@as(u64, @bitCast(serial.sum)), @as(u64, @bitCast(concurrent.sum)));
     try testing.expectEqual(@as(f64, 1), concurrent.sum);
     try testing.expectEqual(serial.score, concurrent.score);

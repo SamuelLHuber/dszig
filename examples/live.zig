@@ -313,7 +313,10 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (optimization_smoke) {
-        const result = try optimizationSmoke(arena, init.gpa, &recorder);
+        const workspace_buffer = try init.gpa.alloc(u8, suite.workspace_bytes_max);
+        defer init.gpa.free(workspace_buffer);
+        var workspace: dszig.Workspace = .init(workspace_buffer);
+        const result = try optimizationSmoke(arena, &workspace, &recorder);
         const json = try smokeTranscript(arena, model, api_name, recorder.lm(), recorder.calls.items, result, "bootstrap_few_shot_smoke", optimization_question);
         try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = out_path, .data = json });
         try w.print("model: {s}; api: {s}; bootstrapped and reloaded one demo; answer: {s}; {d} calls; wrote {s}\n", .{ model, api_name, result, recorder.calls.items.len, out_path });
@@ -377,7 +380,10 @@ pub fn main(init: std.process.Init) !void {
         .temperature = try float(init.environ_map.get("DSZIG_LIVE_TEMPERATURE"), "DSZIG_LIVE_TEMPERATURE", 0.0),
         .copro_init_temperature = try float(init.environ_map.get("DSZIG_LIVE_COPRO_TEMPERATURE"), "DSZIG_LIVE_COPRO_TEMPERATURE", 1.4),
     };
-    const result = try suite.run(arena, init.gpa, recorder.lm(), settings);
+    const workspace_buffer = try init.gpa.alloc(u8, suite.workspace_bytes_max);
+    defer init.gpa.free(workspace_buffer);
+    var workspace: dszig.Workspace = .init(workspace_buffer);
+    const result = try suite.run(arena, init.gpa, &workspace, recorder.lm(), settings);
     const json = try suite.writeTranscript(arena, "dszig", model, recorder.lm(), recorder.calls.items, result, settings);
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = out_path, .data = json });
     for (result.cases) |c| {
@@ -538,9 +544,9 @@ fn singleNativeTool(call: *const dszig.lm.ReplayLM.Call, name: []const u8) bool 
 
 const optimization_question = "What is 3 + 4?";
 
-fn optimizationSmoke(arena: std.mem.Allocator, gpa: std.mem.Allocator, recorder: *dszig.lm.RecordingLM) ![]const u8 {
+fn optimizationSmoke(arena: std.mem.Allocator, workspace: *dszig.Workspace, recorder: *dszig.lm.RecordingLM) ![]const u8 {
     const Program = dszig.ChainOfThought(Smoke);
-    const ctx: dszig.Context = .{ .arena = arena, .lm = recorder.lm(), .json_fallback = false };
+    const ctx: dszig.Context = .{ .arena = arena, .workspace = workspace, .lm = recorder.lm(), .json_fallback = false };
     var record: dszig.value.Record = .empty;
     try record.put(arena, "question", .{ .string = smoke_question });
     try record.put(arena, "answer", .{ .string = "4" });
@@ -551,7 +557,7 @@ fn optimizationSmoke(arena: std.mem.Allocator, gpa: std.mem.Allocator, recorder:
         .max_rounds = 1,
         .max_errors = 1,
     };
-    const compiled = try optimizer.compile(Program, arena, gpa, ctx, .{}, null, &.{
+    const compiled = try optimizer.compile(Program, arena, ctx, .{}, null, &.{
         .{ .record = record, .input_keys = &.{"question"} },
     });
     if (compiled.report.bootstrapped != 1 or compiled.report.errors != 0 or

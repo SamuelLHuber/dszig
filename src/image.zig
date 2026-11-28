@@ -1,5 +1,6 @@
 //! DSPy Image stores a URL reference or a data URI. Only explicit I/O helpers
 //! fetch or open media; inline media validation is deferred to formatting.
+const Workspace = @import("workspace.zig").Workspace;
 const std = @import("std");
 const file_module = @import("file.zig");
 const File = file_module.File;
@@ -87,8 +88,9 @@ pub const Image = struct {
         url: []const u8,
         options: UrlOptions,
     ) !Image {
-        var scratch: std.heap.ArenaAllocator = .init(client.allocator);
-        defer scratch.deinit();
+        // Headers and redirect URLs only; the body stays on client.allocator.
+        var scratch_buffer: [64 * 1024]u8 = undefined;
+        var scratch: std.heap.FixedBufferAllocator = .init(&scratch_buffer);
         const response = try media_download.download(scratch.allocator(), client, url, options);
         defer client.allocator.free(response.body);
         const mime = response.content_type orelse "";
@@ -111,11 +113,7 @@ pub const Image = struct {
         const opened_stat = try file.stat(io);
         if (opened_stat.kind != .file) return error.InvalidImagePath;
         if (opened_stat.size > max_bytes) return error.StreamTooLong;
-        // A local path that looks like a data URI can produce allocated MIME
-        // scratch; keep that storage separate from the final URI.
-        var scratch: std.heap.ArenaAllocator = .init(arena);
-        defer scratch.deinit();
-        const guessed = try guessMime(scratch.allocator(), path) orelse
+        const guessed = try guessMime(arena, path) orelse
             return error.UnknownImageMimeType;
         if (!std.unicode.utf8ValidateSlice(guessed)) return error.InvalidImage;
         return encodeFile(arena, io, file, guessed, @intCast(opened_stat.size), max_bytes);

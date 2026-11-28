@@ -19,6 +19,7 @@
 //!
 //! Upstream (DSPy 3.5.0): dspy/teleprompt/gepa/gepa.py
 
+const Workspace = @import("workspace.zig").Workspace;
 const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
@@ -1672,7 +1673,7 @@ pub const GEPA = struct {
             return hash.finalResult();
         }
 
-        fn fieldMetadata(allocator: Allocator, predictors: []const predict.NamedParam, checkpoint: Checkpoint) (DigestError || Allocator.Error)![32]u8 {
+        fn fieldMetadata(workspace: *Workspace, predictors: []const predict.NamedParam, checkpoint: Checkpoint) (DigestError || Allocator.Error)![32]u8 {
             var hash = Sha256.init(.{});
             size(&hash, predictors.len);
             for (predictors) |p| {
@@ -1713,8 +1714,8 @@ pub const GEPA = struct {
                     // scored when a completion omits the field.
                     hash.update(&.{@intFromBool(field.default_value != null)});
                     if (field.default_value) |get| {
-                        var scratch = std.heap.ArenaAllocator.init(allocator);
-                        defer scratch.deinit();
+                        var scratch = workspace.open();
+                        defer scratch.close();
                         const arena = scratch.allocator();
                         try valueNode(&hash, try get(arena), 0, arena);
                     }
@@ -1758,7 +1759,7 @@ pub const GEPA = struct {
             return hash.finalResult();
         }
 
-        fn predictConfig(allocator: Allocator, predictors: []const predict.NamedParam, override: ?*const predict.PredictConfig) (DigestError || Allocator.Error)![32]u8 {
+        fn predictConfig(workspace: *Workspace, predictors: []const predict.NamedParam, override: ?*const predict.PredictConfig) (DigestError || Allocator.Error)![32]u8 {
             var hash = Sha256.init(.{});
             size(&hash, predictors.len);
             // No config and an empty config both inherit at either layer.
@@ -1767,8 +1768,8 @@ pub const GEPA = struct {
                 try configField(&hash, if (config) |c| c.* else predict.PredictConfig{});
                 // Criteria and instructions change the prompt; thresholds,
                 // cuts, and weights can change the decoded prediction.
-                var scratch = std.heap.ArenaAllocator.init(allocator);
-                defer scratch.deinit();
+                var scratch = workspace.open();
+                defer scratch.close();
                 try valueNode(&hash, p.param.predict.decision_fields, 0, scratch.allocator());
             }
             try configField(&hash, if (override) |c| c.* else predict.PredictConfig{});
@@ -2186,8 +2187,8 @@ pub const GEPA = struct {
 
             fn saveRunArtifacts(e: *Self) !void {
                 const dir = e.log_dir orelse return;
-                var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-                defer scratch.deinit();
+                var scratch = (e.ctx.workspace orelse return error.WorkspaceRequired).open();
+                defer scratch.close();
                 const arena = scratch.allocator();
                 if (e.run_log.items.len != 0) {
                     const path = try std.fs.path.join(arena, &.{ dir.path, "run_log.json" });
@@ -2318,8 +2319,8 @@ pub const GEPA = struct {
 
             fn saveCheckpoint(e: *const Self, last_iteration: ?usize) !void {
                 const checkpoint = e.checkpoint orelse return;
-                var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-                defer scratch.deinit();
+                var scratch = (e.ctx.workspace orelse return error.WorkspaceRequired).open();
+                defer scratch.close();
                 const arena = scratch.allocator();
                 const candidates = try arena.alloc(StoredCandidate, e.candidates.items.len);
                 for (candidates, e.checkpoint_runs.items, 0..) |*candidate, runs, idx| {
@@ -2398,8 +2399,8 @@ pub const GEPA = struct {
                         }
                     }
                 }
-                var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-                defer scratch.deinit();
+                var scratch = (e.ctx.workspace orelse return error.WorkspaceRequired).open();
+                defer scratch.close();
                 const bytes = std.Io.Dir.cwd().readFileAlloc(
                     checkpoint.io,
                     checkpoint.path,
@@ -3342,8 +3343,8 @@ pub const GEPA = struct {
                         return selected;
                     },
                     .custom => |selector| {
-                        var scratch = std.heap.ArenaAllocator.init(e.out);
-                        defer scratch.deinit();
+                        var scratch = (e.ctx.workspace orelse return error.WorkspaceRequired).open();
+                        defer scratch.close();
                         var ctx = e.ctx;
                         ctx.arena = scratch.allocator();
                         ctx.trace = null;
@@ -3502,8 +3503,8 @@ pub const GEPA = struct {
             }
 
             fn tryBatchChildren(e: *Self, backend: BatchReflection, tasks: []const *ReflectionTask) !bool {
-                var scratch = std.heap.ArenaAllocator.init(e.out);
-                defer scratch.deinit();
+                var scratch = (e.ctx.workspace orelse return error.WorkspaceRequired).open();
+                defer scratch.close();
                 var context = e.reflection;
                 context.arena = scratch.allocator();
                 context.trace = null;
@@ -3635,8 +3636,8 @@ pub const GEPA = struct {
             }
 
             fn reflectBatch(e: *Self) !void {
-                var scratch = std.heap.ArenaAllocator.init(e.out);
-                defer scratch.deinit();
+                var scratch = (e.ctx.workspace orelse return error.WorkspaceRequired).open();
+                defer scratch.close();
                 const tmp = scratch.allocator();
                 var storage: [max_proposal_tasks]ReflectionTask = undefined;
                 const tasks = try e.sampleProposals(tmp, &storage);
@@ -3934,8 +3935,8 @@ pub const GEPA = struct {
                 components: []const usize,
                 datasets: []const ?[]const Record,
             ) !?[]const []const u8 {
-                var scratch = std.heap.ArenaAllocator.init(e.out);
-                defer scratch.deinit();
+                var scratch = (e.ctx.workspace orelse return error.WorkspaceRequired).open();
+                defer scratch.close();
                 var context = e.reflection;
                 context.arena = scratch.allocator();
                 context.trace = null;
@@ -4034,8 +4035,8 @@ pub const GEPA = struct {
                 const ids = ids: {
                     if (e.gepa.val_evaluation_policy == null and !e.partial_validation_archive)
                         break :ids try e.mergeSubsample(attempt.id1, attempt.id2, e.all_val_ids);
-                    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-                    defer scratch.deinit();
+                    var scratch = (e.ctx.workspace orelse return error.WorkspaceRequired).open();
+                    defer scratch.close();
                     const common = try python_value.indexSetIntersection(
                         scratch.allocator(),
                         &e.val_indices.items[attempt.id1],
@@ -4368,11 +4369,12 @@ pub const GEPA = struct {
             else
                 CheckpointDigest.dataset(trainset) catch return error.UnsupportedGepaTrainingValue;
             e.demos_digest = CheckpointDigest.demos(preds, ctx.demos_override) catch return error.UnsupportedGepaDemoValue;
-            e.field_metadata_digest = CheckpointDigest.fieldMetadata(out, preds, checkpoint) catch |err| switch (err) {
+            const digest_workspace = ctx.workspace orelse return error.WorkspaceRequired;
+            e.field_metadata_digest = CheckpointDigest.fieldMetadata(digest_workspace, preds, checkpoint) catch |err| switch (err) {
                 error.UnsupportedCheckpointValue => return error.UnsupportedGepaFieldDefaultValue,
                 error.OutOfMemory => return error.OutOfMemory,
             };
-            e.predict_config_digest = CheckpointDigest.predictConfig(out, preds, ctx.predict_config) catch |err| switch (err) {
+            e.predict_config_digest = CheckpointDigest.predictConfig(digest_workspace, preds, ctx.predict_config) catch |err| switch (err) {
                 error.UnsupportedCheckpointValue => return error.UnsupportedGepaPredictConfigValue,
                 error.OutOfMemory => return error.OutOfMemory,
             };
@@ -4490,7 +4492,7 @@ test "GEPA scoring failures preserve capture-specific outputs while feedback err
             "<answer>ok</answer>", "<answer>ok</answer>",
         },
     };
-    const ctx: Context = .{ .arena = arena, .lm = script.lm(), .adapter = .xml };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm(), .adapter = .xml };
     const examples = [_]Example{try Example.fromJson(arena, "{\"question\":\"q\",\"answer\":\"ok\"}", &.{"question"})};
     var program: P = .{};
     var front_scores = [_]f64{0};
@@ -4581,7 +4583,7 @@ test "GEPA compile aborts a canceled program rollout instead of scoring it" {
         try Example.fromJson(arena, "{\"question\":\"second\"}", &.{"question"}),
     };
     var lm: @import("lm.zig").ScriptedLM = .{ .responses = &.{} };
-    const ctx: Context = .{ .arena = arena, .lm = lm.lm() };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = lm.lm() };
     const Pool = parallel.Parallel(GEPA.Run, .{ .workers = 1, .tasks = 2, .attempts = 2, .failures = 2 });
     var pool: Pool = undefined;
     try pool.init(std.testing.io, .{});
@@ -4639,8 +4641,8 @@ test "GEPA compile does not retry a canceled reflection LM" {
             .use_merge = false,
             .batch_reflection = if (batch_fallback) .{ .ptr = &reflection, .propose = Reflection.batch } else null,
         };
-        const ctx: Context = .{ .arena = arena, .adapter = .json, .lm = task.lm() };
-        const reflection_ctx: Context = .{ .arena = arena, .lm = .{
+        const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .adapter = .json, .lm = task.lm() };
+        const reflection_ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = .{
             .ptr = &reflection,
             .vtable = &.{ .complete = Reflection.complete },
         } };
@@ -4881,7 +4883,7 @@ test "GEPA requires one budget and evaluates the seed even with a zero budget" {
         try Example.fromJson(arena, "{\"question\":\"r\",\"answer\":\"ok\"}", &.{"question"}),
     };
     const Program = predict.Predict(Sig);
-    const ctx: Context = .{ .arena = arena, .lm = script.lm() };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm() };
     const options: GEPA.Options = .{ .valset = &.{} };
     const invalid: []const GEPA = &.{
         .{ .metric = Metric.score, .auto = .light, .max_full_evals = 0 },
@@ -4999,7 +5001,7 @@ test "GEPA ranks before deduplicating and snapshots all validation batches befor
         .val_evaluation_policy = .{ .ptr = &script, .next_batch = Script.batch, .max_batch_size = 1 },
     };
     const examples = [_]Example{ example, example };
-    const ctx: Context = .{ .arena = arena, .lm = model.lm(), .adapter = .json };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = model.lm(), .adapter = .json };
     var invalid = optimizer;
     invalid.sampling_strategy = .{ .same_parent = 0 };
     try std.testing.expectError(error.EmptyProposalBatch, invalid.compile(P, arena, ctx, .{}, &examples, .{}));
@@ -5137,7 +5139,7 @@ test "GEPA batch reflection preserves eligible job order and scores individual f
     };
     for (std.enums.values(Mode)) |mode| {
         var script: Script = .{ .mode = mode };
-        const ctx: Context = .{ .arena = arena, .adapter = .json, .lm = .{
+        const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .adapter = .json, .lm = .{
             .ptr = &script,
             .vtable = &.{ .complete = Script.complete },
         } };
@@ -5230,7 +5232,7 @@ test "GEPA epoch sampler pads and rotates whole minibatches at full-width iterat
         }
     };
     var script: @import("lm.zig").ScriptedLM = .{ .responses = &.{} };
-    const context: Context = .{ .arena = arena, .lm = script.lm() };
+    const context: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm() };
     const example = try Example.fromJson(arena, "{\"question\":\"q\"}", &.{"question"});
     const train: [5]Example = @splat(example);
     const student: struct { placeholder: bool = false } = .{};
@@ -5371,7 +5373,7 @@ test "GEPA checkpoint refuses mismatched runs and does not publish oversized sta
         "<answer>first</answer>",
         "<answer>resumed</answer>",
     } };
-    const ctx: Context = .{ .arena = arena, .lm = model.lm() };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = model.lm() };
     const optimizer: GEPA = .{
         .metric = Metric.score,
         .max_metric_calls = 0,
@@ -5438,7 +5440,7 @@ test "GEPA log size failures leave the last complete candidate file intact" {
         "<answer>oversized prediction</answer>",
         "<answer>seed with marker</answer>",
     } };
-    const ctx: Context = .{ .arena = arena, .lm = model.lm() };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = model.lm() };
     var optimizer: GEPA = .{ .metric = Metric.score, .max_metric_calls = 0 };
     var options: GEPA.Options = .{ .log_dir = .{ .io = io, .path = path } };
     _ = try optimizer.compile(P, arena, ctx, .{}, &data, options);
@@ -5524,6 +5526,7 @@ test "GEPA compile logs validation predictions with and without tracking" {
             .instruction_proposer = .{ .ptr = &script, .propose = Callbacks.propose },
         };
         const result = try optimizer.compile(P, arena, .{
+            .workspace = @import("workspace.zig").forTests(),
             .arena = arena,
             .lm = script.lm(),
             .json_fallback = false,
@@ -5600,7 +5603,7 @@ test "GEPA validation files distinguish seed failure and child parse failure" {
             .track_best_outputs = true,
             .instruction_proposer = .{ .ptr = &script, .propose = Callbacks.propose },
         };
-        const result = try optimizer.compile(P, arena, .{ .arena = arena, .lm = script.lm(), .json_fallback = false }, .{}, validation[0..2], .{
+        const result = try optimizer.compile(P, arena, .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm(), .json_fallback = false }, .{}, validation[0..2], .{
             .valset = &validation,
             .log_dir = .{ .io = io, .path = path },
         });
@@ -5724,6 +5727,7 @@ test "GEPA merge scores repeated rows by the last rollout and preserves failure 
         const path = try directory.dir.realPathFileAlloc(io, ".", arena);
         var model: Model = .{};
         const ctx: Context = .{
+            .workspace = @import("workspace.zig").forTests(),
             .arena = arena,
             .lm = .{ .ptr = &model, .vtable = &.{ .complete = Model.complete } },
             .json_fallback = false,
@@ -5794,7 +5798,7 @@ test "GEPA best outputs keep ties and replace an older frontier without extra ev
         "<answer>high1</answer>", "<answer>high1</answer>",
         "<answer>high2</answer>", "<answer>low2</answer>",
     } };
-    const ctx: Context = .{ .arena = arena, .lm = script.lm(), .json_fallback = false };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm(), .json_fallback = false };
     const examples = [_]Example{
         try Example.fromJson(arena, "{\"question\":\"q\"}", &.{"question"}),
         try Example.fromJson(arena, "{\"question\":\"r\"}", &.{"question"}),

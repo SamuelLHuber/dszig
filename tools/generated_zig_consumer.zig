@@ -50,6 +50,10 @@ const lookup_tool: dszig.Tool = .{
     .func = lookupValue,
 };
 
+/// Fixed scratch for internal scopes, reserved statically.
+var workspace_buffer: [16 * 1024 * 1024]u8 = undefined;
+var workspace: dszig.Workspace = .init(&workspace_buffer);
+
 pub fn main(init: std.process.Init) !void {
     if (comptime builtin.os.tag != .linux) return error.UnsupportedPlatform;
     const options = try arguments(try init.minimal.args.toSlice(init.arena.allocator()));
@@ -100,6 +104,7 @@ fn generated(init: std.process.Init, endpoint: []const u8) !void {
     };
     const generator: native.Generator = .{};
     const result = native.generateAndRun(&generator, &engine, .{
+        .workspace = &workspace,
         .arena = init.arena.allocator(),
         .lm = provider.lm(),
         .json_fallback = false,
@@ -181,7 +186,7 @@ fn lookup(raw: *anyopaque, argument: []const u8, output: []u8, _: u64) native.Ca
     const parsed = std.json.parseFromSliceLeaky(dszig.Value, arena, argument, .{}) catch
         return error.ToolFailed;
     if (parsed != .object) return error.ToolFailed;
-    const answer = lookup_tool.call(.{ .arena = arena }, &parsed.object) catch
+    const answer = lookup_tool.call(.{ .workspace = &workspace, .arena = arena }, &parsed.object) catch
         return error.ToolFailed;
     var writer: std.Io.Writer = .fixed(output);
     std.json.Stringify.value(answer, .{}, &writer) catch return error.ToolFailed;

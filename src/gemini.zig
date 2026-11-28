@@ -1,4 +1,5 @@
 //! Gemini Developer API and Vertex AI generateContent transport.
+const Workspace = @import("workspace.zig").Workspace;
 const std = @import("std");
 const lm_mod = @import("lm.zig");
 const http = @import("http.zig");
@@ -17,6 +18,8 @@ pub const Gemini = struct {
     base_url: []const u8 = "https://generativelanguage.googleapis.com/v1beta",
     max_tokens: ?u32 = null,
     max_response_bytes: usize = 4 * 1024 * 1024,
+    /// Fixed scratch reserved once per Live connection for parsed messages.
+    live_scratch_bytes_max: usize = 8 * 1024 * 1024,
     max_retries: u8 = 3,
     retry_base_ms: u32 = 500,
     timeout_ns: ?u64 = null,
@@ -259,12 +262,12 @@ pub const Gemini = struct {
     /// GenerateContent SSE emits one end on exhaustion, including any late usage.
     pub fn streamRequest(
         self: *Gemini,
-        backing: Allocator,
+        workspace: *Workspace,
         request: *const sdk.Request,
         sink: StreamSink,
     ) Error!StreamOutcome {
-        var scratch: std.heap.ArenaAllocator = .init(backing);
-        defer scratch.deinit();
+        var scratch = workspace.open();
+        defer scratch.close();
         const model = wireModel(request.fields.model);
         return self.runStream(scratch.allocator(), &request.fields, model, .canonical, sink, null);
     }
@@ -327,17 +330,19 @@ pub const Gemini = struct {
         }
         const allocator = self.client.allocator;
         const model = wireModel(self.model);
+        const workspace_buffer = try allocator.alloc(u8, self.live_scratch_bytes_max);
+        errdefer allocator.free(workspace_buffer);
         session.* = .{
             .timed = self.liveTimeouts(),
-            .connection_arena = .init(allocator),
-            .scratch = .init(allocator),
+            .workspace_buffer = workspace_buffer,
+            .workspace = .init(workspace_buffer),
             .max_bytes = self.max_response_bytes,
             .audio_native = liveAudioNative(model),
         };
-        errdefer session.connection_arena.deinit();
-        errdefer session.scratch.deinit();
         errdefer session.buffer.deinit(allocator);
-        const uri = try liveEndpoint(session.connection_arena.allocator(), self.base_url, self.api_key);
+        session.connection = session.workspace.open();
+        const uri = try liveEndpoint(session.connection.allocator(), self.base_url, self.api_key);
+        session.scratch = session.workspace.open();
         session.client = try http.isolatedClient(self.client, session.timed.io());
         errdefer session.client.deinit();
         session.socket = try @import("websocket.zig").open(&session.client, uri);
@@ -348,7 +353,7 @@ pub const Gemini = struct {
         const arena = session.scratch.allocator();
         try session.socket.sendText(try session.setupFrame(arena, model, &options));
         var remaining = session.max_bytes;
-        if (try waitLiveSetup(&session.socket, &session.scratch, &session.buffer, &remaining) == .rejected)
+        if (try waitLiveSetup(&session.socket, &session.scratch, allocator, &session.buffer, &remaining) == .rejected)
             return error.LMFailure;
         session.open = true;
     }
@@ -385,10 +390,14 @@ pub const Gemini = struct {
 
         var buffer: std.ArrayList(u8) = .empty;
         defer buffer.deinit(client.allocator);
-        var scratch: std.heap.ArenaAllocator = .init(client.allocator);
-        defer scratch.deinit();
+        // Reserved once per connection, like GeminiLiveSession, not from the result arena.
+        const live_buffer = try client.allocator.alloc(u8, self.live_scratch_bytes_max);
+        defer client.allocator.free(live_buffer);
+        var live_workspace: Workspace = .init(live_buffer);
+        var scratch = live_workspace.open();
+        defer scratch.close();
         var remaining = self.max_response_bytes;
-        if (try waitLiveSetup(&socket, &scratch, &buffer, &remaining) == .rejected)
+        if (try waitLiveSetup(&socket, &scratch, client.allocator, &buffer, &remaining) == .rejected)
             return error.LMFailure;
 
         // Match DSPy: a rejected setup never opens local files for the turn.
@@ -404,7 +413,7 @@ pub const Gemini = struct {
         var saw_tool = false;
         for (0..8192) |_| {
             if (state.outcome == .stopped) return;
-            const value = try receiveLive(&socket, &scratch, &buffer, &remaining);
+            const value = try receiveLive(&socket, &scratch, client.allocator, &buffer, &remaining);
             if (value != .object) continue;
             if (value.object.get("error")) |detail|
                 return state.emit(.{ .provider_error = try streamError(scratch.allocator(), detail) });
@@ -534,8 +543,11 @@ const GeminiLiveSession = struct {
     timed: @import("timed_io.zig"),
     client: std.http.Client = undefined,
     socket: @import("websocket.zig") = undefined,
-    connection_arena: std.heap.ArenaAllocator,
-    scratch: std.heap.ArenaAllocator,
+    workspace_buffer: []u8,
+    workspace: Workspace,
+    /// Connection lifetime; `scratch` above it is reset for every message.
+    connection: Workspace.Scope = undefined,
+    scratch: Workspace.Scope = undefined,
     buffer: std.ArrayList(u8) = .empty,
     pending: []const Event = &.{},
     max_bytes: usize,
@@ -597,9 +609,10 @@ const GeminiLiveSession = struct {
         self.socket.finish() catch {};
         self.socket.deinit();
         self.buffer.deinit(self.client.allocator);
-        self.scratch.deinit();
+        self.scratch.close();
+        self.connection.close();
+        self.client.allocator.free(self.workspace_buffer);
         self.client.deinit();
-        self.connection_arena.deinit();
     }
 
     /// A WebSocket write failure terminates the connection. Call close to
@@ -608,8 +621,9 @@ const GeminiLiveSession = struct {
     pub fn send(self: *GeminiLiveSession, input: Input) !void {
         if (!self.open) return error.SessionClosed;
         if (!self.socket.isOpen()) return error.PeerClosed;
-        var scratch: std.heap.ArenaAllocator = .init(self.client.allocator);
-        defer scratch.deinit();
+        // Pending events stay valid: this scope sits above the message scope.
+        var scratch = self.workspace.open();
+        defer scratch.close();
         const payload = try self.inputFrame(scratch.allocator(), input);
         self.socket.sendText(payload) catch |err| {
             self.pending = &.{};
@@ -655,7 +669,7 @@ const GeminiLiveSession = struct {
         var remaining = self.max_bytes;
         if (self.pending.len == 0) {
             for (0..8192) |_| {
-                const value = try receiveLive(&self.socket, &self.scratch, &self.buffer, &remaining);
+                const value = try receiveLive(&self.socket, &self.scratch, self.client.allocator, &self.buffer, &remaining);
                 if (value != .object) continue;
                 self.pending = try sessionEvents(self.scratch.allocator(), value);
                 if (self.pending.len != 0) break;
@@ -1029,12 +1043,13 @@ fn liveJson(arena: Allocator, value: Value) ![]const u8 {
 
 fn waitLiveSetup(
     socket: *@import("websocket.zig"),
-    scratch: *std.heap.ArenaAllocator,
+    scratch: *Workspace.Scope,
+    buffer_allocator: Allocator,
     buffer: *std.ArrayList(u8),
     remaining: *usize,
 ) !enum { accepted, rejected } {
     for (0..8192) |_| {
-        const value = try receiveLive(socket, scratch, buffer, remaining);
+        const value = try receiveLive(socket, scratch, buffer_allocator, buffer, remaining);
         if (value != .object) continue;
         if (value.object.contains("setupComplete")) return .accepted;
         if (value.object.contains("error")) return .rejected;
@@ -1044,12 +1059,13 @@ fn waitLiveSetup(
 
 fn receiveLive(
     socket: *@import("websocket.zig"),
-    scratch: *std.heap.ArenaAllocator,
+    scratch: *Workspace.Scope,
+    buffer_allocator: Allocator,
     buffer: *std.ArrayList(u8),
     remaining: *usize,
 ) !Value {
-    _ = scratch.reset(.retain_capacity);
-    const message = try socket.receive(scratch.child_allocator, buffer, remaining.*);
+    scratch.reset();
+    const message = try socket.receive(buffer_allocator, buffer, remaining.*);
     remaining.* -= message.bytes.len;
     // Text messages were validated by the WebSocket layer. DSPy also
     // decodes binary messages as strict UTF-8 before inspecting JSON.
@@ -2995,7 +3011,7 @@ test "Gemini reads local media anew for each GenerateContent request" {
         defer serving.cancel(io) catch {};
         if (sse) {
             var capture: Capture = .{};
-            try std.testing.expectEqual(.exhausted, try gemini.streamRequest(arena, request, .{
+            try std.testing.expectEqual(.exhausted, try gemini.streamRequest(@import("workspace.zig").forTests(), request, .{
                 .context = &capture,
                 .on_event = Capture.onEvent,
             }));
@@ -3019,7 +3035,7 @@ test "Gemini reads local media anew for each GenerateContent request" {
     gemini.header_provider = .{ .context = &reached, .prepare = Probe.prepare };
     try std.testing.expectError(error.LMFailure, gemini.completeRequest(arena, request));
     var capture: Capture = .{};
-    try std.testing.expectError(error.LMFailure, gemini.streamRequest(arena, request, .{
+    try std.testing.expectError(error.LMFailure, gemini.streamRequest(@import("workspace.zig").forTests(), request, .{
         .context = &capture,
         .on_event = Capture.onEvent,
     }));
@@ -3134,7 +3150,7 @@ test "Gemini replays structured tool results and media with continuation over HT
         defer serving.cancel(io) catch {};
         if (streaming) {
             var capture: Capture = .{};
-            try std.testing.expectEqual(.exhausted, try gemini.streamRequest(arena, request, .{
+            try std.testing.expectEqual(.exhausted, try gemini.streamRequest(@import("workspace.zig").forTests(), request, .{
                 .context = &capture,
                 .on_event = Capture.onEvent,
             }));
@@ -3247,7 +3263,7 @@ test "Gemini generation removes only its first model binding prefix" {
             defer serving.cancel(io) catch {};
             if (streaming) {
                 var capture: Capture = .{ .model = case[2] };
-                try std.testing.expectEqual(.exhausted, try gemini.streamRequest(arena, request, .{
+                try std.testing.expectEqual(.exhausted, try gemini.streamRequest(@import("workspace.zig").forTests(), request, .{
                     .context = &capture,
                     .on_event = Capture.onEvent,
                 }));
@@ -4025,7 +4041,7 @@ test "Gemini Live closes when local turn preparation fails" {
     var serving = try io.concurrent(live_test.Fixture.serveFailedTurn, .{ io, &listener });
     defer serving.cancel(io) catch {};
     var events: usize = 0;
-    const result = gemini.streamRequest(arena, request, .{ .context = &events, .on_event = Counter.event });
+    const result = gemini.streamRequest(@import("workspace.zig").forTests(), request, .{ .context = &events, .on_event = Counter.event });
     try serving.await(io);
     try std.testing.expectError(error.LMFailure, result);
     try std.testing.expectEqual(0, events);
@@ -4069,7 +4085,7 @@ test "Gemini Live sends Unicode strings in valid WebSocket text frames" {
             var serving = try io.concurrent(Fixture.serve, .{ io, &listener, &.{turn}, true, setup });
             defer serving.cancel(io) catch {};
             var found = false;
-            const outcome = gemini.streamRequest(arena, request, .{ .context = &found, .on_event = Fixture.onEvent });
+            const outcome = gemini.streamRequest(@import("workspace.zig").forTests(), request, .{ .context = &found, .on_event = Fixture.onEvent });
             try serving.await(io);
             try std.testing.expectEqual(.exhausted, try outcome);
             try std.testing.expect(found);
@@ -4151,7 +4167,7 @@ test "Gemini Live sends local media over the WebSocket" {
         var serving = try io.concurrent(Fixture.serve, .{ io, &listener, &.{turn}, true, setup });
         defer serving.cancel(io) catch {};
         var found = false;
-        const outcome = gemini.streamRequest(arena, developer, .{
+        const outcome = gemini.streamRequest(@import("workspace.zig").forTests(), developer, .{
             .context = &found,
             .on_event = Fixture.onEvent,
         });
@@ -4177,7 +4193,7 @@ test "Gemini Live sends local media over the WebSocket" {
         var serving = try io.concurrent(Fixture.serve, .{ io, &listener, expected, true, null });
         defer serving.cancel(io) catch {};
         var found = false;
-        try std.testing.expectEqual(.exhausted, try gemini.streamRequest(arena, request, .{
+        try std.testing.expectEqual(.exhausted, try gemini.streamRequest(@import("workspace.zig").forTests(), request, .{
             .context = &found,
             .on_event = Fixture.onEvent,
         }));
@@ -4209,7 +4225,7 @@ test "Gemini Live sends local media over the WebSocket" {
         var serving = try io.concurrent(Fixture.serveScenario, .{ io, &listener, expected, true, null, null, reply, null, null });
         defer serving.cancel(io) catch {};
         var capture: Transcript = .{};
-        try std.testing.expectEqual(.exhausted, try gemini.streamRequest(arena, request, .{
+        try std.testing.expectEqual(.exhausted, try gemini.streamRequest(@import("workspace.zig").forTests(), request, .{
             .context = &capture,
             .on_event = Transcript.onEvent,
         }));
@@ -4374,7 +4390,7 @@ test "Gemini Live sends local media over the WebSocket" {
                     .messages = &.{.{ .role = .user, .parts = &.{.{ .text = .{ .text = "inspect" } }} }},
                 });
                 defer live_request.release();
-                try std.testing.expectEqual(.exhausted, try gemini.streamRequest(arena, live_request, sink));
+                try std.testing.expectEqual(.exhausted, try gemini.streamRequest(@import("workspace.zig").forTests(), live_request, sink));
                 try serving.await(io);
             }
             try std.testing.expectEqual(@as(usize, 3), capture.step);
@@ -4518,7 +4534,7 @@ test "Gemini Live sends local media over the WebSocket" {
                 });
                 defer serving.cancel(io) catch {};
                 var capture: Capture = .{};
-                const streamed = gemini.streamRequest(arena, parts_request, .{
+                const streamed = gemini.streamRequest(@import("workspace.zig").forTests(), parts_request, .{
                     .context = &capture,
                     .on_event = Capture.onEvent,
                 });
@@ -4603,7 +4619,7 @@ test "Gemini Live sends local media over the WebSocket" {
         var serving = try io.concurrent(Fixture.serve, .{ io, &listener, &.{payload}, true, null });
         defer serving.cancel(io) catch {};
         var found = false;
-        try std.testing.expectEqual(.exhausted, try gemini.streamRequest(arena, filtered, .{
+        try std.testing.expectEqual(.exhausted, try gemini.streamRequest(@import("workspace.zig").forTests(), filtered, .{
             .context = &found,
             .on_event = Fixture.onEvent,
         }));
@@ -4625,7 +4641,7 @@ test "Gemini Live sends local media over the WebSocket" {
         var serving = try io.concurrent(Fixture.serve, .{ io, &listener, audio_frames, true, null });
         defer serving.cancel(io) catch {};
         var found = false;
-        try std.testing.expectEqual(.exhausted, try gemini.streamRequest(arena, inline_wav, .{
+        try std.testing.expectEqual(.exhausted, try gemini.streamRequest(@import("workspace.zig").forTests(), inline_wav, .{
             .context = &found,
             .on_event = Fixture.onEvent,
         }));
@@ -4656,7 +4672,7 @@ test "Gemini Live sends local media over the WebSocket" {
         var serving = try io.concurrent(Fixture.serve, .{ io, &listener, frames, true, setup });
         defer serving.cancel(io) catch {};
         var found = false;
-        const outcome = gemini.streamRequest(arena, audio_request, .{
+        const outcome = gemini.streamRequest(@import("workspace.zig").forTests(), audio_request, .{
             .context = &found,
             .on_event = Fixture.onEvent,
         });
@@ -4696,7 +4712,7 @@ test "Gemini Live sends local media over the WebSocket" {
         var serving = try io.concurrent(Fixture.serve, .{ io, &listener, frames, true, case.setup });
         defer serving.cancel(io) catch {};
         var found = false;
-        const outcome = gemini.streamRequest(arena, prompt, .{
+        const outcome = gemini.streamRequest(@import("workspace.zig").forTests(), prompt, .{
             .context = &found,
             .on_event = Fixture.onEvent,
         });
@@ -4740,7 +4756,7 @@ test "Gemini Live sends local media over the WebSocket" {
         var serving = try io.concurrent(Fixture.serve, .{ io, &listener, frames, true, case.setup });
         defer serving.cancel(io) catch {};
         var found = false;
-        const outcome = gemini.streamRequest(arena, prompt, .{
+        const outcome = gemini.streamRequest(@import("workspace.zig").forTests(), prompt, .{
             .context = &found,
             .on_event = Fixture.onEvent,
         });
@@ -4784,7 +4800,7 @@ test "Gemini Live sends local media over the WebSocket" {
             var serving = try io.concurrent(Fixture.serve, .{ io, &listener, frames, true, stream_setup });
             defer serving.cancel(io) catch {};
             var found = false;
-            const outcome = gemini.streamRequest(arena, prompt, .{ .context = &found, .on_event = Fixture.onEvent });
+            const outcome = gemini.streamRequest(@import("workspace.zig").forTests(), prompt, .{ .context = &found, .on_event = Fixture.onEvent });
             try serving.await(io);
             try std.testing.expectEqual(.exhausted, try outcome);
             try std.testing.expect(found);
@@ -4836,7 +4852,7 @@ test "Gemini Live sends local media over the WebSocket" {
             var serving = try io.concurrent(Fixture.serveSinkStop, .{ io, &listener, stop_after == 2 });
             defer serving.cancel(io) catch {};
             var sink: Sink = .{ .stop_after = stop_after };
-            const outcome = gemini.streamRequest(arena, prompt, .{ .context = &sink, .on_event = Sink.onEvent });
+            const outcome = gemini.streamRequest(@import("workspace.zig").forTests(), prompt, .{ .context = &sink, .on_event = Sink.onEvent });
             try serving.await(io);
             try std.testing.expectEqual(.stopped, try outcome);
             try std.testing.expectEqual(stop_after, sink.events);
@@ -4870,7 +4886,7 @@ test "Gemini Live sends local media over the WebSocket" {
                     return .proceed;
                 }
             };
-            try std.testing.expectError(error.LMFailure, gemini.streamRequest(arena, missing_media, .{
+            try std.testing.expectError(error.LMFailure, gemini.streamRequest(@import("workspace.zig").forTests(), missing_media, .{
                 .context = &event_count,
                 .on_event = Count.event,
             }));
@@ -5170,7 +5186,7 @@ test "Gemini Live refuses invalid WebSocket upgrades before sending setup" {
             defer _ = serving.cancel(io) catch null;
             if (streaming) {
                 var event_count: usize = 0;
-                const result = gemini.streamRequest(arena, request, .{
+                const result = gemini.streamRequest(@import("workspace.zig").forTests(), request, .{
                     .context = &event_count,
                     .on_event = Capture.onEvent,
                 });
@@ -5216,7 +5232,7 @@ test "Gemini Live completes turns after interim HTTP responses" {
         defer serving.cancel(io) catch {};
         if (streaming) {
             var received = false;
-            const outcome = try gemini.streamRequest(arena, request, .{
+            const outcome = try gemini.streamRequest(@import("workspace.zig").forTests(), request, .{
                 .context = &received,
                 .on_event = live_test.Fixture.onEvent,
             });
@@ -5294,7 +5310,7 @@ test "Gemini Live skips binary JSON that is not UTF-8" {
         defer serving.cancel(io) catch {};
         if (streaming) {
             var capture: Capture = .{};
-            try std.testing.expectEqual(.exhausted, try gemini.streamRequest(arena, request, .{
+            try std.testing.expectEqual(.exhausted, try gemini.streamRequest(@import("workspace.zig").forTests(), request, .{
                 .context = &capture,
                 .on_event = Capture.onEvent,
             }));
@@ -5717,7 +5733,7 @@ test "Gemini generation honors normalized HTTP and RPC retry decisions" {
             defer serving.cancel(io) catch {};
             if (streaming) {
                 var capture: Capture = .{};
-                const outcome = gemini.streamRequest(arena, request, .{ .context = &capture, .on_event = Capture.onEvent });
+                const outcome = gemini.streamRequest(@import("workspace.zig").forTests(), request, .{ .context = &capture, .on_event = Capture.onEvent });
                 if (succeeded) {
                     try std.testing.expectEqual(.exhausted, try outcome);
                     try std.testing.expectEqualStrings(if (empty) "se" else "sde", capture.events[0..capture.len]);
@@ -5751,7 +5767,7 @@ test "Gemini generation honors normalized HTTP and RPC retry decisions" {
         var serving = try io.concurrent(Fixture.serve, .{ io, &listener, true, case, .ok, false });
         defer serving.cancel(io) catch {};
         var capture: Capture = .{};
-        const outcome = gemini.streamRequest(arena, request, .{ .context = &capture, .on_event = Capture.onEvent });
+        const outcome = gemini.streamRequest(@import("workspace.zig").forTests(), request, .{ .context = &capture, .on_event = Capture.onEvent });
         try serving.await(io);
         try std.testing.expectEqual(1, attempts.count);
         if (case == .valid_terminal_usage) {
@@ -5787,7 +5803,7 @@ test "Gemini generation honors normalized HTTP and RPC retry decisions" {
         }
 
         var capture: Capture = .{};
-        try std.testing.expectEqual(.exhausted, try gemini.streamRequest(arena, request, .{
+        try std.testing.expectEqual(.exhausted, try gemini.streamRequest(@import("workspace.zig").forTests(), request, .{
             .context = &capture,
             .on_event = Capture.onEvent,
         }));
@@ -5838,7 +5854,7 @@ test "Gemini generation honors normalized HTTP and RPC retry decisions" {
         var serving = try io.concurrent(Fixture.reply, .{ io, &listener, true, .rate_limit_in_stream, .ok, row.headers });
         defer serving.cancel(io) catch {};
         var hint: RetryHint = .{};
-        try std.testing.expectEqual(.exhausted, try gemini.streamRequest(arena, request, .{
+        try std.testing.expectEqual(.exhausted, try gemini.streamRequest(@import("workspace.zig").forTests(), request, .{
             .context = &hint,
             .on_event = RetryHint.onEvent,
         }));
@@ -5863,7 +5879,7 @@ test "Gemini generation honors normalized HTTP and RPC retry decisions" {
                 });
                 try std.testing.expectError(if (overflow) error.ContextWindowExceeded else error.LMFailure, result);
             } else {
-                try std.testing.expectEqual(.exhausted, try gemini.streamRequest(arena, request, sink));
+                try std.testing.expectEqual(.exhausted, try gemini.streamRequest(@import("workspace.zig").forTests(), request, sink));
             }
             try serving.await(io);
             try std.testing.expectEqual(1, attempts.count);
@@ -5949,7 +5965,7 @@ test "Gemini preserves generated media with gateway scalar fields" {
         defer serving.cancel(io) catch {};
         if (streaming) {
             var capture: Capture = .{};
-            try std.testing.expectEqual(.exhausted, try gemini.streamRequest(arena, request, .{
+            try std.testing.expectEqual(.exhausted, try gemini.streamRequest(@import("workspace.zig").forTests(), request, .{
                 .context = &capture,
                 .on_event = Capture.onEvent,
             }));
@@ -6055,7 +6071,7 @@ test "Gemini generation validates usage and token score telemetry" {
             defer serving.cancel(io) catch {};
             var capture: Capture = .{};
             const usage: Error!sdk.Usage = if (streaming) streamed: {
-                const result = gemini.streamRequest(arena, request, .{
+                const result = gemini.streamRequest(@import("workspace.zig").forTests(), request, .{
                     .context = &capture,
                     .on_event = Capture.onEvent,
                 });
@@ -6115,7 +6131,7 @@ test "Gemini generation validates usage and token score telemetry" {
             defer serving.cancel(io) catch {};
             var capture: ScoreCapture = .{};
             const result: Error!?f64 = if (streaming) streamed: {
-                const outcome = gemini.streamRequest(arena, request, .{ .context = &capture, .on_event = ScoreCapture.onEvent }) catch |err| break :streamed err;
+                const outcome = gemini.streamRequest(@import("workspace.zig").forTests(), request, .{ .context = &capture, .on_event = ScoreCapture.onEvent }) catch |err| break :streamed err;
                 try std.testing.expectEqual(.exhausted, outcome);
                 break :streamed capture.score;
             } else buffered: {

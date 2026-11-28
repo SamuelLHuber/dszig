@@ -30,6 +30,7 @@ const embedding = @import("embedder.zig");
 const value = @import("value.zig");
 const KNN = @import("knn.zig").KNN;
 const Context = predict.Context;
+const Workspace = @import("workspace.zig").Workspace;
 const Example = optimize.Example;
 const BootstrapFewShot = optimize.BootstrapFewShot;
 
@@ -39,6 +40,10 @@ pub fn KNNFewShot(comptime P: type) type {
 
         knn: KNN,
         bootstrap: BootstrapFewShot,
+        /// Fixed scratch each forward reserves from its arena for the
+        /// per-neighborhood bootstrap, so the bootstrap's nested scopes never
+        /// share the caller's workspace with the arena that owns its demos.
+        workspace_bytes_max: usize = 1024 * 1024,
 
         pub const Program = ProgramWithTeacher(P);
 
@@ -66,11 +71,17 @@ pub fn KNNFewShot(comptime P: type) type {
                     // DSPy creates a fresh BootstrapFewShot for each neighborhood.
                     var bootstrap = self.captured.optimizer.bootstrap;
                     bootstrap.error_count = 0;
+                    // Labeled-only bootstraps open no scratch scope.
+                    var nested: Workspace = undefined;
+                    var bootstrap_ctx = ctx;
+                    if (bootstrap.max_bootstrapped_demos > 0) {
+                        nested = .init(try ctx.arena.alloc(u8, self.captured.optimizer.workspace_bytes_max));
+                        bootstrap_ctx.workspace = &nested;
+                    }
                     const result = try bootstrap.compile(
                         P,
                         ctx.arena,
-                        self.captured.gpa,
-                        ctx,
+                        bootstrap_ctx,
                         self.captured.original.*,
                         if (self.captured.teacher) |teacher| teacher.* else null,
                         neighbors,
@@ -283,7 +294,7 @@ test "KNNFewShot uses original captures, real bootstrap demos, teacher settings,
     student.qa.state.demos = try testDemo(arena, "old");
     var teacher: TestTeacher = .{ .marker = "teacher", .events = &events, .compiled = true };
     teacher.qa.state.demos = try testDemo(arena, "teacher-old");
-    const compile_ctx: Context = .{ .arena = arena, .lm = unused_lm.lm() };
+    const compile_ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = unused_lm.lm() };
     var program = try optimizer.compileWithTeacher(TestTeacher, arena, testing.allocator, compile_ctx, &student, &teacher);
     try testing.expectEqual(@as(usize, 1), events.embeddings.items.len);
     try testing.expectEqual(@as(usize, 0), events.calls.items.len);
@@ -300,7 +311,7 @@ test "KNNFewShot uses original captures, real bootstrap demos, teacher settings,
     program.visible.marker = "visible-mutated";
     program.visible.qa.state.demos = try testDemo(arena, "visible-only");
     var trace: predict.Trace = .{ .arena = arena };
-    const ctx: Context = .{ .arena = arena, .lm = student_lm.lm(), .trace = &trace };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = student_lm.lm(), .trace = &trace };
     const red = try program.forward(ctx, .{ .question = "red-query" });
     const blue = try program.forward(ctx, .{ .question = "blue-query" });
     try testing.expectEqualStrings("student:red-query|captured-mutated:1", red.answer);
@@ -313,6 +324,14 @@ test "KNNFewShot uses original captures, real bootstrap demos, teacher settings,
     try testing.expect(!program.compiled and !program.visible.compiled);
     try testing.expectEqual(@as(usize, 0), unused_lm.index);
     try expectIndependentCapture(Optimizer, &optimizer, arena, ctx, &events);
+    // Serial evaluation runs forward with its arena in a workspace scope.
+    var scope = ctx.workspace.?.open();
+    defer scope.close();
+    var scoped = ctx;
+    scoped.arena = scope.allocator();
+    scoped.trace = null;
+    const scoped_red = try program.forward(scoped, .{ .question = "red-query" });
+    try testing.expectEqualStrings("student:red-query|captured-mutated:1", scoped_red.answer);
 }
 
 fn expectCallSequence(events: *const TestEvents, trace: *const predict.Trace) !void {
@@ -379,7 +398,7 @@ test "KNNFewShot transparent discovery keeps direct Predict self and nested orig
     var model = embedding.Embedder.initCustom(testing.allocator, .{ .context = &events, .embed = TestEvents.embed }, .{ .caching = false });
     defer model.deinit();
     var unused_lm: lm_mod.ScriptedLM = .{ .responses = &.{} };
-    const ctx: Context = .{ .arena = arena, .lm = unused_lm.lm() };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = unused_lm.lm() };
     const P = predict.Predict(TestSignature);
     const optimizer = try KNNFewShot(P).init(arena, 1, try testTrainset(arena), &model, .{});
     var student: P = .{};
@@ -425,7 +444,7 @@ test "KNNFewShot propagates source bootstrap failure for an empty negative-k nei
     var model = embedding.Embedder.initCustom(testing.allocator, .{ .context = &events, .embed = TestEvents.embed }, .{ .caching = false });
     defer model.deinit();
     var unused_lm: lm_mod.ScriptedLM = .{ .responses = &.{} };
-    const ctx: Context = .{ .arena = arena, .lm = unused_lm.lm() };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = unused_lm.lm() };
     const P = predict.Predict(TestSignature);
     const optimizer = try KNNFewShot(P).init(arena, -2, try testTrainset(arena), &model, .{
         .max_bootstrapped_demos = 0,
@@ -448,7 +467,7 @@ test "KNNFewShot observes live optimizer options and retrieval state after compi
     var model = embedding.Embedder.initCustom(testing.allocator, .{ .context = &events, .embed = TestEvents.embed }, .{ .caching = false });
     defer model.deinit();
     var student_lm: TestLM = .{ .label = "student", .events = &events };
-    const ctx: Context = .{ .arena = arena, .lm = student_lm.lm() };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = student_lm.lm() };
     var optimizer = try KNNFewShot(TestProgram).init(arena, 1, try testTrainset(arena), &model, .{
         .max_bootstrapped_demos = 0,
         .max_labeled_demos = 1,
@@ -477,7 +496,7 @@ test "KNNFewShot validates live teacher metadata before empty-neighborhood boots
     var model = embedding.Embedder.initCustom(testing.allocator, .{ .context = &events, .embed = TestEvents.embed }, .{ .caching = false });
     defer model.deinit();
     var unused_lm: lm_mod.ScriptedLM = .{ .responses = &.{} };
-    const ctx: Context = .{ .arena = arena, .lm = unused_lm.lm() };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = unused_lm.lm() };
     var optimizer = try KNNFewShot(TestProgram).init(arena, 1, try testTrainset(arena), &model, .{
         .max_bootstrapped_demos = 0,
         .max_labeled_demos = 0,

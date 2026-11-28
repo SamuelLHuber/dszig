@@ -238,11 +238,11 @@ pub const Harness = struct {
         const program: Program = .{ .calls = &self.program_calls, .mode = mode };
         const context: dszig.Context = .{
             .arena = self.execution.allocator(),
+            .workspace = dszig.workspace.forTests(),
             .lm = .{ .ptr = &self.lm_calls, .vtable = &.{ .complete = unexpected_complete } },
         };
         const actual = dszig.optimize.evaluate(
             Program,
-            self.execution.allocator(),
             context,
             &program,
             self.examples[0..scenario.len],

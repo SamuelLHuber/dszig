@@ -42,7 +42,7 @@ test "DSZig reproduces DSPy 3.5.0's independently recorded deterministic suite" 
         .supports_decision_requests = if (transcript.object.get("supports_decision_requests")) |value| value.bool else false,
     };
 
-    const result = try suite.run(arena, testing.allocator, replay.lm(), try .fromTranscript(transcript));
+    const result = try suite.run(arena, testing.allocator, dszig.workspace.forTests(), replay.lm(), try .fromTranscript(transcript));
     try testing.expectEqual(@as(usize, 0), replay.misses);
     try testing.expect(replay.exhausted());
 

@@ -311,7 +311,7 @@ fn searchOptions(arena: Allocator, row: Value) !RandomSearch.Options {
 
 fn searchRun(arena: Allocator, gpa: Allocator, row: Value) !SearchOutcome {
     var silent: dszig.lm.ScriptedLM = .{ .responses = &.{} };
-    const ctx: dszig.Context = .{ .arena = arena, .lm = silent.lm() };
+    const ctx: dszig.Context = .{ .workspace = &workspace, .arena = arena, .lm = silent.lm() };
     const search = try searchConfig(row);
     const options = try searchOptions(arena, row);
     const student = try studentProgram(arena);
@@ -396,7 +396,7 @@ fn metaLabeledRow(arena: Allocator, init: std.process.Init, tally: *Tally, row: 
         .optimizer = .{ .k = try std.fmt.parseInt(i128, try text(row, "k"), 10) },
         .compile_options = .{ .sample = try flag(row, "sample") },
     };
-    const result = try meta.compileWith(Program, arena, init.gpa, init.io, .{ .arena = arena, .lm = model.lm() }, &student, try examplesTo(arena, train), metaOptions("labeled"), .{ .labeled = &labeled });
+    const result = try meta.compileWith(Program, arena, init.gpa, init.io, .{ .workspace = &workspace, .arena = arena, .lm = model.lm() }, &student, try examplesTo(arena, train), metaOptions("labeled"), .{ .labeled = &labeled });
     if (try sourceErrorType(row)) |_| {
         // The step's error is recorded by BetterTogether, not propagated.
         return tally.check(result.flag_compilation_error_occurred, case, "BetterTogether step refusal");
@@ -422,10 +422,14 @@ fn metaSearchRow(arena: Allocator, init: std.process.Init, tally: *Tally, row: V
         .prompt = try searchConfig(row),
         .prompt_compile_options = try searchOptions(arena, row),
     };
-    const result = try meta.compile(Program, arena, init.gpa, init.io, .{ .arena = arena, .lm = model.lm() }, &student, try examplesTo(arena, try count(row, "train")), metaOptions("p"), defaults);
+    const result = try meta.compile(Program, arena, init.gpa, init.io, .{ .workspace = &workspace, .arena = arena, .lm = model.lm() }, &student, try examplesTo(arena, try count(row, "train")), metaOptions("p"), defaults);
     try tally.check(!result.flag_compilation_error_occurred, case, "default prompt step success");
     try checkDemos(tally, case, try field(row, "best_demos"), &result.program);
 }
+
+/// Fixed scratch for internal scopes, reserved statically.
+var workspace_buffer: [16 * 1024 * 1024]u8 = undefined;
+var workspace: dszig.Workspace = .init(&workspace_buffer);
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
