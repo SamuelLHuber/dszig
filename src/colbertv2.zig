@@ -3,6 +3,7 @@
 //! Cache keys are native identities, not Python diskcache-compatible hashes.
 //!
 //! Upstream (DSPy 3.5.0): dspy/dsp/colbertv2.py
+const assert = std.debug.assert;
 const Workspace = @import("workspace.zig").Workspace;
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -72,15 +73,18 @@ pub const Result = struct {
 pub const ColBERTv2 = struct {
     client: *std.http.Client,
     cache: *request_cache.Cache,
-    /// Fixed scratch for request URLs, bodies and responses.
-    workspace: *Workspace,
+    /// Fixed scratch for request URLs, bodies and responses: one per
+    /// concurrent caller, at most 64, reserved by the caller.
+    workspaces: []Workspace,
+    busy: std.atomic.Value(u64) = .init(0),
     /// Borrowed unless init appends a truthy port into its supplied arena.
     url: []const u8 = "http://0.0.0.0",
     post_requests: bool = false,
     max_response_bytes: usize = 4 * 1024 * 1024,
     timeout_ns: ?u64 = 10_000_000_000,
 
-    pub fn init(arena: Allocator, client: *std.http.Client, cache: *request_cache.Cache, workspace: *Workspace, options: Options) !ColBERTv2 {
+    pub fn init(arena: Allocator, client: *std.http.Client, cache: *request_cache.Cache, workspaces: []Workspace, options: Options) !ColBERTv2 {
+        if (workspaces.len == 0 or workspaces.len > 64) return error.InvalidWorkspaces;
         var url = options.url;
         if (options.port) |port| switch (port) {
             .string => |text| {
@@ -93,7 +97,7 @@ pub const ColBERTv2 = struct {
         return .{
             .client = client,
             .cache = cache,
-            .workspace = workspace,
+            .workspaces = workspaces,
             .url = url,
             .post_requests = options.post_requests,
             .max_response_bytes = options.max_response_bytes,
@@ -171,8 +175,28 @@ pub const ColBERTv2 = struct {
         return key;
     }
 
+    /// More concurrent fetches than workspaces is `error.WorkspacesBusy`.
+    fn acquire(self: *ColBERTv2) error{WorkspacesBusy}!u6 {
+        assert(self.workspaces.len > 0 and self.workspaces.len <= 64);
+        const all: u64 = if (self.workspaces.len == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(self.workspaces.len)) - 1;
+        var busy = self.busy.load(.monotonic);
+        while (true) {
+            const free = all & ~busy;
+            if (free == 0) return error.WorkspacesBusy;
+            const slot: u6 = @intCast(@ctz(free));
+            busy = self.busy.cmpxchgWeak(busy, busy | (@as(u64, 1) << slot), .acquire, .monotonic) orelse return slot;
+        }
+    }
+
+    fn releaseSlot(self: *ColBERTv2, slot: u6) void {
+        const previous = self.busy.fetchAnd(~(@as(u64, 1) << slot), .release);
+        assert(previous & (@as(u64, 1) << slot) != 0);
+    }
+
     fn fetch(self: *ColBERTv2, query: []const u8, k: i64) !*request_cache.Payload {
-        var scratch = self.workspace.open();
+        const slot = try self.acquire();
+        defer self.releaseSlot(slot);
+        var scratch = self.workspaces[slot].open();
         defer scratch.close();
         const arena = scratch.allocator();
         const url = if (self.post_requests) self.url else try getRequestUrl(arena, self.url, query, k);
@@ -356,4 +380,18 @@ test "ColBERT GET slices twice and POST preserves arbitrary long_text" {
     try testing.expectError(error.MissingText, parsePayload(testing.allocator,
         \\{"topk":[{"text":"alpha"},{"text":"beta"},{"text":"gamma"},{"long_text":"dropped by second slice"},{"text":"epsilon"}]}
     , false, -1));
+}
+
+test "concurrent fetches take distinct fixed workspaces" {
+    var buffers: [2][64]u8 = undefined;
+    var workspaces: [2]Workspace = .{ .init(&buffers[0]), .init(&buffers[1]) };
+    var colbert: ColBERTv2 = .{ .client = undefined, .cache = undefined, .workspaces = &workspaces };
+    const first = try colbert.acquire();
+    const second = try colbert.acquire();
+    try std.testing.expect(first != second);
+    try std.testing.expectError(error.WorkspacesBusy, colbert.acquire());
+    colbert.releaseSlot(first);
+    try std.testing.expectEqual(first, try colbert.acquire());
+    colbert.releaseSlot(first);
+    colbert.releaseSlot(second);
 }
