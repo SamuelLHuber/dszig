@@ -12,8 +12,8 @@ const Record = dszig.value.Record;
 const Call = dszig.lm.ReplayLM.Call;
 
 pub const target_dspy = "3.5.0";
-/// Sampling settings of a recording. The defaults reproduce the committed
-/// gpt-4o-mini runs; models that accept only temperature 1 (gpt-5.6-luna,
+/// Sampling settings of a recording. The defaults reproduce the deterministic
+/// mock suite; models that accept only temperature 1 (gpt-5.6-luna,
 /// gpt-6-luna) record with `temperature = 1` and COPRO's `init_temperature = 1`.
 /// Non-default values are written into the transcript so replays reuse them.
 pub const Settings = struct {
@@ -37,8 +37,8 @@ pub const Settings = struct {
 };
 /// The suite arena is reserved once at startup and never grows; a run that
 /// outgrows it fails with OutOfMemory. A full run uses about 3 MiB on the mock
-/// transcript and 8.5 MiB on the committed gpt-4o-mini recordings, so this
-/// leaves over 3x headroom for longer real completions.
+/// transcript and 9 MiB on the committed gpt-5.6-luna and gpt-6-luna
+/// recordings, so this leaves over 3x headroom for longer real completions.
 pub const arena_bytes_max = 32 * 1024 * 1024;
 
 pub const Typed = dszig.Signature(struct {

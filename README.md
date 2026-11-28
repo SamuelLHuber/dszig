@@ -4588,7 +4588,7 @@ whole chunks, unused capacity included. The suite arena is a
 `FixedBufferAllocator` over `arena_bytes_max` (32 MiB) reserved once at
 startup, so it never grows and a run that outgrows it fails with
 `OutOfMemory`; reserved heap counts that whole buffer. A full run uses about
-3 MiB of it on the mock transcript and 8.5 MiB on the gpt-4o-mini recordings. Untouched pages of the
+3 MiB of it on the mock transcript and 9 MiB on the gpt-5.6-luna and gpt-6-luna recordings. Untouched pages of the
 buffer are not resident, so they do not show in RSS.
 Measured 2026-11-23 on an 8-vCPU Intel Xeon Linux VM:
 
@@ -6308,43 +6308,6 @@ observations alone are not native coverage. Native behavior tests preserve
 the corresponding source-backed consumer boundaries; the probes do not add
 real-model inference evidence.
 
-The existing `tests/fixtures/live/*gpt-4o-mini.json` recordings were made against
-**DSPy 3.4.1**. They remain unchanged as historical artifacts. They are not
-relabeled or used as evidence that the new 3.5 protocol matches an old protocol.
-Fresh 3.5 live recordings must identify their actual model, capabilities and
-`target_dspy` before either runtime replays them.
-
-### DSPy 3.5.0 real-model parity (gpt-4o-mini)
-
-`tests/fixtures/live/dspy_3.5.0_gpt-4o-mini.json` (DSPy 3.5.0, 684 real calls)
-and `tests/fixtures/live/dszig_3.5.0_gpt-4o-mini.json` (DSZig, 685 real calls)
-were each recorded against the public OpenAI API through the Responses API, with
-response-schema and function-calling capabilities enabled. Each recording is
-replayed through the other runtime: every request must byte-match a recorded
-request, every recorded call must be consumed, and case outputs, scores,
-artifacts and optimizer traces must be equal. `check.sh` runs both directions
-for every committed `*_3.5.0*.json` transcript without a key.
-
-| Pipeline | DSPy 3.5.0 | DSZig |
-|---|---|---|
-| RAG + BootstrapFewShot | 100% → 100% | 100% → 100% |
-| Dates + BootstrapFewShot | 0% → 100% | 0% → 100% |
-| Dates + BootstrapFewShotWithRandomSearch | 0% → 100% | 0% → 100% |
-| Dates + MIPROv2 | 0% → 100% | 0% → 100% |
-| Dates + MIPROv2 (program-aware proposer) | 0% → 100% | 0% → 100% |
-| RAG ReAct + BootstrapFewShot | 100% → 100% | 100% → 100% |
-| Dates + COPRO | 0% → 0% | 0% → 0% |
-| Dates + SIMBA (small configuration) | 0% → 0% | 0% → 0% |
-| Dates + GEPA | 0% → 100% | 0% → 100% |
-
-Accuracy is at par on the same model: equal scores in both independent runs and
-identical results when either runtime replays the other's completions. The one
-call-count difference comes from sampling, not protocol: the replay checks
-prove each runtime makes exactly the other's requests given the same completions.
-DSPy 3.5 routes `openai/*` models through the Responses API, so `dz-live` records
-DSZig with `DSZIG_LIVE_API=responses`; a Chat Completions recording returns native
-tool calls where Responses returns text and does not cross-replay.
-
 ### DSPy 3.5.0 real-model parity (gpt-5.6-luna, gpt-6-luna)
 
 Both reasoning models accept only temperature 1 (or none), so these recordings
@@ -6373,21 +6336,12 @@ MIPROv2) comes from sampling, and each runtime reproduces the other's 0% or 100%
 exactly when replaying its completions. These recordings exposed one ordering
 bug: DSPy appends natively returned reasoning after the parsed output fields,
 which GEPA's reflection prompt shows; DSZig now does the same.
+DSPy 3.5 routes `openai/*` models through the Responses API, so `dz-live` records
+both runtimes with `DSZIG_LIVE_API=responses`; a Chat Completions recording returns
+native tool calls where Responses returns text and does not cross-replay.
+This is finite live-model coverage, not proof of every optimizer option or
+full DSPy parity.
 
-The committed `dspy_3.5.0.json` and `dszig_3.5.0.json` recordings use the public
-OpenAI endpoint with `gpt-4o-mini`: 679 DSPy calls and 680 native calls.
-`devenv shell -- dz-live` completed both authenticated recordings, both
-cross-runtime replays and the pinned reference gate. The nine pipeline scores
-and serialized artifacts matched on replay; GEPA improved the date task from
-0% to 100%, while COPRO and SIMBA remained at 0% in this run. This is finite
-live-model coverage, not proof of every optimizer option or full DSPy parity.
-The recorder preserves lm15's already-flat JSON-schema metadata and also
-normalizes nested Chat-wire schema dictionaries.
-
-A separate native Chat Completions run on public OpenAI used SecretSpec and
-`gpt-4o-mini` for 683 recorded calls. Pinned DSPy 3.5.0 strictly replayed that
-transcript and reproduced all eight adapter cases and nine pipeline scores
-and artifacts. COPRO and SIMBA completed but did not improve the date task.
 Separate native live checks exercised asynchronous field streaming on both
 Chat Completions and Responses. These runs do not qualify the homelab endpoint.
 
@@ -6423,7 +6377,7 @@ devenv shell -- dz-live-document-smoke  # one typed File prediction on Responses
 devenv shell -- dz-live-tool-smoke /tmp/dszig-tool-smoke.json
 devenv shell -- dz-live-optimization-smoke /tmp/dszig-bootstrap-smoke.json
 devenv shell -- dz-live-verify /tmp/dszig-release-receipts # directory must not exist
-devenv shell -- dz-live                 # DSPy and DSZig recordings, cross-replayed
+devenv shell -- dz-live                 # DSPy and DSZig recordings on gpt-5.6-luna and gpt-6-luna, cross-replayed
 ```
 
 These managed commands use `OPENAI_API_KEY` and pin `OPENAI_BASE_URL` to
@@ -6491,7 +6445,7 @@ export DSZIG_LIVE_API=responses
 # Set DSZIG_LIVE_MODEL to an actual model served by the authenticated endpoint.
 # Supply CODEX_LB_API_KEY in the environment, not in source or committed files.
 zig build live -- --smoke
-zig build live -- tests/fixtures/live/dszig_3.5.0.json
+zig build live -- tests/fixtures/live/dszig_3.5.0_gpt-5.6-luna.json
 ```
 
 `DSZIG_LIVE_REASONING=1`, `DSZIG_LIVE_RESPONSE_SCHEMA=1` and

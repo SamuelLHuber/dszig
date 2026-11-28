@@ -85,11 +85,17 @@ in
         env -u CODEX_LB_API_KEY OPENAI_BASE_URL=https://api.openai.com/v1 \
         bash -euo pipefail -c '
           : "''${OPENAI_API_KEY:?OPENAI_API_KEY is required for live inference}"
-          (cd tools/dspy_reference && uv run --locked live.py \
-            ../../tests/fixtures/live/dspy_3.5.0.json "openai/''${DSZIG_LIVE_MODEL:-gpt-4o-mini}")
-          zig build replay -- tests/fixtures/live/dspy_3.5.0.json
-          zig build live -- tests/fixtures/live/dszig_3.5.0.json
-          (cd tools/dspy_reference && uv run --locked check_live.py ../../tests/fixtures/live/dszig_3.5.0.json)
+          # Both models accept only temperature 1; the transcripts record it.
+          export DSZIG_LIVE_API=responses DSZIG_LIVE_TEMPERATURE=1 DSZIG_LIVE_COPRO_TEMPERATURE=1 \
+            DSZIG_LIVE_REASONING=1 DSZIG_LIVE_RESPONSE_SCHEMA=1 DSZIG_LIVE_FUNCTION_CALLING=1
+          for model in ''${DSZIG_LIVE_MODELS:-gpt-5.6-luna gpt-6-luna}; do
+            export DSZIG_LIVE_MODEL="$model"
+            (cd tools/dspy_reference && uv run --locked live.py \
+              "../../tests/fixtures/live/dspy_3.5.0_$model.json" "openai/$model")
+            zig build replay -- "tests/fixtures/live/dspy_3.5.0_$model.json"
+            zig build live -- "tests/fixtures/live/dszig_3.5.0_$model.json"
+            (cd tools/dspy_reference && uv run --locked check_live.py "../../tests/fixtures/live/dszig_3.5.0_$model.json")
+          done
           tools/dspy_reference/check.sh
         '
     '';

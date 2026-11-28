@@ -2,7 +2,7 @@
 //! (tools/dspy_reference/gen_suite_replay.py). This is mock-provider parity,
 //! not live-model evidence. Every request must byte-match DSPy's recording,
 //! every call must be consumed, and outputs, scores and artifacts must agree.
-//! Historical real-model recordings remain unchanged under fixtures/live/.
+//! check.sh replays the real-model recordings under fixtures/live/.
 
 const std = @import("std");
 const dszig = @import("dszig");
