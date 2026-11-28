@@ -18,6 +18,8 @@ pub const Gemini = struct {
     base_url: []const u8 = "https://generativelanguage.googleapis.com/v1beta",
     max_tokens: ?u32 = null,
     max_response_bytes: usize = 4 * 1024 * 1024,
+    /// Fixed scratch reserved once per Live connection for parsed messages.
+    live_scratch_bytes_max: usize = 8 * 1024 * 1024,
     max_retries: u8 = 3,
     retry_base_ms: u32 = 500,
     timeout_ns: ?u64 = null,
@@ -328,17 +330,19 @@ pub const Gemini = struct {
         }
         const allocator = self.client.allocator;
         const model = wireModel(self.model);
+        const workspace_buffer = try allocator.alloc(u8, self.live_scratch_bytes_max);
+        errdefer allocator.free(workspace_buffer);
         session.* = .{
             .timed = self.liveTimeouts(),
-            .connection_arena = .init(allocator),
-            .scratch = .init(allocator),
+            .workspace_buffer = workspace_buffer,
+            .workspace = .init(workspace_buffer),
             .max_bytes = self.max_response_bytes,
             .audio_native = liveAudioNative(model),
         };
-        errdefer session.connection_arena.deinit();
-        errdefer session.scratch.deinit();
         errdefer session.buffer.deinit(allocator);
-        const uri = try liveEndpoint(session.connection_arena.allocator(), self.base_url, self.api_key);
+        session.connection = session.workspace.open();
+        const uri = try liveEndpoint(session.connection.allocator(), self.base_url, self.api_key);
+        session.scratch = session.workspace.open();
         session.client = try http.isolatedClient(self.client, session.timed.io());
         errdefer session.client.deinit();
         session.socket = try @import("websocket.zig").open(&session.client, uri);
@@ -349,7 +353,7 @@ pub const Gemini = struct {
         const arena = session.scratch.allocator();
         try session.socket.sendText(try session.setupFrame(arena, model, &options));
         var remaining = session.max_bytes;
-        if (try waitLiveSetup(&session.socket, &session.scratch, &session.buffer, &remaining) == .rejected)
+        if (try waitLiveSetup(&session.socket, &session.scratch, allocator, &session.buffer, &remaining) == .rejected)
             return error.LMFailure;
         session.open = true;
     }
@@ -386,10 +390,11 @@ pub const Gemini = struct {
 
         var buffer: std.ArrayList(u8) = .empty;
         defer buffer.deinit(client.allocator);
-        var scratch: std.heap.ArenaAllocator = .init(client.allocator);
-        defer scratch.deinit();
+        var live_workspace: Workspace = .init(try arena.alloc(u8, self.live_scratch_bytes_max));
+        var scratch = live_workspace.open();
+        defer scratch.close();
         var remaining = self.max_response_bytes;
-        if (try waitLiveSetup(&socket, &scratch, &buffer, &remaining) == .rejected)
+        if (try waitLiveSetup(&socket, &scratch, client.allocator, &buffer, &remaining) == .rejected)
             return error.LMFailure;
 
         // Match DSPy: a rejected setup never opens local files for the turn.
@@ -405,7 +410,7 @@ pub const Gemini = struct {
         var saw_tool = false;
         for (0..8192) |_| {
             if (state.outcome == .stopped) return;
-            const value = try receiveLive(&socket, &scratch, &buffer, &remaining);
+            const value = try receiveLive(&socket, &scratch, client.allocator, &buffer, &remaining);
             if (value != .object) continue;
             if (value.object.get("error")) |detail|
                 return state.emit(.{ .provider_error = try streamError(scratch.allocator(), detail) });
@@ -535,8 +540,11 @@ const GeminiLiveSession = struct {
     timed: @import("timed_io.zig"),
     client: std.http.Client = undefined,
     socket: @import("websocket.zig") = undefined,
-    connection_arena: std.heap.ArenaAllocator,
-    scratch: std.heap.ArenaAllocator,
+    workspace_buffer: []u8,
+    workspace: Workspace,
+    /// Connection lifetime; `scratch` above it is reset for every message.
+    connection: Workspace.Scope = undefined,
+    scratch: Workspace.Scope = undefined,
     buffer: std.ArrayList(u8) = .empty,
     pending: []const Event = &.{},
     max_bytes: usize,
@@ -598,9 +606,10 @@ const GeminiLiveSession = struct {
         self.socket.finish() catch {};
         self.socket.deinit();
         self.buffer.deinit(self.client.allocator);
-        self.scratch.deinit();
+        self.scratch.close();
+        self.connection.close();
+        self.client.allocator.free(self.workspace_buffer);
         self.client.deinit();
-        self.connection_arena.deinit();
     }
 
     /// A WebSocket write failure terminates the connection. Call close to
@@ -609,8 +618,9 @@ const GeminiLiveSession = struct {
     pub fn send(self: *GeminiLiveSession, input: Input) !void {
         if (!self.open) return error.SessionClosed;
         if (!self.socket.isOpen()) return error.PeerClosed;
-        var scratch: std.heap.ArenaAllocator = .init(self.client.allocator);
-        defer scratch.deinit();
+        // Pending events stay valid: this scope sits above the message scope.
+        var scratch = self.workspace.open();
+        defer scratch.close();
         const payload = try self.inputFrame(scratch.allocator(), input);
         self.socket.sendText(payload) catch |err| {
             self.pending = &.{};
@@ -656,7 +666,7 @@ const GeminiLiveSession = struct {
         var remaining = self.max_bytes;
         if (self.pending.len == 0) {
             for (0..8192) |_| {
-                const value = try receiveLive(&self.socket, &self.scratch, &self.buffer, &remaining);
+                const value = try receiveLive(&self.socket, &self.scratch, self.client.allocator, &self.buffer, &remaining);
                 if (value != .object) continue;
                 self.pending = try sessionEvents(self.scratch.allocator(), value);
                 if (self.pending.len != 0) break;
@@ -1030,12 +1040,13 @@ fn liveJson(arena: Allocator, value: Value) ![]const u8 {
 
 fn waitLiveSetup(
     socket: *@import("websocket.zig"),
-    scratch: *std.heap.ArenaAllocator,
+    scratch: *Workspace.Scope,
+    buffer_allocator: Allocator,
     buffer: *std.ArrayList(u8),
     remaining: *usize,
 ) !enum { accepted, rejected } {
     for (0..8192) |_| {
-        const value = try receiveLive(socket, scratch, buffer, remaining);
+        const value = try receiveLive(socket, scratch, buffer_allocator, buffer, remaining);
         if (value != .object) continue;
         if (value.object.contains("setupComplete")) return .accepted;
         if (value.object.contains("error")) return .rejected;
@@ -1045,12 +1056,13 @@ fn waitLiveSetup(
 
 fn receiveLive(
     socket: *@import("websocket.zig"),
-    scratch: *std.heap.ArenaAllocator,
+    scratch: *Workspace.Scope,
+    buffer_allocator: Allocator,
     buffer: *std.ArrayList(u8),
     remaining: *usize,
 ) !Value {
-    _ = scratch.reset(.retain_capacity);
-    const message = try socket.receive(scratch.child_allocator, buffer, remaining.*);
+    scratch.reset();
+    const message = try socket.receive(buffer_allocator, buffer, remaining.*);
     remaining.* -= message.bytes.len;
     // Text messages were validated by the WebSocket layer. DSPy also
     // decodes binary messages as strict UTF-8 before inspecting JSON.

@@ -63,6 +63,16 @@ pub const Workspace = struct {
             scope.* = undefined;
         }
 
+        /// Release everything allocated through the scope and keep it open,
+        /// like an arena reset that retains capacity.
+        pub fn reset(scope: *Scope) void {
+            const ws = scope.ws;
+            assert(ws.depth == scope.depth);
+            assert(ws.fixed.end_index >= scope.mark);
+            ws.used_peak = @max(ws.used_peak, ws.fixed.end_index);
+            ws.fixed.end_index = scope.mark;
+        }
+
         const vtable: Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
 
         fn innermost(ptr: *anyopaque) *Workspace {
@@ -145,4 +155,19 @@ test "outer frees under an open inner scope wait for the outer close" {
     _ = try outer.allocator().alloc(u8, 48);
     outer.close();
     try testing.expectEqual(@as(usize, 0), ws.used());
+}
+
+test "reset releases a scope's allocations and keeps it open" {
+    var buffer: [64]u8 = undefined;
+    var ws: Workspace = .init(&buffer);
+    var outer = ws.open();
+    _ = try outer.allocator().alloc(u8, 8);
+    var scope = ws.open();
+    _ = try scope.allocator().alloc(u8, 48);
+    scope.reset();
+    try testing.expectEqual(@as(usize, 8), ws.used());
+    _ = try scope.allocator().alloc(u8, 56);
+    scope.close();
+    outer.close();
+    try testing.expectEqual(@as(usize, 64), ws.peak());
 }
