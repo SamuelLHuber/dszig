@@ -3886,7 +3886,7 @@ test "BootstrapFewShot reads borrowed settings for retries and later examples" {
         .seed = 1,
         .teacher_settings_ref = &settings,
     };
-    const sampled = try optuna.compile(Program, arena, testing.allocator, testing.io, ctx, .{}, null, 2, &train, train[0..1]);
+    const sampled = try optuna.compile(Program, arena, testing.io, ctx, .{}, null, 2, &train, train[0..1]);
     try testing.expectEqual(@as(i64, 1), sampled.parameters[0].high);
     try testing.expectEqualStrings("accepted", sampled.program.predict.state.demos[0].get("answer").?.string);
 }

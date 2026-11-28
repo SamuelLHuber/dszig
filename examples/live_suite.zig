@@ -302,7 +302,7 @@ fn pipeline(
             .program_aware_proposer = aware,
             .program_code = dates_program_code,
         };
-        const compiled = try optimizer.compile(P, arena, gpa, ctx, null, student, null, trainset, options);
+        const compiled = try optimizer.compile(P, arena, ctx, null, student, null, trainset, options);
         const optimized = try dszig.optimize.evaluate(P, ctx, &compiled.program, devset, metric, 10);
         return .{
             .baseline = baseline.score,

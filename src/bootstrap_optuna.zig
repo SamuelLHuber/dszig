@@ -93,7 +93,6 @@ pub const BootstrapFewShotWithOptuna = struct {
         self: BootstrapFewShotWithOptuna,
         comptime P: type,
         out: Allocator,
-        gpa: Allocator,
         io: std.Io,
         ctx: predict.Context,
         student_in: P,
@@ -102,7 +101,7 @@ pub const BootstrapFewShotWithOptuna = struct {
         trainset: []const Example,
         valset: ?[]const Example,
     ) !Result(P) {
-        return self.compileTyped(P, P, out, gpa, io, ctx, student_in, teacher_in, max_demos, trainset, valset);
+        return self.compileTyped(P, P, out, io, ctx, student_in, teacher_in, max_demos, trainset, valset);
     }
 
     /// Use a distinct teacher type with BootstrapFewShot-compatible predictors.
@@ -111,7 +110,6 @@ pub const BootstrapFewShotWithOptuna = struct {
         self: BootstrapFewShotWithOptuna,
         comptime P: type,
         out: Allocator,
-        gpa: Allocator,
         io: std.Io,
         ctx: predict.Context,
         student_in: P,
@@ -120,7 +118,7 @@ pub const BootstrapFewShotWithOptuna = struct {
         trainset: []const Example,
         valset: ?[]const Example,
     ) !Result(P) {
-        return self.compileTyped(P, @TypeOf(teacher), out, gpa, io, ctx, student_in, teacher, max_demos, trainset, valset);
+        return self.compileTyped(P, @TypeOf(teacher), out, io, ctx, student_in, teacher, max_demos, trainset, valset);
     }
 
     fn compileTyped(
@@ -128,7 +126,6 @@ pub const BootstrapFewShotWithOptuna = struct {
         comptime P: type,
         comptime T: type,
         out: Allocator,
-        gpa: Allocator,
         io: std.Io,
         ctx: predict.Context,
         student_in: P,
@@ -137,9 +134,8 @@ pub const BootstrapFewShotWithOptuna = struct {
         trainset: []const Example,
         valset: ?[]const Example,
     ) !Result(P) {
-        var workspace: std.heap.ArenaAllocator = .init(gpa);
-        defer workspace.deinit();
-        const arena = workspace.allocator();
+        // Bootstrap state outlives every trial, so it lives with the result.
+        const arena = out;
         const student = try copyProgram(P, arena, arena, student_in, true);
         const val = if (valset) |given| if (given.len > 0) given else trainset else trainset;
 
@@ -173,11 +169,11 @@ pub const BootstrapFewShotWithOptuna = struct {
         const trials = try out.alloc(Trial(P), self.num_candidate_programs);
         const history = try arena.alloc(tpe.Trial, self.num_candidate_programs);
         var sampler = if (self.seed) |seed| tpe.Sampler.init(seed) else tpe.Sampler.initUnseeded(io);
-        var sampling: std.heap.ArenaAllocator = .init(gpa);
-        defer sampling.deinit();
+        const workspace = ctx.workspace orelse return error.WorkspaceRequired;
         var best: ?usize = null;
         for (trials, 0..) |*trial, number| {
-            _ = sampling.reset(.retain_capacity);
+            var sampling = workspace.open();
+            defer sampling.close();
             const scratch = sampling.allocator();
             var program = try copyProgram(P, out, scratch, student, true);
             const program_predictors = try predict.namedPredictors(scratch, &program);
@@ -426,7 +422,7 @@ test "heterogeneous Bootstrap teachers improve RandomSearch and Optuna student c
         .max_labeled_demos = 1,
         .num_candidate_programs = 2,
     };
-    const tuned = try search_optuna.compileWithTeacher(TestProgram, arena, testing.allocator, testing.io, ctx, .{}, teacher, 1, &train, null);
+    const tuned = try search_optuna.compileWithTeacher(TestProgram, arena, testing.io, ctx, .{}, teacher, 1, &train, null);
     try testing.expectEqual(@as(usize, 1), tuned.bootstrap_report.bootstrapped);
     try testing.expectEqual(@as(usize, 0), tuned.best_trial);
     try testing.expectEqual(@as(usize, 2), tuned.trials.len);
@@ -469,7 +465,7 @@ test "BootstrapOptuna selects one demo in predictor order and retains every tria
         .max_labeled_demos = 5,
         .num_candidate_programs = 20,
     };
-    const result = try optimizer.compile(TestProgram, out.allocator(), testing.allocator, testing.io, ctx, student, null, 3, trainset, valset);
+    const result = try optimizer.compile(TestProgram, out.allocator(), testing.io, ctx, student, null, 3, trainset, valset);
     try testing.expect(try value.recordEqual(&original, &student.z.state.demos[0]));
     try testing.expectEqual(@as(usize, 3), result.best_trial);
     try testing.expectEqual(@as(usize, 3), result.bootstrap_report.bootstrapped);
@@ -511,8 +507,8 @@ test "BootstrapOptuna absent and empty validation both fall back to training" {
     const ctx: predict.Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = silent.lm() };
     const trainset = try testExamples(arena, &.{ "0", "1", "2", "3", "4", "5" });
     const optimizer: BootstrapFewShotWithOptuna = .{ .metric = sourceMetric, .seed = 9, .max_labeled_demos = 5, .num_candidate_programs = 20 };
-    const absent = try optimizer.compile(TestProgram, arena, testing.allocator, testing.io, ctx, .{}, null, 3, trainset, null);
-    const empty = try optimizer.compile(TestProgram, arena, testing.allocator, testing.io, ctx, .{}, null, 3, trainset, &.{});
+    const absent = try optimizer.compile(TestProgram, arena, testing.io, ctx, .{}, null, 3, trainset, null);
+    const empty = try optimizer.compile(TestProgram, arena, testing.io, ctx, .{}, null, 3, trainset, &.{});
     for (absent.trials, empty.trials, source_choices, 0..) |a, b, choices, i| {
         try testing.expectEqualSlices(?i64, a.params, b.params);
         try testing.expectEqual(@as(?i64, choices[0]), a.params[0]);
@@ -535,7 +531,7 @@ test "BootstrapOptuna ties keep the first program and do not mutate the teacher"
     var teacher: TestProgram = .{};
     teacher.z.state.demos = &.{(try testExamples(arena, &.{"88"}))[0].record};
     const optimizer: BootstrapFewShotWithOptuna = .{ .metric = tiedMetric, .seed = 9, .max_labeled_demos = 5, .num_candidate_programs = 20 };
-    const result = try optimizer.compile(TestProgram, arena, testing.allocator, testing.io, ctx, .{}, teacher, 3, trainset, null);
+    const result = try optimizer.compile(TestProgram, arena, testing.io, ctx, .{}, teacher, 3, trainset, null);
     try testing.expectEqualStrings("88", teacher.z.state.demos[0].get("answer").?.string);
     try testing.expectEqual(@as(usize, 0), result.best_trial);
     try testing.expectEqualStrings("0", result.program.z.state.demos[0].get("answer").?.string);
@@ -557,7 +553,7 @@ test "BootstrapOptuna zero rounds preserves labeled candidates and defaults rema
     const trainset = try testExamples(arena, &.{ "0", "1", "2", "3", "4", "5" });
     const valset = try testExamples(arena, &.{ "0", "0", "1" });
     const optimizer: BootstrapFewShotWithOptuna = .{ .metric = sourceMetric, .seed = 9, .max_labeled_demos = 5, .max_rounds = 0, .num_candidate_programs = 20 };
-    const result = try optimizer.compile(TestProgram, arena, testing.allocator, testing.io, ctx, .{}, null, 3, trainset, valset);
+    const result = try optimizer.compile(TestProgram, arena, testing.io, ctx, .{}, null, 3, trainset, valset);
     try testing.expectEqual(@as(usize, 0), result.bootstrap_report.attempts);
     try testing.expectEqual(@as(usize, 0), result.bootstrap_report.bootstrapped);
     try testing.expectEqual(@as(usize, 9), result.best_trial);
@@ -568,7 +564,7 @@ test "BootstrapOptuna zero rounds preserves labeled candidates and defaults rema
         try testing.expect(!trial.program.a.state.demos[0].contains("augmented"));
     }
     const defaults: BootstrapFewShotWithOptuna = .{ .metric = sourceMetric, .seed = 9 };
-    const default_result = try defaults.compile(TestProgram, arena, testing.allocator, testing.io, ctx, .{}, null, 3, trainset, valset);
+    const default_result = try defaults.compile(TestProgram, arena, testing.io, ctx, .{}, null, 3, trainset, valset);
     try testing.expectEqual(@as(usize, 16), default_result.trials.len);
     try testing.expectEqual(@as(usize, 3), default_result.bootstrap_report.bootstrapped);
     try testing.expectEqual(@as(i64, 5), default_result.parameters[0].high);
@@ -595,19 +591,19 @@ test "BootstrapOptuna source errors precede study lookup and NaN never wins" {
     const ctx: predict.Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = silent.lm() };
     const trainset = try testExamples(arena, &.{ "0", "1", "2", "3", "4", "5" });
     const optimizer: BootstrapFewShotWithOptuna = .{ .metric = sourceMetric, .seed = 9, .num_candidate_programs = 0 };
-    try testing.expectError(error.StudentCompiled, optimizer.compile(TestProgram, arena, testing.allocator, testing.io, ctx, .{ .compiled = true }, null, 3, &.{}, null));
+    try testing.expectError(error.StudentCompiled, optimizer.compile(TestProgram, arena, testing.io, ctx, .{ .compiled = true }, null, 3, &.{}, null));
     var teacher: TestProgram = .{};
     teacher.a.state.instructions = "different";
-    try testing.expectError(error.ProgramMismatch, optimizer.compile(TestProgram, arena, testing.allocator, testing.io, ctx, .{}, teacher, 3, &.{}, null));
-    try testing.expectError(error.EmptyBootstrapTrainset, optimizer.compile(TestProgram, arena, testing.allocator, testing.io, ctx, .{}, null, 3, &.{}, null));
-    try testing.expectError(error.NoCompletedTrials, optimizer.compile(TestProgram, arena, testing.allocator, testing.io, ctx, .{}, null, 3, trainset, null));
+    try testing.expectError(error.ProgramMismatch, optimizer.compile(TestProgram, arena, testing.io, ctx, .{}, teacher, 3, &.{}, null));
+    try testing.expectError(error.EmptyBootstrapTrainset, optimizer.compile(TestProgram, arena, testing.io, ctx, .{}, null, 3, &.{}, null));
+    try testing.expectError(error.NoCompletedTrials, optimizer.compile(TestProgram, arena, testing.io, ctx, .{}, null, 3, trainset, null));
     var empty_demos = optimizer;
     empty_demos.max_labeled_demos = 0;
-    try testing.expectError(error.NoCompletedTrials, empty_demos.compile(TestProgram, arena, testing.allocator, testing.io, ctx, .{}, null, 0, trainset, null));
+    try testing.expectError(error.NoCompletedTrials, empty_demos.compile(TestProgram, arena, testing.io, ctx, .{}, null, 0, trainset, null));
     empty_demos.num_candidate_programs = 1;
-    try testing.expectError(error.InvalidBounds, empty_demos.compile(TestProgram, arena, testing.allocator, testing.io, ctx, .{}, null, 0, trainset, null));
+    try testing.expectError(error.InvalidBounds, empty_demos.compile(TestProgram, arena, testing.io, ctx, .{}, null, 0, trainset, null));
     const nan_optimizer: BootstrapFewShotWithOptuna = .{ .metric = nanMetric, .seed = 9, .num_candidate_programs = 3 };
-    try testing.expectError(error.NoCompletedTrials, nan_optimizer.compile(TestProgram, arena, testing.allocator, testing.io, ctx, .{}, null, 3, trainset, null));
+    try testing.expectError(error.NoCompletedTrials, nan_optimizer.compile(TestProgram, arena, testing.io, ctx, .{}, null, 3, trainset, null));
 }
 
 test "BootstrapOptuna catches individual evaluation failures but never swallows an aborted later trial" {
@@ -619,13 +615,13 @@ test "BootstrapOptuna catches individual evaluation failures but never swallows 
     const trainset = try testExamples(arena, &.{ "0", "1", "2", "3", "4", "5" });
     const partial_val = try testExamples(arena, &.{"fail"});
     const optimizer: BootstrapFewShotWithOptuna = .{ .metric = tiedMetric, .seed = 9, .max_labeled_demos = 5, .num_candidate_programs = 3 };
-    const partial = try optimizer.compile(TestProgram, arena, testing.allocator, testing.io, ctx, .{ .fail = true }, null, 3, trainset, partial_val);
+    const partial = try optimizer.compile(TestProgram, arena, testing.io, ctx, .{ .fail = true }, null, 3, trainset, partial_val);
     try testing.expectEqual(@as(usize, 3), partial.trials.len);
     try testing.expectEqual(@as(usize, 0), partial.best_trial);
     for (partial.trials) |trial| try testing.expectEqual(@as(?f64, 0), trial.score);
     const abort_val = try testExamples(arena, &.{ "fail", "fail", "fail", "fail", "fail", "fail", "fail", "fail", "fail", "fail" });
-    try testing.expectError(error.LMFailure, optimizer.compile(TestProgram, arena, testing.allocator, testing.io, ctx, .{ .fail = true }, null, 3, trainset, abort_val));
-    try testing.expectError(error.LMFailure, optimizer.compile(TestProgram, arena, testing.allocator, testing.io, ctx, .{ .fail = true, .fail_after_first = true }, null, 3, trainset, abort_val));
+    try testing.expectError(error.LMFailure, optimizer.compile(TestProgram, arena, testing.io, ctx, .{ .fail = true }, null, 3, trainset, abort_val));
+    try testing.expectError(error.LMFailure, optimizer.compile(TestProgram, arena, testing.io, ctx, .{ .fail = true, .fail_after_first = true }, null, 3, trainset, abort_val));
 }
 
 test "BootstrapOptuna inherits the caller limit in bootstrap and trial evaluation" {
@@ -662,7 +658,6 @@ test "BootstrapOptuna inherits the caller limit in bootstrap and trial evaluatio
     try testing.expectError(error.ParseValue, opt.compile(
         P,
         a,
-        testing.allocator,
         testing.io,
         ctx,
         .{},
@@ -675,7 +670,6 @@ test "BootstrapOptuna inherits the caller limit in bootstrap and trial evaluatio
     try testing.expectError(error.ParseValue, opt.compile(
         P,
         a,
-        testing.allocator,
         testing.io,
         ctx,
         .{},
@@ -700,7 +694,7 @@ test "BootstrapOptuna keeps supplied teacher demos but resets the implicit teach
     var student: TestProgram = .{};
     student.z.state.demos = &.{(try testExamples(arena, &.{"99"}))[0].record};
     const optimizer: BootstrapFewShotWithOptuna = .{ .metric = teacherMetric, .seed = 9, .max_labeled_demos = 0, .num_candidate_programs = 1 };
-    const supplied = try optimizer.compile(TestProgram, arena, testing.allocator, testing.io, ctx, student, teacher, 1, trainset, null);
+    const supplied = try optimizer.compile(TestProgram, arena, testing.io, ctx, student, teacher, 1, trainset, null);
     try testing.expectEqual(@as(usize, 1), supplied.bootstrap_report.bootstrapped);
     try testing.expectEqual(@as(usize, 1), supplied.bootstrap_report.attempts);
     try testing.expectEqualStrings("0", supplied.program.z.state.demos[0].get("answer").?.string);
@@ -709,7 +703,7 @@ test "BootstrapOptuna keeps supplied teacher demos but resets the implicit teach
     try testing.expectEqualStrings("99", student.z.state.demos[0].get("answer").?.string);
     var implicit = optimizer;
     implicit.metric = resetTeacherMetric;
-    const reset = try implicit.compile(TestProgram, arena, testing.allocator, testing.io, ctx, student, null, 1, trainset, null);
+    const reset = try implicit.compile(TestProgram, arena, testing.io, ctx, student, null, 1, trainset, null);
     try testing.expectEqual(@as(usize, 1), reset.bootstrap_report.bootstrapped);
     try testing.expectEqual(@as(usize, 1), reset.bootstrap_report.attempts);
     try testing.expectEqual(@as(?f64, 100), reset.trials[0].score);
@@ -731,18 +725,18 @@ test "BootstrapOptuna unseeded compilation uses supplied entropy and seeded prob
     const ctx: predict.Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = silent.lm() };
     const trainset = try testExamples(arena, &.{ "0", "1", "2", "3", "4", "5" });
     const optimizer: BootstrapFewShotWithOptuna = .{ .metric = tiedMetric };
-    try testing.expectError(error.EntropyUnavailable, optimizer.compile(TestProgram, arena, testing.allocator, io, ctx, .{}, null, 3, trainset, null));
+    try testing.expectError(error.EntropyUnavailable, optimizer.compile(TestProgram, arena, io, ctx, .{}, null, 3, trainset, null));
     var seeded = optimizer;
     seeded.seed = 9;
-    const reproducible = try seeded.compile(TestProgram, arena, testing.allocator, io, ctx, .{}, null, 3, trainset, null);
+    const reproducible = try seeded.compile(TestProgram, arena, io, ctx, .{}, null, 3, trainset, null);
     try testing.expectEqual(@as(usize, 16), reproducible.trials.len);
     var singleton = optimizer;
     singleton.max_labeled_demos = 0;
-    const fixed = try singleton.compile(TestProgram, arena, testing.allocator, io, ctx, .{}, null, 1, trainset, null);
+    const fixed = try singleton.compile(TestProgram, arena, io, ctx, .{}, null, 1, trainset, null);
     try testing.expectEqual(@as(usize, 16), fixed.trials.len);
     var no_trials = optimizer;
     no_trials.num_candidate_programs = 0;
-    try testing.expectError(error.NoCompletedTrials, no_trials.compile(TestProgram, arena, testing.allocator, io, ctx, .{}, null, 3, trainset, null));
+    try testing.expectError(error.NoCompletedTrials, no_trials.compile(TestProgram, arena, io, ctx, .{}, null, 3, trainset, null));
 }
 
 test "BootstrapOptuna retains NaN trial programs without advancing the startup count" {
@@ -754,7 +748,7 @@ test "BootstrapOptuna retains NaN trial programs without advancing the startup c
     const trainset = try testExamples(arena, &.{ "0", "1", "2", "3", "4", "5" });
     const valset = try testExamples(arena, &.{ "0", "0", "1" });
     const optimizer: BootstrapFewShotWithOptuna = .{ .metric = mixedNanMetric, .seed = 9, .max_labeled_demos = 5, .num_candidate_programs = 30 };
-    const result = try optimizer.compile(TestProgram, arena, testing.allocator, testing.io, ctx, .{}, null, 3, trainset, valset);
+    const result = try optimizer.compile(TestProgram, arena, testing.io, ctx, .{}, null, 3, trainset, valset);
     try testing.expectEqual(@as(usize, 1), result.best_trial);
     // Ten completed trials are reached at trial 13, not at trial 9.
     const startup_choices = [_][2]i64{
