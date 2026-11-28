@@ -30,6 +30,7 @@ const embedding = @import("embedder.zig");
 const value = @import("value.zig");
 const KNN = @import("knn.zig").KNN;
 const Context = predict.Context;
+const Workspace = @import("workspace.zig").Workspace;
 const Example = optimize.Example;
 const BootstrapFewShot = optimize.BootstrapFewShot;
 
@@ -39,6 +40,10 @@ pub fn KNNFewShot(comptime P: type) type {
 
         knn: KNN,
         bootstrap: BootstrapFewShot,
+        /// Fixed scratch each forward reserves from its arena for the
+        /// per-neighborhood bootstrap, so the bootstrap's nested scopes never
+        /// share the caller's workspace with the arena that owns its demos.
+        workspace_bytes_max: usize = 1024 * 1024,
 
         pub const Program = ProgramWithTeacher(P);
 
@@ -66,10 +71,14 @@ pub fn KNNFewShot(comptime P: type) type {
                     // DSPy creates a fresh BootstrapFewShot for each neighborhood.
                     var bootstrap = self.captured.optimizer.bootstrap;
                     bootstrap.error_count = 0;
+                    const nested_buffer = try ctx.arena.alloc(u8, self.captured.optimizer.workspace_bytes_max);
+                    var nested: Workspace = .init(nested_buffer);
+                    var bootstrap_ctx = ctx;
+                    bootstrap_ctx.workspace = &nested;
                     const result = try bootstrap.compile(
                         P,
                         ctx.arena,
-                        ctx,
+                        bootstrap_ctx,
                         self.captured.original.*,
                         if (self.captured.teacher) |teacher| teacher.* else null,
                         neighbors,
@@ -312,6 +321,14 @@ test "KNNFewShot uses original captures, real bootstrap demos, teacher settings,
     try testing.expect(!program.compiled and !program.visible.compiled);
     try testing.expectEqual(@as(usize, 0), unused_lm.index);
     try expectIndependentCapture(Optimizer, &optimizer, arena, ctx, &events);
+    // Serial evaluation runs forward with its arena in a workspace scope.
+    var scope = ctx.workspace.?.open();
+    defer scope.close();
+    var scoped = ctx;
+    scoped.arena = scope.allocator();
+    scoped.trace = null;
+    const scoped_red = try program.forward(scoped, .{ .question = "red-query" });
+    try testing.expectEqualStrings("student:red-query|captured-mutated:1", scoped_red.answer);
 }
 
 fn expectCallSequence(events: *const TestEvents, trace: *const predict.Trace) !void {
