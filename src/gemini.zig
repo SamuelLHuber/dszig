@@ -390,7 +390,10 @@ pub const Gemini = struct {
 
         var buffer: std.ArrayList(u8) = .empty;
         defer buffer.deinit(client.allocator);
-        var live_workspace: Workspace = .init(try arena.alloc(u8, self.live_scratch_bytes_max));
+        // Reserved once per connection, like GeminiLiveSession, not from the result arena.
+        const live_buffer = try client.allocator.alloc(u8, self.live_scratch_bytes_max);
+        defer client.allocator.free(live_buffer);
+        var live_workspace: Workspace = .init(live_buffer);
         var scratch = live_workspace.open();
         defer scratch.close();
         var remaining = self.max_response_bytes;
