@@ -71,10 +71,13 @@ pub fn KNNFewShot(comptime P: type) type {
                     // DSPy creates a fresh BootstrapFewShot for each neighborhood.
                     var bootstrap = self.captured.optimizer.bootstrap;
                     bootstrap.error_count = 0;
-                    const nested_buffer = try ctx.arena.alloc(u8, self.captured.optimizer.workspace_bytes_max);
-                    var nested: Workspace = .init(nested_buffer);
+                    // Labeled-only bootstraps open no scratch scope.
+                    var nested: Workspace = undefined;
                     var bootstrap_ctx = ctx;
-                    bootstrap_ctx.workspace = &nested;
+                    if (bootstrap.max_bootstrapped_demos > 0) {
+                        nested = .init(try ctx.arena.alloc(u8, self.captured.optimizer.workspace_bytes_max));
+                        bootstrap_ctx.workspace = &nested;
+                    }
                     const result = try bootstrap.compile(
                         P,
                         ctx.arena,
