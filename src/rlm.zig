@@ -602,7 +602,7 @@ test "RLM extraction preserves an output named repl_history" {
         .history = &history,
         .responses = &.{"<repl_history>\n42\n</repl_history>\n\n<first>\nresult\n</first>"},
     };
-    const result = try program.forward(.{ .arena = arena, .lm = script.lm(), .json_fallback = false }, .{ .question = "input" });
+    const result = try program.forward(.{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm(), .json_fallback = false }, .{ .question = "input" });
     const system_prompt = history.requests.items[0].messages[0].content.text;
     const repl_history_position = std.mem.indexOf(u8, system_prompt, "1. `repl_history`") orelse return error.WrongExtractionFieldOrder;
     const first_position = std.mem.indexOf(u8, system_prompt, "2. `first`") orelse return error.WrongExtractionFieldOrder;

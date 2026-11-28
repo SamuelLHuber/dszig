@@ -155,9 +155,9 @@ pub const ReAnchor = struct {
         valset: ?[]const Example,
     ) !P {
         if (trainset.len == 0) return error.EmptyTrainset;
-        var work_memory: std.heap.ArenaAllocator = .init(gpa);
-        defer work_memory.deinit();
-        const work = work_memory.allocator();
+        // Compile-lifetime state is used across nested evaluation scopes, so
+        // it lives with the result.
+        const work = out;
 
         var program = student.*;
         const all = try predict.namedPredictors(work, &program);
@@ -258,7 +258,7 @@ fn Runner(comptime P: type) type {
             const result = try arena.alloc(f64, examples.len);
             if (runner.self.concurrent_evaluation) |bound| {
                 _ = try bound.run(bound.ptr, runner.program, examples, runner.self.metric, 1, result);
-            } else try serialScores(P, runner.gpa, runner.ctx, runner.program, examples, runner.self.metric, result);
+            } else try serialScores(P, runner.ctx, runner.program, examples, runner.self.metric, result);
             for (result) |score| if (!std.math.isFinite(score)) return error.NonFiniteMetric;
             return result;
         }
@@ -276,7 +276,7 @@ fn Runner(comptime P: type) type {
             var ctx = runner.ctx;
             ctx.decision_evidence = &collector;
             const result = try arena.alloc(f64, trainset.len);
-            try serialScores(P, runner.gpa, ctx, runner.program, trainset, runner.self.metric, result);
+            try serialScores(P, ctx, runner.program, trainset, runner.self.metric, result);
             for (result) |score| if (!std.math.isFinite(score)) return error.NonFiniteMetric;
             var evidence: std.ArrayList(Value) = .empty;
             for (collector.items.items) |entry| {
@@ -289,7 +289,6 @@ fn Runner(comptime P: type) type {
 
 fn serialScores(
     comptime P: type,
-    gpa: Allocator,
     ctx: Context,
     program: *const P,
     examples: []const Example,
@@ -297,10 +296,7 @@ fn serialScores(
     result: []f64,
 ) !void {
     assert(result.len == examples.len);
-    var scratch: std.heap.ArenaAllocator = .init(gpa);
-    defer scratch.deinit();
-    const detailed = try optimize.evaluateDetailed(P, scratch.allocator(), ctx, program, examples, metric, .{ .max_errors = 1 });
-    for (result, detailed.rows) |*score, row| score.* = row.score;
+    _ = try optimize.evaluateWithScores(P, null, ctx, program, examples, metric, 1, result);
 }
 
 const skipped_reason = "fitted behavior did not beat the original";

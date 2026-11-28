@@ -1984,8 +1984,8 @@ test "a zero-shot predictor invocation does not discard stored demos" {
     var program: Predict(Sig) = .{};
     program.state.demos = &.{stored};
     const input: Sig.Input = .{ .question = "Capital of France?" };
-    const zero_shot = try program.forward(.{ .arena = arena, .lm = model.lm(), .demos_override = &.{} }, input);
-    const few_shot = try program.forward(.{ .arena = arena, .lm = model.lm() }, input);
+    const zero_shot = try program.forward(.{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = model.lm(), .demos_override = &.{} }, input);
+    const few_shot = try program.forward(.{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = model.lm() }, input);
     try testing.expectEqualStrings("Paris", zero_shot.answer);
     try testing.expectEqualStrings("Paris", few_shot.answer);
     for (history.requests.items[0].messages) |message|
@@ -2033,9 +2033,9 @@ test "bound LM precedence includes explicit null and fanout and resets without c
     var program: Predict(Sig) = .{};
     program.state.lm = bound.lm();
     const input: Sig.Input = .{ .question = "q" };
-    try testing.expectEqual(@as(i64, 1), (try program.forward(.{ .arena = arena, .lm = fallback.lm() }, input)).answer);
+    try testing.expectEqual(@as(i64, 1), (try program.forward(.{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = fallback.lm() }, input)).answer);
     try testing.expectEqual(@as(i64, 3), (try program.forward(.{ .arena = arena, .lm_override = override.lm() }, input)).answer);
-    try testing.expectEqual(@as(i64, 2), (try program.forward(.{ .arena = arena, .lm = fallback.lm(), .lm_override_present = true }, input)).answer);
+    try testing.expectEqual(@as(i64, 2), (try program.forward(.{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = fallback.lm(), .lm_override_present = true }, input)).answer);
     const inputs = try value.toRecord(arena, Sig.Input, input);
     const many = try program.state.callMany(.{ .arena = arena }, &inputs, 2);
     try testing.expectEqual(@as(i64, 4), many[0].get("answer").?.integer);
@@ -2046,7 +2046,7 @@ test "bound LM precedence includes explicit null and fanout and resets without c
     try testing.expectError(error.NoLM, program.forward(.{ .arena = arena, .parse_failure = &capture }, input));
     try testing.expectEqual(@as(u32, 0), capture.expected_count);
     try testing.expectEqual(@as(i64, 6), (try copy.forward(.{ .arena = arena }, input)).answer);
-    try testing.expectEqual(@as(i64, 2), (try program.forward(.{ .arena = arena, .lm = fallback.lm() }, input)).answer);
+    try testing.expectEqual(@as(i64, 2), (try program.forward(.{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = fallback.lm() }, input)).answer);
 }
 
 fn testPromptTokens(arena: Allocator, usage: ?Graph.Value) !i64 {
@@ -2261,7 +2261,7 @@ test "TwoStepAdapter parse failure never retries the main LM" {
     var extraction_lm: lm_mod.ScriptedLM = .{ .responses = &.{ "bad chat", "bad json" } };
     const two_step: TwoStepAdapter = .{ .extraction_model = extraction_lm.lm() };
     var trace: Trace = .{ .arena = arena };
-    const ctx = two_step.context(.{ .arena = arena, .lm = main_lm.lm(), .trace = &trace });
+    const ctx = two_step.context(.{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = main_lm.lm(), .trace = &trace });
     const program: Predict(FailureSignature) = .{};
     try testing.expectError(error.AdapterParse, program.forward(ctx, .{ .question = "q" }));
     try testing.expectEqual(@as(usize, 1), main_lm.index);
@@ -2415,7 +2415,7 @@ test "native negotiation leaves a second ToolCalls output in the text signature"
         .supports_function_calling = true,
     };
     const inputs = try value.toRecord(arena, Sig.Input, .{ .tools = &.{} });
-    const rows = try program.state.callMany(.{ .arena = arena, .lm = script.lm() }, &inputs, 2);
+    const rows = try program.state.callMany(.{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm() }, &inputs, 2);
     try testing.expectEqual(2, rows.len);
     for (rows) |row| {
         const calls = try tool_mod.ToolCalls.fromValue(arena, row.get("calls").?);
@@ -2634,7 +2634,7 @@ test "default XML CoT distinguishes off from none for native reasoning adaptatio
         };
         var lm = model.lm();
         lm.supports_reasoning = true;
-        const result = try cot.forward(.{ .arena = arena, .lm = lm, .lm_options = case.options }, .{ .question = "Explain?" });
+        const result = try cot.forward(.{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = lm, .lm_options = case.options }, .{ .question = "Explain?" });
 
         try testing.expectEqual(@as(usize, 1), history.requests.items.len);
         const request = history.requests.items[0];
@@ -2742,7 +2742,7 @@ test "CoT keeps prior rationale in History when the fallback name collides" {
         .history = &requests,
     };
     const cot: ChainOfThought(Conversation) = .{};
-    const out = try cot.forward(.{ .arena = arena, .lm = model.lm(), .json_fallback = false }, .{
+    const out = try cot.forward(.{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = model.lm(), .json_fallback = false }, .{
         .question = "new question",
         .plan = "new task plan",
         .history = .{ .messages = &.{event} },

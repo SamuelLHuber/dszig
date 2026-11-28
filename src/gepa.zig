@@ -5600,7 +5600,7 @@ test "GEPA validation files distinguish seed failure and child parse failure" {
             .track_best_outputs = true,
             .instruction_proposer = .{ .ptr = &script, .propose = Callbacks.propose },
         };
-        const result = try optimizer.compile(P, arena, .{ .arena = arena, .lm = script.lm(), .json_fallback = false }, .{}, validation[0..2], .{
+        const result = try optimizer.compile(P, arena, .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm(), .json_fallback = false }, .{}, validation[0..2], .{
             .valset = &validation,
             .log_dir = .{ .io = io, .path = path },
         });

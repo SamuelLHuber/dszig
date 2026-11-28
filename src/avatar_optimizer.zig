@@ -128,7 +128,6 @@ pub const AvatarOptimizer = struct {
         self: AvatarOptimizer,
         comptime P: type,
         out: Allocator,
-        gpa: Allocator,
         ctx: Context,
         rng: *pyrandom.Random,
         student: P,
@@ -147,9 +146,10 @@ pub const AvatarOptimizer = struct {
         const comparator: predict.Predict(Comparator) = .{};
         const feedback_instruction: predict.Predict(FeedbackBasedInstruction) = .{};
 
+        const workspace = ctx.workspace orelse return error.WorkspaceRequired;
         for (0..iterations_max) |_| {
-            var scratch: std.heap.ArenaAllocator = .init(gpa);
-            defer scratch.deinit();
+            var scratch = workspace.open();
+            defer scratch.close();
             const arena = scratch.allocator();
             var c = ctx;
             c.arena = arena;
@@ -289,7 +289,7 @@ test "AvatarOptimizer applies a new instruction only on a strictly better score"
     var recording: @import("lm.zig").RecordingLM = .{ .inner = script.lm(), .arena = arena };
     var rng: pyrandom.Random = .init(0);
     const optimizer: AvatarOptimizer = .{ .metric = testMetric, .max_iters = 2 };
-    const result = try optimizer.compile(P, arena, testing.allocator, .{ .arena = arena, .lm = recording.lm() }, &rng, student, &trainset);
+    const result = try optimizer.compile(P, arena, .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = recording.lm() }, &rng, student, &trainset);
 
     try testing.expectEqual(@as(usize, 12), script.index);
     try testing.expectEqual(@as(usize, 2), result.iterations.len);
@@ -320,9 +320,9 @@ test "AvatarOptimizer scores failures zero and needs both example classes" {
     const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm() };
     var idle = optimizer;
     idle.max_iters = 0;
-    const copy = try idle.compile(P, arena, testing.allocator, ctx, &rng, student, &.{});
+    const copy = try idle.compile(P, arena, ctx, &rng, student, &.{});
     try testing.expectEqual(student.actor.state.signature_class, copy.program.actor.state.signature_class);
-    try testing.expectError(error.AvatarEmptyTrainset, optimizer.compile(P, arena, testing.allocator, ctx, &rng, student, &.{}));
+    try testing.expectError(error.AvatarEmptyTrainset, optimizer.compile(P, arena, ctx, &rng, student, &.{}));
 
     // q2 names a tool that does not exist: the failure scores 0 and is the
     // negative example, so the comparator still runs.
@@ -333,7 +333,7 @@ test "AvatarOptimizer scores failures zero and needs both example classes" {
     } };
     var low = optimizer;
     low.optimize_for = .min;
-    const minimized = try low.compile(P, arena, testing.allocator, ctx, &rng, student, &trainset);
+    const minimized = try low.compile(P, arena, ctx, &rng, student, &trainset);
     try testing.expectEqual(@as(usize, 5), script.index);
     try testing.expect(minimized.iterations[0].applied);
     try testing.expectEqualStrings("n", minimized.program.actor.state.instructions);
@@ -341,16 +341,16 @@ test "AvatarOptimizer scores failures zero and needs both example classes" {
     script.index = 0;
     var other = optimizer;
     other.optimize_for = .other;
-    const unchanged = try other.compile(P, arena, testing.allocator, ctx, &rng, student, &trainset);
+    const unchanged = try other.compile(P, arena, ctx, &rng, student, &trainset);
     try testing.expectEqual(@as(usize, 5), script.index);
     try testing.expectEqualStrings(avatar.actor_instructions, unchanged.program.actor.state.instructions);
 
     // Both right: no negatives, and the comparator is never asked.
     script = .{ .responses = &.{ test_finish, "<answer>a</answer>", test_finish, "<answer>b</answer>" } };
-    try testing.expectError(error.AvatarNoNegativeExamples, optimizer.compile(P, arena, testing.allocator, ctx, &rng, student, &trainset));
+    try testing.expectError(error.AvatarNoNegativeExamples, optimizer.compile(P, arena, ctx, &rng, student, &trainset));
     try testing.expectEqual(@as(usize, 4), script.index);
     script = .{ .responses = &.{ test_finish, "<answer>x</answer>", test_finish, "<answer>y</answer>" } };
-    try testing.expectError(error.AvatarNoPositiveExamples, optimizer.compile(P, arena, testing.allocator, ctx, &rng, student, &trainset));
+    try testing.expectError(error.AvatarNoPositiveExamples, optimizer.compile(P, arena, ctx, &rng, student, &trainset));
 }
 
 test "AvatarOptimizer preserves a failed actor for idle compile and requires reset for training" {
@@ -368,11 +368,11 @@ test "AvatarOptimizer preserves a failed actor for idle compile and requires res
     const idle: AvatarOptimizer = .{ .metric = testMetric, .max_iters = 0 };
     const active: AvatarOptimizer = .{ .metric = testMetric, .max_iters = 1 };
     const trainset = try testTrainset(arena);
-    var copy = (try idle.compile(P, arena, testing.allocator, ctx, &rng, student, &.{})).program;
+    var copy = (try idle.compile(P, arena, ctx, &rng, student, &.{})).program;
     try testing.expectError(error.AvatarActorEvolved, copy.call(ctx, .{ .question = "q1" }, .{}));
     try testing.expectError(
         error.AvatarActorEvolved,
-        active.compile(P, arena, testing.allocator, ctx, &rng, student, &trainset),
+        active.compile(P, arena, ctx, &rng, student, &trainset),
     );
 
     copy.reset();

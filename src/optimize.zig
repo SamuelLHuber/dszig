@@ -253,7 +253,9 @@ pub const EvaluationOptions = struct {
 };
 
 /// Serial evaluation retaining predictions in devset order. Predictions and
-/// rows live in `out` (an arena); each row borrows its example from `devset`.
+/// rows live in `out`; each row borrows its example from `devset`. `out` must
+/// not be a scope of `ctx.workspace`: rows are written while per-example
+/// scopes are open.
 pub fn evaluateDetailed(
     comptime P: type,
     out: Allocator,
@@ -372,7 +374,8 @@ pub fn evaluateWith(
     return evaluateWithScores(P, concurrent, ctx, program, devset, metric, max_errors, null);
 }
 
-fn evaluateWithScores(
+/// `evaluateWith`, writing each example's score into `subscores`.
+pub fn evaluateWithScores(
     comptime P: type,
     concurrent: ?ConcurrentEvaluation,
     ctx: Context,

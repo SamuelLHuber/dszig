@@ -872,7 +872,7 @@ test "SIMBA lets metrics score missing predictions after program failure" {
     const example = try Example.fromJson(arena, "{\"question\":\"q\",\"fallback\":0.375}", &.{"question"});
     var program: Program = .{};
     const optimizer: SIMBA = .{ .metric = MissingPredictionMetric.score };
-    const run = try optimizer.wrap(Program, arena, .{ .arena = arena, .lm = script.lm() }, &program, &example);
+    const run = try optimizer.wrap(Program, arena, .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm() }, &program, &example);
     try std.testing.expect(run.prediction == null);
     try std.testing.expectEqual(@as(f64, 0.375), run.score.?);
     try std.testing.expectEqual(@as(usize, 0), run.steps.len);

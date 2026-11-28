@@ -547,7 +547,7 @@ test "Refine masks ReAct custom objects in feedback without changing stored trac
         .module_code = "dspy.ReAct(QA, tools=[])",
         .reward_code = "def score(inputs, prediction): return float(prediction.answer)",
     });
-    const result = (try refined.forward(.{ .arena = arena, .lm = lm.lm(), .trace = &trace }, .{ .question = "q" })).?;
+    const result = (try refined.forward(.{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = lm.lm(), .trace = &trace }, .{ .question = "q" })).?;
     try testing.expectEqualStrings("8", result.answer);
     try testing.expectEqualStrings("100", trace.steps.items[0].inputs.get("target_threshold").?.string);
     const program_outputs = try std.json.parseFromSliceLeaky(Value, arena, trace.steps.items[0].inputs.get("program_outputs").?.string, .{});
@@ -603,7 +603,7 @@ test "Refine assigns separate advice to independent ReAct instances" {
         .module_code = "AgentPair",
         .reward_code = "score",
     });
-    const result = (try refined.forward(.{ .arena = arena, .lm = lm.lm(), .trace = &trace }, .{ .question = "q" })).?;
+    const result = (try refined.forward(.{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = lm.lm(), .trace = &trace }, .{ .question = "q" })).?;
     try testing.expectEqualStrings("8", result.answer);
     try testing.expectEqualStrings("first-specific", trace.steps.items[1].inputs.get("hint_").?.string);
     try testing.expectEqualStrings("last-specific", trace.steps.items[2].inputs.get("hint_").?.string);
@@ -637,7 +637,7 @@ test "Refine retains exact integer thresholds beyond binary64 and binary128 prec
             .module_code = "Predict(QA)",
             .reward_code = "large_score",
         });
-        const result = (try refined.forward(.{ .arena = arena, .lm = lm.lm(), .trace = &trace }, .{ .question = "q" })).?;
+        const result = (try refined.forward(.{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = lm.lm(), .trace = &trace }, .{ .question = "q" })).?;
         try testing.expectEqualStrings(if (negative) "7" else "8", result.answer);
         if (!negative) {
             try testing.expectEqualStrings("\"<non-serializable: int>\"", trace.steps.items[0].inputs.get("target_threshold").?.string);
@@ -802,7 +802,7 @@ test "Refine uses the original signature map and serializes canonical prediction
         .reward_code = "reward",
     });
     const original_class = refined.module.qa.state.signature_class;
-    const result = (try refined.forward(.{ .arena = arena, .lm = lm.lm(), .trace = &trace }, {})).?;
+    const result = (try refined.forward(.{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = lm.lm(), .trace = &trace }, {})).?;
     try testing.expectEqualStrings("8", result.get("answer").?.string);
     try testing.expectEqual(@as(usize, 3), lm.index);
     try testing.expectEqual(@as(i128, 2), refined.fail_count);
@@ -875,7 +875,7 @@ test "Refine masks undeclared trace kwargs without rewriting the selected trace"
         .module_code = "Program",
         .reward_code = "score",
     });
-    const result = (try refined.forward(.{ .arena = arena, .lm = lm.lm(), .trace = &trace }, .{ .question = "q" })).?;
+    const result = (try refined.forward(.{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = lm.lm(), .trace = &trace }, .{ .question = "q" })).?;
     try testing.expectEqualStrings("8", result.answer);
     try testing.expectEqual(@as(usize, 3), lm.index);
     try testing.expectEqual(@as(usize, 2), trace.steps.items.len);
@@ -920,7 +920,7 @@ test "Refine masks the actual hint value rather than the overwritten field annot
         .module_code = "Predict",
         .reward_code = "score",
     });
-    const result = (try refined.forward(.{ .arena = arena, .lm = lm.lm(), .trace = &trace }, .{
+    const result = (try refined.forward(.{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = lm.lm(), .trace = &trace }, .{
         .question = "q",
         .hint_ = .{ .text = "original" },
     })).?;
@@ -1115,7 +1115,7 @@ test "Refine interruption keeps prior feedback but does not publish a selected a
             .reward_code = "score",
         });
         try testing.expectError(interruption, refine.forward(
-            .{ .arena = arena, .lm = lm.lm(), .trace = &trace },
+            .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = lm.lm(), .trace = &trace },
             .{ .question = "q" },
         ));
         try testing.expectEqual(@as(usize, 3), lm.index);
@@ -1252,7 +1252,7 @@ test "Refine projects runtime dictionary fields and pairs without changing the s
         var kwargs: Record = .empty;
         try kwargs.put(arena, "question", .{ .string = "q" });
         try kwargs.put(arena, "extra_code", try @import("code.zig").Code.init("x = 1").toRuntime(arena));
-        const selected = (try refined.forward(.{ .arena = arena, .lm = lm.lm(), .trace = &trace }, .{ .object = kwargs })).?;
+        const selected = (try refined.forward(.{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = lm.lm(), .trace = &trace }, .{ .object = kwargs })).?;
         try testing.expectEqual(@as(i64, 8), selected.integer);
         try testing.expectEqual(@as(usize, if (has_feedback) 3 else 2), lm.index);
         try testing.expectEqual(@as(i128, if (has_feedback) 2 else 1), refined.fail_count);
@@ -1300,7 +1300,7 @@ test "Refine needs named inputs only for feedback" {
             .module_code = "ScalarInput",
             .reward_code = "score",
         });
-        const result = (try refined.forward(.{ .arena = arena, .lm = lm.lm(), .trace = &trace }, "q")).?;
+        const result = (try refined.forward(.{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = lm.lm(), .trace = &trace }, "q")).?;
         const retried = threshold == 8;
         try testing.expectEqualStrings(if (retried) "8" else "7", result.answer);
         try testing.expectEqual(@as(usize, if (retried) 2 else 1), lm.index);
@@ -1366,7 +1366,7 @@ test "Refine sends typed dictionary entries rather than storage fields to feedba
     });
     var kwargs: Record = .empty;
     try kwargs.put(arena, "question", .{ .string = "q" });
-    const winner = (try refined.forward(.{ .arena = arena, .lm = lm.lm(), .trace = &trace }, .{ .map = kwargs })).?;
+    const winner = (try refined.forward(.{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = lm.lm(), .trace = &trace }, .{ .map = kwargs })).?;
     try testing.expectEqualStrings("x = 8", winner.get("implementation").?.code);
     try testing.expectEqual(@as(usize, 3), lm.index);
     try testing.expectEqual(@as(i128, 2), refined.fail_count);
