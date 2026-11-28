@@ -658,12 +658,12 @@ pub const BootstrapFewShot = struct {
     /// Compile `student` (must be uncompiled). A distinct native teacher type
     /// is allowed if its ordered predictor names and signatures match the
     /// student's; the metric receives the teacher's own prediction and trace.
-    /// Result demos live in `out`; per-attempt scratch comes from `gpa`.
+    /// Result demos live in `out`; per-attempt scratch comes from
+    /// `ctx.workspace`.
     pub fn compile(
         self: *BootstrapFewShot,
         comptime P: type,
         out: Allocator,
-        gpa: Allocator,
         ctx: Context,
         student_in: P,
         teacher_in: anytype,
@@ -674,9 +674,9 @@ pub const BootstrapFewShot = struct {
         try predict.resetPredictors(out, &student);
         const T = teacherType(P, @TypeOf(teacher_in));
         if (try teacherProgram(T, teacher_in)) |teacher| {
-            return self.compilePreparedTeacher(P, T, out, gpa, ctx, student, teacher, trainset);
+            return self.compilePreparedTeacher(P, T, out, ctx, student, teacher, trainset);
         }
-        return self.compilePreparedTeacher(P, P, out, gpa, ctx, student, student_in, trainset);
+        return self.compilePreparedTeacher(P, P, out, ctx, student, student_in, trainset);
     }
 
     fn compilePreparedTeacher(
@@ -684,7 +684,6 @@ pub const BootstrapFewShot = struct {
         comptime P: type,
         comptime T: type,
         out: Allocator,
-        gpa: Allocator,
         ctx: Context,
         student_in: P,
         teacher_in: T,
@@ -718,8 +717,6 @@ pub const BootstrapFewShot = struct {
         try storage.init();
         var state: RecordPrediction.State = .{ .output = storage.record };
         var output: T.Output = undefined;
-        var teacher_memory: std.heap.ArenaAllocator = .init(gpa);
-        defer teacher_memory.deinit();
 
         for (trainset, 0..) |*example, example_idx| {
             if (n_bootstrapped >= self.max_bootstrapped_demos) break;
@@ -729,8 +726,6 @@ pub const BootstrapFewShot = struct {
                 const ok = try self.bootstrapOne(
                     T,
                     out,
-                    gpa,
-                    teacher_memory.allocator(),
                     ctx,
                     &teacher,
                     teacher_preds,
@@ -778,8 +773,6 @@ pub const BootstrapFewShot = struct {
         self: *BootstrapFewShot,
         comptime P: type,
         out: Allocator,
-        gpa: Allocator,
-        teacher_arena: Allocator,
         ctx: Context,
         teacher: *P,
         teacher_preds: []const predict.NamedParam,
@@ -790,8 +783,9 @@ pub const BootstrapFewShot = struct {
         output: *P.Output,
         state: *RecordPrediction.State,
     ) !bool {
-        var scratch: std.heap.ArenaAllocator = .init(gpa);
-        defer scratch.deinit();
+        const workspace = ctx.workspace orelse return error.WorkspaceRequired;
+        var scratch = workspace.open();
+        defer scratch.close();
         const arena = scratch.allocator();
         var trace: Trace = .{ .arena = arena };
         // Source catches the failure after exiting the teacher settings scope.
@@ -835,7 +829,8 @@ pub const BootstrapFewShot = struct {
                     for (teacher_preds, cached) |p, *cache| {
                         const filtered = p.param.predict.demos;
                         if (filtered.len < cache.len) {
-                            cache.* = try teacher_arena.dupe(Record, filtered);
+                            // Filters persist across attempts, so they live with the result.
+                            cache.* = try out.dupe(Record, filtered);
                         }
                     }
                 }
@@ -1119,6 +1114,6 @@ pub const BootstrapFewShotWithRandomSearch = struct {
         };
         // Only bootstrap consumes the teacher. Earlier reset/labeled candidates
         // may satisfy stop_at_score before an invalid Source list is encountered.
-        return (try optimizer.compile(P, arena, gpa, ctx, student, teacher, shuffled orelse trainset)).program;
+        return (try optimizer.compile(P, arena, ctx, student, teacher, shuffled orelse trainset)).program;
     }
 };

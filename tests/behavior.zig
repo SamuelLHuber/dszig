@@ -3257,6 +3257,7 @@ test "BootstrapFewShot counts metric failures with program failures after restor
     teacher.state.demos = &.{ trainset[0].record, trainset[1].record, trainset[2].record };
     var model: Model = .{};
     const ctx: dszig.Context = .{
+        .workspace = dszig.workspace.forTests(),
         .arena = arena,
         .lm = .{ .ptr = &model, .vtable = &.{ .complete = Model.complete } },
         .adapter = .xml,
@@ -3267,7 +3268,7 @@ test "BootstrapFewShot counts metric failures with program failures after restor
         .max_labeled_demos = 0,
         .max_errors = 2,
     };
-    const result = try optimizer.compile(P, arena, testing.allocator, ctx, .{}, teacher, &trainset);
+    const result = try optimizer.compile(P, arena, ctx, .{}, teacher, &trainset);
     try testing.expectEqual(@as(usize, 3), result.report.attempts);
     try testing.expectEqual(@as(usize, 1), result.report.errors);
     try testing.expectEqual(@as(usize, 2), result.report.bootstrapped);
@@ -3279,7 +3280,7 @@ test "BootstrapFewShot counts metric failures with program failures after restor
     for ([_]usize{ 0, 1 }) |max_errors| {
         model.calls = 0;
         optimizer.max_errors = max_errors;
-        try testing.expectError(error.ParseValue, optimizer.compile(P, arena, testing.allocator, ctx, .{}, teacher, &trainset));
+        try testing.expectError(error.ParseValue, optimizer.compile(P, arena, ctx, .{}, teacher, &trainset));
         try testing.expectEqual(@as(usize, 1), model.calls);
     }
 
@@ -3287,7 +3288,7 @@ test "BootstrapFewShot counts metric failures with program failures after restor
     model.fail_first = true;
     Metric.expected_demos = 2;
     optimizer.max_errors = optimizer.error_count + 2;
-    try testing.expectError(error.ParseValue, optimizer.compile(P, arena, testing.allocator, ctx, .{}, teacher, &.{ trainset[1], trainset[0], trainset[2] }));
+    try testing.expectError(error.ParseValue, optimizer.compile(P, arena, ctx, .{}, teacher, &.{ trainset[1], trainset[0], trainset[2] }));
     try testing.expectEqual(@as(usize, 2), model.calls);
 
     model.calls = 0;
@@ -3296,7 +3297,6 @@ test "BootstrapFewShot counts metric failures with program failures after restor
     const recovered = try optimizer.compile(
         P,
         arena,
-        testing.allocator,
         ctx,
         .{},
         teacher,
@@ -3313,7 +3313,7 @@ test "BootstrapFewShot counts metric failures with program failures after restor
     Metric.expected_demos = 3;
     optimizer.max_errors = 100;
     try testing.expectEqual(@as(usize, 5), optimizer.error_count);
-    try testing.expectError(error.OutOfMemory, optimizer.compile(P, arena, testing.allocator, ctx, .{}, teacher, &.{ allocation_failure, trainset[1] }));
+    try testing.expectError(error.OutOfMemory, optimizer.compile(P, arena, ctx, .{}, teacher, &.{ allocation_failure, trainset[1] }));
     try testing.expectEqual(@as(usize, 1), model.calls);
     try testing.expectEqual(@as(usize, 5), optimizer.error_count);
 }
@@ -3359,7 +3359,6 @@ test "BootstrapFewShot propagates cancellation without spending the retry budget
     try testing.expectError(error.Canceled, optimizer.compile(
         Student,
         arena,
-        testing.allocator,
         ctx,
         .{},
         Teacher{ .calls = &calls },
@@ -3411,7 +3410,7 @@ test "BootstrapFewShot counts failed demo comparisons and retains earlier filter
     teacher.second.state.demos = &second_demos;
     const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena };
     var optimizer: dszig.BootstrapFewShot = .{ .max_labeled_demos = 0, .max_errors = 2 };
-    const result = try optimizer.compile(Program, arena, testing.allocator, ctx, .{}, teacher, &.{ bad, good });
+    const result = try optimizer.compile(Program, arena, ctx, .{}, teacher, &.{ bad, good });
     try testing.expectEqual(@as(usize, 1), calls);
     try testing.expectEqual(@as(usize, 2), result.report.attempts);
     try testing.expectEqual(@as(usize, 1), result.report.errors);
@@ -3423,7 +3422,7 @@ test "BootstrapFewShot counts failed demo comparisons and retains earlier filter
 
     optimizer = .{ .max_labeled_demos = 0, .max_errors = 1 };
     calls = 0;
-    try testing.expectError(error.ParseValue, optimizer.compile(Program, arena, testing.allocator, ctx, .{}, teacher, &.{ bad, good }));
+    try testing.expectError(error.ParseValue, optimizer.compile(Program, arena, ctx, .{}, teacher, &.{ bad, good }));
     try testing.expectEqual(@as(usize, 0), calls);
     try testing.expectEqual(@as(usize, 1), optimizer.error_count);
 }
@@ -3472,7 +3471,7 @@ test "BootstrapFewShot binds trace demos before mapping predictors and outside t
     const row = try dszig.Example.fromJson(arena, "{\"question\":\"q\"}", &.{"question"});
     var optimizer: dszig.BootstrapFewShot = .{ .max_labeled_demos = 0, .max_errors = 10 };
 
-    const accepted = try optimizer.compile(Program, arena, testing.allocator, ctx, .{}, Program{
+    const accepted = try optimizer.compile(Program, arena, ctx, .{}, Program{
         .inputs_json = "{\"base\":{\"inherited\":7,\"answer\":\"stale\",\"question\":\"old\",\"augmented\":false},\"question\":\"q\"}",
         .outputs_json = "{\"answer\":\"answer\",\"extra\":8}",
     }, &.{row});
@@ -3498,7 +3497,6 @@ test "BootstrapFewShot binds trace demos before mapping predictors and outside t
         try testing.expectError(error.DuplicateTraceDemoKeyword, optimizer.compile(
             Program,
             arena,
-            testing.allocator,
             ctx,
             .{},
             teacher,
@@ -3509,7 +3507,6 @@ test "BootstrapFewShot binds trace demos before mapping predictors and outside t
     try testing.expectError(error.UnsupportedTraceDemoBase, optimizer.compile(
         Program,
         arena,
-        testing.allocator,
         ctx,
         .{},
         Program{ .boxed_base = true },
@@ -3518,7 +3515,7 @@ test "BootstrapFewShot binds trace demos before mapping predictors and outside t
     try testing.expectEqual(@as(usize, 0), optimizer.error_count);
 
     optimizer.metric = Program.reject;
-    const rejected = try optimizer.compile(Program, arena, testing.allocator, ctx, .{}, Program{
+    const rejected = try optimizer.compile(Program, arena, ctx, .{}, Program{
         .outputs_json = "{\"augmented\":false}",
         .mapped = false,
     }, &.{row});
@@ -3540,7 +3537,7 @@ test "BootstrapFewShot scores never drop across three generations" {
     var scores: [4]f64 = undefined;
     scores[0] = (try dszig.optimize.evaluate(rag.RAG, ctx, &teacher, trainset, rag.keywordMetric, 10)).score;
     for (scores[1..]) |*score| {
-        const result = try optimizer.compile(rag.RAG, out.allocator(), testing.allocator, ctx, .{}, teacher, trainset);
+        const result = try optimizer.compile(rag.RAG, out.allocator(), ctx, .{}, teacher, trainset);
         teacher = result.program;
         score.* = (try dszig.optimize.evaluate(rag.RAG, ctx, &teacher, trainset, rag.keywordMetric, 10)).score;
     }
@@ -3561,7 +3558,7 @@ test "teacher_settings runs bootstrapping under the teacher's LM" {
         .max_labeled_demos = 0,
         .teacher_settings = .{ .lm = keyword.lm() },
     };
-    const result = try optimizer.compile(rag.RAG, out.allocator(), testing.allocator, ctx, .{}, null, trainset);
+    const result = try optimizer.compile(rag.RAG, out.allocator(), ctx, .{}, null, trainset);
     try testing.expectEqual(@as(usize, 2), result.report.bootstrapped);
     try testing.expectEqual(@as(usize, 0), silent.index);
     try testing.expectEqual(@as(usize, 2), result.program.generate_answer.predict.state.demos.len);
@@ -3592,7 +3589,7 @@ test "BootstrapFewShot zero rounds retains labeled demos and zero errors propaga
         try dszig.Example.fromJson(arena, "{\"question\":\"q2\",\"answer\":\"a2\"}", &.{"question"}),
     };
     var optimizer: dszig.BootstrapFewShot = .{ .max_rounds = 0, .max_errors = 0, .max_labeled_demos = 2 };
-    const result = try optimizer.compile(P, arena, testing.allocator, ctx, .{}, null, &trainset);
+    const result = try optimizer.compile(P, arena, ctx, .{}, null, &trainset);
     try testing.expect(result.program.compiled);
     try testing.expectEqual(@as(usize, 0), result.report.attempts);
     try testing.expectEqual(@as(usize, 0), failing.calls);
@@ -3605,7 +3602,7 @@ test "BootstrapFewShot zero rounds retains labeled demos and zero errors propaga
     try testing.expectEqualStrings("a1", demos[1].get("answer").?.string);
     optimizer.max_rounds = 1;
     optimizer.max_labeled_demos = 0;
-    try testing.expectError(error.LMFailure, optimizer.compile(P, arena, testing.allocator, ctx, .{}, null, &trainset));
+    try testing.expectError(error.LMFailure, optimizer.compile(P, arena, ctx, .{}, null, &trainset));
     try testing.expectEqual(@as(usize, 1), failing.calls);
 
     // A teacher-local override must not leak to the outer failure handler.
@@ -3618,7 +3615,7 @@ test "BootstrapFewShot zero rounds retains labeled demos and zero errors propaga
     };
     try testing.expectError(
         error.LMFailure,
-        inherited.compile(P, arena, testing.allocator, compile_ctx, .{}, null, &trainset),
+        inherited.compile(P, arena, compile_ctx, .{}, null, &trainset),
     );
     try testing.expectEqual(@as(usize, 2), inherited.error_count);
     try testing.expectEqual(@as(usize, 2), failing.calls);
@@ -3638,7 +3635,7 @@ test "BootstrapFewShot zero threshold accepts a zero score while null rejects it
         .max_bootstrapped_demos = 1,
         .max_labeled_demos = 0,
     };
-    const accepted = try optimizer.compile(rag.RAG, arena, testing.allocator, ctx, .{}, null, trainset);
+    const accepted = try optimizer.compile(rag.RAG, arena, ctx, .{}, null, trainset);
     try testing.expect(accepted.program.compiled);
     try testing.expectEqual(@as(usize, 1), accepted.report.bootstrapped);
     try testing.expectEqual(@as(usize, 0), accepted.report.validation);
@@ -3650,7 +3647,7 @@ test "BootstrapFewShot zero threshold accepts a zero score while null rejects it
     try testing.expectEqualStrings("Not sure.", (try dszig.Reasoning.fromValue(demos[0].get("reasoning").?)).content);
 
     optimizer.metric_threshold = null;
-    const rejected = try optimizer.compile(rag.RAG, arena, testing.allocator, ctx, .{}, null, trainset);
+    const rejected = try optimizer.compile(rag.RAG, arena, ctx, .{}, null, trainset);
     try testing.expect(rejected.program.compiled);
     try testing.expectEqual(@as(usize, 0), rejected.report.bootstrapped);
     try testing.expectEqual(@as(usize, 1), rejected.report.validation);
@@ -3701,7 +3698,8 @@ test "BootstrapFewShot retries the settings model without retuning a bound model
     };
     var optimizer: dszig.BootstrapFewShot = .{ .metric = Metric.score, .max_rounds = 2, .max_labeled_demos = 0 };
     Metric.calls = 0;
-    const result = try optimizer.compile(Program, arena, testing.allocator, .{
+    const result = try optimizer.compile(Program, arena, .{
+        .workspace = dszig.workspace.forTests(),
         .arena = arena,
         .lm = fallback_tape.lm(),
         .lm_options = .{ .temperature = 0 },
@@ -3759,6 +3757,7 @@ test "BootstrapFewShot scopes trace retention to teacher attempts" {
         } };
         var trace: dszig.Trace = .{ .arena = arena };
         const ctx: dszig.Context = .{
+            .workspace = dszig.workspace.forTests(),
             .arena = arena,
             .lm = lm.lm(),
             .trace = &trace,
@@ -3771,7 +3770,7 @@ test "BootstrapFewShot scopes trace retention to teacher attempts" {
             .teacher_settings = .{ .max_trace_size = case.teacher },
         };
         Metric.count = 0;
-        const result = try optimizer.compile(BootstrapTracePair, arena, testing.allocator, ctx, .{}, null, &.{row});
+        const result = try optimizer.compile(BootstrapTracePair, arena, ctx, .{}, null, &.{row});
         try testing.expectEqual(@as(usize, 1), result.report.bootstrapped);
         try testing.expectEqual(@as(usize, 2), lm.index);
         try testing.expectEqualStrings(case.expected, Metric.observed[0..Metric.count]);
@@ -3849,7 +3848,7 @@ test "BootstrapFewShot reads borrowed settings for retries and later examples" {
         try .fromJson(arena, "{\"question\":\"one\",\"answer\":\"label\"}", &.{"question"}),
         try .fromJson(arena, "{\"question\":\"two\",\"answer\":\"label\"}", &.{"question"}),
     };
-    const result = try optimizer.compile(Program, arena, testing.allocator, ctx, .{}, null, &train);
+    const result = try optimizer.compile(Program, arena, ctx, .{}, null, &train);
     try testing.expectEqual(@as(usize, 3), result.report.attempts);
     try testing.expectEqual(@as(usize, 0), result.report.errors);
     const demos = result.program.predict.state.demos;
@@ -3902,7 +3901,7 @@ test "Evaluate matches DSPy scores for the RAG fixture" {
     const trainset = try rag.trainset(out.allocator());
     const baseline = try dszig.optimize.evaluate(rag.RAG, ctx, &rag.RAG{}, trainset, rag.keywordMetric, 10);
     var optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 2, .max_labeled_demos = 3 };
-    const result = try optimizer.compile(rag.RAG, out.allocator(), testing.allocator, ctx, .{}, null, trainset);
+    const result = try optimizer.compile(rag.RAG, out.allocator(), ctx, .{}, null, trainset);
     const optimized = try dszig.optimize.evaluate(rag.RAG, ctx, &result.program, trainset, rag.keywordMetric, 10);
     try testing.expectEqual(expected.object.get("baseline").?.float, baseline.score);
     try testing.expectEqual(expected.object.get("optimized").?.float, optimized.score);
@@ -3935,12 +3934,12 @@ test "compile is deterministic and does not mutate its inputs" {
     const trainset = try rag.trainset(out.allocator());
     var optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 2, .max_labeled_demos = 3 };
     const student: rag.RAG = .{};
-    const a = try optimizer.compile(rag.RAG, out.allocator(), testing.allocator, ctx, student, null, trainset);
-    const b = try optimizer.compile(rag.RAG, out.allocator(), testing.allocator, ctx, student, null, trainset);
+    const a = try optimizer.compile(rag.RAG, out.allocator(), ctx, student, null, trainset);
+    const b = try optimizer.compile(rag.RAG, out.allocator(), ctx, student, null, trainset);
     try testing.expect(!student.compiled);
     try testing.expectEqual(@as(usize, 0), student.generate_answer.predict.state.demos.len);
     try testing.expectEqualStrings(try dszig.state.saveAlloc(out.allocator(), &a.program), try dszig.state.saveAlloc(out.allocator(), &b.program));
-    try testing.expectError(error.StudentCompiled, optimizer.compile(rag.RAG, out.allocator(), testing.allocator, ctx, a.program, null, trainset));
+    try testing.expectError(error.StudentCompiled, optimizer.compile(rag.RAG, out.allocator(), ctx, a.program, null, trainset));
 }
 
 test "compiled sub-modules are frozen out of the parameter walk" {
@@ -3966,17 +3965,17 @@ test "optimize, evaluate and save run in fixed buffers" {
     var out_buf: [256 * 1024]u8 = undefined;
     var scratch_buf: [128 * 1024]u8 align(16) = undefined;
     var out: std.heap.FixedBufferAllocator = .init(&out_buf);
-    var scratch: std.heap.FixedBufferAllocator = .init(&scratch_buf);
+    var workspace: dszig.Workspace = .init(&scratch_buf);
     var keyword = rag.keywordLM();
-    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = out.allocator(), .lm = keyword.lm(), .retriever = rag.corpus.retriever() };
+    const ctx: dszig.Context = .{ .workspace = &workspace, .arena = out.allocator(), .lm = keyword.lm(), .retriever = rag.corpus.retriever() };
     const trainset = try rag.trainset(out.allocator());
     var optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 2, .max_labeled_demos = 3 };
-    const result = try optimizer.compile(rag.RAG, out.allocator(), scratch.allocator(), ctx, .{}, null, trainset);
+    const result = try optimizer.compile(rag.RAG, out.allocator(), ctx, .{}, null, trainset);
     // Per-attempt scratch is released after every example.
-    try testing.expectEqual(@as(usize, 0), scratch.end_index);
+    try testing.expectEqual(@as(usize, 0), workspace.used());
     const eval = try dszig.optimize.evaluate(rag.RAG, ctx, &result.program, trainset, rag.keywordMetric, 10);
     try testing.expectEqual(@as(f64, 80.0), eval.score);
-    try testing.expectEqual(@as(usize, 0), scratch.end_index);
+    try testing.expectEqual(@as(usize, 0), workspace.used());
     _ = try dszig.state.saveAlloc(out.allocator(), &result.program);
 }
 
@@ -3994,7 +3993,7 @@ fn compileAndSave(gpa: Allocator) !void {
     const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = out.allocator(), .lm = keyword.lm(), .retriever = rag.corpus.retriever() };
     const trainset = try rag.trainset(out.allocator());
     var optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 2, .max_labeled_demos = 3 };
-    const result = try optimizer.compile(rag.RAG, out.allocator(), gpa, ctx, .{}, null, trainset);
+    const result = try optimizer.compile(rag.RAG, out.allocator(), ctx, .{}, null, trainset);
     _ = try dszig.state.saveAlloc(out.allocator(), &result.program);
 }
 

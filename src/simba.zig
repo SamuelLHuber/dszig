@@ -833,7 +833,7 @@ test "SIMBA metric failures keep successful predictions and traces but allocatio
     defer memory.deinit();
     const arena = memory.allocator();
     var script: @import("lm.zig").ScriptedLM = .{ .responses = &.{ "<answer>ok</answer>", "<answer>ok</answer>" } };
-    const ctx: Context = .{ .arena = arena, .lm = script.lm(), .adapter = .xml };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm(), .adapter = .xml };
     const example = try Example.fromJson(arena, "{\"question\":\"q\",\"answer\":\"ok\"}", &.{"question"});
     var program: P = .{};
     var optimizer: SIMBA = .{ .metric = FailingMetric.failure };
@@ -930,7 +930,7 @@ test "SIMBA binds trace demos before predictor lookup and drops invalid candidat
     defer memory.deinit();
     const arena = memory.allocator();
     var script: @import("lm.zig").ScriptedLM = .{ .responses = &.{} };
-    const ctx: Context = .{ .arena = arena, .lm = script.lm() };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm() };
     const train = try Example.fromJson(arena, "{\"question\":\"é长rest\"}", &.{"question"});
     const optimizer: SIMBA = .{
         .metric = MetricCheck.score,
@@ -985,7 +985,7 @@ test "SIMBA scores only the baseline when no search steps are requested" {
     defer memory.deinit();
     const arena = memory.allocator();
     var script: @import("lm.zig").ScriptedLM = .{ .responses = &.{"<answer>yes</answer>"} };
-    const ctx: Context = .{ .arena = arena, .lm = script.lm() };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm() };
     const train = [_]Example{
         try Example.fromJson(arena, "{\"question\":\"ok?\",\"answer\":\"yes\"}", &.{"question"}),
     };
@@ -1036,7 +1036,7 @@ test "SIMBA rejects zero temperatures at the respective sampling stages" {
     for ([_]bool{ true, false }) |zero_before_rollout| {
         CountingMetric.calls = 0;
         var script: @import("lm.zig").ScriptedLM = .{ .responses = &.{"<answer>yes</answer>"} };
-        const ctx: Context = .{ .arena = arena, .lm = script.lm() };
+        const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm() };
         const optimizer: SIMBA = .{
             .metric = CountingMetric.score,
             .max_steps = 1,
@@ -1089,7 +1089,7 @@ test "SIMBA rejects nonfinite sampling weights at the respective sampling stages
     for (cases) |case| {
         CountingMetric.calls = 0;
         var script: @import("lm.zig").ScriptedLM = .{ .responses = &responses };
-        const ctx: Context = .{ .arena = arena, .lm = script.lm() };
+        const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm() };
         const optimizer: SIMBA = .{
             .metric = CountingMetric.score,
             .max_steps = case.steps,

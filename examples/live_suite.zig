@@ -352,7 +352,7 @@ fn pipeline(
         try optimizer.compile(P, arena, gpa, ctx, student, null, trainset, null, .{ .restrict = null, .labeled_sample = true })
     else bootstrap: {
         var instance = optimizer;
-        break :bootstrap try instance.compile(P, arena, gpa, ctx, student, null, trainset);
+        break :bootstrap try instance.compile(P, arena, ctx, student, null, trainset);
     };
     const optimized = try dszig.optimize.evaluate(P, ctx, &compiled.program, devset, metric, 10);
     const candidates = if (search) summaries: {

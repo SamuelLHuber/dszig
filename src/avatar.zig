@@ -526,7 +526,7 @@ test "Avatar failures keep completed evolution and refuse reuse until reset" {
     var script: @import("lm.zig").ScriptedLM = .{ .responses = &.{ testAction(1, "search", "\"alpha\""), testAction(2, "missing", "\"beta\"") } };
     var program = try P.init(arena, &tools);
     program.actor.state.instructions = "ACTOR ONLY";
-    const ctx: Context = .{ .arena = arena, .lm = script.lm() };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm() };
     try testing.expectError(error.AvatarUnknownTool, program.call(ctx, .{ .question = "Q" }, .{}));
     try testing.expectEqual(@as(usize, 1), search.calls);
     try testing.expect(program.evolved());

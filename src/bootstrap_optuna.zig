@@ -153,9 +153,9 @@ pub const BootstrapFewShotWithOptuna = struct {
             .teacher_settings_ref = self.teacher_settings_ref,
         };
         var compiled = if (teacher_in) |given|
-            try bootstrap.compile(P, arena, gpa, ctx, student, try copyProgram(T, arena, arena, given, false), trainset)
+            try bootstrap.compile(P, arena, ctx, student, try copyProgram(T, arena, arena, given, false), trainset)
         else
-            try bootstrap.compile(P, arena, gpa, ctx, student, try copyProgram(P, arena, arena, student_in, true), trainset);
+            try bootstrap.compile(P, arena, ctx, student, try copyProgram(P, arena, arena, student_in, true), trainset);
         const compiled_predictors = try predict.namedPredictors(arena, &compiled.program);
         const parameters = try out.alloc(tpe.Param, compiled_predictors.len);
         for (compiled_predictors, parameters) |p, *param| {
@@ -378,7 +378,7 @@ test "heterogeneous Bootstrap maps teacher traces, scores its own output and pre
         .max_labeled_demos = 1,
     };
     var teacher: DistinctTeacher = .{};
-    const result = try bootstrap.compile(TestProgram, arena, testing.allocator, ctx, .{}, @as(?DistinctTeacher, teacher), &train);
+    const result = try bootstrap.compile(TestProgram, arena, ctx, .{}, @as(?DistinctTeacher, teacher), &train);
     try testing.expectEqualDeep(optimize.BootstrapFewShot.Report{ .bootstrapped = 1, .attempts = 1, .errors = 0, .validation = 0 }, result.report);
     try testing.expect(result.program.compiled);
     try testing.expectEqual(@as(i64, 7), try TestProgram.selected(result.program.z.state));
@@ -390,11 +390,11 @@ test "heterogeneous Bootstrap maps teacher traces, scores its own output and pre
     try testing.expectEqual(@as(usize, 0), teacher.z.state.demos.len);
 
     teacher.a.state.instructions = "Different instruction.";
-    try testing.expectError(error.ProgramMismatch, bootstrap.compile(TestProgram, arena, testing.allocator, ctx, .{}, teacher, &.{}));
-    try testing.expectError(error.ProgramMismatch, bootstrap.compile(TestProgram, arena, testing.allocator, ctx, .{}, teacher, &train));
+    try testing.expectError(error.ProgramMismatch, bootstrap.compile(TestProgram, arena, ctx, .{}, teacher, &.{}));
+    try testing.expectError(error.ProgramMismatch, bootstrap.compile(TestProgram, arena, ctx, .{}, teacher, &train));
 
     bootstrap.metric = tiedMetric;
-    const fallback = try bootstrap.compile(TestProgram, arena, testing.allocator, ctx, .{}, @as(?DistinctTeacher, null), &train);
+    const fallback = try bootstrap.compile(TestProgram, arena, ctx, .{}, @as(?DistinctTeacher, null), &train);
     try testing.expectEqual(@as(i64, 0), try TestProgram.selected(fallback.program.z.state));
 }
 

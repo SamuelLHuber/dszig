@@ -25,7 +25,7 @@ pub fn main(init: std.process.Init) !void {
         .max_bootstrapped_demos = 2,
         .max_labeled_demos = 3,
     };
-    const result = try optimizer.compile(rag.RAG, arena, init.gpa, ctx, .{}, null, trainset);
+    const result = try optimizer.compile(rag.RAG, arena, ctx, .{}, null, trainset);
     const optimized = try dszig.optimize.evaluate(rag.RAG, ctx, &result.program, trainset, rag.keywordMetric, 10);
 
     var buf: [1024]u8 = undefined;

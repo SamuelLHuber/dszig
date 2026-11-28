@@ -99,7 +99,7 @@ fn runCase(
     var history: dszig.lm.History = .{ .arena = arena };
     var script: dszig.lm.ScriptedLM = .{ .responses = &.{case.get("completion").?.string}, .history = &history };
     state.demos = try parseRecords(arena, demos_json);
-    const ctx: dszig.Context = .{ .arena = arena, .lm = script.lm(), .adapter = adapter };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = script.lm(), .adapter = adapter };
     const output = try program.forward(ctx, input);
 
     const expected = case.get("messages").?.array.items;
@@ -179,10 +179,10 @@ test "BootstrapFewShot RAG artifact is byte-identical to DSPy" {
     defer out.deinit();
     var keyword = rag.keywordLM();
     const retriever = rag.corpus.retriever();
-    const ctx: dszig.Context = .{ .arena = out.allocator(), .lm = keyword.lm(), .retriever = retriever };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = out.allocator(), .lm = keyword.lm(), .retriever = retriever };
     const trainset = try rag.trainset(out.allocator());
     var optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 2, .max_labeled_demos = 3 };
-    const result = try optimizer.compile(rag.RAG, out.allocator(), testing.allocator, ctx, .{}, null, trainset);
+    const result = try optimizer.compile(rag.RAG, out.allocator(), ctx, .{}, null, trainset);
     try testing.expect(result.program.compiled);
     try testing.expectEqual(@as(usize, 2), result.report.bootstrapped);
     const saved = try dszig.state.saveAlloc(out.allocator(), &result.program);
@@ -198,10 +198,10 @@ test "BootstrapFewShot multi-hop artifact picks DSPy's same-predictor traces" {
     defer out.deinit();
     var keyword = rag.multihopLM();
     const retriever = rag.corpus.retriever();
-    const ctx: dszig.Context = .{ .arena = out.allocator(), .lm = keyword.lm(), .retriever = retriever };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = out.allocator(), .lm = keyword.lm(), .retriever = retriever };
     const trainset = try rag.trainset(out.allocator());
     var optimizer: dszig.BootstrapFewShot = .{ .metric = rag.keywordMetric, .max_bootstrapped_demos = 4, .max_labeled_demos = 1 };
-    const result = try optimizer.compile(rag.MultiHop, out.allocator(), testing.allocator, ctx, .{}, null, trainset);
+    const result = try optimizer.compile(rag.MultiHop, out.allocator(), ctx, .{}, null, trainset);
     try testing.expectEqual(@as(usize, 4), result.report.bootstrapped);
     const saved = try dszig.state.saveAlloc(out.allocator(), &result.program);
     try testing.expectEqualStrings(bootstrap_multihop, saved);
@@ -254,7 +254,7 @@ fn checkReact(comptime Agent: type, name: []const u8) !void {
     for (calls, completions) |c, *out| out.* = c.object.get("completion").?.string;
     var history: dszig.lm.History = .{ .arena = arena };
     var scripted: dszig.lm.ScriptedLM = .{ .responses = completions, .history = &history };
-    const ctx: dszig.Context = .{ .arena = arena, .lm = scripted.lm() };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = scripted.lm() };
     const agent = try Agent.init(arena);
     var inputs: Record = .empty;
     try inputs.put(arena, "question", .{ .string = "When did Apollo 11 land?" });
@@ -290,7 +290,7 @@ test "ReAct records invalid arguments as tool errors before forced typed submit"
         "<next_thought>\ny\n</next_thought>\n\n<tool_calls>\n{\"tool_calls\": [{\"name\": \"add\", \"args\": {\"a\": \"one\"}}]}\n</tool_calls>",
         "<next_thought>\nSubmit the answer.\n</next_thought>\n\n<tool_calls>\n{\"tool_calls\": [{\"name\": \"submit\", \"args\": {\"answer\": \"none\"}}]}\n</tool_calls>",
     } };
-    const ctx: dszig.Context = .{ .arena = arena, .lm = scripted.lm() };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = scripted.lm() };
     var agent = try dszig.ReAct(AgentQA, &.{add_tool}).init(arena);
     agent.max_iters = 2;
     var inputs: Record = .empty;
@@ -353,7 +353,7 @@ test "Ensemble reduces with majority and samples like random.sample" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var scripted: dszig.lm.ScriptedLM = .{ .responses = &.{} };
-    const ctx: dszig.Context = .{ .arena = arena, .lm = scripted.lm() };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = scripted.lm() };
     const all: dszig.Ensemble(Echo, 4) = .{ .programs = .{ .{ .answer = "Paris" }, .{ .answer = "Berlin" }, .{ .answer = "berlin!" }, .{ .answer = "Rome" } } };
     try testing.expectEqualStrings("Berlin", (try all.forward(ctx, .{ .question = "?" })).answer);
     // random.seed(0); random.sample(range(4), 2) == [3, 1] in CPython.
@@ -375,7 +375,7 @@ test "Ensemble handles DSPy zero and invalid sizes and custom reduction order" {
     var memory: std.heap.ArenaAllocator = .init(testing.allocator);
     defer memory.deinit();
     var scripted: dszig.lm.ScriptedLM = .{ .responses = &.{} };
-    const ctx: dszig.Context = .{ .arena = memory.allocator(), .lm = scripted.lm() };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = memory.allocator(), .lm = scripted.lm() };
     const input: Echo.Input = .{ .question = "?" };
     var rng: dszig.pyrandom.Random = .init(42);
     var program: dszig.EnsembleWithReducer(Echo, 4, Reduce.join) = .{ .ensemble = .{
@@ -464,7 +464,7 @@ test "SIMBA program, scores and every request match DSPy" {
     for ([_][]const dszig.Example{ train, dev }) |set| {
         for (set) |ex| try mock.golds.put(arena, ex.record.get("question").?.string, ex.record.get("answer").?.string);
     }
-    const ctx: dszig.Context = .{ .arena = arena, .lm = mock.lm(), .lm_options = .{ .temperature = 0.0 } };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = mock.lm(), .lm_options = .{ .temperature = 0.0 } };
     const simba: dszig.SIMBA = .{ .metric = live_suite.exactMetric, .bsize = 4, .num_candidates = 3, .max_steps = 3, .max_demos = 2 };
     const result = try simba.compile(live_suite.DateQA, arena, ctx, .{}, train, .{ .program_code = live_suite.dates_class_source });
 
@@ -506,7 +506,7 @@ test "SIMBA with concurrent rollouts makes DSPy's requests and selects DSPy's pr
     defer testing.allocator.destroy(pool);
     try pool.init(testing.io, .{});
     defer pool.deinit();
-    const ctx: dszig.Context = .{ .arena = arena, .lm = mocks[0].lm(), .lm_options = .{ .temperature = 0.0 } };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = mocks[0].lm(), .lm_options = .{ .temperature = 0.0 } };
     const simba: dszig.SIMBA = .{
         .metric = live_suite.exactMetric,
         .bsize = 4,
@@ -886,7 +886,7 @@ fn checkGepa(comptime P: type, case: []const u8, budget: usize, concurrent: bool
     defer testing.allocator.destroy(pool);
     try pool.init(testing.io, .{});
     defer pool.deinit();
-    const ctx: dszig.Context = .{ .arena = arena, .lm = mocks[0].lm(), .lm_options = .{ .temperature = 0.0 } };
+    const ctx: dszig.Context = .{ .workspace = dszig.workspace.forTests(), .arena = arena, .lm = mocks[0].lm(), .lm_options = .{ .temperature = 0.0 } };
     var gepa: dszig.GEPA = .{ .metric = gepaMetric, .max_metric_calls = budget };
     if (concurrent) gepa.rollouts = .{ .runner = pool.runner(), .contexts = &contexts };
     const result = try gepa.compile(P, arena, ctx, .{}, train, .{ .valset = dev });

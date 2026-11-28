@@ -659,7 +659,7 @@ test "Refine preserves null selection for NaN and empty advice does not install 
         "<answer>8</answer>",
     } };
     var trace: Trace = .{ .arena = arena };
-    const ctx: Context = .{ .arena = arena, .lm = lm.lm(), .trace = &trace };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = lm.lm(), .trace = &trace };
     var refined = Refine(TestPair(false)).init(.{}, .{
         .n = 2,
         .reward_fn = nanScore,
@@ -686,7 +686,7 @@ test "Refine failure budgets persist and zero means the constructor attempt coun
     var memory: std.heap.ArenaAllocator = .init(testing.allocator);
     defer memory.deinit();
     var lm: lm_mod.ScriptedLM = .{ .responses = &.{} };
-    const ctx: Context = .{ .arena = memory.allocator(), .lm = lm.lm() };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = memory.allocator(), .lm = lm.lm() };
     var refined = Refine(FailingProgram).init(.{}, .{
         .n = 4,
         .reward_fn = testScore,
@@ -712,7 +712,7 @@ test "Refine feedback failure keeps the selected result without leaking failed a
     const arena = memory.allocator();
     var lm: lm_mod.ScriptedLM = .{ .responses = &.{ "<answer>7</answer>", "invalid-feedback" } };
     var trace: Trace = .{ .arena = arena };
-    const ctx: Context = .{ .arena = arena, .lm = lm.lm(), .trace = &trace, .json_fallback = false };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = lm.lm(), .trace = &trace, .json_fallback = false };
     var refined = Refine(predict.Predict(TestSignature)).init(.{}, .{
         .n = 2,
         .reward_fn = testScore,
@@ -835,7 +835,7 @@ test "Refine resolves the LM before returning for an empty range" {
         .module_code = "Predict",
         .reward_code = "score",
     });
-    const ctx: Context = .{ .arena = memory.allocator() };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = memory.allocator() };
     try testing.expectError(error.NoLM, refined.forward(ctx, .{ .question = "q" }));
     try testing.expectEqual(@as(i128, 2), refined.fail_count);
 }

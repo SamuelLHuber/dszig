@@ -235,7 +235,7 @@ pub const InferRules = struct {
             .teacher_settings = self.teacher_settings,
             .teacher_settings_ref = self.teacher_settings_ref,
         };
-        const bootstrapped = try bootstrap.compile(P, bootstrap_out, gpa, ctx, student_in.*, if (teacher_in) |t| t.* else null, trainset);
+        const bootstrapped = try bootstrap.compile(P, bootstrap_out, ctx, student_in.*, if (teacher_in) |t| t.* else null, trainset);
         const original = try out.create(P);
         original.* = try ownPredictorState(P, out, bootstrap_out, bootstrapped.program);
         self.student_storage = original;

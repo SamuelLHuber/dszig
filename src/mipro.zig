@@ -602,7 +602,6 @@ pub const MIPROv2 = struct {
         const demo_sets = try self.demoCandidates(
             P,
             out,
-            gpa,
             ctx,
             program,
             teacher,
@@ -629,7 +628,6 @@ pub const MIPROv2 = struct {
         self: MIPROv2,
         comptime P: type,
         out: Allocator,
-        gpa: Allocator,
         ctx: Context,
         student: P,
         teacher: anytype,
@@ -670,7 +668,7 @@ pub const MIPROv2 = struct {
                     .teacher_settings = self.teacher_settings,
                     .teacher_settings_ref = self.teacher_settings_ref,
                 };
-                candidate = (try bootstrap.compile(P, out, gpa, ctx, student, teacher, shuffled)).program;
+                candidate = (try bootstrap.compile(P, out, ctx, student, teacher, shuffled)).program;
             }
             for (try predict.namedPredictors(out, &candidate), sets) |p, *s| try s.append(out, p.param.predict.demos);
         }
@@ -1338,7 +1336,8 @@ test "MIPRO demo candidates observe teacher setting changes between examples" {
         .teacher_settings_ref = &settings,
     };
     var rng: pyrandom.Random = .init(0);
-    const sets = try optimizer.demoCandidates(P, arena, testing.allocator, .{
+    const sets = try optimizer.demoCandidates(P, arena, .{
+        .workspace = @import("workspace.zig").forTests(),
         .arena = arena,
         .lm = task.lm(),
     }, .{}, null, &rows, 3, false, &rng);

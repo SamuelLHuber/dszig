@@ -317,7 +317,7 @@ test "AvatarOptimizer scores failures zero and needs both example classes" {
 
     // No iterations: a copy, no LM call, even without a trainset.
     var script: @import("lm.zig").ScriptedLM = .{ .responses = &.{} };
-    const ctx: Context = .{ .arena = arena, .lm = script.lm() };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm() };
     var idle = optimizer;
     idle.max_iters = 0;
     const copy = try idle.compile(P, arena, testing.allocator, ctx, &rng, student, &.{});
@@ -361,7 +361,7 @@ test "AvatarOptimizer preserves a failed actor for idle compile and requires res
     const P = avatar.Avatar(TestQA);
     var student = try P.init(arena, &.{});
     var script: @import("lm.zig").ScriptedLM = .{ .responses = &.{test_finish} };
-    const ctx: Context = .{ .arena = arena, .lm = script.lm() };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm() };
     try testing.expectError(error.ScriptExhausted, student.call(ctx, .{ .question = "q1" }, .{}));
 
     var rng: pyrandom.Random = .init(0);

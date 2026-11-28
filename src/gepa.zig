@@ -4490,7 +4490,7 @@ test "GEPA scoring failures preserve capture-specific outputs while feedback err
             "<answer>ok</answer>", "<answer>ok</answer>",
         },
     };
-    const ctx: Context = .{ .arena = arena, .lm = script.lm(), .adapter = .xml };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm(), .adapter = .xml };
     const examples = [_]Example{try Example.fromJson(arena, "{\"question\":\"q\",\"answer\":\"ok\"}", &.{"question"})};
     var program: P = .{};
     var front_scores = [_]f64{0};
@@ -4581,7 +4581,7 @@ test "GEPA compile aborts a canceled program rollout instead of scoring it" {
         try Example.fromJson(arena, "{\"question\":\"second\"}", &.{"question"}),
     };
     var lm: @import("lm.zig").ScriptedLM = .{ .responses = &.{} };
-    const ctx: Context = .{ .arena = arena, .lm = lm.lm() };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = lm.lm() };
     const Pool = parallel.Parallel(GEPA.Run, .{ .workers = 1, .tasks = 2, .attempts = 2, .failures = 2 });
     var pool: Pool = undefined;
     try pool.init(std.testing.io, .{});
@@ -4639,8 +4639,8 @@ test "GEPA compile does not retry a canceled reflection LM" {
             .use_merge = false,
             .batch_reflection = if (batch_fallback) .{ .ptr = &reflection, .propose = Reflection.batch } else null,
         };
-        const ctx: Context = .{ .arena = arena, .adapter = .json, .lm = task.lm() };
-        const reflection_ctx: Context = .{ .arena = arena, .lm = .{
+        const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .adapter = .json, .lm = task.lm() };
+        const reflection_ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = .{
             .ptr = &reflection,
             .vtable = &.{ .complete = Reflection.complete },
         } };
@@ -4881,7 +4881,7 @@ test "GEPA requires one budget and evaluates the seed even with a zero budget" {
         try Example.fromJson(arena, "{\"question\":\"r\",\"answer\":\"ok\"}", &.{"question"}),
     };
     const Program = predict.Predict(Sig);
-    const ctx: Context = .{ .arena = arena, .lm = script.lm() };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm() };
     const options: GEPA.Options = .{ .valset = &.{} };
     const invalid: []const GEPA = &.{
         .{ .metric = Metric.score, .auto = .light, .max_full_evals = 0 },
@@ -4999,7 +4999,7 @@ test "GEPA ranks before deduplicating and snapshots all validation batches befor
         .val_evaluation_policy = .{ .ptr = &script, .next_batch = Script.batch, .max_batch_size = 1 },
     };
     const examples = [_]Example{ example, example };
-    const ctx: Context = .{ .arena = arena, .lm = model.lm(), .adapter = .json };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = model.lm(), .adapter = .json };
     var invalid = optimizer;
     invalid.sampling_strategy = .{ .same_parent = 0 };
     try std.testing.expectError(error.EmptyProposalBatch, invalid.compile(P, arena, ctx, .{}, &examples, .{}));
@@ -5137,7 +5137,7 @@ test "GEPA batch reflection preserves eligible job order and scores individual f
     };
     for (std.enums.values(Mode)) |mode| {
         var script: Script = .{ .mode = mode };
-        const ctx: Context = .{ .arena = arena, .adapter = .json, .lm = .{
+        const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .adapter = .json, .lm = .{
             .ptr = &script,
             .vtable = &.{ .complete = Script.complete },
         } };
@@ -5230,7 +5230,7 @@ test "GEPA epoch sampler pads and rotates whole minibatches at full-width iterat
         }
     };
     var script: @import("lm.zig").ScriptedLM = .{ .responses = &.{} };
-    const context: Context = .{ .arena = arena, .lm = script.lm() };
+    const context: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm() };
     const example = try Example.fromJson(arena, "{\"question\":\"q\"}", &.{"question"});
     const train: [5]Example = @splat(example);
     const student: struct { placeholder: bool = false } = .{};
@@ -5371,7 +5371,7 @@ test "GEPA checkpoint refuses mismatched runs and does not publish oversized sta
         "<answer>first</answer>",
         "<answer>resumed</answer>",
     } };
-    const ctx: Context = .{ .arena = arena, .lm = model.lm() };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = model.lm() };
     const optimizer: GEPA = .{
         .metric = Metric.score,
         .max_metric_calls = 0,
@@ -5438,7 +5438,7 @@ test "GEPA log size failures leave the last complete candidate file intact" {
         "<answer>oversized prediction</answer>",
         "<answer>seed with marker</answer>",
     } };
-    const ctx: Context = .{ .arena = arena, .lm = model.lm() };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = model.lm() };
     var optimizer: GEPA = .{ .metric = Metric.score, .max_metric_calls = 0 };
     var options: GEPA.Options = .{ .log_dir = .{ .io = io, .path = path } };
     _ = try optimizer.compile(P, arena, ctx, .{}, &data, options);
@@ -5794,7 +5794,7 @@ test "GEPA best outputs keep ties and replace an older frontier without extra ev
         "<answer>high1</answer>", "<answer>high1</answer>",
         "<answer>high2</answer>", "<answer>low2</answer>",
     } };
-    const ctx: Context = .{ .arena = arena, .lm = script.lm(), .json_fallback = false };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm(), .json_fallback = false };
     const examples = [_]Example{
         try Example.fromJson(arena, "{\"question\":\"q\"}", &.{"question"}),
         try Example.fromJson(arena, "{\"question\":\"r\"}", &.{"question"}),

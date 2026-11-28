@@ -1908,7 +1908,7 @@ test "Predict cache overrides bypass storage and preserve the previous response"
         var cache: @import("cache.zig").CachedLM = .{ .gpa = testing.allocator, .inner = engine.lm() };
         defer cache.deinit();
         const program: Predict(Sig) = .{};
-        var ctx: Context = .{ .arena = arena, .lm = cache.lm() };
+        var ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = cache.lm() };
         try testing.expectEqualStrings("call 1", (try program.call(ctx, input)).fields().answer);
         ctx.predict_config = &.{ .cache = false };
         try testing.expectEqualStrings("call 2", (try program.forward(ctx, input)).answer);
@@ -1923,7 +1923,7 @@ test "Predict cache overrides bypass storage and preserve the previous response"
         defer cache.deinit();
         var program: Predict(Sig) = .{};
         program.state.config = &.{ .cache = false };
-        var ctx: Context = .{ .arena = arena, .lm = cache.lm() };
+        var ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = cache.lm() };
         try testing.expectEqualStrings("call 1", (try program.forward(ctx, input)).answer);
         ctx.predict_config = &.{ .cache = true };
         try testing.expectEqualStrings("call 2", (try program.forward(ctx, input)).answer);
@@ -1952,7 +1952,7 @@ test "per-call candidate count overrides configured fanout without leaking into 
     };
     var program: Predict(Sig) = .{};
     program.state.config = &.{ .n = 2, .temperature = 0.1 };
-    var ctx: Context = .{ .arena = arena, .lm = model.lm(), .predict_config = &.{ .n = 1 } };
+    var ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = model.lm(), .predict_config = &.{ .n = 1 } };
     const input: Sig.Input = .{ .question = "Capital of France?" };
     _ = try program.forwardPrediction(ctx, input);
     try testing.expectEqual(@as(usize, 1), history.requests.items.len);
@@ -2004,7 +2004,7 @@ test "record prediction renders and traces omitted defaults without replacing ex
     var history: lm_mod.History = .{ .arena = arena };
     var model: lm_mod.KeywordLM = .{ .rules = &.{}, .default = "<answer>1</answer>", .history = &history };
     var trace: Trace = .{ .arena = arena };
-    const ctx: Context = .{ .arena = arena, .lm = model.lm(), .trace = &trace };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = model.lm(), .trace = &trace };
     const program: Predict(Sig) = .{};
     var input: Record = .empty;
 
@@ -2084,7 +2084,7 @@ test "module calls scope usage onto the returned prediction instance unless a tr
         .metadata = &.{ one, one, one, one, one, one },
     };
     var storage: usage_mod.Storage = .{ .arena = arena, .io = testing.io };
-    const plain: Context = .{ .arena = arena, .lm = engine.lm() };
+    const plain: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = engine.lm() };
     var tracked = plain;
     tracked.track_usage = .{ .storage = &storage, .limits = .{ .models = 1, .entries = 2 } };
     const input: Sig.Input = .{ .question = "q" };
@@ -2310,7 +2310,7 @@ test "predict and chain of thought run through the adapter with trace" {
         "{\"plan\": \"r\", \"answer\": \"Lyon\"}",
     } };
     var trace: Trace = .{ .arena = arena.allocator() };
-    const ctx: Context = .{ .arena = arena.allocator(), .lm = script.lm(), .trace = &trace };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena.allocator(), .lm = script.lm(), .trace = &trace };
     const cot: ChainOfThought(QA) = .{};
     const out = try cot.forward(ctx, .{ .question = "Capital of France?" });
     try testing.expectEqualStrings("Paris", out.answer);
@@ -2371,7 +2371,7 @@ test "Predict consumes returned tool calls independently of request negotiation"
         .{ .json, "{\"answer\":5,\"calls\":null}", 5 },
     }) |case| {
         var script: lm_mod.ScriptedLM = .{ .responses = &.{case[1]}, .tool_calls = &.{returned} };
-        var ctx: Context = .{ .arena = arena, .lm = script.lm(), .adapter = case[0], .use_native_function_calling = true };
+        var ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm(), .adapter = case[0], .use_native_function_calling = true };
         const input: Sig.Input = .{ .question = "q" };
         try testing.expectError(error.MissingToolInput, program.forward(ctx, input));
         try testing.expectEqual(0, script.index);
@@ -2438,7 +2438,7 @@ test "Predict consumes the per-call trace control only after inference" {
         "<answer>D</answer>",
     } };
     var trace: Trace = .{ .arena = arena };
-    const ctx: Context = .{ .arena = arena, .lm = script.lm(), .trace = &trace };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm(), .trace = &trace };
     const program: Predict(QA) = .{};
     var input: Record = .empty;
     try input.put(arena, "question", .{ .string = "q" });
@@ -2819,7 +2819,7 @@ test "published fields prevent retrying a broken stream with JSON" {
     var program: Predict(S) = .{};
     for ([_][]const u8{ "unstructured text", "<answer>\nalready sent\n</answer>\n" }, [_]bool{ false, true }) |body, publishes| {
         var model: Model = .{ .body = body };
-        const ctx: Context = .{ .arena = arena, .lm = .{
+        const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = .{
             .ptr = &model,
             .vtable = &.{ .complete = Model.complete, .complete_stream = Model.completeStream },
         } };
@@ -2851,7 +2851,7 @@ test "in-memory retriever ranks by overlap" {
     defer arena.deinit();
     const corpus: InMemoryRetriever = .{ .passages = &.{ "Berlin is in Germany.", "Paris is the capital of France.", "France has wine." } };
     var script: lm_mod.ScriptedLM = .{ .responses = &.{} };
-    const ctx: Context = .{ .arena = arena.allocator(), .lm = script.lm(), .retriever = corpus.retriever() };
+    const ctx: Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena.allocator(), .lm = script.lm(), .retriever = corpus.retriever() };
     const r: Retrieve = .{ .k = 2 };
     const got = try r.forward(ctx, "What is the capital of France?");
     try testing.expectEqualStrings("Paris is the capital of France.", got[0]);

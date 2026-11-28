@@ -399,7 +399,7 @@ test "comparison requires exact count and preserves malformed proposal error pre
     var history: lm.History = .{ .arena = arena };
     var script: lm.ScriptedLM = .{ .responses = &.{}, .history = &history };
     var trace: predict.Trace = .{ .arena = arena };
-    const ctx: predict.Context = .{ .arena = arena, .lm = script.lm(), .trace = &trace };
+    const ctx: predict.Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm(), .trace = &trace };
     const compare: MultiChainComparison(OracleSignature, 2) = .{};
     var records = [_]Record{
         try completionRecord(arena, "{\"answer\":1}"),
@@ -424,7 +424,7 @@ test "comparison uses typed Predict with captured upstream prompt temperature tr
     var history: lm.History = .{ .arena = arena };
     var script: lm.ScriptedLM = .{ .responses = &.{ response, response, response, response }, .history = &history };
     var trace: predict.Trace = .{ .arena = arena };
-    const ctx: predict.Context = .{ .arena = arena, .lm = script.lm(), .trace = &trace, .json_fallback = false };
+    const ctx: predict.Context = .{ .workspace = @import("workspace.zig").forTests(), .arena = arena, .lm = script.lm(), .trace = &trace, .json_fallback = false };
     var compare: MultiChainComparison(OracleSignature, 2) = .{};
     const completions = [_]Record{
         try completionRecord(arena, "{\"rationale\":\"One\\nignored\",\"analysis\":\"not the answer\",\"answer\":41}"),
