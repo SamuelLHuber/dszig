@@ -1,4 +1,5 @@
 //! Native Anthropic Messages generation.
+const Workspace = @import("workspace.zig").Workspace;
 const std = @import("std");
 const lm_mod = @import("lm.zig");
 const http = @import("http.zig");
@@ -254,12 +255,13 @@ pub const Anthropic = struct {
     /// `.stop` closes the connection without waiting for another event.
     pub fn streamRequest(
         self: *Anthropic,
+        workspace: *Workspace,
         backing: Allocator,
         request: *const sdk.Request,
         sink: StreamSink,
     ) Error!StreamOutcome {
-        var scratch: std.heap.ArenaAllocator = .init(backing);
-        defer scratch.deinit();
+        var scratch = workspace.open();
+        defer scratch.close();
         return self.runStream(scratch.allocator(), backing, request, sink, null);
     }
 
@@ -1733,7 +1735,7 @@ test "Anthropic rejects foreign canonical models before credentials" {
     });
     defer request.release();
     try std.testing.expectError(error.LMFailure, provider.completeRequest(arena, request));
-    try std.testing.expectError(error.LMFailure, provider.streamRequest(arena, request, .{
+    try std.testing.expectError(error.LMFailure, provider.streamRequest(@import("workspace.zig").forTests(), arena, request, .{
         .context = &called,
         .on_event = Probe.onEvent,
     }));

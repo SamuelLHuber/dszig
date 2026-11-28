@@ -4,6 +4,7 @@
 //!
 //! Upstream (DSPy 3.5.0): dspy/clients/base_lm.py, dspy/clients/lm.py, dspy/utils/exceptions.py
 
+const Workspace = @import("workspace.zig").Workspace;
 const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
@@ -2569,9 +2570,9 @@ pub const OpenAI = struct {
     /// response assembly. Events are borrowed for the duration of the callback.
     /// Returning `.stop` closes the stream without emitting further events.
     /// `.exhausted` does not imply a terminal frame was received.
-    pub fn streamRequest(self: *OpenAI, backing: Allocator, request: *const sdk.Request, sink: StreamSink) Error!StreamOutcome {
-        var scratch = std.heap.ArenaAllocator.init(backing);
-        defer scratch.deinit();
+    pub fn streamRequest(self: *OpenAI, workspace: *Workspace, request: *const sdk.Request, sink: StreamSink) Error!StreamOutcome {
+        var scratch = workspace.open();
+        defer scratch.close();
         const stream = try self.runStream(scratch.allocator(), request, sink, false);
         return stream.outcome;
     }
@@ -4503,7 +4504,7 @@ test "OpenAI generation parses non-200 success in buffered and streamed calls" {
             defer serving.cancel(io) catch {};
             if (streaming) {
                 var observation: Fixture.Observation = .{};
-                const result = provider.streamRequest(testing.allocator, request, .{
+                const result = provider.streamRequest(@import("workspace.zig").forTests(), request, .{
                     .context = &observation,
                     .on_event = Fixture.Observation.observe,
                 });
